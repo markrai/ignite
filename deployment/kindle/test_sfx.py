@@ -52,7 +52,9 @@ def _posix_env(sh: str) -> dict[str, str]:
 
 
 def _to_posix_path(path: Path) -> str:
-    s = str(path.resolve()).replace("\\", "/")
+    # absolute() keeps symlink pathnames. resolve() follows symlinks and would
+    # hide refuse-symlink coverage (e.g. recovery root checks).
+    s = str(path.absolute()).replace("\\", "/")
     if len(s) >= 2 and s[1] == ":":
         return f"/{s[0].lower()}{s[2:]}"
     return s

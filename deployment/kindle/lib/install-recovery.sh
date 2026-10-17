@@ -165,6 +165,11 @@ ignite_install_recovery() {
 
   umask 077
 
+  # Re-bind at call time so host-test overrides keep the logical pathname
+  # (symlink components must not be resolved away before -L checks).
+  IGNITE_RECOVERY_ROOT="${IGNITE_RECOVERY_ROOT:-/var/local/ignite-recovery}"
+  IGNITE_RECOVERY_PARENT=$(dirname "$IGNITE_RECOVERY_ROOT")
+
   if [ "$(id -u)" -ne 0 ] && [ "${IGNITE_RECOVERY_ALLOW_NONROOT:-}" != "1" ]; then
     ignite_recovery_die "requires the existing privileged installer context"
     return 1

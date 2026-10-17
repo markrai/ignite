@@ -1143,12 +1143,24 @@ fn reject_protected_recovery_path(path: &Path) -> Result<(), String> {
         .to_string_lossy()
         .replace('/', "\\")
         .to_ascii_lowercase();
+    // Match require_disposable_exec_root: Windows fixtures plus portable
+    // checkout roots (Linux CI does not use c:\dev\project\...).
+    let manifest = env!("CARGO_MANIFEST_DIR")
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .map(|p| p.to_string_lossy().replace('/', "\\").to_ascii_lowercase())
+        .unwrap_or_default();
     if s.contains("ignite-divergence-analysis-18d3\\reference")
         || s.contains("ignite-currentstate-18e6c")
         || s.contains("ignite-divergence-analysis-18d3\\work\\18e6d")
         || s.contains("ignite-livetail-18e6b")
         || s.contains("c:\\dev\\project\\ignite\\")
         || s.contains("c:\\dev\\project\\scribe\\")
+        || (!manifest.is_empty() && s.contains(&manifest))
+        || (!workspace.is_empty() && (s == workspace || s.starts_with(&(workspace.clone() + "\\"))))
     {
         return Err(format!(
             "REFUSE RECOVERY EXEC: {} is a protected or product path",

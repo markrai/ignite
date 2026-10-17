@@ -140,9 +140,16 @@ def test_symlink_root_refused(tmp_path: Path) -> None:
         os.symlink(target, root, target_is_directory=True)
     except OSError as exc:
         pytest.skip(f"symlinks unavailable: {exc}")
+    # Harness must pass the symlink pathname itself (not its resolve() target).
+    assert root.is_symlink()
+    assert Path(_to_posix_path(root)).name == "ignite-recovery"
     failed = _run_install(payload, kindle)
-    assert failed.returncode != 0
-    assert "symlink" in (failed.stdout + failed.stderr)
+    assert failed.returncode != 0, failed.stdout + failed.stderr
+    combined = failed.stdout + failed.stderr
+    assert "symlink" in combined
+    # Must not publish recovery artifacts through the symlink into the target.
+    assert not (target / "bin" / "dropbearmulti").exists()
+    assert root.is_symlink()
 
 
 def test_chown_failure_refuses(tmp_path: Path) -> None:
