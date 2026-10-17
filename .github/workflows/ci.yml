@@ -75,3 +75,41 @@ jobs:
       - name: Launcher unit tests
         working-directory: tools/kindle_launcher
         run: pytest -q
+
+  ignite-web:
+    name: ignite-web production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ignite/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignite-web-wasm
+      - name: Install npm dependencies
+        working-directory: ignite/web
+        run: npm ci
+      - name: Production build (Cargo WASM + Vite)
+        working-directory: ignite/web
+        run: npm run build
+      - name: Typecheck and lint
+        working-directory: ignite/web
+        run: |
+          npm run typecheck
+          npm run lint
+      - name: Vitest (fresh WASM)
+        working-directory: ignite/web
+        run: npm test
+      - name: Rust WASM bridge + web fixture parity
+        run: |
+          cargo test -p scribe-web-wasm --locked
+          cargo test -p scribe-sync-tool --test web_fixtures --locked
+      - name: Confirm dist WASM matches Cargo artifact
+        working-directory: ignite/web
+        run: node scripts/verify-dist-wasm.mjs

@@ -1,0 +1,20 @@
+{
+  "blob": {
+    "file": "blobs/43c443ca845f30b12c08d5c29b095f5ddb44c3dbbd3d46355a8d94789a8d022f.gray8",
+    "sha256": "43c443ca845f30b12c08d5c29b095f5ddb44c3dbbd3d46355a8d94789a8d022f"
+  },
+  "library_id": "01a14ab8-8368-75bf-ae2e-f7fcd3c81bcc",
+  "live_ops": "live-ops-v1.json",
+  "second_library": {
+    "library_id": "01a14ab8-8396-743a-b040-f17022430660",
+    "snapshot": "snapshot-b-v1.json",
+    "snapshot_sha256": "a9aa15cf280077a5a48ffeec43f3ea63a60b5d264a74e2e21b199c2d76561765"
+  },
+  "snapshot": "snapshot-v1.json",
+  "snapshot_sha256": "f801f3ebacb01e6e50fd900a36be5979954cbade65e404c2036d052ed27e1943",
+  "snapshot_sha256_after_live_ops": [
+    "eced9351622c73b470e076c22c499cf98deea586df0db06a3fda63494e009a23",
+    "b09ad99e98182a12eded564ea01d0a1ea04b2a435ecc7a5fd17f00cb7dc0979e"
+  ],
+  "v": 1
+}

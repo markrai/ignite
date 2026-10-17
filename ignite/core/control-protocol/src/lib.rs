@@ -1,5 +1,5 @@
 //! D1 control-plane wire contract shared by Scribe Server, Scribe for Kindle and (as documented
-//! JSON) Scribe Web.
+//! JSON) ignite-web.
 //!
 //! This crate is deliberately separate from `sync-protocol`: server identity, discovery,
 //! pairing and credentials are **deployment/auth** concepts, never notebook content. Nothing

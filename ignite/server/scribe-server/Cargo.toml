@@ -10,7 +10,7 @@ name = "scribe-server"
 path = "src/main.rs"
 
 [dependencies]
-# The sync plane is reused, never forked: ledger, reducer, snapshots, blobs, Scribe Web static.
+# The sync plane is reused, never forked: ledger, reducer, snapshots, blobs, ignite-web static.
 scribe-sync-server = { workspace = true }
 control-protocol = { workspace = true }
 rusqlite = { version = "0.33", features = ["bundled"] }

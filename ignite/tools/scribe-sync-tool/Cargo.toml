@@ -1,0 +1,20 @@
+[package]
+name = "scribe-sync-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sync identity/snapshot inspection for an Ignite library (+ server compare)"
+
+[dependencies]
+scribe-app = { path = "../../kindle/scribe-app" }
+sync-protocol = { workspace = true, features = ["mint"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+sync-engine = { path = "../../core/sync-engine" }
+uuid = { version = "1", features = ["v7"] }
+scribe-sync-server = { path = "../../server/scribe-sync-server" }
+kindle-platform = { workspace = true }
+notebook-core = { workspace = true, features = ["mint"] }
+serde_json = "1"

@@ -11,13 +11,13 @@ scribe-sync-server — Scribe sync ledger (S2A/S2B/S3A)
 
 Usage:
   scribe-sync-server --data-dir <dir> [--bind 127.0.0.1:8787] [--token-verifier-file <file>]
-                     [--web-root <web/scribe-web/dist>] [--accept-replace-stroke-lineages]
+                     [--web-root <ignite/web/dist>] [--accept-replace-stroke-lineages]
   scribe-sync-server new-token --verifier-out <file>
 
 serve       default bind is loopback. A non-loopback bind (e.g. --bind 0.0.0.0:8787) REFUSES to
             start unless --token-verifier-file is given; with it, every /v1 request needs
             `Authorization: Bearer <token>`. Plain HTTP: trusted LAN only (no TLS in S2B).
---web-root  S3A: also serve the read-only Scribe Web bundle for non-/v1 paths (same origin, no
+--web-root  S3A: also serve the read-only ignite-web bundle for non-/v1 paths (same origin, no
             CORS). Must contain index.html and must not overlap the ledger or verifier.
 --accept-replace-stroke-lineages
             opt-in: persist new ReplaceStrokeLineages envelopes. Default off so installing

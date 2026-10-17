@@ -6,12 +6,14 @@ members = [
     "ignite/core/sync-engine",
     "ignite/core/control-protocol",
     "ignite/core/nbk-reader",
+    "ignite/core/scribe-web-wasm",
     "ignite/kindle/scribe-lifecycle",
     "ignite/kindle/kindle-platform",
     "ignite/kindle/ink-probe",
     "ignite/kindle/scribe-app",
     "ignite/server/scribe-sync-server",
     "ignite/server/scribe-server",
+    "ignite/tools/scribe-sync-tool",
 ]
 default-members = [
     "ignite/core/notebook-core",
@@ -19,12 +21,14 @@ default-members = [
     "ignite/core/sync-engine",
     "ignite/core/control-protocol",
     "ignite/core/nbk-reader",
+    "ignite/core/scribe-web-wasm",
     "ignite/kindle/scribe-lifecycle",
     "ignite/kindle/kindle-platform",
     "ignite/kindle/ink-probe",
     "ignite/kindle/scribe-app",
     "ignite/server/scribe-sync-server",
     "ignite/server/scribe-server",
+    "ignite/tools/scribe-sync-tool",
 ]
 
 [workspace.package]
@@ -39,6 +43,7 @@ sync-engine = { path = "ignite/core/sync-engine" }
 control-protocol = { path = "ignite/core/control-protocol" }
 nbk-reader = { path = "ignite/core/nbk-reader" }
 kindle-platform = { path = "ignite/kindle/kindle-platform" }
+scribe-app = { path = "ignite/kindle/scribe-app" }
 scribe-sync-server = { path = "ignite/server/scribe-sync-server" }
 scribe-server = { path = "ignite/server/scribe-server" }
 

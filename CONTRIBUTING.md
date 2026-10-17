@@ -20,7 +20,9 @@ Host unit tests do **not** need a Kindle, jailbreak, or production credentials.
 | `ignite/core/` | Shared crates (`notebook-core`, `sync-protocol`, `sync-engine`, …) |
 | `ignite/kindle/` | Kindle runtime (`scribe-app`, `kindle-platform`, …) |
 | `ignite/server/` | Self-hosted sync / control servers |
-| `ignite/web/` | Web companion placeholder (not yet migrated) |
+| `ignite/web/` | ignite-web (Vite/React browser replica) |
+| `ignite/core/scribe-web-wasm/` | WASM protocol bridge for ignite-web |
+| `ignite/tools/scribe-sync-tool/` | Sync inspection + web fixture generation |
 | `ignite/assets/` | Fonts and third-party notices |
 | `deployment/kindle/` | Installer scripts, SFX builder, pytest suite |
 | `scripts/kindle/` | Release packaging (`package-release.ps1`) |

@@ -1,0 +1,16 @@
+/* Pre-bundle launch colors (CSP style-src 'self' — no inline styles).
+ * Matches styles.css --bg light/dark so standalone/home-screen launch avoids a white flash. */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #f4f2ee;
+  color: #1d1d1f;
+}
+@media (prefers-color-scheme: dark) {
+  html,
+  body {
+    background: #121315;
+    color: #e8e6e3;
+  }
+}

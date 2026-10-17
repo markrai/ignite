@@ -1,0 +1,3 @@
+# Rust-generated fixtures are exact bytes (canonical JSON + pinned SHA-256): never convert.
+tests/fixtures/** -text
+src/model/generated/** text eol=lf

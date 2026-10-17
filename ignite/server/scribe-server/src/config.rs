@@ -4,7 +4,7 @@
 //! [server]
 //! listen    = "0.0.0.0:80"                       # installer picks 80, or a fallback port
 //! state_dir = "/var/lib/scribe-server"            # ServerId, control.sqlite, ledger/
-//! web_root  = "/usr/share/scribe-server/web"      # built Scribe Web bundle
+//! web_root  = "/usr/share/scribe-server/web"      # built ignite-web bundle
 //! name      = ""                                  # "" → "Scribe Server on <Hostname>"
 //!
 //! [discovery]

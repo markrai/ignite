@@ -1,0 +1,25 @@
+[package]
+name = "scribe-web-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ignite-web protocol bridge: authoritative Rust canonical SyncEnvelopeV1 encoding, ID construction and the reducer's erase (wasm32, no JS glue)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Protocol + reducer only: no scribe-app, kindle-platform, server, SQLite, Tokio or filesystem.
+# sync-protocol without `mint` (randomness comes from the browser's crypto.getRandomValues).
+sync-protocol = { workspace = true }
+# The one eraser: the reducer's `erase_page_strokes` over notebook-core's clip primitive
+# (both wasm32-clean; notebook-core without `mint`).
+sync-engine = { path = "../sync-engine" }
+notebook-core = { workspace = true, default-features = false }
+uuid = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Reducer fixtures as the independent oracle for projection parity.
+sync-engine = { path = "../sync-engine", features = ["testkit"] }

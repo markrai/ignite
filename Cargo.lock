@@ -817,6 +817,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "scribe-sync-tool"
+version = "0.9.11"
+dependencies = [
+ "kindle-platform",
+ "notebook-core",
+ "scribe-app",
+ "scribe-sync-server",
+ "serde_json",
+ "sync-engine",
+ "sync-protocol",
+ "uuid",
+]
+
+[[package]]
+name = "scribe-web-wasm"
+version = "0.9.11"
+dependencies = [
+ "notebook-core",
+ "serde",
+ "serde_json",
+ "sync-engine",
+ "sync-protocol",
+ "uuid",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"

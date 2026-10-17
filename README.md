@@ -26,7 +26,7 @@ License: **AGPL-3.0-only** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 |------|--------|
 | Kindle app + installer | Active development / beta |
 | Self-hosted sync server | In-tree; use on trusted networks |
-| Web companion | **Not yet migrated** (`ignite/web/` placeholder) |
+| Web companion | **ignite-web** in `ignite/web/` (browser replica + sync) |
 | Experimental recovery | **Disabled** in product builds (see below) |
 
 Version: see [`ignite/VERSION`](ignite/VERSION).
@@ -37,7 +37,7 @@ Version: see [`ignite/VERSION`](ignite/VERSION).
 ignite/core/       Shared Rust crates (notebook, sync protocol/engine)
 ignite/kindle/     Kindle runtime (scribe-app, platform, lifecycle)
 ignite/server/     Self-hosted sync / control servers
-ignite/web/        Web companion placeholder
+ignite/web/        ignite-web (browser replica)
 ignite/assets/     Fonts + third-party notices
 deployment/kindle/ Installer, SFX, pytest
 scripts/kindle/    Release packaging
@@ -127,10 +127,12 @@ prerequisite for using Ignite as a notebook.
 
 ## Known limitations
 
-- Web UI not in this repository yet
 - Compatibility beyond verified Scribe firmware is incomplete
 - Sync servers are plain HTTP for LAN/self-host use—do not expose casually
 - Review 79 (performance investigation) remains open
+- ignite-web Playwright E2E coverage has been run on Chromium; Firefox and
+  WebKit/Safari E2E suites have not yet been executed in this migration, so
+  compatibility on those browsers remains unverified
 
 ## Contributing
 

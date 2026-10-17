@@ -1,4 +1,4 @@
-//! S3A optional static hosting of the Scribe Web bundle (same origin as `/v1`, so the browser
+//! S3A optional static hosting of the ignite-web bundle (same origin as `/v1`, so the browser
 //! needs no CORS at all).
 //!
 //! * Only non-`/v1` paths are static; `/v1` always stays the (authenticated) sync API.
@@ -79,7 +79,7 @@ impl WebRoot {
         }
         if !root.join("index.html").is_file() {
             return Err(format!(
-                "REFUSE: --web-root {} has no index.html (build web/scribe-web first)",
+                "REFUSE: --web-root {} has no index.html (build ignite/web first)",
                 root.display()
             ));
         }

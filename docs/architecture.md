@@ -1,7 +1,7 @@
 # Ignite architecture (contributor overview)
 
 Ignite is a local-first handwriting notebook for a prepared Kindle Scribe, with
-optional self-hosted sync and a future web companion.
+optional self-hosted sync and **ignite-web** (`ignite/web/`) as the browser replica.
 
 ## Kindle native runtime
 
@@ -50,10 +50,15 @@ by default** and must not be enabled casually.
 
 Pairing / discovery helpers live in `scribe-server` + `control-protocol`.
 
-## Web companion
+## ignite-web
 
-`ignite/web/` is a **placeholder** in this tree. A full browser client is not
-yet migrated here. Do not assume web parity with the Kindle app.
+`ignite/web/` is the browser notebook replica (Vite/React). Canonical sync
+encoding is produced by the Rust WASM bridge `scribe-web-wasm`
+(`ignite/core/scribe-web-wasm`); TypeScript does not implement wire encoding.
+Browser durable state uses IndexedDB `scribe-web-sync` (name preserved for
+existing clients). PWA manifest `id` is the stable `/ignite-web` (not versioned).
+Product mode pairs through `/control/v1` on `scribe-server`; developer-token
+mode talks to `scribe-sync-server` over `/v1`.
 
 ## Packaging and installation
 

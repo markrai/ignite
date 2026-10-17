@@ -1,5 +1,5 @@
 //! Scribe Server (D1 product): composes the existing sync server (ledger, reducer, snapshots,
-//! blobs, Scribe Web static serving — `scribe-sync-server`, reused, never forked) with a
+//! blobs, ignite-web static serving — `scribe-sync-server`, reused, never forked) with a
 //! product control plane (server identity, first-run claim, pairing, per-device credentials,
 //! browser sessions, revocation) and DNS-SD advertisement.
 //!

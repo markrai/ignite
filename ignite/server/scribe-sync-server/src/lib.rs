@@ -8,7 +8,7 @@
 //! LAN only — TLS belongs in front of it (reverse proxy) in a later phase.
 //!
 //! S3A: `GET /v1/libraries` (read-only discovery) and optional same-origin static hosting of
-//! the Scribe Web bundle (`--web-root`, see [`web`]).
+//! the ignite-web bundle (`--web-root`, see [`web`]).
 
 pub mod auth;
 pub mod http;

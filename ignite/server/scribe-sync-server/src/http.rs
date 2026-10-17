@@ -409,7 +409,7 @@ fn info_json(info: &crate::store::LibraryInfo) -> Vec<u8> {
 pub struct ServerConfig {
     /// When set, every `/v1` request must carry `Authorization: Bearer <token>`.
     pub auth: Option<TokenVerifier>,
-    /// S3A: serve the Scribe Web bundle for non-`/v1` paths. `None` = no static behavior at all.
+    /// S3A: serve the ignite-web bundle for non-`/v1` paths. `None` = no static behavior at all.
     pub web_root: Option<WebRoot>,
     /// D1 product mode: the control plane (`/control/*` routes + `/v1` authorization). When set
     /// it replaces `auth` for `/v1`; the sync routes themselves are unchanged.
