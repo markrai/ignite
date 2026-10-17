@@ -736,17 +736,35 @@ fn kindle_109_strings_are_fixtures_not_production_constants() {
     assert_eq!(cmd[1], "dbclient");
 }
 
+/// The Linux collector must reject a supervised identity whose PID does not exist.
+/// u32::MAX cannot be allocated as a Linux process ID.
 #[test]
-fn linux_entry_point_fails_closed_without_kernel_procfs() {
+fn linux_collector_refuses_nonexistent_supervised_pid() {
+    let missing_pid = u32::MAX;
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{missing_pid}")).exists(),
+            "/proc/{missing_pid} unexpectedly exists"
+        );
+    }
+
     let (plan, _, argv) = leaked_plan_host();
-    let sup = supervised(1, 1, argv);
+    let sup = supervised(missing_pid, 1, argv);
     let mut r = req(&plan, &sup);
     r.source = ObservationSourceKind::LinuxProcfs;
     let err = collect_linux_tunnel_observation(&r).unwrap_err();
-    assert!(err.iter().any(|e| e.contains("Linux")
-        || e.contains("not available")
-        || e.contains("missing")
-        || e.contains("PID")));
+    // Fail-closed: missing /proc entry (Linux) or unsupported platform (Windows).
+    assert!(
+        err.iter().any(|e| {
+            e.contains("missing") || e.contains("not available") || e.contains("Linux /proc")
+        }),
+        "expected missing-PID / unsupported-platform refuse, got {err:?}"
+    );
+    assert!(
+        err.iter().all(|e| e.contains("REFUSE TUNNEL OBSERVE")),
+        "expected refuse prefix, got {err:?}"
+    );
 }
 
 #[test]
