@@ -25,9 +25,10 @@ Host unit tests do **not** need a Kindle, jailbreak, or production credentials.
 | `ignite/tools/scribe-sync-tool/` | Sync inspection + web fixture generation |
 | `ignite/assets/` | Fonts and third-party notices |
 | `deployment/kindle/` | Installer scripts, SFX builder, pytest suite |
+| `deployment/linux/` | Ignite Server portable Linux bundle + staging tests |
 | `scripts/kindle/` | Release packaging (`package-release.ps1`) |
 | `tools/` | Cross-build, Dropbear client build, launcher helpers |
-| `docs/` | Architecture, troubleshooting, compatibility |
+| `docs/` | Architecture, troubleshooting, compatibility, self-hosting |
 
 ## Build and test (host)
 

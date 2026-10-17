@@ -113,3 +113,44 @@ jobs:
       - name: Confirm dist WASM matches Cargo artifact
         working-directory: ignite/web
         run: node scripts/verify-dist-wasm.mjs
+
+  ignite-server-linux:
+    name: Ignite Server Linux bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ignite/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignite-server-linux
+      - name: Shell syntax checks
+        run: |
+          set -euo pipefail
+          for f in deployment/linux/*.sh; do
+            bash -n "$f"
+          done
+      - name: Build portable Linux bundle
+        run: bash deployment/linux/build-bundle.sh dist/ignite-server-linux
+      - name: Static bundle checks
+        run: bash deployment/linux/test-bundle.sh dist/ignite-server-linux
+      - name: Unsafe path rejection
+        run: bash deployment/linux/test-path-safety.sh dist/ignite-server-linux
+      - name: Staging install / upgrade / rollback seams
+        run: bash deployment/linux/test-staging.sh dist/ignite-server-linux
+      - name: CARGO_TARGET_DIR binary location
+        run: bash deployment/linux/test-cargo-target-dir.sh
+
+  ignite-server-firewall:
+    name: Ignite Server firewall ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ufw + firewalld ownership (disposable containers)
+        run: bash deployment/linux/ci-firewall.sh

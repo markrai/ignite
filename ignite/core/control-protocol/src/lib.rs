@@ -104,7 +104,7 @@ impl From<ServerId> for String {
     }
 }
 
-/// `"Scribe Server on Workshop"` from a hostname (`workshop`, `workshop.local`).
+/// `"Ignite Server on Workshop"` from a hostname (`workshop`, `workshop.local`).
 /// Trimmed to one DNS label's worth of bytes on a char boundary.
 pub fn default_display_name(hostname: &str) -> String {
     let short = hostname.split('.').next().unwrap_or("").trim();
@@ -113,7 +113,7 @@ pub fn default_display_name(hostname: &str) -> String {
         Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
         None => "this computer".to_string(),
     };
-    clamp_label(&format!("Scribe Server on {host}"))
+    clamp_label(&format!("Ignite Server on {host}"))
 }
 
 /// Clamp to [`MAX_INSTANCE_NAME_BYTES`] on a UTF-8 boundary, removing control characters.
@@ -179,7 +179,7 @@ pub fn parse_advertisement(txt: &[(String, String)]) -> Result<Advertised, Strin
     Ok(Advertised {
         server_id,
         name: if name.is_empty() {
-            "Scribe Server".into()
+            "Ignite Server".into()
         } else {
             name
         },
@@ -480,16 +480,16 @@ mod tests {
     fn display_names() {
         assert_eq!(
             default_display_name("workshop"),
-            "Scribe Server on Workshop"
+            "Ignite Server on Workshop"
         );
         assert_eq!(
             default_display_name("WORKSHOP.local"),
-            "Scribe Server on Workshop"
+            "Ignite Server on Workshop"
         );
-        assert_eq!(default_display_name(""), "Scribe Server on this computer");
+        assert_eq!(default_display_name(""), "Ignite Server on this computer");
         let long = "x".repeat(200);
         assert!(default_display_name(&long).len() <= MAX_INSTANCE_NAME_BYTES);
-        let emoji = format!("Scribe Server on {}", "é".repeat(40));
+        let emoji = format!("Ignite Server on {}", "é".repeat(40));
         let c = clamp_label(&emoji);
         assert!(c.len() <= MAX_INSTANCE_NAME_BYTES && c.is_char_boundary(c.len()));
         assert_eq!(clamp_label("a\u{7}b\n"), "ab");
@@ -497,13 +497,13 @@ mod tests {
 
     #[test]
     fn advertisement_is_nonsecret_and_parses() {
-        let txt = advertisement_txt(sid(), "Scribe Server on Workshop");
+        let txt = advertisement_txt(sid(), "Ignite Server on Workshop");
         validate_txt(&txt).unwrap();
         let keys: Vec<&str> = txt.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["v", "sid", "name", "cp"]);
         let a = parse_advertisement(&txt).unwrap();
         assert_eq!(a.server_id, sid());
-        assert_eq!(a.name, "Scribe Server on Workshop");
+        assert_eq!(a.name, "Ignite Server on Workshop");
         let mut bad = txt.clone();
         bad.push(("token".into(), "x".into()));
         assert!(validate_txt(&bad).is_err());

@@ -60,6 +60,13 @@ existing clients). PWA manifest `id` is the stable `/ignite-web` (not versioned)
 Product mode pairs through `/control/v1` on `scribe-server`; developer-token
 mode talks to `scribe-sync-server` over `/v1`.
 
+## Ignite Server (Linux self-hosting)
+
+Portable Linux packaging lives under `deployment/linux/` (bundle build, install /
+upgrade, systemd unit, ownership-scoped firewall helpers, disposable staging
+tests). On-disk paths remain `/etc/scribe-server` and `/var/lib/scribe-server`
+for compatibility. See [`self-hosting.md`](self-hosting.md).
+
 ## Packaging and installation
 
 1. Cross-compile ARMv7hf binaries (`tools/docker_build_armv7hf.sh`).

@@ -13,8 +13,7 @@ use sync_protocol::{
 };
 
 fn fixture_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../web/tests/fixtures/wasm-envelopes-v1.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/tests/fixtures/wasm-envelopes-v1.json")
 }
 
 fn id(n: u8) -> uuid::Uuid {

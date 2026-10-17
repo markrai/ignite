@@ -1,0 +1,45 @@
+# Ignite Server — systemd unit (Linux portable self-hosting).
+# Runs as the unprivileged `scribe` account. Port 80 is bound through CAP_NET_BIND_SERVICE
+# (the only capability granted); the process never runs as root.
+# On-disk paths and unit name remain scribe-server for compatibility with existing installs.
+[Unit]
+Description=Ignite Server (notebook sync, ignite-web, LAN discovery)
+Documentation=file:///usr/share/scribe-server/README.txt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scribe
+Group=scribe
+ExecStart=/usr/local/bin/scribe-server serve --config /etc/scribe-server/config.toml
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+# Bind a privileged port (80) without root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening (compatible with SQLite, mDNS multicast and interface enumeration).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/scribe-server
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

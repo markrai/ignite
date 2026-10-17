@@ -17,7 +17,7 @@ const STATUS = JSON.stringify({
   v: 1,
   mode: "product",
   server_id: "01a0de1f-f9d6-7036-a2b7-478dc58007ff",
-  server_name: "Scribe Server on Vega",
+  server_name: "Ignite Server on Workshop",
   version: "0.1.0",
   claimed: true,
   session: null,
@@ -26,7 +26,7 @@ const STATUS = JSON.stringify({
 describe("D1 control API client", () => {
   it("detects product mode, and developer mode when there is no control plane", async () => {
     const product = createControlApi(recorder({ "/control/v1/status": { status: 200, body: STATUS } }).fetchFn);
-    expect((await product.status())?.server_name).toBe("Scribe Server on Vega");
+    expect((await product.status())?.server_name).toBe("Ignite Server on Workshop");
     const dev404 = createControlApi(recorder({}).fetchFn);
     expect(await dev404.status()).toBeNull();
     const devStatic = createControlApi(recorder({ "/control/v1/status": { status: 200, body: "<!doctype html>" } }).fetchFn);

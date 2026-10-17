@@ -25,7 +25,7 @@ License: **AGPL-3.0-only** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 | Area | Status |
 |------|--------|
 | Kindle app + installer | Active development / beta |
-| Self-hosted sync server | In-tree; use on trusted networks |
+| Self-hosted sync server | **Ignite Server** — portable Linux bundle (see [self-hosting](docs/self-hosting.md)) |
 | Web companion | **ignite-web** in `ignite/web/` (browser replica + sync) |
 | Experimental recovery | **Disabled** in product builds (see below) |
 
@@ -40,10 +40,19 @@ ignite/server/     Self-hosted sync / control servers
 ignite/web/        ignite-web (browser replica)
 ignite/assets/     Fonts + third-party notices
 deployment/kindle/ Installer, SFX, pytest
+deployment/linux/  Ignite Server portable Linux bundle + install tests
 scripts/kindle/    Release packaging
 tools/             Cross-build, Dropbear client, launcher
-docs/              Architecture, troubleshooting, compatibility
+docs/              Architecture, troubleshooting, compatibility, self-hosting
 ```
+
+## Self-hosted Ignite Server
+
+Build and install a portable Linux bundle (Ignite Server + ignite-web) from source:
+
+see [`docs/self-hosting.md`](docs/self-hosting.md). Trusted LAN / plain HTTP only;
+Docker Compose packaging is not included in this phase.
+
 
 ## Supported device expectations
 
@@ -133,6 +142,8 @@ prerequisite for using Ignite as a notebook.
 - ignite-web Playwright E2E coverage has been run on Chromium; Firefox and
   WebKit/Safari E2E suites have not yet been executed in this migration, so
   compatibility on those browsers remains unverified
+- Ignite Server portable Linux packaging is validated with disposable staging
+  tests; Docker Compose / Portainer images are not provided yet
 
 ## Contributing
 
