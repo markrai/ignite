@@ -1,0 +1,14 @@
+upstream_name=dropbear
+upstream_version=2024.85
+tarball=dropbear-2024.85.tar.bz2
+tarball_sha256=86b036c433a69d89ce51ebae335d65c47738ccf90d13e5eb0fea832e556da502
+signing_key_fingerprint=F7347EF2EE2E07A267628CA944931494F29C6773
+signing_key_uid=Dropbear SSH Release Signing <matt@ucc.asn.au>
+signing_key_sources=Debian bookworm dropbear_2022.83-1+deb12u3.debian.tar.xz debian/upstream/signing-key.asc; Ubuntu universe dropbear_2022.83-4.debian.tar.xz debian/upstream/signing-key.asc
+elf_sha256=d20b510a58b59ff5bf482bb5fcc66768d4c4c51705855b9f5c9e47ffaaf3d1e9
+elf_bytes=145544
+host=arm-linux-gnueabihf
+interpreter=/lib/ld-linux-armhf.so.3
+max_glibc=GLIBC_2.28
+program=dbclient
+multi=1

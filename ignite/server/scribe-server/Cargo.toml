@@ -1,0 +1,31 @@
+[package]
+name = "scribe-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scribe Server (D1 product): the existing sync server + control plane (ServerId, first-run claim, pairing, per-device credentials, browser sessions) + DNS-SD advertisement"
+
+[[bin]]
+name = "scribe-server"
+path = "src/main.rs"
+
+[dependencies]
+# The sync plane is reused, never forked: ledger, reducer, snapshots, blobs, Scribe Web static.
+scribe-sync-server = { workspace = true }
+control-protocol = { workspace = true }
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+getrandom = "0.3"
+uuid = { version = "1", default-features = false, features = ["std"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+# DNS-SD / mDNS: pure Rust, no async runtime, Linux/macOS/Windows (D1 audit, see docs).
+mdns-sd = { version = "0.21", default-features = false }
+# D1.1: portable interface inventory for the shared LAN policy (same version mdns-sd uses).
+if-addrs = "0.15"
+ctrlc = { version = "3.4", features = ["termination"] }
+
+[dev-dependencies]
+ureq = { version = "2", default-features = false, features = ["json"] }
+serde_json = "1"

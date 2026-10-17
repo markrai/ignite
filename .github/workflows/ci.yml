@@ -1,0 +1,77 @@
+# Ignite continuous integration — no secrets, no deploy, no device contact.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-test:
+    name: Rust workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (report only; large intentional dead_code surface in recovery)
+        run: cargo clippy --workspace --all-targets --locked
+        continue-on-error: true
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Kindle lib suite
+        run: cargo test -p scribe-app --lib --locked
+
+  recovery-isolation:
+    name: Recovery and harness isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ripgrep
+      - name: Assert recovery stays disabled and harness stays out of release packaging
+        run: bash tools/ci/check_recovery_isolation.sh
+
+  armv7-check:
+    name: ARMv7hf compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+      - name: Install cross linker
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc-arm-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: armv7
+      - name: cargo check (Kindle target)
+        run: cargo check -p scribe-app -p scribe-lifecycle -p ink-probe --locked --target armv7-unknown-linux-gnueabihf
+
+  kindle-installer:
+    name: Kindle installer pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run deployment/kindle tests
+        working-directory: deployment/kindle
+        run: pytest -q
+      - name: Launcher unit tests
+        working-directory: tools/kindle_launcher
+        run: pytest -q

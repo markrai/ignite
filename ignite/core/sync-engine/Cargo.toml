@@ -1,0 +1,21 @@
+[package]
+name = "sync-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic semantic reducer: SyncSnapshotV1 + SyncOperationV1 -> next state (portable, wasm32-clean)"
+
+[features]
+# Deterministic fixtures for reducer/server tests only.
+testkit = []
+
+[dependencies]
+# Portable only: no filesystem, HTTP, SQLite, Kindle APIs, clocks, or OS randomness.
+notebook-core = { workspace = true, default-features = false }
+sync-protocol = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", default-features = false, features = ["std", "v5"] }
+
+[dev-dependencies]
+sync-engine = { path = ".", features = ["testkit"] }
+sync-protocol = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "ink-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal stylus → display latency probe for Kindle Scribe"
+
+[[bin]]
+name = "ink-probe"
+path = "src/main.rs"
+
+[dependencies]
+notebook-core = { workspace = true, features = ["mint"] }
+kindle-platform = { workspace = true }

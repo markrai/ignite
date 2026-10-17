@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "ignite/core/notebook-core",
+    "ignite/core/sync-protocol",
+    "ignite/core/sync-engine",
+    "ignite/core/control-protocol",
+    "ignite/core/nbk-reader",
+    "ignite/kindle/scribe-lifecycle",
+    "ignite/kindle/kindle-platform",
+    "ignite/kindle/ink-probe",
+    "ignite/kindle/scribe-app",
+    "ignite/server/scribe-sync-server",
+    "ignite/server/scribe-server",
+]
+default-members = [
+    "ignite/core/notebook-core",
+    "ignite/core/sync-protocol",
+    "ignite/core/sync-engine",
+    "ignite/core/control-protocol",
+    "ignite/core/nbk-reader",
+    "ignite/kindle/scribe-lifecycle",
+    "ignite/kindle/kindle-platform",
+    "ignite/kindle/ink-probe",
+    "ignite/kindle/scribe-app",
+    "ignite/server/scribe-sync-server",
+    "ignite/server/scribe-server",
+]
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+version = "0.9.11"
+
+[workspace.dependencies]
+notebook-core = { path = "ignite/core/notebook-core", default-features = false }
+sync-protocol = { path = "ignite/core/sync-protocol" }
+sync-engine = { path = "ignite/core/sync-engine" }
+control-protocol = { path = "ignite/core/control-protocol" }
+nbk-reader = { path = "ignite/core/nbk-reader" }
+kindle-platform = { path = "ignite/kindle/kindle-platform" }
+scribe-sync-server = { path = "ignite/server/scribe-sync-server" }
+scribe-server = { path = "ignite/server/scribe-server" }
+
+# Ship optimized binaries without DWARF or a leftover symbol table.
+# Does not change unwind/panic behavior (panic = "unwind" remains the default).
+# Parity with the original Scribe native workspace release profile (Slice 16).
+[profile.release]
+debug = false
+strip = true
+lto = true
+codegen-units = 1

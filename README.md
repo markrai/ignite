@@ -1,0 +1,147 @@
+# Ignite
+
+**Ignite** is an open-source **Kindle Scribe notebook replacement**: local
+handwriting, durable notebooks on-device, optional self-hosted sync, and a
+single-file installer for prepared Kindles.
+
+> Ignite requires a Kindle that is **already prepared** for third-party apps
+> (jailbreak / community tooling, SH Integration, root helper). It does **not**
+> jailbreak a stock Kindle and does **not** claim support for every Kindle
+> generation. For jailbreaking, follow the community guide at
+> [kindlemodding.org/jailbreaking](https://kindlemodding.org/jailbreaking/).
+
+License: **AGPL-3.0-only** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+## Features
+
+- Multi-stroke notebook editing on Kindle Scribe e-ink
+- On-device library, tools, and durable page storage
+- Optional LAN sync with a self-hosted server
+- One-file customer installer (`Install Ignite v*.sh`)
+- Diagnose / backup / uninstall helpers
+
+## Status
+
+| Area | Status |
+|------|--------|
+| Kindle app + installer | Active development / beta |
+| Self-hosted sync server | In-tree; use on trusted networks |
+| Web companion | **Not yet migrated** (`ignite/web/` placeholder) |
+| Experimental recovery | **Disabled** in product builds (see below) |
+
+Version: see [`ignite/VERSION`](ignite/VERSION).
+
+## Repository layout
+
+```text
+ignite/core/       Shared Rust crates (notebook, sync protocol/engine)
+ignite/kindle/     Kindle runtime (scribe-app, platform, lifecycle)
+ignite/server/     Self-hosted sync / control servers
+ignite/web/        Web companion placeholder
+ignite/assets/     Fonts + third-party notices
+deployment/kindle/ Installer, SFX, pytest
+scripts/kindle/    Release packaging
+tools/             Cross-build, Dropbear client, launcher
+docs/              Architecture, troubleshooting, compatibility
+```
+
+## Supported device expectations
+
+See [`docs/compatibility.md`](docs/compatibility.md).
+
+- **Verified:** Kindle Scribe (1st generation), firmware **5.18.6**, 32-bit ARM
+- **In progress / tester:** 2024 Scribe polarity path (firmware **5.19.6**)
+
+## Kindle installation (overview)
+
+1. Prepare the Kindle for third-party apps using the
+   [Kindle Modding jailbreak guide](https://kindlemodding.org/jailbreaking/).
+2. Obtain `Install Ignite vVERSION.sh` (release artifact) and its `.sha256`.
+3. Verify the checksum.
+4. Copy the Scriptlet into the Kindle **Documents** folder over USB.
+5. Open **Install Ignite** on the device.
+6. Launch **Ignite** from the Library.
+
+Application registration identity is **`com.markrai.ignite`** (from 0.9.11).
+Upgrading from 0.9.10 migrates the older `com.markrai.scribe` handler automatically;
+notebooks stay at `/mnt/us/scribe-data` and sync service discovery remains
+`_scribe._tcp`.
+
+Full steps: [`deployment/kindle/README.txt`](deployment/kindle/README.txt).  
+Problems: [`docs/troubleshooting.md`](docs/troubleshooting.md).
+
+## Build from source
+
+### Host tools
+
+- Recent stable Rust (`rustup`)
+- Optional: Docker (Kindle ARMv7hf + Dropbear builds)
+- Python 3 + pytest (installer tests)
+
+### Rust workspace (no Kindle required)
+
+```bash
+cargo test --workspace --locked
+cargo test -p scribe-app --lib --locked
+```
+
+### Kindle ARMv7hf binaries
+
+```bash
+docker run --rm -v "$(pwd):/src" -w /src rust:1-bullseye \
+  bash /src/tools/docker_build_armv7hf.sh
+```
+
+### Customer Scriptlet (packaging host)
+
+```powershell
+# After Dropbear client build under target/dropbear-kindle/
+.\scripts\kindle\package-release.ps1
+```
+
+Details: [`docs/release-packaging.md`](docs/release-packaging.md),
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Development setup
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Default tests use disposable temp
+dirs and loopback sockets only—no production credentials or device required.
+
+## Architecture
+
+Concise overview: [`docs/architecture.md`](docs/architecture.md).
+
+## Experimental recovery
+
+Ignite’s tree includes research/recovery modules and a verified protected
+Dropbear transport path on Kindle hardware. **Publishing source does not
+activate recovery.**
+
+- `LIVE_NON_LOOPBACK_POST_ENABLED = false`
+- Ordinary startup does not submit recovery operations
+- No production SSH keys or host pins are bundled
+- Test-only `kindle-supervisor-harness` is excluded from the customer Scriptlet
+
+Real historical recovery remains a separate, controlled process—not a
+prerequisite for using Ignite as a notebook.
+
+## Known limitations
+
+- Web UI not in this repository yet
+- Compatibility beyond verified Scribe firmware is incomplete
+- Sync servers are plain HTTP for LAN/self-host use—do not expose casually
+- Review 79 (performance investigation) remains open
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports:
+[`SECURITY.md`](SECURITY.md).
+
+## Third-party notices
+
+Fonts (SIL OFL), Dropbear (upstream permissive license, build-time fetch), and
+Rust crate licenses: [`ignite/assets/THIRD_PARTY_NOTICES.md`](ignite/assets/THIRD_PARTY_NOTICES.md).
+
+## License
+
+[GNU Affero General Public License v3.0 only](LICENSE) (AGPL-3.0-only).

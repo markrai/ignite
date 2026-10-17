@@ -1,0 +1,16 @@
+[package]
+name = "scribe-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kindle appmgrd lifecycle host / probe (LIPC load/go/pause/unload)"
+
+[[bin]]
+name = "scribe-lifecycle"
+path = "src/main.rs"
+
+[dependencies]
+libloading = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

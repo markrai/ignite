@@ -1,0 +1,48 @@
+[package]
+name = "scribe-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Live multi-stroke Kindle Scribe notebook runtime (Gate F0+)"
+
+[[bin]]
+name = "scribe-app"
+path = "src/main.rs"
+
+# Test-only Kindle hardware harness for SupervisedRecoveryStream (Review 122).
+# Never packaged into the customer Scriptlet; requires an explicit feature.
+[[bin]]
+name = "kindle-supervisor-harness"
+path = "src/bin/kindle_supervisor_harness.rs"
+required-features = ["kindle_supervisor_harness"]
+
+[features]
+# Narrow, non-production gate: exposes DisposableStreamPermit construction and the
+# isolated harness binary. Ordinary scribe-app / Scriptlet builds must omit this.
+kindle_supervisor_harness = []
+
+[dependencies]
+notebook-core = { workspace = true, features = ["mint"] }
+kindle-platform = { workspace = true }
+sync-protocol = { workspace = true, features = ["mint"] }
+uuid = { version = "1", default-features = false, features = ["std", "v7"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+# S2B outbound sync client: small blocking HTTP/1.1, no TLS, no async runtime.
+ureq = { version = "2", default-features = false }
+sync-engine = { workspace = true }
+nbk-reader = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+# D1: paired-server control plane + DNS-SD discovery (no async runtime, no TLS).
+control-protocol = { workspace = true }
+mdns-sd = { version = "0.21", default-features = false }
+# Display-only page text: pure-Rust TTF raster (no FreeType / Kindle system fonts).
+fontdue = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+# Host-side integration tests (never linked into the Kindle binary).
+scribe-sync-server = { workspace = true }
+scribe-server = { workspace = true }
+# D1 / NBK import host fixtures (crates.io).
+rusqlite = { version = "0.33", features = ["bundled"] }
+sync-engine = { workspace = true, features = ["testkit"] }

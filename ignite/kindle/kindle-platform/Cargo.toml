@@ -1,0 +1,13 @@
+[package]
+name = "kindle-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kindle Scribe platform capabilities (input, display, orientation)"
+
+[dependencies]
+notebook-core = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Thin libc only when compiling Linux backends; no invented Kindle ioctls.
+libc = "0.2"

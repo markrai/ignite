@@ -1,0 +1,19 @@
+[package]
+name = "sync-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-independent Scribe sync domain model: global IDs, semantic snapshots, operations"
+
+[features]
+# Parsing, validation, serialization, hashing and deterministic (UUIDv5) derivation need no OS
+# randomness. Minting new random/time-ordered IDs is opt-in so the default build has no native
+# RNG dependency (clean wasm32-unknown-unknown check). Native replicas enable `mint`.
+default = []
+mint = ["uuid/v4", "uuid/v7"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", default-features = false }
+uuid = { version = "1", default-features = false, features = ["std", "v5"] }

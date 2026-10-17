@@ -1,0 +1,21 @@
+{ "def": "interface", "assoc": { "interface": "application" } },
+{
+  "def": "handlerId",
+  "assoc": {
+    "handlerId": "com.markrai.ignite",
+    "props": {
+      "extend-start": "Y",
+      "unloadPolicy": "unloadOnPause",
+      "maxGoTime": "60",
+      "maxLoadTime": "60",
+      "maxPauseTime": "60",
+      "maxUnloadTime": "60",
+      "searchbar-mode": "transient",
+      "supportedOrientation": "U",
+      "framework": "",
+      "lipcId": "com.markrai.ignite",
+      "default-chrome-style": "NH",
+      "command": "/mnt/us/scribe-app/bin/scribe-lifecycle-host.sh"
+    }
+  }
+}

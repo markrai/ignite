@@ -1,0 +1,6 @@
+# Portable cross-link configuration for the confirmed Scribe target.
+# Requires an ARM GNU hard-float linker on PATH (e.g. arm-linux-gnueabihf-gcc).
+# Do not put machine-specific absolute paths here.
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"

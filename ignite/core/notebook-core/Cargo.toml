@@ -1,0 +1,16 @@
+[package]
+name = "notebook-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-independent notebook concepts and operation-oriented direction"
+
+[features]
+# Minting new stroke IDs (UUIDv7) needs OS randomness. On by default for the Kindle app and
+# probes; the portable `sync-engine` disables it so it stays wasm32-clean and never mints.
+default = ["mint"]
+mint = ["dep:uuid"]
+
+[dependencies]
+# UUIDv7 minting for new stroke IDs (S1). Parsing/mapping lives in `sync-protocol`.
+uuid = { version = "1", default-features = false, features = ["std", "v7"], optional = true }

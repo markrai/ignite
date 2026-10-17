@@ -1,0 +1,12 @@
+Ignite
+Copyright (C) 2024-2026 Mark Rai
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 only (AGPL-3.0-only).
+
+See the file LICENSE for the full license text.
+
+Third-party components bundled or fetched for builds are described in
+ignite/assets/THIRD_PARTY_NOTICES.md and retain their own copyright notices
+and licenses.

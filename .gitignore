@@ -1,0 +1,72 @@
+# Secrets and local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets/
+
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Databases and local data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Temporary and OS junk
+*.tmp
+*.temp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and coverage
+*.log
+/coverage/
+/lcov.info
+*.profraw
+*.profdata
+
+# Developer-specific / IDE
+.idea/
+.vscode/
+*.code-workspace
+.claude/
+.cursor/
+.history/
+.direnv/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+node_modules/
+dist/
+.cache/
+
+# Personal notebook samples and device dumps (never commit)
+**/personal/
+**/samples/private/
+**/*-device-copy/
+**/*.nbk.personal
+
+# Packaging / cross-build outputs (regenerate locally)
+/target/package/
+/target/dropbear-kindle/
+**/Ignite-Diagnose*.txt
+
+# Editor / agent local state
+*.orig
+*.rej
+
+# Never publish sibling review evidence from this tree
+/ignite-review/

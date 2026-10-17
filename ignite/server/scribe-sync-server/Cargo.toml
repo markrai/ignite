@@ -1,0 +1,25 @@
+[package]
+name = "scribe-sync-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "S2A sync server: durable ledger, deduplication and canonical sequencing (host only, loopback)"
+
+[dependencies]
+sync-protocol = { workspace = true }
+sync-engine = { workspace = true }
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+getrandom = "0.3"
+sha2 = "0.10"
+
+[dev-dependencies]
+sync-engine = { workspace = true, features = ["testkit"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde_json = "1"
