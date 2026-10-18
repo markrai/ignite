@@ -59,6 +59,20 @@ assert(
   "wasm requestfailed is critical",
 );
 
+// Precedence: critical resource type wins even when URL looks like an API path.
+assert(
+  classifyFailure({ url: "http://x/v1/bundle/app.js", status: 404, resourceType: "script" }) === "critical",
+  "failed script under /v1/ is critical (not expected_api)",
+);
+assert(
+  classifyFailure({ url: "http://x/control/v1/theme.css", status: 500, resourceType: "stylesheet" }) === "critical",
+  "failed stylesheet under /control/v1/ is critical",
+);
+assert(
+  classifyFailure({ url: "http://x/v1/libraries/missing", status: 404, resourceType: "fetch" }) === "expected_api",
+  "ordinary API 404 remains expected_api",
+);
+
 // --- smoke.mjs must pass options as 3rd arg to waitForFunction ---
 const smokeSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "smoke.mjs"), "utf8");
 assert(

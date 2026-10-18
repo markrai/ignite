@@ -1,5 +1,8 @@
 /**
  * Distinguish critical browser resource failures from expected API 4xx.
+ *
+ * Precedence: critical document/script/stylesheet/WASM failures always win,
+ * even when the URL path looks like `/v1/` or `/control/v1/`.
  */
 
 /**
@@ -13,13 +16,12 @@ export function isCriticalResource(url, resourceType) {
   if (t === "document" || t === "script" || t === "stylesheet" || t === "wasm") return true;
   if (/\.wasm(\?|$)/i.test(u) || /scribe_web_wasm/i.test(u)) return true;
   if (/\/assets\//i.test(u) && /\.(js|css|mjs|wasm)(\?|$)/i.test(u)) return true;
-  // Main document navigations
-  if (t === "document") return true;
   return false;
 }
 
 /**
  * Expected/benign control-plane or sync API statuses during smoke (not PASS-killers).
+ * Only applies to non-critical resource types (fetch/xhr/other).
  * @param {string} url
  * @param {number} status
  */
@@ -41,11 +43,11 @@ export function isExpectedApiStatus(url, status) {
 export function classifyFailure(ev) {
   const url = ev.url || "";
   const status = ev.status;
-  if (status != null && isExpectedApiStatus(url, status)) return "expected_api";
+  // Critical browser resources take precedence over API-path heuristics.
   if (isCriticalResource(url, ev.resourceType)) return "critical";
-  if (ev.error && isCriticalResource(url, ev.resourceType || "document")) return "critical";
-  // requestfailed on script/document/wasm without status
-  if (ev.error && isCriticalResource(url, ev.resourceType)) return "critical";
-  if (ev.error && (/\.wasm(\?|$)/i.test(url) || /\/assets\/.+\.js/i.test(url))) return "critical";
+  if (ev.error && (/\.wasm(\?|$)/i.test(url) || /\/assets\/.+\.(js|css|mjs)/i.test(url))) {
+    return "critical";
+  }
+  if (status != null && isExpectedApiStatus(url, status)) return "expected_api";
   return "other";
 }

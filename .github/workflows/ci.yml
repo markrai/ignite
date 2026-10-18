@@ -154,3 +154,28 @@ jobs:
       - uses: actions/checkout@v4
       - name: ufw + firewalld ownership (disposable containers)
         run: bash deployment/linux/ci-firewall.sh
+
+  # Focused acceptance harness regressions only — no Multipass, HCS, VM, or Chromium download.
+  ignite-accept-regressions:
+    name: Ignite Server acceptance regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: deployment/linux/acceptance/browser-smoke/package-lock.json
+      - name: Browser-smoke helper tests (pinned Node 20)
+        working-directory: deployment/linux/acceptance/browser-smoke
+        run: |
+          npm ci --omit=dev
+          npm test
+      - name: Browser smoke exit-status capture (behavioral)
+        run: bash deployment/linux/acceptance/test-run-browser-smoke-rc.sh
+      - name: Guest browser-class structure
+        shell: pwsh
+        run: pwsh -NoProfile -File deployment/linux/acceptance/test-guest-browser-class.ps1
+      - name: PowerShell argv forwarding (literal --)
+        shell: pwsh
+        run: pwsh -NoProfile -File deployment/linux/acceptance/test-run-host-ps1-argv.ps1

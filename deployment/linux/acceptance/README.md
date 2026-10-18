@@ -92,9 +92,11 @@ cd deployment\linux\acceptance\browser-smoke
 npm ci --omit=dev
 npm test
 cd ..\..\..\..
+bash deployment/linux/acceptance/test-run-browser-smoke-rc.sh
 powershell -NoProfile -File deployment\linux\acceptance\test-guest-browser-class.ps1
 powershell -NoProfile -File deployment\linux\acceptance\test-run-host-ps1-argv.ps1
 ```
+
 
 ## Evidence hygiene
 

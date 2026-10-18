@@ -144,6 +144,10 @@ BROWSER_NOTE=""
 BROWSER_CLASS=""
 COOKIE=""
 
+# Invokes Playwright smoke. Does not toggle set -e/set +e (callers capture status via
+# `smoke_rc=0; run_browser_smoke || smoke_rc=$?` so a non-zero return cannot abort the script
+# before the diagnostic branch runs).
+# Returns: 0 success, 2 missing smoke.mjs, 3 missing node, 4 missing playwright, else smoke exit.
 run_browser_smoke() {
   local smoke_js="$SMOKE_DIR/smoke.mjs"
   [ -f "$smoke_js" ] || return 2
@@ -165,23 +169,18 @@ run_browser_smoke() {
     "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"
     node "$smoke_js"
   )
-  set +e
+  # `|| return` propagates a non-zero smoke status without toggling errexit.
   if [ "$(id -u)" -eq 0 ] && id ubuntu >/dev/null 2>&1; then
-    sudo -u ubuntu -- "${run_cmd[@]}"
+    sudo -u ubuntu -- "${run_cmd[@]}" || return $?
   else
-    "${run_cmd[@]}"
+    "${run_cmd[@]}" || return $?
   fi
-  local rc=$?
-  set -e
-  return "$rc"
+  return 0
 }
 
 if [ "$REQUIRE_BROWSER" = "1" ]; then
-  # Capture status before `if` — `if ! cmd; then rc=$?` is often 0 in bash.
-  set +e
-  run_browser_smoke
-  smoke_rc=$?
-  set -e
+  smoke_rc=0
+  run_browser_smoke || smoke_rc=$?
   if [ "$smoke_rc" -ne 0 ]; then
     case "$smoke_rc" in
       2) fail "IGNITE_ACCEPT_REQUIRE_BROWSER=1 but browser-smoke missing at $SMOKE_DIR" ;;
@@ -210,10 +209,8 @@ if [ "$REQUIRE_BROWSER" = "1" ]; then
 else
   # Optional browser: curl claim only when smoke was NOT attempted (missing deps).
   # If Playwright runs and fails after (or during) claim, do not curl-claim again.
-  set +e
-  run_browser_smoke
-  smoke_rc=$?
-  set -e
+  smoke_rc=0
+  run_browser_smoke || smoke_rc=$?
   if [ "$smoke_rc" -eq 0 ] \
      && grep -q '"browser_class": "playwright-chromium"' "$EVIDENCE/browser-smoke.json" 2>/dev/null \
      && grep -q '"ok": true' "$EVIDENCE/browser-smoke.json" 2>/dev/null; then

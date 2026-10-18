@@ -51,6 +51,15 @@ if ($src -notmatch 'refusing curl re-claim') {
 if ($src -notmatch 'smoke_rc" -eq 2') {
   throw "optional path must gate curl fallback on smoke_rc 2/3/4"
 }
+if ($src -notmatch 'run_browser_smoke \|\| smoke_rc=\$\?') {
+  throw "must capture status via run_browser_smoke || smoke_rc=`$? (safe under set -e)"
+}
+# Function body must not toggle errexit (structural complement to behavioral test).
+$fnMatch = [regex]::Match($src, '(?ms)run_browser_smoke\(\)\s*\{.*?^\}')
+if (-not $fnMatch.Success) { throw "could not locate run_browser_smoke function body" }
+if ($fnMatch.Value -match '(?m)^\s*set [+-]e(\s|$)') {
+  throw "run_browser_smoke must not manipulate errexit (set +/-e)"
+}
 
 Write-Host "PASS: guest-acceptance.sh browser_class gating structure ok"
 exit 0
