@@ -70,3 +70,5 @@ dist/
 
 # Never publish sibling review evidence from this tree
 /ignite-review/
+ Disposable Linux acceptance run artifacts (generated; may contain host-local paths)
+/deployment/linux/acceptance/evidence-*/

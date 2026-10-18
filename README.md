@@ -33,17 +33,26 @@ Version: see [`ignite/VERSION`](ignite/VERSION).
 
 ## Repository layout
 
+This outer directory is a **development workspace**. The Ignite product lives
+under the inner `ignite/` tree (including `ignite/web/`). An optional `scribe/`
+directory may sit as a **sibling of `ignite/` inside this same workspace** for
+local native-Scribe work; it is not part of the Ignite product tree and is not
+moved or merged by Ignite tooling.
+
 ```text
-ignite/core/       Shared Rust crates (notebook, sync protocol/engine)
-ignite/kindle/     Kindle runtime (scribe-app, platform, lifecycle)
-ignite/server/     Self-hosted sync / control servers
-ignite/web/        ignite-web (browser replica)
-ignite/assets/     Fonts + third-party notices
-deployment/kindle/ Installer, SFX, pytest
-deployment/linux/  Ignite Server portable Linux bundle + install tests
-scripts/kindle/    Release packaging
-tools/             Cross-build, Dropbear client, launcher
-docs/              Architecture, troubleshooting, compatibility, self-hosting
+C:\dev\project\ignite\          (outer workspace / this repository root)
+  ignite\                       Ignite product
+    core\                       Shared Rust crates (notebook, sync protocol/engine)
+    kindle\                     Kindle runtime (scribe-app, platform, lifecycle)
+    server\                     Self-hosted sync / control servers
+    web\                        ignite-web (browser replica + PWA)
+    assets\                     Fonts + third-party notices
+  scribe\                       Optional local native-Scribe work (not Ignite product)
+  deployment\kindle\            Installer, SFX, pytest
+  deployment\linux\             Ignite Server portable Linux bundle + acceptance tests
+  scripts\kindle\               Release packaging
+  tools\                        Cross-build, Dropbear client, launcher
+  docs\                         Architecture, troubleshooting, compatibility, self-hosting
 ```
 
 ## Self-hosted Ignite Server

@@ -184,7 +184,7 @@ if [ -z "$ROOT" ]; then
 fi
 if [ -n "$ROOT" ]; then
   ignite_assert_staging_destinations_safe "$ROOT" || exit 1
-  # Write marker before creating install layout. Only empty/fresh roots or
+  # Write marker before creating install layout. Only empty/fresh roots o
   # already-marked trees are eligible (never adopt arbitrary nonempty dirs).
   # Never write through a symlinked marker (would overwrite an outside target).
   if [ -L "$ROOT/$IGNITE_STAGING_MARKER" ]; then

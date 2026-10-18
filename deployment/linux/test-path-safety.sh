@@ -386,7 +386,9 @@ echo "brk-alive" >"$VICTIM_BRK/keep.unit"
 printf 'ignite-staging-root=1\ncreated_by=test\n' >"$STAGE_BRK/$IGNITE_STAGING_MARKER"
 ln -s "$VICTIM_BRK" "$STAGE_BRK/etc"
 echo "dummy" >"$VICTIM_BRK/systemd/system/scribe-server.service"
-if "$BROKEN/uninstall.sh" --root="$STAGE_BRK" >"$BASE/brk.out" 2>"$BASE/brk.err"; then
+# Repo-tracked scripts are often mode 0644; invoke via bash so CI exercises
+# safe_rm containment rather than failing on the missing executable bit.
+if bash "$BROKEN/uninstall.sh" --root="$STAGE_BRK" >"$BASE/brk.out" 2>"$BASE/brk.err"; then
   fail "broken-validator uninstall unexpectedly succeeded without containment"
 fi
 grep -Eqi "refus|outside" "$BASE/brk.err" || fail "broken-validator uninstall missing containment refuse"
