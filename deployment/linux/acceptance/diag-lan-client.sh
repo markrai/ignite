@@ -1,35 +1,43 @@
 #!/usr/bin/env bash
-# Independent LAN-client discovery diagnostics for Ignite Server (_scribe._tcp).
+# Independent LAN-client discovery diagnostic for Ignite Server (_scribe._tcp). Read-only:
+# never changes firewall, interfaces, routes or system config; never claims, pairs, sends
+# credentials or writes notebook data.
 #
-# Run this on a **second physical machine** on the same trusted LAN as a
-# host-networked Ignite Server. Multipass / HCS / container-only networking
-# must NOT be labeled physical-LAN PASS.
+# Run on a SECOND PHYSICAL machine on the same trusted LAN as the server:
 #
-#   IGNITE_LAN_DIAG=1 bash deployment/linux/acceptance/diag-lan-client.sh
-#   IGNITE_LAN_DIAG=1 IGNITE_LAN_EXPECT_SID=<server_id> \
+#   IGNITE_LAN_EXPECT_SID=<server_id from diag-lan-server.sh> \
 #     bash deployment/linux/acceptance/diag-lan-client.sh
 #
-# Optional: IGNITE_LAN_HTTP_PROBE=1 also fetches http://<resolved>:<port>/control/v1/status
-# (default 1). Does not pair, claim, or send credentials.
+# Optional: IGNITE_LAN_EVIDENCE=<dir>, IGNITE_LAN_BROWSE_TIMEOUT=<s> (default 12),
+# IGNITE_LAN_HTTP_PROBE=0 (skip HTTP). Needs avahi-browse (avahi-tools / avahi-utils),
+# python3, curl, ip.
 #
-# Reports four separate things; this tool can only ever establish the first two:
-#   SERVER_LOCAL_ADVERTISEMENT — the advertisement resolved to an address of THIS machine
-#   LAN_CLIENT_DISCOVERY       — resolved to another machine and reachable over HTTP
-#   KINDLE_DISCOVERY / KINDLE_PAIRING_SYNC — always NOT_TESTED (needs the physical device)
+# LAN_CLIENT_DISCOVERY=PASS only when ALL hold for one advertisement:
+#   * this client is not a VM / WSL guest (systemd-detect-virt),
+#   * TXT sid equals IGNITE_LAN_EXPECT_SID (the separately identified target),
+#   * it resolved to an address NOT on this machine,
+#   * it arrived on a physical, LAN-eligible interface (same name policy as the server's
+#     netpolicy, plus a real device in sysfs) and resolved to a private address on that
+#     interface's subnet,
+#   * GET /control/v1/status at that address:port answered 200 with server_id == TXT sid.
+# A TXT/HTTP identity mismatch for the target is FAIL, never a warning.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-MODE="${IGNITE_LAN_DIAG:-}"
 EXPECT_SID="${IGNITE_LAN_EXPECT_SID:-}"
 HTTP_PROBE="${IGNITE_LAN_HTTP_PROBE:-1}"
 BROWSE_TIMEOUT="${IGNITE_LAN_BROWSE_TIMEOUT:-12}"
+# Test hook only: sysfs net class root used to tell physical NICs from virtual devices.
+SYSFS_NET="${IGNITE_LAN_SYSFS_NET:-/sys/class/net}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 EVIDENCE="${IGNITE_LAN_EVIDENCE:-$ROOT/deployment/linux/acceptance/evidence-lan-client-$TS}"
 
 die() { echo "diag-lan-client: ERROR: $*" >&2; exit 1; }
 say() { echo "diag-lan-client: $*"; }
 
-[ "$MODE" = "1" ] || die "set IGNITE_LAN_DIAG=1 (explicit opt-in). Refusing to run."
+for t in python3 ip; do
+  command -v "$t" >/dev/null 2>&1 || die "$t is required"
+done
 
 mkdir -p "$EVIDENCE"
 chmod 700 "$EVIDENCE" 2>/dev/null || true
@@ -37,187 +45,216 @@ chmod 700 "$EVIDENCE" 2>/dev/null || true
 sanitize() {
   sed -E \
     -e 's/setup_code=[A-Z0-9-]+/setup_code=<redacted>/g' \
-    -e 's/scribe_session=[^;[:space:]]+/scribe_session=<redacted>/g'
+    -e 's/scribe_session=[^;[:space:]]+/scribe_session=<redacted>/g' \
+    -e 's/[Aa]uthorization:[[:space:]]*Bearer[[:space:]]+[^[:space:]]+/Authorization: Bearer <redacted>/g'
 }
 
-note() { printf '%s\n' "$*" | tee -a "$EVIDENCE/report.txt"; }
-
+ME="$(hostname 2>/dev/null || echo unknown)"
 {
   echo "tool=diag-lan-client"
   echo "ts_utc=$TS"
-  echo "host=$(hostname 2>/dev/null || echo unknown)"
+  echo "host=$ME"
   echo "expect_sid=${EXPECT_SID:-<none>}"
-  echo "NOTE=independent discovery requires a resolved address that is NOT on this machine"
 } >"$EVIDENCE/report.txt"
 
+# Is this client itself virtualized? A VM / WSL guest is never an independent physical client.
+VIRT="unknown"
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+  VIRT="$(systemd-detect-virt 2>/dev/null || true)"
+  VIRT="${VIRT:-unknown}"
+elif grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+  VIRT="wsl"
+fi
+
 say "client interface inventory"
-{
-  echo "=== ip -brief addr ==="
-  ip -brief addr 2>/dev/null || ifconfig -a 2>/dev/null || echo "no ip/ifconfig"
-} >"$EVIDENCE/interfaces.txt"
-# This machine's own addresses (to tell server-local sightings from independent ones).
-{
-  ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
-  hostname -I 2>/dev/null | tr ' ' '\n'
-  echo 127.0.0.1
-  echo ::1
-} | sed '/^$/d' | sort -u >"$EVIDENCE/local-addrs.txt"
+ip -brief addr >"$EVIDENCE/interfaces.txt" 2>&1 || true
+# iface<TAB>cidr for every address on this machine.
+ip -o addr show 2>/dev/null | awk '{print $2 "\t" $4}' >"$EVIDENCE/local-inventory.tsv" || true
+# Interfaces backed by a real device (virtual bridges/veth/tun/docker have none in sysfs).
+: >"$EVIDENCE/physical-ifaces.txt"
+for i in $(cut -f1 "$EVIDENCE/local-inventory.tsv" | sort -u); do
+  [ -e "$SYSFS_NET/$i/device" ] && echo "$i" >>"$EVIDENCE/physical-ifaces.txt"
+done
 
-BROWSE="NOT_TESTED"   # PASS | NO_SIGHTING | TIMEOUT | BLOCKED
-echo '{"advertisements":[],"count":0}' >"$EVIDENCE/resolved.json"
-
+BROWSE_RC=127
 if command -v avahi-browse >/dev/null 2>&1; then
   say "DNS-SD browse + resolve _scribe._tcp (timeout ${BROWSE_TIMEOUT}s)"
   set +e
   timeout "$BROWSE_TIMEOUT" avahi-browse -rtp _scribe._tcp \
-    >"$EVIDENCE/avahi-scribe-resolve.txt" 2>"$EVIDENCE/avahi-browse.err"
-  BR_RC=$?
+    >"$EVIDENCE/avahi-browse.raw" 2>"$EVIDENCE/avahi-browse.err"
+  BROWSE_RC=$?
   set -e
-  # Parseable resolved rows: =;iface;proto;name;type;domain;host;address;port;txt
-  python3 - "$EVIDENCE/avahi-scribe-resolve.txt" "$EVIDENCE/local-addrs.txt" \
-    "$(hostname 2>/dev/null || true)" "$EVIDENCE/resolved.json" <<'PY'
-import json, re, sys
-rows = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
-local = {l.strip() for l in open(sys.argv[2], encoding="utf-8") if l.strip()}
-me = (sys.argv[3] or "").lower().split(".")[0]
+  sanitize <"$EVIDENCE/avahi-browse.raw" >"$EVIDENCE/avahi-browse.txt"
+  rm -f "$EVIDENCE/avahi-browse.raw"
+else
+  echo "avahi-browse not installed" >"$EVIDENCE/avahi-browse.txt"
+fi
+
+[ "$HTTP_PROBE" = 1 ] && ! command -v curl >/dev/null 2>&1 && die "curl is required for the HTTP probe"
+
+say "classifying advertisements$([ "$HTTP_PROBE" = 1 ] && echo ' and probing HTTP identity')"
+python3 - "$EVIDENCE" "$ME" "$EXPECT_SID" "$BROWSE_RC" "$HTTP_PROBE" "$VIRT" <<'PY'
+import ipaddress, json, re, subprocess, sys
+
+ev, me, expect, browse_rc, http_probe, virt = sys.argv[1:7]
+browse_rc = int(browse_rc)
+me = me.lower().split(".")[0]
+
+# Mirrors ignite/server/scribe-server/src/netpolicy.rs (NON_LAN_PREFIXES, private addresses),
+# plus Multipass's bridge.
+NON_LAN = ("lo", "docker", "br-", "veth", "virbr", "vnet", "tailscale", "tun", "tap", "wg",
+           "zt", "cni", "flannel", "cali", "kube", "lxc", "lxd", "podman", "vmnet", "vboxnet",
+           "utun", "llw", "awdl", "ham", "mpqemu")
+RFC1918 = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+ULA = ipaddress.ip_network("fc00::/7")
+
+def lan_name(n): return not n.startswith(NON_LAN)
+def private_lan(ip):
+    return any(ip in n for n in RFC1918) if ip.version == 4 else ip in ULA
+
+inv = []
+for line in open(f"{ev}/local-inventory.tsv", encoding="utf-8"):
+    parts = line.split()
+    if len(parts) == 2:
+        try:
+            inv.append((parts[0], ipaddress.ip_interface(parts[1])))
+        except ValueError:
+            pass
+physical = set(open(f"{ev}/physical-ifaces.txt", encoding="utf-8").read().split())
+local_ips = {i.ip for _, i in inv}
+
+def on_link(iface, ip):
+    """ip is on the subnet of a physical, LAN-eligible, private address of the receiving iface."""
+    return any(n == iface and lan_name(n) and n in physical and private_lan(i.ip)
+               and ip.version == i.version and ip in i.network for n, i in inv)
+
 ads = []
-for line in rows:
+for line in open(f"{ev}/avahi-browse.txt", encoding="utf-8", errors="replace"):
     if not line.startswith("=;"):
         continue
-    f = line.split(";", 9)
+    f = line.rstrip("\n").split(";", 9)
     if len(f) < 10 or f[4] != "_scribe._tcp":
         continue
-    addr = f[7].split("%", 1)[0]
     txt = dict(p.split("=", 1) for p in re.findall(r'"([^"]*)"', f[9]) if "=" in p)
-    host = f[6].lower()
-    is_local = addr in local or addr.startswith("127.") or addr == "::1" \
-        or (me and host.split(".")[0] == me)
-    ads.append({"iface": f[1], "family": f[2], "host": f[6], "address": addr,
-                "port": int(f[8]) if f[8].isdigit() else None, "txt": txt,
-                "local": is_local})
-json.dump({"advertisements": ads, "count": len(ads)},
-          open(sys.argv[4], "w", encoding="utf-8"), indent=2)
-open(sys.argv[4], "a", encoding="utf-8").write("\n")
-PY
-  ADS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["count"])' "$EVIDENCE/resolved.json")"
-  if [ "$ADS" -gt 0 ]; then
-    BROWSE="PASS"
-  elif [ "$BR_RC" -eq 124 ]; then
-    BROWSE="TIMEOUT"
-  elif [ "$BR_RC" -ne 0 ]; then
-    BROWSE="BLOCKED"
-  else
-    BROWSE="NO_SIGHTING"
-  fi
-  case "$BROWSE" in
-    PASS) note "browse=PASS resolved_advertisements=$ADS" ;;
-    TIMEOUT) note "browse=TIMEOUT (no resolved record within ${BROWSE_TIMEOUT}s: multicast isolation, firewall, or no advertiser)" ;;
-    BLOCKED) note "browse=BLOCKED (avahi-browse rc=$BR_RC; is avahi-daemon running? see avahi-browse.err)" ;;
-    NO_SIGHTING) note "browse=NO_SIGHTING (browse completed; no _scribe._tcp advertiser visible)" ;;
-  esac
-else
-  BROWSE="BLOCKED"
-  note "browse=BLOCKED (avahi-browse missing — install avahi-utils)"
-  echo "avahi-browse not installed" >"$EVIDENCE/avahi-scribe-resolve.txt"
-fi
-
-LOCAL_ADS="$(python3 -c 'import json,sys; print(sum(1 for a in json.load(open(sys.argv[1]))["advertisements"] if a["local"]))' "$EVIDENCE/resolved.json")"
-REMOTE_ADS="$(python3 -c 'import json,sys; print(sum(1 for a in json.load(open(sys.argv[1]))["advertisements"] if not a["local"]))' "$EVIDENCE/resolved.json")"
-note "local_advertisements=$LOCAL_ADS remote_advertisements=$REMOTE_ADS"
-
-HTTP="NOT_TESTED"
-SID_MATCH="NOT_TESTED"
-if [ "$HTTP_PROBE" = "1" ] && [ "$REMOTE_ADS" -gt 0 ]; then
-  say "HTTP connectivity to resolved non-local addresses"
-  python3 - "$EVIDENCE/resolved.json" "$EVIDENCE/http-probe.txt" "$EXPECT_SID" <<'PY'
-import json, sys, urllib.request
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-out = open(sys.argv[2], "w", encoding="utf-8")
-expect = sys.argv[3] or ""
-any_ok = False
-sid_match = "NOT_TESTED"
-for ad in data.get("advertisements") or []:
-    addr = ad.get("address")
-    if not addr or ad.get("local"):
-        continue
-    port = ad.get("port") or 8787
-    host = f"[{addr}]" if ":" in addr else addr
-    url = f"http://{host}:{port}/control/v1/status"
-    out.write(f"probe {url}\n")
+    addr_s = f[7].split("%", 1)[0]
     try:
-        with urllib.request.urlopen(url, timeout=5) as r:
-            j = json.loads(r.read().decode("utf-8", "replace"))
-    except Exception as e:
-        out.write(f"  error={e}\n")
+        ip = ipaddress.ip_address(addr_s)
+    except ValueError:
+        ip = None
+    iface = f[1]
+    ad = {
+        "iface": iface, "family": f[2], "instance": f[3], "host": f[6], "address": addr_s,
+        "port": int(f[8]) if f[8].isdigit() else None, "txt_sid": txt.get("sid", ""),
+        "local": bool(ip is not None and (ip in local_ips or ip.is_loopback))
+                 or (bool(me) and f[6].lower().split(".")[0] == me),
+        "iface_physical": lan_name(iface) and iface in physical,
+        "lan_address": bool(ip is not None and private_lan(ip) and on_link(iface, ip)),
+        "http": "NOT_TESTED", "http_server_id": "", "identity": "UNVERIFIED",
+    }
+    ads.append(ad)
+
+# HTTP identity probe: only remote ads on a physical on-link LAN address (direct, no proxy).
+probes = {}
+out = open(f"{ev}/http-probe.txt", "w", encoding="utf-8")
+for ad in ads:
+    if ad["local"]:
+        ad["http"] = "SKIPPED_LOCAL"; continue
+    if not (ad["iface_physical"] and ad["lan_address"]):
+        ad["http"] = "SKIPPED_NOT_PHYSICAL_LAN"; continue
+    if http_probe != "1" or ad["port"] is None:
         continue
-    sid = j.get("server_id") or ""
-    out.write(f"  http=200 server_id={sid} claimed={j.get('claimed')}\n")
-    txt_sid = (ad.get("txt") or {}).get("sid") or ""
-    if txt_sid and sid and txt_sid != sid:
-        out.write(f"  WARN txt_sid_mismatch txt={txt_sid} status={sid}\n")
-    any_ok = True
-    if expect:
-        if sid == expect:
-            sid_match = "PASS"
-        elif sid_match != "PASS":
-            sid_match = "FAIL"
-out.write(f"any_http_ok={any_ok}\n")
-out.write(f"sid_match={sid_match}\n")
+    key = (ad["address"], ad["port"])
+    if key not in probes:
+        host = f"[{ad['address']}]" if ":" in ad["address"] else ad["address"]
+        url = f"http://{host}:{ad['port']}/control/v1/status"
+        r = subprocess.run(["curl", "-sS", "--noproxy", "*", "--max-time", "5",
+                            "-w", "\n%{http_code}", url], capture_output=True, text=True)
+        body, _, code = r.stdout.rpartition("\n")
+        sid = ""
+        if code == "200":
+            try:
+                sid = json.loads(body).get("server_id") or ""
+            except ValueError:
+                code = "200_BAD_JSON"
+        probes[key] = (code, sid, (r.stderr or "").strip().splitlines()[-1:] or [""])
+        out.write(f"probe {url} iface={ad['iface']}\n  http={code} server_id={sid}"
+                  + (f" error={probes[key][2][0]}" if code != "200" else "") + "\n")
+    code, sid, _ = probes[key]
+    ad["http"] = "PASS" if code == "200" and sid else "FAIL"
+    ad["http_server_id"] = sid
+    if ad["http"] == "PASS":
+        ad["identity"] = "CONSISTENT" if ad["txt_sid"] and ad["txt_sid"] == sid else "INCONSISTENT"
+out.close()
+
+browse = ("BLOCKED" if browse_rc == 127 else "PASS" if ads else "TIMEOUT" if browse_rc == 124
+          else "BLOCKED" if browse_rc != 0 else "NO_SIGHTING")
+for ad in ads:
+    ad["target"] = bool(expect) and expect in (ad["txt_sid"], ad["http_server_id"])
+targets = [a for a in ads if a["target"]]
+remote_t = [a for a in targets if not a["local"]]
+good = [a for a in remote_t if a["iface_physical"] and a["lan_address"] and a["http"] == "PASS"
+        and a["txt_sid"] == expect and a["http_server_id"] == expect]
+inconsistent_t = [a for a in targets if a["identity"] == "INCONSISTENT"]
+
+def verdict():
+    if browse == "BLOCKED":
+        return "BLOCKED", "avahi_unavailable"
+    if http_probe != "1":
+        return "NOT_TESTED", "http_probe_disabled"
+    if not expect:
+        return "NOT_TESTED", "set_IGNITE_LAN_EXPECT_SID_to_identify_the_target"
+    if not ads:
+        return "FAIL", f"browse_{browse.lower()}"
+    if not targets:
+        return "FAIL", "target_sid_not_advertised"
+    if inconsistent_t:
+        return "FAIL", "target_txt_sid_differs_from_http_server_id"
+    if not remote_t:
+        return "NOT_TESTED", "target_only_seen_as_this_machine"
+    if good:
+        return "PASS", "target_discovered_resolved_reached_identity_verified"
+    if not any(a["iface_physical"] and a["lan_address"] for a in remote_t):
+        return "FAIL", "target_only_via_virtual_interface_or_off_subnet_address"
+    return "FAIL", "target_unreachable_over_http"
+
+lan, reason = verdict()
+if lan == "PASS" and virt != "none":
+    lan, reason = "NOT_TESTED", f"client_is_virtualized_{virt}"
+
+best = (good or remote_t or targets or [None])[0]
+json.dump({"advertisements": ads, "count": len(ads)},
+          open(f"{ev}/resolved.json", "w", encoding="utf-8"), indent=2)
+res = {
+    "BROWSE": browse,
+    "ADVERTISEMENTS": len(ads),
+    "DISTINCT_ADVERTISED_SIDS": len({a["txt_sid"] for a in ads}),
+    "TARGET_ADVERTISEMENT": ("NOT_TESTED" if not expect else "FOUND" if targets else "NOT_FOUND"),
+    "TARGET_INTERFACE": best["iface"] if best else "",
+    "TARGET_ENDPOINT": f"{best['address']}:{best['port']}" if best else "",
+    "HTTP": (best["http"] if best and best["http"] in ("PASS", "FAIL") else
+             "FAIL" if remote_t and any(a["http"] == "FAIL" for a in remote_t) else "NOT_TESTED"),
+    "SERVER_ID_MATCH": ("NOT_TESTED" if not expect or not any(a["http"] == "PASS" for a in targets)
+                        else "FAIL" if inconsistent_t or not good else "PASS"),
+    "CLIENT_HOST_VIRTUALIZATION": virt,
+    "SERVER_LOCAL_ADVERTISEMENT": "OBSERVED" if any(a["local"] for a in ads) else "NOT_OBSERVED",
+    "LAN_CLIENT_DISCOVERY": lan,
+    "LAN_CLIENT_DISCOVERY_REASON": reason,
+    "KINDLE_DISCOVERY": "NOT_TESTED",
+    "KINDLE_PAIRING_SYNC": "NOT_TESTED",
+}
+with open(f"{ev}/verdict.txt", "w", encoding="utf-8") as v:
+    for k, val in res.items():
+        v.write(f"{k}={val}\n")
 PY
-  sanitize <"$EVIDENCE/http-probe.txt" >"$EVIDENCE/http-probe.sanitized.txt"
-  mv "$EVIDENCE/http-probe.sanitized.txt" "$EVIDENCE/http-probe.txt"
-  if grep -q 'any_http_ok=True' "$EVIDENCE/http-probe.txt"; then HTTP="PASS"; else HTTP="FAIL"; fi
-  SID_MATCH="$(sed -n 's/^sid_match=//p' "$EVIDENCE/http-probe.txt" | head -1)"
-  note "http_probe=$HTTP server_id_consistency=${SID_MATCH:-NOT_TESTED}"
-fi
-
-if [ "${ADS:-0}" -gt 1 ]; then
-  note "WARN=multiple _scribe advertisements visible; Kindle endpoint selection may vary"
-fi
-
-VIRTUAL="no"
-if grep -qiE 'multipass|docker0|hyper-v|vboxnet|vEthernet|mpqemubr|virbr' "$EVIDENCE/interfaces.txt" 2>/dev/null; then
-  VIRTUAL="yes"
-  note "WARN=virtual_or_docker_iface_names_seen — results may reflect virtual networking"
-fi
-
-# Server-local sightings never count as independent discovery.
-SERVER_LOCAL="NOT_OBSERVED"
-[ "$LOCAL_ADS" -gt 0 ] && SERVER_LOCAL="OBSERVED"
-LAN_CLIENT="NOT_TESTED"
-case "$BROWSE" in
-  BLOCKED) LAN_CLIENT="BLOCKED" ;;
-  TIMEOUT|NO_SIGHTING) LAN_CLIENT="FAIL" ;;
-  PASS)
-    if [ "$REMOTE_ADS" -eq 0 ]; then
-      LAN_CLIENT="NOT_TESTED"   # only this machine's own advertisement was seen
-    elif [ "$HTTP_PROBE" != "1" ]; then
-      LAN_CLIENT="NOT_TESTED"
-    elif [ "$HTTP" != "PASS" ]; then
-      LAN_CLIENT="FAIL"
-    elif [ -n "$EXPECT_SID" ] && [ "$SID_MATCH" != "PASS" ]; then
-      LAN_CLIENT="FAIL"
-    else
-      LAN_CLIENT="PASS"
-    fi
-    ;;
-esac
 
 {
   echo
-  echo "BROWSE=$BROWSE"
-  echo "HTTP=$HTTP"
-  echo "SERVER_ID_MATCH=$SID_MATCH"
-  echo "SERVER_LOCAL_ADVERTISEMENT=$SERVER_LOCAL"
-  echo "LAN_CLIENT_DISCOVERY=$LAN_CLIENT"
-  echo "VIRTUAL_NETWORK_SUSPECTED=$VIRTUAL"
-  echo "KINDLE_DISCOVERY=NOT_TESTED"
-  echo "KINDLE_PAIRING_SYNC=NOT_TESTED"
+  cat "$EVIDENCE/verdict.txt"
 } | tee -a "$EVIDENCE/report.txt"
+rm -f "$EVIDENCE/verdict.txt"
 
 say "done — evidence in $EVIDENCE"
-case "$LAN_CLIENT" in
-  PASS) say "independent LAN-client discovery PASS on this client$([ "$VIRTUAL" = yes ] && echo ' (virtual interfaces present — confirm the path is physical)'); Kindle discovery and pairing remain NOT_TESTED." ;;
-  NOT_TESTED) say "no independent discovery shown (only server-local advertisement, or HTTP probe disabled)." ;;
-  *) say "independent LAN-client discovery $LAN_CLIENT (see report.txt)." ;;
+case "$(sed -n 's/^LAN_CLIENT_DISCOVERY=//p' "$EVIDENCE/report.txt" | tail -1)" in
+  PASS) say "independent physical-LAN discovery PASS. Kindle discovery and pairing remain NOT_TESTED." ;;
+  *) say "independent physical-LAN discovery not shown — see LAN_CLIENT_DISCOVERY_REASON and http-probe.txt." ;;
 esac
