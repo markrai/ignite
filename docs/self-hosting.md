@@ -204,8 +204,9 @@ override `listen` (and the healthcheck URL) together.
 Back up the Docker volume for `/var/lib/scribe-server` plus any host config override.
 Restore onto the same volume and start a current image. Do not run
 `docker compose down -v` unless you intend to destroy customer data. Disposable
-acceptance proves restart/recreate with the **same** image; distinct software-version
-migration and notebook/blob API round-trips are not claimed by that suite alone.
+acceptance proves restart/recreate with the **same** image, including a paired-client
+notebook/blob API round-trip verified after each; distinct software-version migration is not
+claimed by that suite.
 
 Full operator notes: [`deployment/linux/docker/README.md`](../deployment/linux/docker/README.md).
 
@@ -234,7 +235,11 @@ bash deployment/linux/ci-firewall.sh
 bash deployment/linux/docker/test-compose-static.sh
 bash deployment/linux/test-docker-network-probe.sh
 
-# Full disposable image accept (explicit opt-in; Linux Engine or Multipass guest)
-IGNITE_DOCKER_ACCEPT=1 bash deployment/linux/docker/accept-disposable.sh
-# IGNITE_DOCKER_ACCEPT=multipass bash deployment/linux/docker/accept-disposable.sh
+# Full disposable image accept in a fresh Multipass VM (default; also from Windows CMD via WSL)
+bash deployment/linux/docker/accept-disposable.sh
+# Or this host's Linux Docker Engine, explicitly:
+IGNITE_DOCKER_ACCEPT=local bash deployment/linux/docker/accept-disposable.sh
 ```
+
+See [Disposable acceptance](../deployment/linux/docker/README.md#disposable-acceptance) for
+Windows/WSL details, cleanup guarantees, and result fields.

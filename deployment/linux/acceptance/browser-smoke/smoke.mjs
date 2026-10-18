@@ -10,13 +10,15 @@
  *   IGNITE_ACCEPT_EVIDENCE    — directory for structured evidence
  *   IGNITE_ACCEPT_FIXTURES    — fixture dir (manifest + snapshot + blob); default ./fixtures
  *   IGNITE_ACCEPT_SMOKE_TIMEOUT_MS — overall budget (default 180000)
+ *   IGNITE_ACCEPT_SESSION_FILE — if set, write `scribe_session=…` (chmod 0600) for callers;
+ *                                must be outside evidence (e.g. accept scratch). Never under evidence.
  *
  * Exit 0 only when every required assertion passes → browser_class=playwright-chromium.
  * Always writes browser-smoke.json (sanitized), including on failure.
  */
 
 import { chromium } from "playwright";
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyFailure } from "./classify.mjs";
@@ -28,6 +30,7 @@ const BASE = (process.env.IGNITE_ACCEPT_BASE_URL || "http://127.0.0.1:8787").rep
 const EVIDENCE = process.env.IGNITE_ACCEPT_EVIDENCE || join(HERE, "evidence-out");
 const FIXTURES = resolve(process.env.IGNITE_ACCEPT_FIXTURES || join(HERE, "fixtures"));
 const SETUP_CODE = process.env.IGNITE_ACCEPT_SETUP_CODE || "";
+const SESSION_FILE = process.env.IGNITE_ACCEPT_SESSION_FILE || "";
 const SECRETS = SETUP_CODE ? [SETUP_CODE] : [];
 const BUDGET_MS = Number(process.env.IGNITE_ACCEPT_SMOKE_TIMEOUT_MS || 180_000);
 const NAV_TIMEOUT = 60_000;
@@ -287,6 +290,16 @@ async function main() {
     }
 
     const cookieHeader = session?.value ? `scribe_session=${session.value}` : "";
+    if (SESSION_FILE && cookieHeader) {
+      // Caller-owned scratch path only — never write session material into EVIDENCE.
+      writeFileSync(SESSION_FILE, cookieHeader + "\n", { encoding: "utf8", mode: 0o600 });
+      try {
+        chmodSync(SESSION_FILE, 0o600);
+      } catch {
+        /* best-effort on platforms without chmod */
+      }
+      pass("session_file_written");
+    }
     const docCookie = await page.evaluate(() => document.cookie);
     if (session?.value && docCookie.includes(session.value)) {
       fail("session cookie value visible to document.cookie");

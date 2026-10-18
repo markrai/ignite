@@ -1,50 +1,69 @@
 #!/usr/bin/env bash
 # Disposable acceptance for the real Ignite Server image (not mocks).
 #
-# Preferred: Linux Docker Engine on this host (IGNITE_DOCKER_ACCEPT=1).
-# Or: Multipass Ubuntu 24.04 guest with Docker installed inside the guest only.
+# Default: a fresh Multipass Ubuntu 24.04 VM with Docker installed inside the guest only.
+# Works from Linux, macOS, Git Bash, and WSL (Windows CMD: `bash ...` → WSL), using the
+# Windows multipass.exe through WSL interop when no native multipass exists.
 #
-#   IGNITE_DOCKER_ACCEPT=1 bash deployment/linux/docker/accept-disposable.sh
-#   IGNITE_DOCKER_ACCEPT=multipass bash deployment/linux/docker/accept-disposable.sh
+#   bash deployment/linux/docker/accept-disposable.sh
 #
-# Never runs docker compose down -v against unrelated projects.
-# Deletes only resources tagged with this run's unique project/volume names.
+# Explicit local mode: this host's Linux Docker Engine (CI runners, Linux dev boxes).
+#
+#   IGNITE_DOCKER_ACCEPT=local bash deployment/linux/docker/accept-disposable.sh
+#
+# Optional: IGNITE_DOCKER_BROWSER_SMOKE=1 runs the Playwright claim on the unclaimed server
+# (installed inside the disposable guest in Multipass mode; never on this host).
+#
+# Safety comes from isolation, unique names, and ownership-aware cleanup: the VM, compose
+# project, volume, and image are named for this run, refused if they already exist, and only
+# resources this invocation created are deleted. Never falls back from Multipass to the host's
+# Docker Engine. Never runs docker compose down -v against unrelated projects.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODE="${IGNITE_DOCKER_ACCEPT:-}"
+MODE="${IGNITE_DOCKER_ACCEPT:-multipass}"
 # Compose project names must be lowercase (hyphens/underscores ok).
-RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_ID="${IGNITE_DOCKER_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ID="$(echo "$RUN_ID" | tr '[:upper:]' '[:lower:]')"
+case "$RUN_ID" in
+  *[!a-z0-9-]*|"") echo "accept-disposable: ERROR: IGNITE_DOCKER_RUN_ID must be [a-z0-9-]" >&2; exit 1 ;;
+esac
 PROJECT="ignite-dacc-${RUN_ID}"
 VOLUME="${PROJECT}-state"
 IMAGE="ignite-server:accept-${RUN_ID}"
 EVIDENCE="${IGNITE_DOCKER_EVIDENCE:-$ROOT/deployment/linux/docker/evidence-${RUN_ID}}"
 BUNDLE="${IGNITE_DOCKER_BUNDLE:-$ROOT/dist/ignite-server-linux}"
+BROWSER_REQUESTED="${IGNITE_DOCKER_BROWSER_SMOKE:-0}"
 
 die() { echo "accept-disposable: ERROR: $*" >&2; exit 1; }
 say() { echo "accept-disposable: $*"; }
 
-[ -n "$MODE" ] || die "set IGNITE_DOCKER_ACCEPT=1 (local Linux engine) or =multipass
-Refusing to run disposable Docker acceptance without explicit opt-in."
-
-mkdir -p "$EVIDENCE"
-chmod 700 "$EVIDENCE" 2>/dev/null || true
+case "$MODE" in
+  1|local|yes) MODE=local ;;
+  multipass) ;;
+  *) die "unknown IGNITE_DOCKER_ACCEPT=$MODE (unset for Multipass, or 'local' for this host's Linux engine)" ;;
+esac
 
 # Private scratch for claim JSON / raw HTTP — never under $EVIDENCE; wiped on every exit.
-SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ignite-dacc-scratch.XXXXXX")"
-chmod 700 "$SCRATCH"
+# Created by run_local only (Multipass mode keeps every secret inside the guest).
+SCRATCH=""
 
 sanitize() {
-  # Strip setup codes and session cookies from evidence copies.
+  # Strip setup codes, session cookies, pairing secrets, and bearer tokens from evidence.
   sed -E \
     -e 's/setup_code=[A-Z0-9-]+/setup_code=<redacted>/g' \
     -e 's/[Ss]et-[Cc]ookie:[^\r\n]+/Set-Cookie: <redacted>/g' \
     -e 's/scribe_session=[^;[:space:]]+/scribe_session=<redacted>/g' \
     -e 's/[Aa]uthorization:[[:space:]]*Bearer[[:space:]]+[^[:space:]]+/Authorization: Bearer <redacted>/g' \
-    -e 's/"setup_code"[[:space:]]*:[[:space:]]*"[^"]+"/"setup_code":"<redacted>"/g'
+    -e 's/"setup_code"[[:space:]]*:[[:space:]]*"[^"]+"/"setup_code":"<redacted>"/g' \
+    -e 's/"request_secret"[[:space:]]*:[[:space:]]*"[^"]+"/"request_secret":"<redacted>"/g' \
+    -e 's/"credential"[[:space:]]*:[[:space:]]*"[^"]+"/"credential":"<redacted>"/g' \
+    -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9_-]{16,}/<redacted-credential>/g'
 }
+
+FIXTURES_DIR="${IGNITE_DOCKER_FIXTURES:-$ROOT/ignite/web/tests/fixtures}"
+ROUNDTRIP_SH="$DOCKER_DIR/api-notebook-blob-roundtrip.sh"
 
 wipe_scratch() {
   [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH" ] || return 0
@@ -87,13 +106,25 @@ create_owned_volume() {
   OWNED_VOLUMES+=("$name")
 }
 
+# Multipass mode ownership: set only after we verified the name was free and called launch.
+VM=""
+VM_OWNED=0
+STAGE=""
+STAGE_OWNED=0
+
 cleanup() {
+  local rc=$?
   set +e
   wipe_scratch
-  # Multipass mode: Docker resources live in the guest; the VM is purged separately.
-  case "${MODE:-}" in
-    multipass) set -e; return 0 ;;
-  esac
+  # Multipass mode: Docker resources live in the guest; purge the VM we launched.
+  if [ "$MODE" = "multipass" ]; then
+    cleanup_vm
+    # A leaked VM must not hide behind a successful exit status.
+    if [ "$VM_CLEANUP" = "FAIL" ] && [ "$rc" -eq 0 ]; then
+      exit 1
+    fi
+    return 0
+  fi
   if [ "${COMPOSE_OWNED:-0}" = "1" ] && [ -n "${COMPOSE_PROJECT_NAME:-}" ] \
     && [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
     # Remove containers/networks for THIS project only — never -v here.
@@ -120,15 +151,20 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 run_local() {
-  command -v docker >/dev/null 2>&1 || die "docker CLI not found"
+  command -v docker >/dev/null 2>&1 || die "docker CLI not found (IGNITE_DOCKER_ACCEPT=local needs a Linux Docker Engine on this host)"
   docker info >/dev/null 2>&1 || die "Docker daemon not accessible"
   # Host networking requires a Linux engine. Docker Desktop for Windows/macOS is insufficient.
   os="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
   say "engine OS report: ${os:-unknown}"
   if echo "$os" | grep -qiE 'Docker Desktop|linuxkit'; then
     die "this engine looks like Docker Desktop/linuxkit — host networking is not a supported accept path.
-Use IGNITE_DOCKER_ACCEPT=multipass on a Linux guest instead."
+Run without IGNITE_DOCKER_ACCEPT to use a disposable Multipass guest instead."
   fi
+
+  mkdir -p "$EVIDENCE"
+  chmod 700 "$EVIDENCE" 2>/dev/null || true
+  SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ignite-dacc-scratch.XXXXXX")"
+  chmod 700 "$SCRATCH"
 
   if [ ! -f "$BUNDLE/scribe-server" ]; then
     say "building Linux bundle via build-bundle.sh"
@@ -279,24 +315,106 @@ YAML
     [ "$OLD_HTTP" = "403" ] || die "expected HTTP 403 claiming with rotated-away code, got $OLD_HTTP"
   fi
 
-  CLAIM_HTTP="$(curl -sS -D "$SCRATCH/claim.headers" -o "$SCRATCH/claim.body" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8787/control/v1/claim \
-    -H 'Content-Type: application/json' \
-    -H 'X-Scribe-Request: 1' \
-    --data-binary @"$CLAIM_JSON" || true)"
-  if [ "$CLAIM_HTTP" != "200" ]; then
-    sanitize <"$SCRATCH/claim.body" >"$EVIDENCE/claim.body.txt" || true
-    echo "claim_http=$CLAIM_HTTP" >"$EVIDENCE/claim.status.txt"
-    wipe_scratch
-    die "claim HTTP failed (status=$CLAIM_HTTP); see claim.body.txt (sanitized)"
+  BROWSER_CLAIM="NOT_TESTED"
+  BROWSER_NOTE="IGNITE_DOCKER_BROWSER_SMOKE!=1"
+  CLAIM_VIA="api"
+  SMOKE_DIR="${IGNITE_DOCKER_SMOKE_DIR:-$ROOT/deployment/linux/acceptance/browser-smoke}"
+
+  # Optional Playwright claim on an *unclaimed* server (must not run against a claimed host).
+  # Dependencies are never installed here: missing ones make the browser result BLOCKED.
+  if [ "$BROWSER_REQUESTED" = "1" ]; then
+    if [ ! -f "$SMOKE_DIR/smoke.mjs" ]; then
+      BROWSER_CLAIM="BLOCKED"; BROWSER_NOTE="smoke.mjs missing"
+    elif ! command -v node >/dev/null 2>&1; then
+      BROWSER_CLAIM="BLOCKED"; BROWSER_NOTE="node missing"
+    elif [ ! -d "$SMOKE_DIR/node_modules/playwright" ]; then
+      BROWSER_CLAIM="BLOCKED"; BROWSER_NOTE="playwright not installed (install-browser-smoke.sh)"
+    elif ! (cd "$SMOKE_DIR" && node --input-type=module -e \
+        'import { chromium } from "playwright"; import { existsSync } from "node:fs"; process.exit(existsSync(chromium.executablePath()) ? 0 : 1);') \
+        >/dev/null 2>&1; then
+      BROWSER_CLAIM="BLOCKED"; BROWSER_NOTE="playwright chromium not installed"
+    fi
+    [ "$BROWSER_CLAIM" = "BLOCKED" ] && say "browser claim BLOCKED: $BROWSER_NOTE (continuing with API claim)"
   fi
-  grep -qi 'scribe_session' "$SCRATCH/claim.headers" \
-    || { wipe_scratch; die "claim did not set session cookie"; }
-  sanitize <"$SCRATCH/claim.headers" >"$EVIDENCE/claim.headers.txt"
-  sanitize <"$SCRATCH/claim.body" >"$EVIDENCE/claim.body.txt"
-  echo "claim_http=200 cookie=present" >"$EVIDENCE/claim.status.txt"
-  rm -f "$CLAIM_JSON" "$SCRATCH/claim.headers" "$SCRATCH/claim.body"
-  unset SETUP_CODE CODE1 CODE2
+
+  if [ "$BROWSER_REQUESTED" = "1" ] && [ "$BROWSER_CLAIM" = "NOT_TESTED" ]; then
+    say "browser claim smoke (unclaimed server)"
+    set +e
+    (
+      cd "$SMOKE_DIR"
+      export IGNITE_ACCEPT_SETUP_CODE="$SETUP_CODE"
+      export IGNITE_ACCEPT_BASE_URL="http://127.0.0.1:8787"
+      export IGNITE_ACCEPT_EVIDENCE="$EVIDENCE"
+      export IGNITE_ACCEPT_FIXTURES="$FIXTURES_DIR"
+      export IGNITE_ACCEPT_SESSION_FILE="$SCRATCH/session.cookie"
+      node smoke.mjs
+    )
+    SMOKE_RC=$?
+    set -e
+    if [ "$SMOKE_RC" -eq 0 ] && [ -f "$SCRATCH/session.cookie" ]; then
+      BROWSER_CLAIM="PASS"
+      BROWSER_NOTE="claim_via=browser"
+      CLAIM_VIA="browser"
+      unset SETUP_CODE
+    else
+      BROWSER_CLAIM="FAIL"
+      BROWSER_NOTE="rc=$SMOKE_RC"
+      rm -f "$SCRATCH/session.cookie"
+      # If smoke claimed the server before failing later, API claim cannot recover.
+      pre="$(curl -fsS http://127.0.0.1:8787/control/v1/status 2>/dev/null || true)"
+      if printf '%s' "$pre" | grep -Eq '"claimed"[[:space:]]*:[[:space:]]*true'; then
+        echo "browser_claim=FAIL $BROWSER_NOTE claimed_by_browser=true" >"$EVIDENCE/browser-note.txt"
+        wipe_scratch
+        die "browser smoke failed after claiming server (rc=$SMOKE_RC); refuse API claim on claimed host"
+      fi
+      say "browser smoke failed before claim (rc=$SMOKE_RC); continuing with API claim (overall result will be FAIL)"
+    fi
+  fi
+  echo "browser_claim=$BROWSER_CLAIM ($BROWSER_NOTE)" >"$EVIDENCE/browser-note.txt"
+
+  if [ "$CLAIM_VIA" = "api" ]; then
+    CLAIM_HTTP="$(curl -sS -D "$SCRATCH/claim.headers" -o "$SCRATCH/claim.body" -w '%{http_code}' \
+      -X POST http://127.0.0.1:8787/control/v1/claim \
+      -H 'Content-Type: application/json' \
+      -H 'X-Scribe-Request: 1' \
+      --data-binary @"$CLAIM_JSON" || true)"
+    if [ "$CLAIM_HTTP" != "200" ]; then
+      sanitize <"$SCRATCH/claim.body" >"$EVIDENCE/claim.body.txt" || true
+      echo "claim_http=$CLAIM_HTTP" >"$EVIDENCE/claim.status.txt"
+      wipe_scratch
+      die "claim HTTP failed (status=$CLAIM_HTTP); see claim.body.txt (sanitized)"
+    fi
+    grep -qi 'scribe_session' "$SCRATCH/claim.headers" \
+      || { wipe_scratch; die "claim did not set session cookie"; }
+    # Admin cookie goes straight from headers to a 0600 scratch file (never a shell variable,
+    # argv, or stdout); sanitized copy only under evidence.
+    (umask 077; python3 - "$SCRATCH/claim.headers" "$SCRATCH/session.cookie" <<'PY'
+import sys
+cookie = ""
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    if line.lower().startswith("set-cookie:") and "scribe_session=" in line:
+        part = line.split(":", 1)[1].strip()
+        # first cookie pair
+        for seg in part.split(";"):
+            seg = seg.strip()
+            if seg.startswith("scribe_session="):
+                cookie = seg
+                break
+if not cookie:
+    raise SystemExit("no scribe_session in Set-Cookie")
+open(sys.argv[2], "w", encoding="utf-8").write(cookie + "\n")
+PY
+    ) || { wipe_scratch; die "could not extract session cookie from claim response"; }
+    sanitize <"$SCRATCH/claim.headers" >"$EVIDENCE/claim.headers.txt"
+    sanitize <"$SCRATCH/claim.body" >"$EVIDENCE/claim.body.txt"
+    echo "claim_http=200 cookie=present claim_via=api" >"$EVIDENCE/claim.status.txt"
+    rm -f "$CLAIM_JSON" "$SCRATCH/claim.headers" "$SCRATCH/claim.body"
+    unset SETUP_CODE CODE1 CODE2
+  else
+    rm -f "$CLAIM_JSON"
+    unset CODE1 CODE2
+    echo "claim_via=browser cookie=present" >"$EVIDENCE/claim.status.txt"
+  fi
 
   STATUS_CLAIMED="$(curl -fsS http://127.0.0.1:8787/control/v1/status)"
   printf '%s\n' "$STATUS_CLAIMED" | sanitize | tee "$EVIDENCE/status-claimed.json"
@@ -304,8 +422,31 @@ YAML
   echo "$STATUS_CLAIMED" | grep -Eq '"claimed"[[:space:]]*:[[:space:]]*true' \
     || die "expected claimed=true in status JSON after claim"
 
-  # Create a small notebook via authenticated API if feasible — at minimum write a marker blob into ledger via status persistence.
-  # Use control status + restart persistence of server_id + claimed.
+  # Product API notebook + blob round-trip (pairing ≠ admin claim).
+  [ -f "$ROUNDTRIP_SH" ] || die "missing $ROUNDTRIP_SH"
+  [ -d "$FIXTURES_DIR" ] || die "fixtures missing: $FIXTURES_DIR"
+  command -v python3 >/dev/null 2>&1 || die "python3 required for notebook/blob round-trip"
+  say "notebook/blob API round-trip (seed)"
+  # Bearer travels only via $SCRATCH/bearer.token (0600); stdout carries ids only.
+  NOTEBOOK_BLOB_ROUNDTRIP="FAIL"
+  ROUNDTRIP_OUT="$SCRATCH/roundtrip.out"
+  BASE_URL="http://127.0.0.1:8787" \
+    ADMIN_COOKIE_FILE="$SCRATCH/session.cookie" \
+    FIXTURES_DIR="$FIXTURES_DIR" \
+    EVIDENCE="$EVIDENCE" \
+    SCRATCH="$SCRATCH" \
+    PHASE_LABEL="initial" \
+    MODE="seed" \
+    bash "$ROUNDTRIP_SH" | tee "$ROUNDTRIP_OUT"
+  RT_LIBRARY_ID="$(sed -n 's/^LIBRARY_ID=//p' "$ROUNDTRIP_OUT" | head -1)"
+  RT_BLOB_SHA="$(sed -n 's/^BLOB_SHA=//p' "$ROUNDTRIP_OUT" | head -1)"
+  [ -s "$SCRATCH/bearer.token" ] && [ -n "$RT_LIBRARY_ID" ] && [ -n "$RT_BLOB_SHA" ] \
+    || die "round-trip seed did not produce bearer file / LIBRARY_ID / BLOB_SHA"
+  rm -f "$ROUNDTRIP_OUT" "$SCRATCH/session.cookie"
+  NOTEBOOK_BLOB_ROUNDTRIP="PASS"
+  RESTART_PERSISTENCE="FAIL"
+  RECREATE_PERSISTENCE="FAIL"
+
   say "restart persistence"
   "${COMPOSE[@]}" restart ignite-server
   ok=0
@@ -322,6 +463,17 @@ YAML
   printf '%s\n' "$body" | sanitize | tee "$EVIDENCE/status-after-restart.json"
   echo "$body" | grep -q "$SERVER_ID" || die "server_id lost after restart"
 
+  say "notebook/blob verify after restart"
+  BASE_URL="http://127.0.0.1:8787" \
+    BEARER_FILE="$SCRATCH/bearer.token" \
+    FIXTURES_DIR="$FIXTURES_DIR" \
+    EVIDENCE="$EVIDENCE" \
+    SCRATCH="$SCRATCH" \
+    PHASE_LABEL="after-restart" \
+    MODE="verify" \
+    bash "$ROUNDTRIP_SH"
+  RESTART_PERSISTENCE="PASS"
+
   # Recreate container (same image + volume) — NOT an image-upgrade proof.
   say "recreate container (same image + volume)"
   "${COMPOSE[@]}" up -d --force-recreate --no-build
@@ -336,6 +488,17 @@ YAML
   echo "$body" | grep -q "$SERVER_ID" || die "server_id lost after recreate"
   echo "$body" | grep -Eq '"claimed"[[:space:]]*:[[:space:]]*true' \
     || die "expected claimed persistence after recreate (init must not auto-run)"
+
+  say "notebook/blob verify after recreate"
+  BASE_URL="http://127.0.0.1:8787" \
+    BEARER_FILE="$SCRATCH/bearer.token" \
+    FIXTURES_DIR="$FIXTURES_DIR" \
+    EVIDENCE="$EVIDENCE" \
+    SCRATCH="$SCRATCH" \
+    PHASE_LABEL="after-recreate" \
+    MODE="verify" \
+    bash "$ROUNDTRIP_SH"
+  RECREATE_PERSISTENCE="PASS"
 
   # Init after claim: no setup_code, same server_id
   INIT3="$(run_init "${PROJECT}-init3")" || die "post-claim init failed"
@@ -380,109 +543,243 @@ YAML
   printf '%s\n' "$LOGS" | sanitize | tee "$EVIDENCE/serve.logs.txt"
   echo "$LOGS" | grep -qi 'setup_code=' && die "setup_code leaked into serve logs" || true
 
-  # Browser smoke (optional if node/playwright available on host)
-  if [ "${IGNITE_DOCKER_BROWSER_SMOKE:-1}" = "1" ] && [ -f "$ROOT/deployment/linux/acceptance/browser-smoke/smoke.mjs" ]; then
-    if command -v node >/dev/null 2>&1; then
-      say "browser smoke against containerized server"
-      (
-        cd "$ROOT/deployment/linux/acceptance/browser-smoke"
-        # Claim already done — smoke may expect unclaimed; run asset checks via curl classification only if smoke needs setup.
-        # Prefer status + asset fetch already done; attempt smoke with SKIP if claimed.
-        if [ -f package.json ]; then
-          npm ci --omit=dev >/dev/null 2>&1 || true
-        fi
-        # Record that claim path used API; browser claim optional when already claimed.
-        echo "browser_claim=api-preclaimed" >"$EVIDENCE/browser-note.txt"
-      )
-    fi
-  fi
-
   wipe_scratch
   bash "$DOCKER_DIR/assert-evidence-clean.sh" "$EVIDENCE" \
     || die "evidence directory failed secret scan before PASS"
 
+  # API acceptance passed if we got here. An explicitly requested browser claim that did not
+  # pass keeps the overall result from being PASS; its own line says FAIL or BLOCKED.
+  RESULT="PASS"
+  if [ "$BROWSER_REQUESTED" = "1" ] && [ "$BROWSER_CLAIM" != "PASS" ]; then
+    RESULT="$BROWSER_CLAIM"
+  fi
   {
     echo "SERVER_ID=$SERVER_ID"
     echo "PROJECT=$PROJECT"
     echo "VOLUME=$VOLUME"
     echo "IMAGE=$IMAGE"
-    echo "RESULT=PASS"
+    echo "RESULT=$RESULT"
+    echo "API_ACCEPTANCE=PASS"
     echo "NETWORK_NOTE=host-network on Linux engine; not a physical Kindle LAN proof"
     echo "IMAGE_UPGRADE=NOT_TESTED"
-    echo "NOTEBOOK_BLOB_ROUNDTRIP=NOT_TESTED"
+    echo "NOTEBOOK_BLOB_ROUNDTRIP=$NOTEBOOK_BLOB_ROUNDTRIP"
+    echo "RESTART_PERSISTENCE=$RESTART_PERSISTENCE"
+    echo "RECREATE_PERSISTENCE=$RECREATE_PERSISTENCE"
     echo "LEDGER_FS_MARKER=PASS"
-    echo "RESTART_RECREATE_SAME_IMAGE=PASS"
-    echo "BROWSER_CLAIM=NOT_TESTED (API claim with CSRF)"
+    echo "API_CLAIM=$([ "$CLAIM_VIA" = "api" ] && echo PASS || echo NOT_TESTED)"
+    echo "CLAIM_VIA=$CLAIM_VIA"
+    echo "BROWSER_CLAIM=$BROWSER_CLAIM"
+    echo "EVIDENCE_SCAN=PASS"
+    echo "MILESTONE_A_APP_DATA=PASS"
+    echo "MILESTONE_B_PHYSICAL_LAN=NOT_TESTED"
+    echo "MILESTONE_C_KINDLE_E2E=NOT_TESTED"
   } >"$EVIDENCE/summary.txt"
+  if [ "$RESULT" != "PASS" ]; then
+    die "API acceptance passed but requested browser claim is $BROWSER_CLAIM ($BROWSER_NOTE); evidence in $EVIDENCE"
+  fi
   say "PASS — evidence in $EVIDENCE"
 }
 
+
+# --- Multipass discovery -------------------------------------------------------------------
+# Native multipass (Linux/macOS), or the Windows multipass.exe reached through WSL interop or
+# Git Bash. Users never need a second Multipass inside WSL.
+MP=""
+MP_WINDOWS=0
+VM_CLEANUP="NOT_RUN"
+MP_DEFAULT_CANDIDATES="/mnt/c/Program Files/Multipass/bin/multipass.exe:/c/Program Files/Multipass/bin/multipass.exe"
+
+resolve_multipass() {
+  local c found=""
+  if [ -n "${IGNITE_MULTIPASS:-}" ]; then
+    [ -x "$IGNITE_MULTIPASS" ] || die "IGNITE_MULTIPASS=$IGNITE_MULTIPASS is not an executable file"
+    found="$IGNITE_MULTIPASS"
+  elif c="$(command -v multipass 2>/dev/null)"; then
+    found="$c"
+  elif c="$(command -v multipass.exe 2>/dev/null)"; then
+    found="$c"
+  else
+    # Windows PATH may not be appended inside WSL (appendWindowsPath=false); try the
+    # standard installer location. IGNITE_MULTIPASS_CANDIDATES overrides (tests use it).
+    local IFS=':'
+    for c in ${IGNITE_MULTIPASS_CANDIDATES-$MP_DEFAULT_CANDIDATES}; do
+      [ -n "$c" ] && [ -x "$c" ] && { found="$c"; break; }
+    done
+  fi
+  [ -n "$found" ] || die "Multipass not found.
+  Install Multipass (https://multipass.run/install). On Windows the standard installer is enough:
+  WSL and Git Bash use C:\\Program Files\\Multipass\\bin\\multipass.exe automatically.
+  For a nonstandard location set IGNITE_MULTIPASS=/path/to/multipass[.exe].
+  To use this host's Linux Docker Engine instead, run with IGNITE_DOCKER_ACCEPT=local.
+  (No fallback to the host Docker Engine is attempted.)"
+  MP="$found"
+  case "$MP" in *.exe) MP_WINDOWS=1 ;; esac
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) MP_WINDOWS=1 ;; esac
+  "$MP" version >/dev/null 2>&1 || die "Multipass found at '$MP' but 'multipass version' failed.
+  Check that the Multipass service (multipassd) is running$([ "$MP_WINDOWS" = 1 ] && echo ' and that WSL interop is enabled')."
+  say "multipass: $MP$([ "$MP_WINDOWS" = 1 ] && echo ' (Windows executable)')"
+}
+
+# MSYS_NO_PATHCONV: stop Git Bash rewriting guest paths like /home/ubuntu into C:/... args.
+mp() { MSYS_NO_PATHCONV=1 "$MP" "$@"; }
+
+# 0 = VM exists, 1 = absent, 2 = could not list (never guess).
+vm_exists() {
+  local out
+  out="$(mp list --format csv 2>/dev/null)" || return 2
+  printf '%s\n' "$out" | tr -d '\r' | cut -d, -f1 | grep -qxF "$VM"
+}
+
+# A Windows multipass.exe parses "C:\..." / "C:/..." as instance "C", so it gets a path
+# relative to a cwd Windows can see. Linux-only filesystems (e.g. WSL ext4) have no drive path:
+# stream those through exec as base64 text instead.
+windows_drive_dir() {
+  local w=""
+  if command -v wslpath >/dev/null 2>&1; then
+    w="$(wslpath -w "$1" 2>/dev/null || true)"
+  elif command -v cygpath >/dev/null 2>&1; then
+    w="$(cygpath -w "$1" 2>/dev/null || true)"
+  fi
+  case "$w" in [A-Za-z]:\\*) return 0 ;; esac
+  return 1
+}
+
+mp_push() {
+  local src="$1" dst="$2" dir base
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  base="$(basename "$src")"
+  if [ "$MP_WINDOWS" = 0 ]; then
+    mp transfer "$src" "$VM:$dst"
+  elif windows_drive_dir "$dir"; then
+    (cd "$dir" && mp transfer "$base" "$VM:$dst")
+  else
+    base64 <"$src" | mp exec "$VM" -- bash -c "base64 -d > '$dst'"
+  fi
+  local want got
+  want="$( (sha256sum "$src" 2>/dev/null || shasum -a 256 "$src") | awk '{print $1}')"
+  got="$(mp exec "$VM" -- sha256sum "$dst" | tr -d '\r' | awk '{print $1}')"
+  [ "$want" = "$got" ] || die "payload integrity mismatch after transfer to $VM:$dst"
+}
+
+host_path_note() {
+  if [ "$MP_WINDOWS" = 1 ] && command -v wslpath >/dev/null 2>&1; then
+    printf ' (%s)' "$(wslpath -w "$1" 2>/dev/null)"
+  fi
+}
+
+cleanup_vm() {
+  if [ "$VM_OWNED" = 1 ] && [ -n "$VM" ]; then
+    say "deleting disposable Multipass VM $VM"
+    local i st
+    # Retry: an interrupted launch can leave the instance busy for a while.
+    for i in $(seq 1 "${IGNITE_MULTIPASS_DELETE_TRIES:-12}"); do
+      mp delete --purge "$VM" >/dev/null 2>&1
+      st=0; vm_exists || st=$?
+      [ "$st" = 1 ] && break
+      sleep "${IGNITE_MULTIPASS_DELETE_WAIT:-5}"
+    done
+    if [ "$st" = 1 ]; then
+      VM_CLEANUP="PASS"
+    else
+      VM_CLEANUP="FAIL"
+      echo "accept-disposable: ERROR: could not confirm deletion of Multipass VM $VM; remove it with: multipass delete --purge $VM" >&2
+    fi
+    VM_OWNED=0
+    if [ -d "$EVIDENCE" ]; then
+      echo "MULTIPASS_CLEANUP=$VM_CLEANUP vm=$VM" >"$EVIDENCE/host-cleanup.txt"
+    fi
+    say "MULTIPASS_CLEANUP=$VM_CLEANUP"
+  fi
+  if [ "$STAGE_OWNED" = 1 ] && [ -n "$STAGE" ]; then
+    rm -rf "$STAGE" >/dev/null 2>&1
+    STAGE_OWNED=0
+  fi
+}
+
 run_multipass() {
-  command -v multipass >/dev/null 2>&1 || die "multipass not found"
+  resolve_multipass
+
+  [ -f "$BUNDLE/scribe-server" ] || die "missing Linux bundle at $BUNDLE (build it on Linux first: bash deployment/linux/build-bundle.sh)"
+  [ -f "$BUNDLE/web/index.html" ] || die "missing web assets in $BUNDLE"
+  [ -d "$FIXTURES_DIR" ] || die "fixtures missing: $FIXTURES_DIR"
+  local t
+  for t in tar base64; do
+    command -v "$t" >/dev/null 2>&1 || die "$t is required on this host"
+  done
+
   VM="ignite-dacc-${RUN_ID}"
   # Sanitize VM name (multipass: hostname rules)
   VM="$(echo "$VM" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-50)"
   GUEST_ROOT="/home/ubuntu/ignite-accept"
-  # Stage outside deployment/linux/docker so `cp -a "$DOCKER_DIR"` cannot nest into itself.
-  STAGE="$ROOT/dist/.docker-accept-stage-${RUN_ID}"
-  rm -rf "$STAGE"
-  mkdir -p "$STAGE"
+  GUEST_EVIDENCE="$GUEST_ROOT/deployment/linux/docker/evidence-${RUN_ID}"
+  # Private, fresh stage outside the repo (the checkout may not be writable from WSL, and
+  # copying packaging files must not nest into itself).
+  local stage_parent="${IGNITE_DOCKER_STAGE_DIR:-${TMPDIR:-/tmp}}"
+  STAGE="$(mktemp -d "$stage_parent/ignite-dacc-stage-${RUN_ID}.XXXXXX")" \
+    || die "cannot create a private stage directory under $stage_parent"
+  STAGE_OWNED=1
+  chmod 700 "$STAGE"
 
-  cleanup_vm() {
-    say "deleting disposable Multipass VM $VM"
-    multipass delete --purge "$VM" >/dev/null 2>&1 || true
-    rm -rf "$STAGE" >/dev/null 2>&1 || true
-  }
-  trap cleanup_vm EXIT
-
-  [ -f "$BUNDLE/scribe-server" ] || die "missing Linux bundle at $BUNDLE (build on Linux first)"
-  [ -f "$BUNDLE/web/index.html" ] || die "missing web assets in $BUNDLE"
+  # Never adopt (or later delete) an instance this run did not create.
+  local st=0
+  vm_exists || st=$?
+  case "$st" in
+    0) die "refusing to adopt preexisting Multipass instance: $VM" ;;
+    2) die "could not list Multipass instances (is multipassd running?)" ;;
+  esac
 
   say "launching disposable Multipass VM $VM (Ubuntu 24.04)"
-  multipass launch 24.04 -n "$VM" -c 4 -m 8G -d 40G
+  VM_OWNED=1
+  mp launch 24.04 -n "$VM" -c 4 -m 8G -d 40G
 
   # Prefer transfer over mount — Windows Multipass often has privileged mounts disabled.
   say "staging bundle + docker packaging for multipass transfer"
-  mkdir -p "$STAGE/payload/deployment/linux" "$STAGE/payload/dist"
+  mkdir -p "$STAGE/payload/deployment/linux/docker" "$STAGE/payload/dist"
   # Copy docker packaging files only (exclude evidence/context/stage dirs).
-  mkdir -p "$STAGE/payload/deployment/linux/docker"
   for item in Dockerfile docker-compose.yml config.toml entrypoint.sh \
-              build-image.sh init-once.sh accept-disposable.sh test-compose-static.sh \
+              build-image.sh init-once.sh accept-disposable.sh \
+              api-notebook-blob-roundtrip.sh test-compose-static.sh \
               assert-evidence-clean.sh README.md; do
     [ -e "$DOCKER_DIR/$item" ] || continue
     cp -a "$DOCKER_DIR/$item" "$STAGE/payload/deployment/linux/docker/$item"
   done
+  mkdir -p "$STAGE/payload/ignite/web/tests"
+  cp -a "$FIXTURES_DIR" "$STAGE/payload/ignite/web/tests/fixtures"
   cp -a "$BUNDLE" "$STAGE/payload/dist/ignite-server-linux"
+  if [ "$BROWSER_REQUESTED" = "1" ]; then
+    local smoke_src="$ROOT/deployment/linux/acceptance/browser-smoke"
+    local smoke_dst="$STAGE/payload/deployment/linux/acceptance/browser-smoke"
+    mkdir -p "$smoke_dst"
+    # Sources + lockfile only; dependencies are installed inside the guest.
+    for item in "$smoke_src"/*.mjs "$smoke_src"/*.sh "$smoke_src"/package.json \
+                "$smoke_src"/package-lock.json "$smoke_src"/fixtures; do
+      if [ -e "$item" ]; then cp -a "$item" "$smoke_dst/"; fi
+    done
+  fi
   chmod +x "$STAGE/payload/dist/ignite-server-linux/scribe-server" \
-    "$STAGE/payload/deployment/linux/docker/"*.sh \
-    "$STAGE/payload/deployment/linux/docker/entrypoint.sh" 2>/dev/null || true
+    "$STAGE/payload/deployment/linux/docker/"*.sh 2>/dev/null || true
   tar -C "$STAGE/payload" -czf "$STAGE/payload.tgz" .
-  # Multipass on Windows treats "C:" as an instance name — transfer via relative path.
-  (
-    cd "$STAGE"
-    multipass transfer payload.tgz "$VM:/home/ubuntu/ignite-payload.tgz"
-  )
-  multipass exec "$VM" -- bash -lc "
+  mp_push "$STAGE/payload.tgz" /home/ubuntu/ignite-payload.tgz
+  mp exec "$VM" -- bash -lc "
     set -euo pipefail
     rm -rf '$GUEST_ROOT'
     mkdir -p '$GUEST_ROOT'
     tar -C '$GUEST_ROOT' -xzf /home/ubuntu/ignite-payload.tgz
     chmod +x '$GUEST_ROOT'/dist/ignite-server-linux/scribe-server \
-      '$GUEST_ROOT'/deployment/linux/docker/*.sh \
-      '$GUEST_ROOT'/deployment/linux/docker/entrypoint.sh
+      '$GUEST_ROOT'/deployment/linux/docker/*.sh
   "
 
-  say "installing Docker Engine inside disposable guest (not on the Windows/dev host)"
+  say "installing Docker Engine inside disposable guest (not on this host)"
   # Multipass guests often boot with skewed clocks; apt then rejects InRelease as "not valid yet".
   HOST_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  multipass exec "$VM" -- sudo date -u -s "$HOST_UTC" >/dev/null 2>&1 || true
-  multipass exec "$VM" -- bash -lc '
+  mp exec "$VM" -- sudo date -u -s "$HOST_UTC" >/dev/null 2>&1 || true
+  mp exec "$VM" -- bash -lc '
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     sudo timedatectl set-ntp true >/dev/null 2>&1 || true
     sleep 2
     sudo apt-get update -qq
-    sudo apt-get install -y -qq ca-certificates curl gnupg
+    sudo apt-get install -y -qq ca-certificates curl gnupg python3
     sudo install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
@@ -494,17 +791,27 @@ run_multipass() {
     sudo chmod 666 /var/run/docker.sock
   '
 
+  if [ "$BROWSER_REQUESTED" = "1" ]; then
+    say "installing Node + Playwright Chromium inside disposable guest (browser claim requested)"
+    # A failed install leaves the guest without playwright; the guest run then reports BLOCKED.
+    mp exec "$VM" -- sudo env PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+      bash "$GUEST_ROOT/deployment/linux/acceptance/browser-smoke/install-browser-smoke.sh" \
+      "$GUEST_ROOT/deployment/linux/acceptance/browser-smoke" \
+      || say "browser dependency install failed in guest; browser claim will be BLOCKED"
+    mp exec "$VM" -- sudo bash -c 'chmod -R a+rX /opt/ms-playwright 2>/dev/null || true'
+  fi
+
   say "running acceptance inside guest (virtual LAN ≠ physical Kindle proof)"
   set +e
-  multipass exec "$VM" -- bash -lc "
+  mp exec "$VM" -- bash -lc "
     set -euo pipefail
     cd '$GUEST_ROOT'
-    export IGNITE_DOCKER_ACCEPT=1
-    export IGNITE_DOCKER_EVIDENCE='$GUEST_ROOT/deployment/linux/docker/evidence-${RUN_ID}'
+    export IGNITE_DOCKER_ACCEPT=local
+    export IGNITE_DOCKER_EVIDENCE='$GUEST_EVIDENCE'
     export IGNITE_DOCKER_BUNDLE='$GUEST_ROOT/dist/ignite-server-linux'
     export IGNITE_DOCKER_BUILD_BUNDLE=0
-    export IGNITE_DOCKER_BROWSER_SMOKE=0
-    # First prove claim with a single init code; rotation covered in CI/local as well.
+    export IGNITE_DOCKER_BROWSER_SMOKE='$BROWSER_REQUESTED'
+    export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
     export IGNITE_DOCKER_TEST_ROTATION=1
     bash deployment/linux/docker/accept-disposable.sh
   "
@@ -512,35 +819,42 @@ run_multipass() {
   set -e
 
   say "retrieving sanitized evidence from guest (rc=$GUEST_RC)"
-  mkdir -p "$ROOT/deployment/linux/docker"
-  multipass exec "$VM" -- bash -lc "
+  mp exec "$VM" -- bash -lc "
     set -euo pipefail
-    if [ -d '$GUEST_ROOT/deployment/linux/docker/evidence-${RUN_ID}' ]; then
-      tar -C '$GUEST_ROOT/deployment/linux/docker' -czf /home/ubuntu/evidence.tgz 'evidence-${RUN_ID}'
+    if [ -d '$GUEST_EVIDENCE' ]; then
+      tar -C '$(dirname "$GUEST_EVIDENCE")' -czf /home/ubuntu/evidence.tgz '$(basename "$GUEST_EVIDENCE")'
     else
       mkdir -p /tmp/empty-ev && tar -C /tmp -czf /home/ubuntu/evidence.tgz empty-ev
     fi
   " || true
   # Pull via base64 on stdout to avoid Windows Multipass SFTP permission quirks.
-  multipass exec "$VM" -- bash -lc 'base64 -w0 /home/ubuntu/evidence.tgz' >"$STAGE/evidence.b64" 2>/dev/null || true
+  mp exec "$VM" -- bash -lc 'base64 -w0 /home/ubuntu/evidence.tgz' >"$STAGE/evidence.b64" 2>/dev/null || true
+  mkdir -p "$STAGE/evidence"
   if [ -s "$STAGE/evidence.b64" ]; then
-    if base64 -d <"$STAGE/evidence.b64" >"$STAGE/evidence.tgz" 2>/dev/null \
-      || base64 --decode <"$STAGE/evidence.b64" >"$STAGE/evidence.tgz" 2>/dev/null; then
-      tar -C "$ROOT/deployment/linux/docker" -xzf "$STAGE/evidence.tgz" || true
-    fi
+    tr -d '\r\n' <"$STAGE/evidence.b64" | base64 -d >"$STAGE/evidence.tgz" 2>/dev/null \
+      && tar -C "$STAGE/evidence" -xzf "$STAGE/evidence.tgz" 2>/dev/null || true
+  fi
+  if [ -d "$STAGE/evidence/evidence-${RUN_ID}" ]; then
+    mkdir -p "$EVIDENCE"
+    chmod 700 "$EVIDENCE" 2>/dev/null || true
+    cp -R "$STAGE/evidence/evidence-${RUN_ID}/." "$EVIDENCE/"
+    # Defense in depth: the guest scans only on its PASS path; scan everything retrieved.
+    bash "$DOCKER_DIR/assert-evidence-clean.sh" "$EVIDENCE" \
+      || die "retrieved evidence failed the secret scan: $EVIDENCE"
   fi
 
-  [ "$GUEST_RC" -eq 0 ] || die "guest acceptance failed (rc=$GUEST_RC); evidence under deployment/linux/docker/evidence-${RUN_ID} if present"
-  [ -f "$ROOT/deployment/linux/docker/evidence-${RUN_ID}/summary.txt" ] \
-    || die "missing evidence summary from guest run"
-  grep -q 'RESULT=PASS' "$ROOT/deployment/linux/docker/evidence-${RUN_ID}/summary.txt" \
-    || die "guest acceptance did not PASS"
-  say "PASS — evidence on host at $ROOT/deployment/linux/docker/evidence-${RUN_ID}"
+  if [ -f "$EVIDENCE/summary.txt" ]; then
+    say "guest summary:"
+    sed 's/^/  /' "$EVIDENCE/summary.txt"
+  fi
+  [ "$GUEST_RC" -eq 0 ] || die "guest acceptance failed (rc=$GUEST_RC); evidence under $EVIDENCE$(host_path_note "$EVIDENCE") if present"
+  [ -f "$EVIDENCE/summary.txt" ] || die "missing evidence summary from guest run"
+  grep -qx 'RESULT=PASS' "$EVIDENCE/summary.txt" || die "guest acceptance did not PASS"
+  say "PASS — evidence on host at $EVIDENCE$(host_path_note "$EVIDENCE")"
   say "Multipass guest will be purged on exit. Virtual networking ≠ physical Kindle LAN."
 }
 
 case "$MODE" in
-  1|local|yes) run_local ;;
+  local) run_local ;;
   multipass) run_multipass ;;
-  *) die "unknown IGNITE_DOCKER_ACCEPT=$MODE (use 1 or multipass)" ;;
 esac

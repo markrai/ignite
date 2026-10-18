@@ -16,12 +16,17 @@ if grep -RqE \
   -e 'Authorization:[[:space:]]*Bearer[[:space:]]+[^[:space:]]+' \
   -e '"setup_code"[[:space:]]*:[[:space:]]*"[A-Z0-9]{4}-[A-Z0-9]{4}"' \
   -e 'Set-Cookie:.*scribe_session=[^<]' \
+  -e '"request_secret"[[:space:]]*:[[:space:]]*"[^"<][^"]+"' \
+  -e '"credential"[[:space:]]*:[[:space:]]*"[^"<][^"]+"' \
+  -e '^BEARER=[A-Za-z0-9._-]{8,}' \
+  -e '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9_-]{16,}' \
   "$DIR" 2>/dev/null; then
   fail "secret-bearing material found under $DIR"
 fi
 
-# Dotfiles that look like claim scratch must not live in evidence.
-if find "$DIR" -name '.claim*' -o -name '*.raw' 2>/dev/null | grep -q .; then
+# Scratch-only files (claim bodies, raw HTTP, credential/header files) must not live in evidence.
+if find "$DIR" \( -name '.claim*' -o -name '*.raw' -o -name 'bearer.token' \
+    -o -name 'session.cookie' -o -name '*.header' \) 2>/dev/null | grep -q .; then
   fail "raw/scratch claim artifacts present under $DIR"
 fi
 

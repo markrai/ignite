@@ -1,0 +1,4 @@
+# Scripts here run under WSL/Linux bash and inside guests; CRLF breaks them
+# (core.autocrlf=true on Windows would otherwise convert on checkout).
+*.sh text eol=lf
+*.mjs text eol=lf

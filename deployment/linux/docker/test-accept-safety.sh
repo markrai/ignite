@@ -178,5 +178,9 @@ fi
 
 pass "scanner fails without echoing secrets"
 
+# --- Launcher (mode/Multipass/cleanup) and round-trip secret handling ---
+bash "$DIR/test-accept-launcher.sh"
+bash "$DIR/test-roundtrip-secrets.sh"
+
 echo "PASS: accept-safety regressions"
 exit 0

@@ -92,8 +92,9 @@ Restore onto the same volume and start a current image. Do **not** use
 
 **Image upgrade:** replace the image tag and recreate the container with the **same**
 volume. Disposable acceptance proves restart/recreate with the **same** image digest;
-a distinct software-version migration path is **not** claimed by that suite. Notebook/blob
-API round-trips are a documented follow-up (filesystem ledger markers only are tested).
+a distinct software-version migration path is **not** claimed by that suite. The suite does
+pair a disposable client and round-trip a fixture blob, library, and operations through the
+product API, then re-verifies them after restart and after container recreate.
 
 ## Security notes
 
@@ -108,7 +109,49 @@ bash deployment/linux/docker/test-compose-static.sh
 bash deployment/linux/docker/test-accept-safety.sh
 bash deployment/linux/docker/assert-evidence-clean.sh deployment/linux/docker/evidence-<id>
 
-# Full disposable accept (explicit opt-in):
-IGNITE_DOCKER_ACCEPT=1 bash deployment/linux/docker/accept-disposable.sh
-# IGNITE_DOCKER_ACCEPT=multipass bash deployment/linux/docker/accept-disposable.sh
+# Full disposable accept in a fresh Multipass VM (the default; no flags needed):
+bash deployment/linux/docker/accept-disposable.sh
+
+# Explicit: this host's Linux Docker Engine instead (CI runners, Linux dev boxes):
+IGNITE_DOCKER_ACCEPT=local bash deployment/linux/docker/accept-disposable.sh
 ```
+
+### Disposable acceptance
+
+`accept-disposable.sh` defaults to a new Ubuntu 24.04 Multipass VM with Docker installed
+inside the guest only. From Windows Command Prompt, run it from the repository root:
+
+```bat
+bash deployment/linux/docker/accept-disposable.sh
+```
+
+`bash` here is WSL. The script uses the Windows `multipass.exe` through WSL interop (found on
+`PATH` or at `C:\Program Files\Multipass\bin\multipass.exe`), so Multipass does not need
+to be installed inside WSL. Git Bash, Linux, and macOS work the same way. For an unusual
+install location set `IGNITE_MULTIPASS=/path/to/multipass[.exe]`. Windows CMD `set VAR=...`
+values are **not** visible inside WSL unless listed in `WSLENV`; the default needs none.
+
+Safety comes from isolation and ownership, not confirmation flags:
+
+- The VM, compose project, volume, and image carry this run's unique id. A preexisting
+  instance or resource with that name is refused, never adopted.
+- Only what this run created is deleted, on success, failure, or Ctrl-C. The VM deletion is
+  retried and verified; `MULTIPASS_CLEANUP=PASS|FAIL` is recorded, and a failed purge makes the
+  run exit nonzero with the `multipass delete --purge <vm>` command to finish it.
+- If Multipass is missing, the run stops with one error. It never falls back to the host's
+  Docker Engine and never installs anything on the host.
+- Setup codes, session cookies, pairing secrets, and bearer credentials stay in a private
+  scratch directory (inside the guest in Multipass mode). They are never printed, passed on
+  a command line, or written to evidence. Retrieved evidence is secret-scanned again on the
+  host.
+
+Optional browser claim: `IGNITE_DOCKER_BROWSER_SMOKE=1` claims the unclaimed server through
+Playwright Chromium (installed inside the disposable guest in Multipass mode; never installed
+on the host in local mode). `BROWSER_CLAIM` is reported separately from `API_CLAIM`. When the
+browser claim is requested, missing dependencies report `BLOCKED` and a failure reports `FAIL`;
+either one makes the overall `RESULT` non-PASS while the API results stay visible.
+
+`summary.txt` reports each check on its own line: `NOTEBOOK_BLOB_ROUNDTRIP`,
+`RESTART_PERSISTENCE`, `RECREATE_PERSISTENCE`, `API_CLAIM`, `BROWSER_CLAIM`, and `EVIDENCE_SCAN`.
+Virtual networking is not physical-LAN proof: `MILESTONE_B_PHYSICAL_LAN` and
+`MILESTONE_C_KINDLE_E2E` stay `NOT_TESTED`.
