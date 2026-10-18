@@ -133,7 +133,8 @@ jobs:
       - name: Shell syntax checks
         run: |
           set -euo pipefail
-          for f in deployment/linux/*.sh; do
+          for f in deployment/linux/*.sh deployment/linux/docker/*.sh; do
+            [ -f "$f" ] || continue
             bash -n "$f"
           done
       - name: Build portable Linux bundle
@@ -146,6 +147,52 @@ jobs:
         run: bash deployment/linux/test-staging.sh dist/ignite-server-linux
       - name: CARGO_TARGET_DIR binary location
         run: bash deployment/linux/test-cargo-target-dir.sh
+      - name: Upload Linux bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-linux-bundle
+          path: dist/ignite-server-linux/
+          retention-days: 7
+
+  # Docker image + host-network disposable accept (separate from unit tests; Linux Engine only).
+  ignite-server-docker:
+    name: Ignite Server Docker image
+    runs-on: ubuntu-latest
+    needs: ignite-server-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Linux bundle artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ignite-server-linux-bundle
+          path: dist/ignite-server-linux
+      - name: Compose/Dockerfile static checks
+        run: bash deployment/linux/docker/test-compose-static.sh
+      - name: Accept evidence/ownership safety (mocked)
+        run: bash deployment/linux/docker/test-accept-safety.sh
+      - name: Make bundle binary executable
+        run: chmod +x dist/ignite-server-linux/scribe-server
+      - name: Build image + disposable accept (host network)
+        run: |
+          set -euo pipefail
+          export IGNITE_DOCKER_ACCEPT=1
+          export IGNITE_DOCKER_BUNDLE="$GITHUB_WORKSPACE/dist/ignite-server-linux"
+          export IGNITE_DOCKER_EVIDENCE="$GITHUB_WORKSPACE/deployment/linux/docker/evidence-ci"
+          export IGNITE_DOCKER_BROWSER_SMOKE=0
+          bash deployment/linux/docker/accept-disposable.sh
+      - name: Assert evidence contains no secrets
+        if: always()
+        id: evidence_clean
+        run: bash deployment/linux/docker/assert-evidence-clean.sh deployment/linux/docker/evidence-ci
+      - name: Upload sanitized Docker accept evidence
+        # Only after secret scan passes — never upload raw credentials on failure.
+        if: always() && steps.evidence_clean.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-docker-evidence
+          path: deployment/linux/docker/evidence-ci/
+          retention-days: 7
+          if-no-files-found: ignore
 
   ignite-server-firewall:
     name: Ignite Server firewall ownership
@@ -179,3 +226,9 @@ jobs:
       - name: PowerShell argv forwarding (literal --)
         shell: pwsh
         run: pwsh -NoProfile -File deployment/linux/acceptance/test-run-host-ps1-argv.ps1
+      - name: Docker networking probe safety
+        run: bash deployment/linux/test-docker-network-probe.sh
+      - name: Docker Compose/Dockerfile static checks
+        run: bash deployment/linux/docker/test-compose-static.sh
+      - name: Docker accept evidence/ownership safety
+        run: bash deployment/linux/docker/test-accept-safety.sh

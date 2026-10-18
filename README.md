@@ -59,8 +59,9 @@ C:\dev\project\ignite\          (outer workspace / this repository root)
 
 Build and install a portable Linux bundle (Ignite Server + ignite-web) from source:
 
-see [`docs/self-hosting.md`](docs/self-hosting.md). Trusted LAN / plain HTTP only;
-Docker Compose packaging is not included in this phase.
+see [`docs/self-hosting.md`](docs/self-hosting.md). Trusted LAN / plain HTTP only.
+Optional Linux Docker Compose / Portainer packaging (host networking) lives under
+[`deployment/linux/docker/`](deployment/linux/docker/).
 
 
 ## Supported device expectations
@@ -152,7 +153,7 @@ prerequisite for using Ignite as a notebook.
   WebKit/Safari E2E suites have not yet been executed in this migration, so
   compatibility on those browsers remains unverified
 - Ignite Server portable Linux packaging is validated with disposable staging
-  tests; Docker Compose / Portainer images are not provided yet
+  tests; optional Compose/Portainer image under `deployment/linux/docker/`
 
 ## Contributing
 

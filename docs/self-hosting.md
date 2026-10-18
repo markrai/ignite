@@ -1,7 +1,8 @@
 # Ignite Server — portable Linux self-hosting
 
-**Status:** Phase 1 portable Linux bundle (source-built). Docker Compose / Portainer
-packaging is not part of this release.
+**Status:** Portable Linux systemd bundle (source-built) and optional **Docker Compose /
+Portainer** packaging (Linux host networking). These are alternative deployment paths;
+Compose does **not** assume the native installer has configured the host firewall.
 
 Public names: **Ignite Server** (host binary + service) and **ignite-web** (browser UI).
 
@@ -149,12 +150,73 @@ require a **secure context** (HTTPS or localhost). Providing HTTPS via an extern
 reverse proxy or VPN terminator is optional and documented for a later phase; it is
 not required for core notebook sync on the LAN.
 
-## What this phase does not include
+## Docker Compose / Portainer (Linux host networking)
 
-- Docker Compose / Portainer images
+Use this when you want a containerized Ignite Server on **Linux Docker Engine**
+(Portainer on a Linux server or compatible NAS included). Ordinary Docker **bridge**
+networking is **not** the supported default (mDNS / LAN discovery fit is poor; see
+[`deployment/linux/docker-network-feasibility.md`](../deployment/linux/docker-network-feasibility.md)).
+
+| Item | Value |
+|------|--------|
+| Docs / scripts | [`deployment/linux/docker/`](../deployment/linux/docker/) |
+| Image tag (local) | `ignite-server:local` (build via `build-image.sh`; Compose is image-only) |
+| Runtime PID 1 UID/GID | `19187:19187` after entrypoint drop (image USER is root for volume chown) |
+| Network | `network_mode: host` |
+| Default port | TCP `8787` |
+| State volume | `/var/lib/scribe-server` |
+| Config | Embedded in the image; optional absolute-path override (Portainer) |
+| Validated arch | **linux/amd64** (ARM not claimed by this packaging path) |
+
+### Build and start
+
+```bash
+bash deployment/linux/build-bundle.sh
+bash deployment/linux/docker/build-image.sh
+cd deployment/linux/docker
+
+# First run only — explicit init (prints setup_code=… while unclaimed):
+bash ./init-once.sh
+
+docker compose up -d
+curl -fsS http://127.0.0.1:8787/control/v1/status
+```
+
+Portainer: load the image on the Linux engine, paste the image-only stack (no `build:` /
+`context/`), use the embedded config or an **absolute** host bind for overrides, and run
+one-off `init` against the **same** named volume before claim.
+
+Open `http://<host>:8787/` and complete the claim in ignite-web. **Do not** put setup
+codes in Compose YAML, Portainer env vars, or shared logs. While unclaimed, every
+`init` issues a **new** code and invalidates the previous one. After claim, restarts
+and same-volume image replacements must not require another claim.
+
+### Host firewall and ports
+
+Compose/Portainer **do not** apply `firewall.sh` from the native installer. You must
+configure and verify host firewall rules for trusted-LAN access (TCP listen port and
+mDNS as appropriate). Ignite’s application network policy still filters connections
+but is **not** a substitute for host firewall configuration. If port `8787` is taken,
+override `listen` (and the healthcheck URL) together.
+
+### Backup, restore, upgrades
+
+Back up the Docker volume for `/var/lib/scribe-server` plus any host config override.
+Restore onto the same volume and start a current image. Do not run
+`docker compose down -v` unless you intend to destroy customer data. Disposable
+acceptance proves restart/recreate with the **same** image; distinct software-version
+migration and notebook/blob API round-trips are not claimed by that suite alone.
+
+Full operator notes: [`deployment/linux/docker/README.md`](../deployment/linux/docker/README.md).
+
+## What this packaging does not include
+
+- Publishing images to Docker Hub / GHCR
+- Automatic container updaters
+- Reverse-proxy / automatic HTTPS configuration
 - Privileged sudoers deploy automation (`scribe-deploy`)
 - Tailscale-specific product dependencies
-- Automatic public-TLS certificate management
+- Claiming physical-LAN Kindle mDNS validation from virtualized Docker tests alone
 
 ## Disposable tests
 
@@ -167,4 +229,12 @@ bash deployment/linux/test-cargo-target-dir.sh
 
 # Firewall ownership (disposable NET_ADMIN container only — never the dev host)
 bash deployment/linux/ci-firewall.sh
+
+# Docker packaging (static; no daemon)
+bash deployment/linux/docker/test-compose-static.sh
+bash deployment/linux/test-docker-network-probe.sh
+
+# Full disposable image accept (explicit opt-in; Linux Engine or Multipass guest)
+IGNITE_DOCKER_ACCEPT=1 bash deployment/linux/docker/accept-disposable.sh
+# IGNITE_DOCKER_ACCEPT=multipass bash deployment/linux/docker/accept-disposable.sh
 ```

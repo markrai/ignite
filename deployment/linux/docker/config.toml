@@ -1,0 +1,13 @@
+# Ignite Server — Docker / Portainer reference config (no secrets).
+# Mount read-only at /etc/scribe-server/config.toml.
+# Change listen only if the host TCP port must differ; keep host networking in mind.
+
+[server]
+listen = "0.0.0.0:8787"
+state_dir = "/var/lib/scribe-server"
+web_root = "/usr/share/scribe-server/web"
+# Display name on the LAN; empty = "Ignite Server on <Hostname>".
+name = ""
+
+[discovery]
+advertise = true

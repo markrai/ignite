@@ -1,0 +1,10 @@
+# Staged docker build context (copied from release bundle; never commit).
+/context/
+
+# Disposable acceptance evidence (may contain redacted logs; keep local).
+/evidence-*/
+/accept-multipass.log
+/*.log
+
+# Local Multipass transfer staging (lives under dist/ when used).
+/.accept-stage-*/

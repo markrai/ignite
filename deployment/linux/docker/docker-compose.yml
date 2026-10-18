@@ -1,0 +1,59 @@
+# Ignite Server — Linux Docker Engine / Portainer stack (host networking).
+#
+# Image-only runtime stack (no build: context). Build with:
+#   bash deployment/linux/docker/build-image.sh
+# then load/tag the image on the target engine as ignite-server:local (or edit image:).
+#
+# Requirements:
+#   - Linux Docker Engine (not Docker Desktop Windows/macOS host networking)
+#   - Free host TCP port 8787 (or change listen in an overridden config + healthcheck)
+#   - Operator-managed host firewall (this stack does NOT apply native installer rules)
+#
+# Config: the image embeds /etc/scribe-server/config.toml. Override only if needed:
+#   - Local Compose: uncomment the bind below (relative path OK on the Compose host).
+#   - Portainer: use an absolute host path, or leave the bind omitted (image default).
+#
+# First-run (operator-controlled; do not automate on every start):
+#   docker compose run --rm ignite-server init --config /etc/scribe-server/config.toml
+#   # Capture setup_code=… from that command's stdout only, then:
+#   docker compose up -d
+#
+# Never store setup codes in this file or in .env.
+
+name: ignite-server
+
+services:
+  ignite-server:
+    image: ignite-server:local
+    container_name: ignite-server
+    network_mode: host
+    restart: unless-stopped
+    # Image USER is root so the entrypoint can chown the state volume, then setpriv
+    # drops to UID/GID 19187 for scribe-server (PID 1). Not privileged mode.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - ignite-state:/var/lib/scribe-server
+      # Optional config override (image embeds a default). Portainer: absolute path only.
+      # - ./config.toml:/etc/scribe-server/config.toml:ro
+    security_opt:
+      - no-new-privileges:true
+    # Host networking: no ports: mapping.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/control/v1/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 512m
+    cpus: 1.0
+
+volumes:
+  ignite-state:
+    name: ignite-server-state
