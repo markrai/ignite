@@ -631,8 +631,9 @@ vm_exists() {
 }
 
 # A Windows multipass.exe parses "C:\..." / "C:/..." as instance "C", so it gets a path
-# relative to a cwd Windows can see. Linux-only filesystems (e.g. WSL ext4) have no drive path:
-# stream those through exec as base64 text instead.
+# relative to a cwd on a Windows drive. Linux-only filesystems (e.g. WSL ext4) are unusable:
+# multipass.exe cannot read them, and it does not forward piped stdin to `exec` (a base64
+# stream delivers 0 bytes and hangs), so on Windows the stage itself lives on a drive.
 windows_drive_dir() {
   local w=""
   if command -v wslpath >/dev/null 2>&1; then
@@ -644,21 +645,89 @@ windows_drive_dir() {
   return 1
 }
 
+MP_TRANSFER_LIMIT="${IGNITE_MULTIPASS_TRANSFER_TIMEOUT:-900}"
+
+# Bounded `multipass transfer`: a wedged transfer must fail (and reach VM cleanup), not hang.
+# Exit 124/137 = timed out. The bound is unconditional: no timeout utility, no transfer.
+# Called in the caller's shell (not the subshells below) so `die` stops the run.
+mp_select_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    MP_TIMEOUT=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then
+    MP_TIMEOUT=gtimeout
+  else
+    die "multipass transfers need a timeout utility, and neither 'timeout' nor 'gtimeout' was found.
+  Install GNU coreutils (Linux/WSL: coreutils package; macOS: brew install coreutils)."
+  fi
+}
+mp_transfer() {
+  MSYS_NO_PATHCONV=1 "$MP_TIMEOUT" -k 10 "$MP_TRANSFER_LIMIT" "$MP" transfer "$@"
+}
+
+host_sha256() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+guest_sha256() { mp exec "$VM" -- sha256sum "$1" 2>/dev/null | tr -d '\r' | awk '{print $1}'; }
+
+# Upload a stage file. Windows: relative name from the drive-backed stage dir.
 mp_push() {
   local src="$1" dst="$2" dir base
   dir="$(cd "$(dirname "$src")" && pwd)"
   base="$(basename "$src")"
+  mp_select_timeout
   if [ "$MP_WINDOWS" = 0 ]; then
-    mp transfer "$src" "$VM:$dst"
-  elif windows_drive_dir "$dir"; then
-    (cd "$dir" && mp transfer "$base" "$VM:$dst")
+    mp_transfer "$src" "$VM:$dst" \
+      || die "multipass transfer to $VM:$dst failed or exceeded ${MP_TRANSFER_LIMIT}s"
   else
-    base64 <"$src" | mp exec "$VM" -- bash -c "base64 -d > '$dst'"
+    windows_drive_dir "$dir" || die "internal: Windows stage $dir is not on a Windows drive"
+    (cd "$dir" && mp_transfer "$base" "$VM:$dst") \
+      || die "multipass transfer to $VM:$dst failed or exceeded ${MP_TRANSFER_LIMIT}s"
   fi
-  local want got
-  want="$( (sha256sum "$src" 2>/dev/null || shasum -a 256 "$src") | awk '{print $1}')"
-  got="$(mp exec "$VM" -- sha256sum "$dst" | tr -d '\r' | awk '{print $1}')"
-  [ "$want" = "$got" ] || die "payload integrity mismatch after transfer to $VM:$dst"
+  [ "$(host_sha256 "$src")" = "$(guest_sha256 "$dst")" ] \
+    || die "payload integrity mismatch after transfer to $VM:$dst"
+}
+
+# Download a guest file to $STAGE/<name>, verified against the guest's sha256 before use.
+# Windows multipass.exe may exit nonzero with "cannot set permissions for local file" after
+# writing the complete file: accept that (with a warning) only when the hash matches.
+mp_pull() {
+  local src="$1" name="$2" want got rc=0 err
+  mp_select_timeout
+  want="$(guest_sha256 "$src")"
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "could not hash $VM:$src in the guest"
+  rm -f "$STAGE/$name"
+  err="$STAGE/$name.transfer-err"
+  if [ "$MP_WINDOWS" = 0 ]; then
+    mp_transfer "$VM:$src" "$STAGE/$name" 2>"$err" || rc=$?
+  else
+    windows_drive_dir "$STAGE" || die "internal: Windows stage $STAGE is not on a Windows drive"
+    (cd "$STAGE" && mp_transfer "$VM:$src" "$name") 2>"$err" || rc=$?
+  fi
+  case "$rc" in
+    124|137) die "multipass transfer from $VM:$src exceeded ${MP_TRANSFER_LIMIT}s" ;;
+  esac
+  got=""
+  [ -f "$STAGE/$name" ] && got="$(host_sha256 "$STAGE/$name")"
+  if [ "$got" != "$want" ]; then
+    sed 's/^/  multipass: /' "$err" >&2
+    die "evidence download from $VM:$src is missing, incomplete, or corrupt (transfer rc=$rc; sha256 mismatch)"
+  fi
+  if [ "$rc" != 0 ]; then
+    echo "accept-disposable: WARNING: multipass transfer exited $rc after a complete download (sha256 verified); accepting:" >&2
+    sed 's/^/  multipass: /' "$err" >&2
+  fi
+}
+
+# WSL: the Windows user's %TEMP% (TEMP is not forwarded into WSL without WSLENV).
+windows_temp_dir() {
+  command -v wslpath >/dev/null 2>&1 || return 1
+  local c w u IFS=':'
+  for c in cmd.exe ${IGNITE_WINDOWS_CMD_CANDIDATES-/mnt/c/Windows/System32/cmd.exe}; do
+    [ -n "$c" ] && command -v "$c" >/dev/null 2>&1 || continue
+    w="$(cd / && "$c" /d /c 'echo %TEMP%' 2>/dev/null | tr -d '\r' | head -n 1)" || continue
+    case "$w" in [A-Za-z]:\\*) ;; *) continue ;; esac
+    u="$(wslpath -u "$w" 2>/dev/null)" || continue
+    [ -d "$u" ] && [ -w "$u" ] && { printf '%s\n' "$u"; return 0; }
+  done
+  return 1
 }
 
 host_path_note() {
@@ -703,7 +772,7 @@ run_multipass() {
   [ -f "$BUNDLE/web/index.html" ] || die "missing web assets in $BUNDLE"
   [ -d "$FIXTURES_DIR" ] || die "fixtures missing: $FIXTURES_DIR"
   local t
-  for t in tar base64; do
+  for t in tar; do
     command -v "$t" >/dev/null 2>&1 || die "$t is required on this host"
   done
 
@@ -715,10 +784,22 @@ run_multipass() {
   # Private, fresh stage outside the repo (the checkout may not be writable from WSL, and
   # copying packaging files must not nest into itself).
   local stage_parent="${IGNITE_DOCKER_STAGE_DIR:-${TMPDIR:-/tmp}}"
+  if [ "$MP_WINDOWS" = 1 ]; then
+    # multipass.exe only reads files on a Windows drive (see windows_drive_dir).
+    if [ -z "${IGNITE_DOCKER_STAGE_DIR:-}" ] && ! windows_drive_dir "$stage_parent"; then
+      stage_parent="$(windows_temp_dir)" || stage_parent=""
+    fi
+    { [ -n "$stage_parent" ] && windows_drive_dir "$stage_parent"; } \
+      || die "Windows multipass.exe can only transfer files that live on a Windows drive,
+  and no writable drive-backed temp directory was found${stage_parent:+ ($stage_parent is not on one)}.
+  Set IGNITE_DOCKER_STAGE_DIR to a writable directory on a Windows drive,
+  e.g. IGNITE_DOCKER_STAGE_DIR=/mnt/c/Users/<you>/AppData/Local/Temp"
+  fi
   STAGE="$(mktemp -d "$stage_parent/ignite-dacc-stage-${RUN_ID}.XXXXXX")" \
     || die "cannot create a private stage directory under $stage_parent"
   STAGE_OWNED=1
-  chmod 700 "$STAGE"
+  # DrvFs may ignore modes; Windows profile ACLs keep %TEMP% private. No secrets are staged.
+  chmod 700 "$STAGE" 2>/dev/null || true
 
   # Never adopt (or later delete) an instance this run did not create.
   local st=0
@@ -826,14 +907,13 @@ run_multipass() {
     else
       mkdir -p /tmp/empty-ev && tar -C /tmp -czf /home/ubuntu/evidence.tgz empty-ev
     fi
-  " || true
-  # Pull via base64 on stdout to avoid Windows Multipass SFTP permission quirks.
-  mp exec "$VM" -- bash -lc 'base64 -w0 /home/ubuntu/evidence.tgz' >"$STAGE/evidence.b64" 2>/dev/null || true
+  " || die "could not package evidence inside the guest (guest rc=$GUEST_RC)"
+  # Native transfer (no base64 over exec stdio: Windows multipass.exe wedges on it), verified
+  # by sha256 before extraction.
+  mp_pull /home/ubuntu/evidence.tgz evidence.tgz
   mkdir -p "$STAGE/evidence"
-  if [ -s "$STAGE/evidence.b64" ]; then
-    tr -d '\r\n' <"$STAGE/evidence.b64" | base64 -d >"$STAGE/evidence.tgz" 2>/dev/null \
-      && tar -C "$STAGE/evidence" -xzf "$STAGE/evidence.tgz" 2>/dev/null || true
-  fi
+  tar -C "$STAGE/evidence" --no-same-owner -xzf "$STAGE/evidence.tgz" \
+    || die "could not extract the retrieved evidence archive"
   if [ -d "$STAGE/evidence/evidence-${RUN_ID}" ]; then
     mkdir -p "$EVIDENCE"
     chmod 700 "$EVIDENCE" 2>/dev/null || true
@@ -841,6 +921,8 @@ run_multipass() {
     # Defense in depth: the guest scans only on its PASS path; scan everything retrieved.
     bash "$DOCKER_DIR/assert-evidence-clean.sh" "$EVIDENCE" \
       || die "retrieved evidence failed the secret scan: $EVIDENCE"
+  elif [ "$GUEST_RC" -eq 0 ]; then
+    die "retrieved evidence archive has no evidence-${RUN_ID} directory"
   fi
 
   if [ -f "$EVIDENCE/summary.txt" ]; then

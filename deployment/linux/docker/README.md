@@ -131,6 +131,21 @@ to be installed inside WSL. Git Bash, Linux, and macOS work the same way. For an
 install location set `IGNITE_MULTIPASS=/path/to/multipass[.exe]`. Windows CMD `set VAR=...`
 values are **not** visible inside WSL unless listed in `WSLENV`; the default needs none.
 
+`multipass.exe` can only read files on a Windows drive, and it does not pass piped stdin through
+to `multipass exec`. So when the Windows executable is in use, the payload is staged in a private
+directory under the Windows user's `%TEMP%`, sent with a relative `multipass transfer`, and
+checked by sha256 inside the guest. The stage is removed afterwards. If no drive-backed temp
+directory can be found, set `IGNITE_DOCKER_STAGE_DIR` to a writable directory on a Windows drive.
+Evidence comes back the same way: the guest archive is downloaded with `multipass transfer`
+into the stage under a relative name and checked against the guest's sha256 before it is
+extracted. `multipass.exe` can exit nonzero with `cannot set permissions for local file` after
+writing the whole file. That case is accepted, with a warning, only when the hash matches. A
+missing, truncated or corrupt download fails the run. Neither direction streams base64 through
+`multipass exec`. A transfer that takes longer than `IGNITE_MULTIPASS_TRANSFER_TIMEOUT` seconds
+(default 900) fails the run, and the VM is still cleaned up. This bound needs GNU `timeout`
+(or `gtimeout` on macOS via `brew install coreutils`). Without either, the run stops before
+any transfer.
+
 Safety comes from isolation and ownership, not confirmation flags:
 
 - The VM, compose project, volume, and image carry this run's unique id. A preexisting

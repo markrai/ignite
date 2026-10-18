@@ -288,11 +288,31 @@ if [ "$MODE" = "seed" ]; then
   esac
 
   say "POST live operations ($PHASE_LABEL)"
+  OPS_REQUEST="$SCRATCH/ops-request.json"
+
+  python3 - "$LIVE_OPS_PATH" "$OPS_REQUEST" <<'PYOPS'
+import json
+import sys
+from pathlib import Path
+
+fixture = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+envelopes = fixture["envelopes"]
+
+if not envelopes or not all(isinstance(e, str) for e in envelopes):
+    raise SystemExit("expected serialized envelope strings")
+
+if not all(isinstance(json.loads(e), dict) for e in envelopes):
+    raise SystemExit("expected JSON objects inside envelopes")
+
+# Preserve exact canonical envelope bytes.
+body = '{"envelopes":[' + ",".join(envelopes) + ']}'
+Path(sys.argv[2]).write_bytes(body.encode("utf-8"))
+PYOPS
   OPS_HTTP="$(curl -sS -o "$SCRATCH/ops-post.body" -w '%{http_code}' \
     -X POST "$BASE_URL/v1/libraries/${LIBRARY_ID}/operations" \
     "${AUTH[@]}" \
     -H "Content-Type: application/json" \
-    --data-binary @"$LIVE_OPS_PATH" || true)"
+    --data-binary @"$OPS_REQUEST" || true)"
   echo "operations_post_http=$OPS_HTTP" >"$EVIDENCE/ops-post.${PHASE_LABEL}.status.txt"
   case "$OPS_HTTP" in
     200|201) ;;
