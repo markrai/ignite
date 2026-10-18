@@ -14,6 +14,9 @@
   Invoke-Multipass takes an explicit [string[]] so Windows PowerShell 5.1
   preserves the literal "--" separator (ValueFromRemainingArguments drops it).
 
+  Requires Playwright Chromium smoke inside the guest
+  (IGNITE_ACCEPT_REQUIRE_BROWSER=1). HTTP-only claim is not a PASS for this driver.
+
 .PARAMETER BundleDir
   Path to dist/ignite-server-linux (or equivalent bundle).
 
@@ -39,6 +42,7 @@ $Bundle = if ([System.IO.Path]::IsPathRooted($BundleDir)) {
 }
 $GuestScript = Join-Path $PSScriptRoot "guest-acceptance.sh"
 $PrepareScript = Join-Path $PSScriptRoot "prepare-guest.sh"
+$BrowserSmokeDir = Join-Path $PSScriptRoot "browser-smoke"
 $Name = "ignite-linux-accept-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
 $EvidenceHost = Join-Path $PSScriptRoot ("evidence-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))
 New-Item -ItemType Directory -Force -Path $EvidenceHost | Out-Null
@@ -124,6 +128,15 @@ if (-not (Test-Path $GuestScript)) {
 if (-not (Test-Path $PrepareScript)) {
   throw "Missing prepare-guest.sh"
 }
+if (-not (Test-Path (Join-Path $BrowserSmokeDir "smoke.mjs"))) {
+  throw "Missing browser-smoke/smoke.mjs"
+}
+if (-not (Test-Path (Join-Path $BrowserSmokeDir "package-lock.json"))) {
+  throw "Missing browser-smoke/package-lock.json (required for npm ci)"
+}
+if (-not (Test-Path (Join-Path $BrowserSmokeDir "fixtures\fixture-manifest.json"))) {
+  throw "Missing browser-smoke/fixtures (claim→library WASM smoke fixtures)"
+}
 
 $MpVersion = (& $MultipassExe @('version') 2>&1 | Out-String).Trim()
 $MpDriver = (& $MultipassExe @('get', 'local.driver') 2>&1 | Out-String).Trim()
@@ -154,17 +167,34 @@ multipass_version<<EOF
 $MpVersion
 EOF
 host_driver=run-host.ps1
+require_browser=1
 "@ | Set-Content -Encoding utf8 (Join-Path $EvidenceHost "platform.txt")
 
-Write-Host "platform_class=true-vm platform_driver=multipass-24.04 multipass_backend=$MpDriver"
+Write-Host "platform_class=true-vm platform_driver=multipass-24.04 multipass_backend=$MpDriver require_browser=1"
 Write-Host "multipass_exe=$MultipassExe"
 Write-Host "bundle=$Bundle"
 Write-Host "evidence=$EvidenceHost"
 
+# Stage browser-smoke without host node_modules (guest runs npm ci for Linux Chromium).
+$SmokeStage = Join-Path ([System.IO.Path]::GetTempPath()) ("ignite-browser-smoke-" + $Name)
+if (Test-Path -LiteralPath $SmokeStage) { Remove-Item -LiteralPath $SmokeStage -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $SmokeStage | Out-Null
+Copy-Item -Force (Join-Path $BrowserSmokeDir "package.json") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "package-lock.json") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "smoke.mjs") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "sanitize.mjs") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "deadline.mjs") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "classify.mjs") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "test-sanitize.mjs") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "test-smoke-helpers.mjs") $SmokeStage
+Copy-Item -Force (Join-Path $BrowserSmokeDir "install-browser-smoke.sh") $SmokeStage
+Copy-Item -Recurse -Force (Join-Path $BrowserSmokeDir "fixtures") (Join-Path $SmokeStage "fixtures")
+
 $guestFailed = $false
 $vmCreated = $false
 try {
-  Invoke-Multipass -Arguments @('launch', '24.04', '--name', $Name, '--cpus', '2', '--memory', '2G', '--disk', '10G')
+  # 3G / 15G: Playwright Chromium + npm install need more headroom than HTTP-only runs.
+  Invoke-Multipass -Arguments @('launch', '24.04', '--name', $Name, '--cpus', '2', '--memory', '3G', '--disk', '15G')
   $vmCreated = $true
 
   # Transfer the bundle directory; Multipass places it as .../ignite-server-linux
@@ -172,6 +202,7 @@ try {
   Invoke-Multipass -Arguments @('transfer', '-r', $Bundle, "${Name}:/home/ubuntu/bundle-upload")
   Invoke-Multipass -Arguments @('transfer', $GuestScript, "${Name}:/home/ubuntu/guest-acceptance.sh")
   Invoke-Multipass -Arguments @('transfer', $PrepareScript, "${Name}:/home/ubuntu/prepare-guest.sh")
+  Invoke-Multipass -Arguments @('transfer', '-r', $SmokeStage, "${Name}:/home/ubuntu/browser-smoke")
 
   # Fresh Multipass/HCS guests can boot with a skewed clock; apt then rejects
   # InRelease files as "not valid yet". Wait for NTP before package ops.
@@ -180,14 +211,20 @@ try {
     'sudo timedatectl set-ntp true 2>/dev/null || true; for i in $(seq 1 40); do synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no); [ "$synced" = yes ] && break; sleep 3; done; date -u; timedatectl status || true'
   )
   Invoke-Multipass -Arguments @('exec', $Name, '--', 'sudo', 'apt-get', 'update', '-qq')
+  Write-Host "host: installing guest packages (curl, nodejs, npm, avahi)…"
   Invoke-Multipass -Arguments @(
     'exec', $Name, '--',
     'sudo', 'env', 'DEBIAN_FRONTEND=noninteractive',
-    'apt-get', 'install', '-y', '-qq', 'curl', 'ca-certificates', 'avahi-utils'
+    'apt-get', 'install', '-y', '-qq', 'curl', 'ca-certificates', 'avahi-utils', 'nodejs', 'npm'
   )
 
   # Strip CRLF on the helper before exec (transfer from Windows may reintroduce them).
   Invoke-Multipass -Arguments @('exec', $Name, '--', 'sed', '-i', 's/\r$//', '/home/ubuntu/prepare-guest.sh')
+  # Normalize browser-smoke layout if transfer nested an extra directory.
+  Invoke-Multipass -Arguments @(
+    'exec', $Name, '--', 'bash', '-lc',
+    'if [ ! -f /home/ubuntu/browser-smoke/smoke.mjs ] && [ -f /home/ubuntu/browser-smoke/browser-smoke/smoke.mjs ]; then mv /home/ubuntu/browser-smoke/browser-smoke /home/ubuntu/browser-smoke-flat && rm -rf /home/ubuntu/browser-smoke && mv /home/ubuntu/browser-smoke-flat /home/ubuntu/browser-smoke; fi; chown -R ubuntu:ubuntu /home/ubuntu/browser-smoke'
+  )
   # prepare-guest.sh is transferred as a file so Windows quoting cannot mangle argv.
   Invoke-Multipass -Arguments @(
     'exec', $Name, '--',
@@ -195,6 +232,8 @@ try {
     'IGNITE_ACCEPT_PLATFORM_CLASS=true-vm',
     'IGNITE_ACCEPT_PLATFORM_DRIVER=multipass-24.04',
     "IGNITE_ACCEPT_MULTIPASS_BACKEND=$MpDriver",
+    'IGNITE_ACCEPT_REQUIRE_BROWSER=1',
+    'IGNITE_ACCEPT_BROWSER_SMOKE=/home/ubuntu/browser-smoke',
     'bash', '/home/ubuntu/prepare-guest.sh'
   )
 
@@ -209,6 +248,9 @@ catch {
   throw
 }
 finally {
+  if (Test-Path -LiteralPath $SmokeStage) {
+    Remove-Item -LiteralPath $SmokeStage -Recurse -Force -ErrorAction SilentlyContinue
+  }
   if ($vmCreated) {
     if ($guestFailed -and $KeepVmOnFailure) {
       Write-Warning "Keeping disposable VM '$Name' for inspection (-KeepVmOnFailure)."
@@ -242,4 +284,15 @@ if (-not (Select-String -Path $summary -Pattern "ACCEPT PASS" -Quiet)) {
 if (-not (Select-String -Path $summary -Pattern "platform_class=true-vm" -Quiet)) {
   throw "true-vm run missing platform_class label"
 }
-Write-Host "HOST ACCEPT COMPLETE evidence=$EvidenceHost platform_class=true-vm multipass_backend=$MpDriver"
+if (-not (Select-String -Path $summary -Pattern "browser_class=playwright-chromium" -Quiet)) {
+  throw "true-vm run missing browser_class=playwright-chromium (HTTP-only is not acceptance PASS for this driver)"
+}
+$smokeJson = Get-ChildItem -Path $EvidenceHost -Recurse -Filter browser-smoke.json -ErrorAction SilentlyContinue |
+  Select-Object -First 1 -ExpandProperty FullName
+if (-not $smokeJson) {
+  throw "missing browser-smoke.json under $EvidenceHost"
+}
+if (-not (Select-String -Path $smokeJson -Pattern '"ok":\s*true' -Quiet)) {
+  throw "browser-smoke.json did not report ok=true"
+}
+Write-Host "HOST ACCEPT COMPLETE evidence=$EvidenceHost platform_class=true-vm multipass_backend=$MpDriver browser_class=playwright-chromium"

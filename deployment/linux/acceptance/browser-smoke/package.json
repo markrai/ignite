@@ -1,0 +1,14 @@
+{
+  "name": "ignite-accept-browser-smoke",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright Chromium smoke for Ignite Server live acceptance (claim, auth, WASM).",
+  "type": "module",
+  "scripts": {
+    "smoke": "node smoke.mjs",
+    "test": "node test-sanitize.mjs && node test-smoke-helpers.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}
