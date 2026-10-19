@@ -51,6 +51,11 @@ export interface ProductServer {
   /** A real Slice 1C backup of this server (`ignite-backup-export`, credential via env only). */
   exportBackup(bearer: string): Uint8Array;
   operations(bearer: string): Promise<{ server_seq: number; envelope: string }[]>;
+  /**
+   * Another administrator browser session, approved on the host (`scribe-server approve-admin`,
+   * as an operator would): its cookie value and device id.
+   */
+  secondAdmin(): Promise<{ cookie: string; deviceId: string }>;
   restart(): Promise<void>;
 }
 
@@ -180,6 +185,19 @@ async function startProduct(): Promise<{ server: ProductServer; stop: () => void
         re.lastIndex = i + 1;
       }
       return out;
+    },
+    async secondAdmin() {
+      const c = (await call("POST", "/control/v1/pairing", { body: { client_type: "browser", display_name: "Second admin" } })).json as {
+        request_id: string;
+        request_secret: string;
+        comparison_code: string;
+      };
+      execFileSync(productBin(), ["approve-admin", c.comparison_code.replace(/\s/g, ""), "--config", configPath], { stdio: "pipe" });
+      const p = await call("POST", `/control/v1/pairing/${c.request_id}/poll`, { body: { request_secret: c.request_secret } });
+      const cookie = /scribe_session=([^;]+)/.exec(p.setCookie!)![1]!;
+      const status = (await call("GET", "/control/v1/status", { cookie })).json as { session: { device_id: string; role: string } };
+      expect(status.session.role).toBe("admin");
+      return { cookie, deviceId: status.session.device_id };
     },
     async restart() {
       await new Promise<void>((ok) => {

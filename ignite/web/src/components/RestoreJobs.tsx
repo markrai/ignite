@@ -4,7 +4,7 @@
 // server string is rendered as text. The one-time confirmation from an upload never reaches this
 // view: it stays inside RestoreActions (the view only learns which job is confirmable).
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { ControlApi, RestoreJob, RestoreJobState } from "../api/controlApi";
 import { RestoreActions, type ActionsState, type ConfirmState, type UploadState } from "./restoreActions";
 import { RestoreJobsLoader, type RestoreJobsState } from "./restoreJobsLoader";
@@ -422,6 +422,7 @@ export function RestoreJobsView({
   onRefresh,
   actions = IDLE_ACTIONS,
   handlers,
+  backup,
 }: {
   state: RestoreJobsState;
   expanded: ReadonlySet<string>;
@@ -430,24 +431,37 @@ export function RestoreJobsView({
   /** Upload and cancel state (never the one-time confirmation). Omitted: read-only. */
   actions?: ActionsState;
   handlers?: RestoreActionHandlers;
+  /** The Backup half of the section (1G-D2), shown above Restore. */
+  backup?: ReactNode;
 }) {
   const { jobs, loading, error } = state;
   const { cancel, confirm } = actions;
   const confirmJobShown = confirm.kind !== "idle" && confirm.kind !== "reviewing" && confirm.kind !== "sending" && !!jobs?.some((j) => j.job_id === confirm.jobId);
   // Uploading needs restore access: hidden while it is refused (the server would refuse anyway).
   const accessRefused = error !== null && error.kind !== "transient";
+  // With the Backup half above it, Refresh belongs to the Restore subsection.
+  const refresh = (
+    <button className="btn" onClick={onRefresh} disabled={loading} aria-label={backup ? "Refresh restores" : undefined} data-testid="restore-refresh">
+      {loading ? "Refreshing…" : "Refresh"}
+    </button>
+  );
   return (
     <section className="settings-card" data-testid="restore-card" aria-labelledby="restore-heading">
       <div className="card-head">
         <h2 id="restore-heading">Backup &amp; Restore</h2>
-        <button className="btn" onClick={onRefresh} disabled={loading} data-testid="restore-refresh">
-          {loading ? "Refreshing…" : "Refresh"}
-        </button>
+        {!backup && refresh}
       </div>
       <p className="hint">
         An Ignite backup preserves each library&apos;s current notebooks and pages (not its edit history). Restoring always creates new libraries; existing libraries are never
         replaced or merged.
       </p>
+      {backup}
+      {backup && (
+        <div className="card-head restore-subhead">
+          <h3>Restore</h3>
+          {refresh}
+        </div>
+      )}
       {error && (
         <div role="alert" className={error.kind === "transient" ? "error-text" : "notice warn"} data-testid="restore-error" data-kind={error.kind}>
           {error.message}
@@ -558,7 +572,7 @@ export function RestoreJobsView({
 }
 
 /** The Backup & Restore section (its own loading and refresh, independent of the rest). */
-export function RestoreJobs({ api }: { api: ControlApi }) {
+export function RestoreJobs({ api, backup }: { api: ControlApi; backup?: ReactNode }) {
   const [state, setState] = useState<RestoreJobsState>({ jobs: null, loading: false, error: null });
   const [actionsState, setActionsState] = useState<ActionsState>(IDLE_ACTIONS);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
@@ -627,6 +641,14 @@ export function RestoreJobs({ api }: { api: ControlApi }) {
     onConfirm: (id) => void actions.current?.confirm(id),
   };
   return (
-    <RestoreJobsView state={state} expanded={expanded} onToggle={toggle} onRefresh={() => void loader.current?.refresh()} actions={actionsState} handlers={handlers} />
+    <RestoreJobsView
+      state={state}
+      expanded={expanded}
+      onToggle={toggle}
+      onRefresh={() => void loader.current?.refresh()}
+      actions={actionsState}
+      handlers={handlers}
+      backup={backup}
+    />
   );
 }

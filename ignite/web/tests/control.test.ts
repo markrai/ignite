@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ControlError, createControlApi, defaultBrowserName, type FetchLike } from "../src/api/controlApi";
+import { ControlError, createControlApi, defaultBrowserName, exportDownloadPath, parseBackupExport, type FetchLike } from "../src/api/controlApi";
 
 function recorder(responses: Record<string, { status: number; body: string }>) {
   const seen: { url: string; init: RequestInit }[] = [];
@@ -72,7 +72,14 @@ describe("D1 control API client", () => {
   it("the control client never touches notebook APIs, tokens or browser storage", () => {
     const src = readFileSync(join(import.meta.dirname, "../src/api/controlApi.ts"), "utf8");
     expect(src).not.toMatch(/\/v1\/libraries|\/v1\/blobs|tokenStore|sessionStorage|localStorage|indexedDB|Authorization/);
-    for (const f of ["components/ProductScreens.tsx", "components/ServerSettings.tsx", "components/RestoreJobs.tsx", "components/restoreJobsLoader.ts"]) {
+    for (const f of [
+      "components/ProductScreens.tsx",
+      "components/ServerSettings.tsx",
+      "components/RestoreJobs.tsx",
+      "components/restoreJobsLoader.ts",
+      "components/BackupExports.tsx",
+      "components/backupExportsController.ts",
+    ]) {
       const t = readFileSync(join(import.meta.dirname, "../src", f), "utf8");
       expect(t, f).not.toMatch(/\bfetch\s*\(|tokenStore|sessionStorage|localStorage|indexedDB/);
     }
@@ -379,5 +386,171 @@ describe("1G-C restore confirmation client", () => {
     const e = (await lost.confirmRestore(id, BODY).catch((x: unknown) => x)) as ControlError;
     expect([e.status, e.code]).toEqual([0, "confirm_interrupted"]);
     expect(e.message).not.toContain(CONFIRMATION);
+  });
+});
+
+// ------------------------------------------------------------------ Slice 1G-D2: backup exports
+
+describe("1G-D2 backup export client", () => {
+  const ID = "01a0de1f-0000-7000-8000-0000000000e1";
+  const BASE_PATH = "/control/v1/admin/backup/exports";
+  const base = { v: 1, export_id: ID, consistency: "per_library_snapshot", expires_in_s: null, archive: null, totals: null, error: null, download: null };
+  const PREPARING = { ...base, state: "preparing" };
+  const READY = {
+    ...base,
+    state: "ready",
+    expires_in_s: 900,
+    archive: { file_name: "ignite-backup.zip", bytes: 1234567, sha256: "ab".repeat(32), format: "ignite-portable-backup", format_version: 1 },
+    totals: { libraries: 2, notebooks: 18, pages: 94, blobs: 3, blob_bytes: 123456 },
+    download: `${BASE_PATH}/${ID}/download`,
+  };
+  const FAILED = { ...base, state: "failed", expires_in_s: 900, error: { code: "io_error", message: "A filesystem error stopped the export." } };
+  const EXPIRED = { ...READY, state: "expired", expires_in_s: 0, download: null };
+  const CLEANUP = { ...READY, state: "cleanup_pending", download: null };
+  const list = (...exports: unknown[]) => JSON.stringify({ v: 1, exports });
+
+  it("parses every state strictly and keeps only the known fields", async () => {
+    const r = recorder({ [BASE_PATH]: { status: 200, body: list(PREPARING, { ...READY, extra: "x" }, FAILED, EXPIRED, CLEANUP) } });
+    const got = await createControlApi(r.fetchFn).listBackupExports();
+    expect(got.map((e) => e.state)).toEqual(["preparing", "ready", "failed", "expired", "cleanup_pending"]);
+    expect(got[0]).toEqual({ export_id: ID, state: "preparing", expires_in_s: null, consistency: "per_library_snapshot", archive: null, totals: null, error: null, download: null });
+    const readyFields: Record<string, unknown> = { ...READY };
+    delete readyFields.v;
+    expect(got[1]).toEqual(readyFields);
+    expect(Object.keys(got[1]!)).not.toContain("extra");
+    expect(got[2]!.error).toEqual({ code: "io_error", message: "A filesystem error stopped the export." });
+    expect(parseBackupExport(READY).download).toBe(exportDownloadPath(ID));
+    for (const s of [r.seen[0]!]) {
+      expect(s.init.method).toBe("GET");
+      expect(s.init).toMatchObject({ cache: "no-store", credentials: "same-origin", redirect: "error", referrerPolicy: "no-referrer" });
+      const h = s.init.headers as Record<string, string>;
+      expect(h["X-Scribe-Request"]).toBeUndefined();
+      expect(h.Authorization).toBeUndefined();
+    }
+  });
+
+  it("refuses malformed or contradictory summaries instead of coercing them", async () => {
+    const bad: [string, unknown][] = [
+      ["version", { ...READY, v: 2 }],
+      ["unknown state", { ...READY, state: "done" }],
+      ["unknown state, nothing else wrong", { ...PREPARING, state: "archived" }],
+      ["unknown state of a failed export", { ...FAILED, state: "aborted" }],
+      ["id", { ...READY, export_id: "../../x", download: `${BASE_PATH}/..%2F..%2Fx/download` }],
+      ["consistency", { ...READY, consistency: "atomic" }],
+      ["ready without archive", { ...READY, archive: null }],
+      ["ready without totals", { ...READY, totals: null }],
+      ["ready without expiry", { ...READY, expires_in_s: null }],
+      ["ready without download", { ...READY, download: null }],
+      ["absolute download", { ...READY, download: `http://evil.example${BASE_PATH}/${ID}/download` }],
+      ["protocol-relative download", { ...READY, download: `//evil.example${BASE_PATH}/${ID}/download` }],
+      ["another export's download", { ...READY, download: `${BASE_PATH}/01a0de1f-0000-7000-8000-0000000000e2/download` }],
+      ["query", { ...READY, download: `${BASE_PATH}/${ID}/download?next=/x` }],
+      ["fragment", { ...READY, download: `${BASE_PATH}/${ID}/download#x` }],
+      ["other path", { ...READY, download: `/control/v1/admin/restore/jobs/${ID}` }],
+      ["download while preparing", { ...PREPARING, download: `${BASE_PATH}/${ID}/download` }],
+      ["download while failed", { ...FAILED, download: `${BASE_PATH}/${ID}/download` }],
+      ["preparing with archive", { ...PREPARING, archive: READY.archive }],
+      ["failed without error", { ...FAILED, error: null }],
+      ["bad sha", { ...READY, archive: { ...READY.archive, sha256: "AB".repeat(32) } }],
+      ["negative count", { ...READY, totals: { ...READY.totals, pages: -1 } }],
+      ["fractional count", { ...READY, totals: { ...READY.totals, pages: 1.5 } }],
+      ["string count", { ...READY, archive: { ...READY.archive, bytes: "12" } }],
+      ["missing message", { ...FAILED, error: { code: "x" } }],
+      ["not an object", "ready"],
+    ];
+    for (const [what, v] of bad) expect(() => parseBackupExport(v), what).toThrow(ControlError);
+    expect(() => parseBackupExport({ ...READY, state: "done" })).toThrow(/unexpected backup export response/);
+    // One bad entry refuses the whole list (never a partial, silently filtered list).
+    const r = recorder({ [BASE_PATH]: { status: 200, body: list(PREPARING, { ...READY, archive: null }) } });
+    expect(((await createControlApi(r.fetchFn).listBackupExports().catch((x: unknown) => x)) as ControlError).code).toBe("unsupported_response");
+    const v2 = recorder({ [BASE_PATH]: { status: 200, body: JSON.stringify({ v: 2, exports: [] }) } });
+    expect(((await createControlApi(v2.fetchFn).listBackupExports().catch((x: unknown) => x)) as ControlError).code).toBe("unsupported_response");
+  });
+
+  it("start is a body-less POST with the CSRF marker and the session cookie only; 202 is preparing, not ready", async () => {
+    const r = recorder({ [BASE_PATH]: { status: 202, body: JSON.stringify(PREPARING) } });
+    const e = await createControlApi(r.fetchFn).startBackupExport();
+    expect(e.state).toBe("preparing");
+    expect(e.download).toBeNull();
+    const [req] = r.seen;
+    expect(req!.url).toBe(BASE_PATH);
+    expect(req!.init.method).toBe("POST");
+    expect(req!.init.body).toBeUndefined();
+    expect(req!.init).toMatchObject({ cache: "no-store", credentials: "same-origin", redirect: "error", referrerPolicy: "no-referrer" });
+    const h = req!.init.headers as Record<string, string>;
+    expect(h["X-Scribe-Request"]).toBe("1");
+    expect(h["Content-Type"]).toBeUndefined();
+    expect(h.Authorization).toBeUndefined();
+  });
+
+  it("only an exact 202 with a preparing summary counts as accepted", async () => {
+    for (const [status, body] of [
+      [200, PREPARING],
+      [201, PREPARING],
+      [202, READY],
+      [202, { v: 1 }],
+    ] as const) {
+      const r = recorder({ [BASE_PATH]: { status, body: JSON.stringify(body) } });
+      const e = await createControlApi(r.fetchFn)
+        .startBackupExport()
+        .catch((x: unknown) => x);
+      expect((e as ControlError).code, `${status}`).toBe("unsupported_response");
+    }
+  });
+
+  it("refusals keep the server's codes; a POST without an answer is interrupted (status 0)", async () => {
+    const fail = async (status: number, body: unknown) => {
+      const r = recorder({ [BASE_PATH]: { status, body: JSON.stringify(body) } });
+      return (await createControlApi(r.fetchFn)
+        .startBackupExport()
+        .catch((x: unknown) => x)) as ControlError;
+    };
+    for (const code of ["export_exists", "export_busy", "too_many_exports"]) expect((await fail(429, { error: code, message: "m" })).code).toBe(code);
+    expect((await fail(403, { error: "loopback_required", message: "m" })).status).toBe(403);
+    expect((await fail(403, { error: "browser_session_required", message: "m" })).code).toBe("browser_session_required");
+    expect((await fail(507, { error: "insufficient_storage", message: "m" })).code).toBe("insufficient_storage");
+    expect((await fail(503, { error: "shutting_down", message: "m" })).status).toBe(503);
+    const broken = createControlApi(() => Promise.reject(new TypeError("network")));
+    const e = (await broken.startBackupExport().catch((x: unknown) => x)) as ControlError;
+    expect([e.status, e.code]).toEqual([0, "interrupted"]);
+    const g = (await broken.listBackupExports().catch((x: unknown) => x)) as ControlError;
+    expect([g.status, g.code]).toEqual([0, "unreachable"]);
+  });
+
+  it("reads and dismisses one export by its encoded id; DELETE has no body; deferred cleanup is reported", async () => {
+    const r = recorder({ [`${BASE_PATH}/${ID}`]: { status: 200, body: JSON.stringify(READY) } });
+    expect((await createControlApi(r.fetchFn).getBackupExport(ID)).state).toBe("ready");
+    const gone = recorder({ [`${BASE_PATH}/${ID}`]: { status: 410, body: '{"error":"expired","message":"m"}' } });
+    expect(((await createControlApi(gone.fetchFn).getBackupExport(ID).catch((x: unknown) => x)) as ControlError).status).toBe(410);
+
+    const del = (body: unknown, status = 200) => recorder({ [`${BASE_PATH}/${ID}`]: { status, body: JSON.stringify(body) } });
+    let d = del({ ok: true, export_id: ID });
+    expect(await createControlApi(d.fetchFn).dismissBackupExport(ID)).toEqual({ export_id: ID, cleanup: "done" });
+    expect(d.seen[0]!.init.method).toBe("DELETE");
+    expect(d.seen[0]!.init.body).toBeUndefined();
+    expect((d.seen[0]!.init.headers as Record<string, string>)["X-Scribe-Request"]).toBe("1");
+    expect((d.seen[0]!.init.headers as Record<string, string>).Authorization).toBeUndefined();
+    d = del({ ok: true, export_id: ID, cleanup: "deferred" });
+    expect((await createControlApi(d.fetchFn).dismissBackupExport(ID)).cleanup).toBe("deferred");
+    for (const [status, code] of [
+      [409, "export_preparing"],
+      [404, "not_found"],
+      [500, "cleanup_failed"],
+    ] as const) {
+      d = del({ error: code, message: "m" }, status);
+      expect(((await createControlApi(d.fetchFn).dismissBackupExport(ID).catch((x: unknown) => x)) as ControlError).code).toBe(code);
+    }
+    d = del({ ok: true, export_id: "someone-else" });
+    expect(((await createControlApi(d.fetchFn).dismissBackupExport(ID).catch((x: unknown) => x)) as ControlError).code).toBe("unsupported_response");
+    const odd = recorder({});
+    await createControlApi(odd.fetchFn)
+      .getBackupExport("a/b?c")
+      .catch(() => undefined);
+    expect(odd.seen[0]!.url).toBe(`${BASE_PATH}/a%2Fb%3Fc`);
+  });
+
+  it("the download path is built locally for exactly one export", () => {
+    expect(exportDownloadPath(ID)).toBe(`/control/v1/admin/backup/exports/${ID}/download`);
+    expect(exportDownloadPath("a/../b")).toBe("/control/v1/admin/backup/exports/a%2F..%2Fb/download");
   });
 });

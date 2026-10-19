@@ -266,6 +266,166 @@ export function parseRestoreJob(v: unknown): RestoreJob {
   };
 }
 
+// --- Slice 1G-D2: backup exports (server-side preparation, native download) ----------------
+//
+// Mirrors the summaries `scribe-server` returns for `/control/v1/admin/backup/exports[/{id}]`
+// (ignite/server/scribe-server/src/export.rs). Only these fields are kept.
+
+/**
+ * `expired`: a ready export past its deadline the server has not withdrawn yet;
+ * `cleanup_pending`: withdrawn (dismissed or expired), its files are still being deleted.
+ */
+export type BackupExportState = "preparing" | "ready" | "failed" | "expired" | "cleanup_pending";
+
+export interface BackupExportArchive {
+  file_name: string;
+  bytes: number;
+  sha256: string;
+  format: string;
+  format_version: number;
+}
+
+export interface BackupExportTotals {
+  libraries: number;
+  notebooks: number;
+  pages: number;
+  blobs: number;
+  blob_bytes: number;
+}
+
+export interface BackupExportError {
+  code: string;
+  message: string;
+}
+
+export interface BackupExport {
+  export_id: string;
+  state: BackupExportState;
+  /** Approximate seconds left as the server reported them; `null` while preparing. */
+  expires_in_s: number | null;
+  /** Each library is captured at its own snapshot point (not one atomic cross-library copy). */
+  consistency: "per_library_snapshot";
+  archive: BackupExportArchive | null;
+  totals: BackupExportTotals | null;
+  error: BackupExportError | null;
+  /** The same-origin download route of this export; set only while it is ready. */
+  download: string | null;
+}
+
+const EXPORT_STATES: readonly string[] = ["preparing", "ready", "failed", "expired", "cleanup_pending"];
+/** Export ids are the server's UUIDv7 text. */
+const EXPORT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+
+/** The only download route an export may have: same origin, this exact export, nothing else. */
+export function exportDownloadPath(exportId: string): string {
+  return `${BASE}/admin/backup/exports/${encodeURIComponent(exportId)}/download`;
+}
+
+function exportUnsupported(what: string): ControlError {
+  return new ControlError(0, "unsupported_response", `The server returned an unexpected backup export response (${what}).`);
+}
+
+/** Validate one export summary (version 1), keeping only the fields above. */
+export function parseBackupExport(v: unknown): BackupExport {
+  const bad = exportUnsupported;
+  if (!isObj(v) || v.v !== 1) throw bad("version");
+  const id = v.export_id;
+  if (typeof id !== "string" || !EXPORT_ID.test(id)) throw bad("export_id");
+  const state = v.state;
+  if (typeof state !== "string" || !EXPORT_STATES.includes(state)) throw bad("state");
+  if (v.consistency !== "per_library_snapshot") throw bad("consistency");
+  const expires = v.expires_in_s;
+  if (expires !== null && (typeof expires !== "number" || !Number.isFinite(expires) || expires < 0)) throw bad("expires_in_s");
+  const count = (o: Obj, k: string): number => {
+    const n = o[k];
+    if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) throw bad(k);
+    return n;
+  };
+  const text = (o: Obj, k: string): string => {
+    const s = o[k];
+    if (typeof s !== "string") throw bad(k);
+    return s;
+  };
+  let archive: BackupExportArchive | null = null;
+  if (v.archive !== null) {
+    if (!isObj(v.archive)) throw bad("archive");
+    const a = v.archive;
+    const sha256 = text(a, "sha256");
+    if (!SHA256.test(sha256)) throw bad("sha256");
+    archive = { file_name: text(a, "file_name"), bytes: count(a, "bytes"), sha256, format: text(a, "format"), format_version: count(a, "format_version") };
+  }
+  let totals: BackupExportTotals | null = null;
+  if (v.totals !== null) {
+    if (!isObj(v.totals)) throw bad("totals");
+    const t = v.totals;
+    totals = { libraries: count(t, "libraries"), notebooks: count(t, "notebooks"), pages: count(t, "pages"), blobs: count(t, "blobs"), blob_bytes: count(t, "blob_bytes") };
+  }
+  let error: BackupExportError | null = null;
+  if (v.error !== null) {
+    if (!isObj(v.error)) throw bad("error");
+    error = { code: text(v.error, "code"), message: text(v.error, "message") };
+  }
+  const download = v.download;
+  if (download !== null && typeof download !== "string") throw bad("download");
+  // Each state's invariants; anything else is not silently accepted.
+  if (state === "ready") {
+    if (!archive || !totals || expires === null) throw bad("ready export");
+    if (download !== exportDownloadPath(id)) throw bad("download");
+  } else if (download !== null) {
+    throw bad("download");
+  }
+  if (state === "preparing" && (archive || totals || error)) throw bad("preparing export");
+  if (state === "failed" && !error) throw bad("failed export");
+  return {
+    export_id: id,
+    state: state as BackupExportState,
+    expires_in_s: expires,
+    consistency: "per_library_snapshot",
+    archive,
+    totals,
+    error,
+    download,
+  };
+}
+
+/** `{ ok: true, export_id }`, plus `cleanup: "deferred"` while the file is being downloaded. */
+export interface BackupExportDismissed {
+  export_id: string;
+  cleanup: "done" | "deferred";
+}
+
+/**
+ * Backup export calls: same-origin, cookie session only, never a body. POST and DELETE carry the
+ * CSRF marker. No answer at all is `interrupted`: the server may have acted anyway.
+ */
+async function exportCall(fetchFn: FetchLike, method: "GET" | "POST" | "DELETE", path: string): Promise<{ status: number; json: unknown }> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (method !== "GET") headers["X-Scribe-Request"] = "1";
+  let resp: Response;
+  try {
+    resp = await fetchFn(BASE + "/admin/backup/exports" + path, {
+      method,
+      headers,
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+    });
+  } catch {
+    if (method === "GET") throw new ControlError(0, "unreachable", "Ignite Server is not reachable.");
+    throw new ControlError(0, "interrupted", "The connection ended before the server answered.");
+  }
+  let json: unknown = null;
+  try {
+    json = await resp.json();
+  } catch {
+    // not JSON
+  }
+  if (!resp.ok) throw refusal(resp.status, json);
+  return { status: resp.status, json };
+}
+
 export class ControlError extends Error {
   constructor(
     readonly status: number,
@@ -455,6 +615,14 @@ export interface ControlApi {
   cancelRestore(jobId: string): Promise<void>;
   /** Confirm a prepared restore with its one-time capability (202 = accepted, not completed). */
   confirmRestore(jobId: string, body: RestoreConfirmation): Promise<RestoreAccepted>;
+  /** This administrator's backup exports. */
+  listBackupExports(): Promise<BackupExport[]>;
+  /** Ask the server to prepare a backup (no body). 202 = accepted and preparing, never ready. */
+  startBackupExport(): Promise<BackupExport>;
+  /** One of this administrator's exports (404 unknown/foreign, 410 expired). */
+  getBackupExport(exportId: string): Promise<BackupExport>;
+  /** Remove a ready or failed export's temporary files from the server (never any library). */
+  dismissBackupExport(exportId: string): Promise<BackupExportDismissed>;
 }
 
 export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init)): ControlApi {
@@ -502,6 +670,30 @@ export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init
     confirmRestore: (id, body) => confirmRestore(fetchFn, id, body),
     cancelRestore: async (id) => {
       await request(fetchFn, "DELETE", `/admin/restore/jobs/${encodeURIComponent(id)}`, undefined, "error");
+    },
+    listBackupExports: async () => {
+      const { json } = await exportCall(fetchFn, "GET", "");
+      if (!isObj(json) || json.v !== 1 || !Array.isArray(json.exports)) throw exportUnsupported("export list");
+      return json.exports.map(parseBackupExport);
+    },
+    startBackupExport: async () => {
+      const { status, json } = await exportCall(fetchFn, "POST", "");
+      // Only an exact 202 with a preparing summary is "accepted"; anything else is not understood.
+      if (status !== 202) throw exportUnsupported("start answer");
+      const e = parseBackupExport(json);
+      if (e.state !== "preparing") throw exportUnsupported("start answer");
+      return e;
+    },
+    getBackupExport: async (id) => {
+      const e = parseBackupExport((await exportCall(fetchFn, "GET", `/${encodeURIComponent(id)}`)).json);
+      if (e.export_id !== id) throw exportUnsupported("export_id");
+      return e;
+    },
+    dismissBackupExport: async (id) => {
+      const { json } = await exportCall(fetchFn, "DELETE", `/${encodeURIComponent(id)}`);
+      if (!isObj(json) || json.ok !== true || json.export_id !== id) throw exportUnsupported("dismissal answer");
+      if (json.cleanup !== undefined && json.cleanup !== "deferred") throw exportUnsupported("dismissal answer");
+      return { export_id: id, cleanup: json.cleanup === "deferred" ? "deferred" : "done" };
     },
   };
 }

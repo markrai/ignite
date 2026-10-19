@@ -560,3 +560,15 @@ body { overflow: hidden; }
 .restore-confirm h3 { margin: 0; font-size: 16px; }
 .restore-ack { display: flex; gap: 8px; align-items: flex-start; }
 .restore-ack input { margin-top: 3px; flex: none; }
+
+/* Slice 1G-D2: Backup (server-prepared export, native download) above Restore */
+.backup-exports { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 10px; margin-top: 4px; }
+.backup-exports h3, .restore-subhead h3 { margin: 0; font-size: 16px; }
+.restore-subhead { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 12px; }
+a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; box-sizing: border-box; }
+.backup-export .row-actions { flex-wrap: wrap; }
+.backup-facts .backup-sha { overflow-wrap: anywhere; word-break: break-all; user-select: all; }
+@media (max-width: 520px) {
+  .backup-facts { grid-template-columns: 1fr; gap: 2px; }
+  .backup-facts dd { margin-bottom: 6px; }
+}

@@ -1,10 +1,11 @@
 // D1 minimal Ignite Server administration: identity/status, pending access requests
-// (Allow/Deny with the comparison code), connected devices (Revoke), and (read-only) backup
-// restore jobs. Admin sessions only.
+// (Allow/Deny with the comparison code), connected devices (Revoke), and Backup & Restore
+// (backup exports and restore jobs). Admin sessions only.
 
 import { useCallback, useEffect, useState } from "react";
 import { ControlError, type ControlApi, type DeviceRecord, type PendingRequest, type ServerStatusAdmin } from "../api/controlApi";
 import { AppVersion } from "./AppVersion";
+import { BackupExports } from "./BackupExports";
 import { RestoreJobs } from "./RestoreJobs";
 
 function when(ms: number | null): string {
@@ -130,7 +131,7 @@ export function ServerSettings({ api, onClose }: { api: ControlApi; onClose: () 
             ))}
           </ul>
         </section>
-        <RestoreJobs api={api} />
+        <RestoreJobs api={api} backup={<BackupExports api={api} />} />
         <p className="hint">Trusted LAN only: plain HTTP, authenticated devices. Do not expose Ignite Server to the Internet.</p>
       </div>
       <AppVersion />
