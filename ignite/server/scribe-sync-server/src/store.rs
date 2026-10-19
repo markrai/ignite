@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -40,6 +40,8 @@ pub const BLOB_DIR: &str = "blobs";
 pub const LOCK_FILE: &str = "ledger.lock";
 /// Private restore staging root inside the data directory (see `Store::restore_staging_root`).
 pub const RESTORE_STAGING_DIR: &str = "restore-staging";
+/// Private temporary files of `Store::put_blob` (same filesystem as the blobs, for hard links).
+pub const UPLOAD_STAGING_DIR: &str = "upload-staging";
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -154,6 +156,8 @@ pub struct FaultHooks {
     /// `install_blob_file`: fail its Nth directory sync (1 = blob's prefix directory,
     /// 2 = blob root, 3 = data directory; 0 = off), on every platform.
     pub fail_blob_dir_sync: AtomicUsize,
+    /// `install_blob_file`: fail the staged file's sync (before anything is linked).
+    pub fail_blob_file_sync: AtomicBool,
 }
 
 /// Outcome of [`Store::install_blob_file`].
@@ -211,6 +215,8 @@ pub struct Store {
     writer: Mutex<Connection>,
     /// Exclusive process lock on `ledger.lock` (released on drop / process exit).
     _process_lock: File,
+    /// Next `put_blob` temporary-file number (names are also exclusively created).
+    upload_seq: AtomicU64,
     pub hooks: FaultHooks,
     /// Operator/test gate. Default **false**: new [`SyncOperationV1::ReplaceStrokeLineages`]
     /// submits are refused (`unsupported_operation`) so installing this binary cannot add
@@ -296,6 +302,7 @@ impl Store {
             blob_dir: data_dir.join(BLOB_DIR),
             writer: Mutex::new(writer),
             _process_lock: lock,
+            upload_seq: AtomicU64::new(0),
             hooks: FaultHooks::default(),
             accept_replace_stroke_lineages: AtomicBool::new(false),
         };
@@ -325,6 +332,15 @@ impl Store {
         }
         tx.commit()?;
         drop(conn);
+        // Upload temporaries left by a crash. Safe: the process lock above means no upload
+        // of this ledger is running, and an installed blob has its own (hard-linked) name.
+        if let Ok(files) = fs::read_dir(data_dir.join(UPLOAD_STAGING_DIR)) {
+            for f in files.flatten() {
+                if f.file_type().is_ok_and(|t| t.is_file()) {
+                    let _ = fs::remove_file(f.path());
+                }
+            }
+        }
         Ok(store)
     }
 
@@ -544,6 +560,11 @@ impl Store {
                     format!("staged blob {sha} does not hold the verified bytes"),
                 ))
             }
+        }
+        if self.hooks.fail_blob_file_sync.load(Ordering::SeqCst) {
+            return Err(StoreError::Internal(format!(
+                "sync staged blob {sha}: injected failure"
+            )));
         }
         // Write access is needed to flush on Windows; the file is neither truncated nor written.
         fs::OpenOptions::new()
@@ -1085,8 +1106,19 @@ impl Store {
         self.blob_dir.join(&sha.as_str()[..2]).join(sha.as_str())
     }
 
-    /// Content-addressed put: hash recomputed from bytes; the URL hash must match. Returns
-    /// `created`.
+    /// Content-addressed put: hash recomputed from bytes; the URL hash must match.
+    ///
+    /// Returns `created`: `true` when this call inserted the blob's index row (HTTP 201),
+    /// `false` when a consistent row already existed (idempotent re-upload, HTTP 200). A file
+    /// left without a row (e.g. by a crash) is re-checked and indexed, which counts as created.
+    /// Of concurrent identical uploads exactly one sees `true`.
+    ///
+    /// The bytes go to an exclusively created file in [`UPLOAD_STAGING_DIR`] and are published
+    /// by [`Self::install_blob_file`] (re-hash, file sync, hard link that never replaces,
+    /// directory sync); the row is inserted only after that succeeds. Refused (409): an
+    /// existing file with other bytes (`blob_conflict`), a row whose file is missing
+    /// (`blob_missing`), a row whose length or path disagrees (`blob_conflict`). The temporary
+    /// name is removed on every return; an installed blob file is never removed.
     pub fn put_blob(&self, url_sha: &str, bytes: &[u8]) -> R<bool> {
         let want = Sha256Hex::parse(url_sha).map_err(|e| StoreError::bad("invalid_sha256", e))?;
         let got = sha256_hex(bytes);
@@ -1096,47 +1128,76 @@ impl Store {
                 format!("body sha256 {got} != url {want}"),
             ));
         }
-        let path = self.blob_path(&want);
-        if let Some(existing) = self.read_blob_file(&want)? {
-            if existing != bytes {
-                return Err(StoreError::conflict(
-                    "blob_conflict",
-                    format!("stored blob {want} differs from submitted bytes"),
-                ));
-            }
-            // Ensure the index row exists (a crash may have left only the file).
-            let conn = self.writer();
-            let n = conn.execute(
-                "INSERT OR IGNORE INTO blobs (sha256, byte_len, rel_path) VALUES (?1, ?2, ?3)",
-                params![
-                    want.as_str(),
-                    bytes.len() as i64,
-                    rel(&path, &self.blob_dir)
-                ],
-            )?;
-            return Ok(n > 0);
-        }
-        let dir = path.parent().expect("blob path has a parent");
-        fs::create_dir_all(dir).map_err(|e| StoreError::Internal(e.to_string()))?;
-        let tmp = dir.join(format!("{}.tmp.{}", want.as_str(), std::process::id()));
-        {
-            let mut f = File::create(&tmp).map_err(|e| StoreError::Internal(e.to_string()))?;
-            f.write_all(bytes)
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-            f.sync_all()
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-        }
-        fs::rename(&tmp, &path).map_err(|e| StoreError::Internal(e.to_string()))?;
+        let staged = self.stage_upload(bytes)?;
+        self.install_blob_file(&want, bytes.len() as u64, &staged.0)?;
+        let rel_path = rel(&self.blob_path(&want), &self.blob_dir);
         let conn = self.writer();
-        conn.execute(
-            "INSERT OR IGNORE INTO blobs (sha256, byte_len, rel_path) VALUES (?1, ?2, ?3)",
-            params![
-                want.as_str(),
-                bytes.len() as i64,
-                rel(&path, &self.blob_dir)
-            ],
-        )?;
-        Ok(true)
+        let row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT byte_len, rel_path FROM blobs WHERE sha256 = ?1",
+                [want.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((len, p)) if len == bytes.len() as i64 && p == rel_path => Ok(false),
+            Some((len, p)) => Err(StoreError::conflict(
+                "blob_conflict",
+                format!(
+                    "blob {want} is indexed as {len} bytes at {p:?}, expected {} bytes at \
+                     {rel_path:?}; index left untouched",
+                    bytes.len()
+                ),
+            )),
+            None => {
+                conn.execute(
+                    "INSERT INTO blobs (sha256, byte_len, rel_path) VALUES (?1, ?2, ?3)",
+                    params![want.as_str(), bytes.len() as i64, rel_path],
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Write `bytes` to a new, exclusively created file in [`UPLOAD_STAGING_DIR`] (never an
+    /// existing name, so concurrent uploads cannot truncate each other's files). Not synced
+    /// here: [`Self::install_blob_file`] re-hashes and syncs it before linking.
+    fn stage_upload(&self, bytes: &[u8]) -> R<UploadTemp> {
+        let dir = self
+            .blob_dir
+            .parent()
+            .ok_or_else(|| StoreError::Internal("ledger has no data directory".into()))?
+            .join(UPLOAD_STAGING_DIR);
+        fs::create_dir_all(&dir)
+            .map_err(|e| StoreError::Internal(format!("create {}: {e}", dir.display())))?;
+        for _ in 0..64 {
+            let n = self.upload_seq.fetch_add(1, Ordering::SeqCst);
+            let path = dir.join(format!("put-{}-{n}.tmp", std::process::id()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    let temp = UploadTemp(path);
+                    f.write_all(bytes).map_err(|e| {
+                        StoreError::Internal(format!("write {}: {e}", temp.0.display()))
+                    })?;
+                    return Ok(temp);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(StoreError::Internal(format!(
+                        "create {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        Err(StoreError::Internal(format!(
+            "no free upload file name in {}",
+            dir.display()
+        )))
     }
 
     fn read_blob_file(&self, sha: &Sha256Hex) -> R<Option<Vec<u8>>> {
@@ -1234,6 +1295,16 @@ fn insert_genesis(
         params![lib, raw, sha, history],
     )?;
     Ok(())
+}
+
+/// A `put_blob` temporary file, removed on drop. Removing it only drops this name: a blob
+/// hard-linked from it keeps its own.
+struct UploadTemp(PathBuf);
+
+impl Drop for UploadTemp {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// `(length, sha256)` of a file, streamed; `None` if it does not exist.
