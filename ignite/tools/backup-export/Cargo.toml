@@ -1,0 +1,26 @@
+[package]
+name = "backup-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only exporter: a verified portable Ignite backup ZIP from the existing /v1 GET API"
+
+[[bin]]
+name = "ignite-backup-export"
+path = "src/main.rs"
+
+[dependencies]
+portable-backup = { path = "../../core/portable-backup" }
+sync-protocol = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+# Same major/feature set the Kindle app already uses: plain HTTP, no TLS, no env proxies.
+ureq = { version = "2", default-features = false }
+# Deflate only (pure-Rust flate2/miniz_oxide backend); no encryption, bzip2, zstd, lzma or
+# clocks (entries carry a fixed timestamp).
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+scribe-sync-server = { workspace = true }
+sync-engine = { workspace = true, features = ["testkit"] }

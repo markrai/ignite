@@ -4,6 +4,7 @@ members = [
     "ignite/core/notebook-core",
     "ignite/core/sync-protocol",
     "ignite/core/sync-engine",
+    "ignite/core/portable-backup",
     "ignite/core/control-protocol",
     "ignite/core/nbk-reader",
     "ignite/core/scribe-web-wasm",
@@ -14,11 +15,13 @@ members = [
     "ignite/server/scribe-sync-server",
     "ignite/server/scribe-server",
     "ignite/tools/scribe-sync-tool",
+    "ignite/tools/backup-export",
 ]
 default-members = [
     "ignite/core/notebook-core",
     "ignite/core/sync-protocol",
     "ignite/core/sync-engine",
+    "ignite/core/portable-backup",
     "ignite/core/control-protocol",
     "ignite/core/nbk-reader",
     "ignite/core/scribe-web-wasm",
@@ -29,6 +32,7 @@ default-members = [
     "ignite/server/scribe-sync-server",
     "ignite/server/scribe-server",
     "ignite/tools/scribe-sync-tool",
+    "ignite/tools/backup-export",
 ]
 
 [workspace.package]

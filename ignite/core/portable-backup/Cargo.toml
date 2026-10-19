@@ -1,0 +1,20 @@
+[package]
+name = "portable-backup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Portable Ignite backup: versioned manifest, entry paths, semantic verification and library re-keying (portable, wasm32-clean)"
+
+[dependencies]
+# Portable only: no filesystem, HTTP, archive format, clocks, or OS randomness. The sync
+# crates are the authority for snapshot parsing, canonical bytes and semantic state.
+sync-protocol = { workspace = true }
+sync-engine = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+# Incremental hashing so blob contents are verified while streaming, never held whole.
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+sync-engine = { workspace = true, features = ["testkit"] }
+scribe-sync-server = { workspace = true }
+serde_json = "1"
