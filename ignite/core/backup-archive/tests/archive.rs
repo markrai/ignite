@@ -736,3 +736,138 @@ fn disk_start_must_be_the_single_disk() {
         );
     }
 }
+
+// --------------------------------------------------------------------------- staging sink
+
+struct Capture {
+    snapshots: Vec<sync_protocol::LibraryId>,
+    blobs: std::collections::BTreeMap<String, std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+    verified: Vec<String>,
+    fail_begin: bool,
+}
+
+struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for Shared {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl backup_archive::VerifiedEntrySink for Capture {
+    fn snapshot(&mut self, s: portable_backup::VerifiedSnapshot) -> Result<(), String> {
+        self.snapshots.push(s.source_library_id());
+        Ok(())
+    }
+    fn begin_blob(
+        &mut self,
+        sha: &sync_protocol::Sha256Hex,
+        _len: u64,
+    ) -> Result<Box<dyn Write>, String> {
+        if self.fail_begin {
+            return Err("disk full".into());
+        }
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.blobs.insert(sha.to_string(), buf.clone());
+        Ok(Box::new(Shared(buf)))
+    }
+    fn blob_verified(
+        &mut self,
+        sha: &sync_protocol::Sha256Hex,
+        _: Box<dyn Write>,
+    ) -> Result<(), String> {
+        self.verified.push(sha.to_string());
+        Ok(())
+    }
+}
+
+fn capture() -> Capture {
+    Capture {
+        snapshots: vec![],
+        blobs: Default::default(),
+        verified: vec![],
+        fail_begin: false,
+    }
+}
+
+#[test]
+fn the_staging_sink_receives_exactly_the_verified_bytes() {
+    let entries = logical_entries();
+    let bytes = valid_raw().build();
+    let mut sink = capture();
+    let plan = backup_archive::verify_reader_into(
+        &mut std::io::Cursor::new(&bytes),
+        &Limits::DEFAULT,
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(
+        plan,
+        inspect_bytes(&bytes, &Limits::DEFAULT).unwrap(),
+        "same plan as inspection"
+    );
+    assert_eq!(sink.snapshots, vec![lib_a(), lib_b()]);
+    for name in blob_names(&entries) {
+        let sha = &name["blobs/".len()..];
+        let original = &entries.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert_eq!(&*sink.blobs[sha].lock().unwrap(), original);
+    }
+    assert_eq!(sink.verified.len(), 2);
+
+    // An unlisted blob is refused without ever being offered to the sink.
+    let mut e = entries.clone();
+    let extra = vec![7u8; 33];
+    let extra_sha = sha256_hex(&extra).to_string();
+    e.push((format!("blobs/{extra_sha}"), extra));
+    let mut sink = capture();
+    let err = backup_archive::verify_reader_into(
+        &mut std::io::Cursor::new(RawZip::of(&e).build()),
+        &Limits::DEFAULT,
+        &mut sink,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, K::Backup(C::UnexpectedEntry));
+    assert!(!sink.blobs.contains_key(&extra_sha));
+
+    // A corrupt blob is staged partially but never reported verified.
+    let mut z = valid_raw();
+    let blob = blob_names(&entries)[0].clone();
+    z.entry(&blob).data[3] ^= 1;
+    let mut sink = capture();
+    let err = backup_archive::verify_reader_into(
+        &mut std::io::Cursor::new(z.build()),
+        &Limits::DEFAULT,
+        &mut sink,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, K::Backup(C::HashMismatch));
+    assert!(sink.verified.is_empty());
+
+    // Sink failures are staging errors, not archive damage; hostile archives still fail first.
+    let mut sink = Capture {
+        fail_begin: true,
+        ..capture()
+    };
+    let err = backup_archive::verify_reader_into(
+        &mut std::io::Cursor::new(&bytes),
+        &Limits::DEFAULT,
+        &mut sink,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, K::Staging);
+    let mut sink = capture();
+    let mut dup = entries.clone();
+    dup.push(entries[0].clone());
+    let err = backup_archive::verify_reader_into(
+        &mut std::io::Cursor::new(RawZip::of(&dup).build()),
+        &Limits::DEFAULT,
+        &mut sink,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, K::Zip(Z::DuplicateEntry));
+    assert!(sink.snapshots.is_empty() && sink.blobs.is_empty());
+}

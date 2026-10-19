@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -38,6 +38,8 @@ pub const DB_FILE: &str = "ledger.sqlite3";
 pub const BLOB_DIR: &str = "blobs";
 /// Held exclusively for the lifetime of a [`Store`] (one server process per ledger).
 pub const LOCK_FILE: &str = "ledger.lock";
+/// Private restore staging root inside the data directory (see `Store::restore_staging_root`).
+pub const RESTORE_STAGING_DIR: &str = "restore-staging";
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -147,6 +149,20 @@ pub struct FaultHooks {
     pub fail_submit_before_commit: AtomicBool,
     /// After a successful `COMMIT`, HTTP still returns an error (lost ACK). The ledger has the row.
     pub fail_drop_response_after_commit: AtomicBool,
+    /// `bootstrap_many`: fail after inserting this many libraries, before `COMMIT` (0 = off).
+    pub fail_bootstrap_many_after_libraries: AtomicUsize,
+    /// `install_blob_file`: fail its Nth directory sync (1 = blob's prefix directory,
+    /// 2 = blob root, 3 = data directory; 0 = off), on every platform.
+    pub fail_blob_dir_sync: AtomicUsize,
+}
+
+/// Outcome of [`Store::install_blob_file`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobInstall {
+    /// A verified identical file was already in place (left untouched).
+    Existing,
+    /// The staged file was linked into place.
+    Installed,
 }
 
 /// One row of `GET /v1/libraries` (no invented library title: the model has none).
@@ -329,32 +345,12 @@ impl Store {
     /// bytes; a different genesis for an existing library is a conflict, never a replacement.
     /// Returns `(info, created)`.
     pub fn bootstrap(&self, raw: &[u8]) -> R<(LibraryInfo, bool)> {
-        let snap: SyncSnapshotV1 =
-            from_json(raw).map_err(|e| StoreError::bad("invalid_snapshot", e))?;
-        if snap.v != SNAPSHOT_VERSION {
-            return Err(StoreError::bad(
-                "unsupported_version",
-                format!("snapshot version {}", snap.v),
-            ));
-        }
-        snap.validate()
-            .map_err(|e| StoreError::bad("invalid_snapshot", e))?;
-        let canonical =
-            to_canonical_json(&snap).map_err(|e| StoreError::Internal(e.to_string()))?;
-        if canonical != raw {
-            return Err(StoreError::bad(
-                "non_canonical",
-                "genesis must be the canonical SyncSnapshotV1 bytes",
-            ));
-        }
-        let state = LibraryState::genesis(snap.clone())
-            .map_err(|e| StoreError::bad("invalid_snapshot", e))?;
-        let history = state
-            .history
-            .to_canonical_bytes()
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-        let sha = sha256_hex(raw).to_string();
-        let lib = snap.library_id.to_string();
+        let PreparedGenesis {
+            snap,
+            history,
+            sha,
+            lib,
+        } = prepare_genesis(raw)?;
 
         let mut conn = self.writer();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -385,17 +381,7 @@ impl Store {
         if !missing.is_empty() {
             return Err(StoreError::MissingBlobs(missing));
         }
-        tx.execute(
-            "INSERT INTO libraries (library_id, genesis_bytes, genesis_sha256, head_server_seq)
-             VALUES (?1, ?2, ?3, 0)",
-            params![lib, raw, sha],
-        )?;
-        tx.execute(
-            "INSERT INTO current_state
-             (library_id, through_server_seq, snapshot_bytes, snapshot_sha256, history_bytes)
-             VALUES (?1, 0, ?2, ?3, ?4)",
-            params![lib, raw, sha, history],
-        )?;
+        insert_genesis(&tx, &lib, raw, &sha, &history)?;
         tx.commit()?;
         Ok((
             LibraryInfo {
@@ -405,6 +391,257 @@ impl Store {
             },
             true,
         ))
+    }
+
+    /// Publish several **new** libraries atomically (restore). One `BEGIN IMMEDIATE`
+    /// transaction:
+    ///
+    /// 1. every `blobs` entry must already be a file in the blob store with exactly
+    ///    `byte_len` bytes (callers install and verify them first, see
+    ///    [`Self::install_blob_file`]); its index row is inserted (or must already agree);
+    /// 2. for each of the `count` libraries, `load(i)` yields canonical genesis bytes, validated
+    ///    exactly as [`Self::bootstrap`] validates them; the library id must not exist yet
+    ///    (an identical existing genesis is a conflict too: never merged, never idempotent) and
+    ///    must be unique in the batch; every referenced blob must be indexed with its length;
+    ///    `libraries` + `current_state` rows are inserted at sequence 0;
+    /// 3. `COMMIT` — only after every library was inserted.
+    ///
+    /// Any error rolls the whole transaction back: no library and no index row from this call
+    /// becomes visible. Readers (WAL snapshots) see either none or all of the new libraries.
+    /// Blob *files* are outside this transaction; see `install_blob_file`.
+    pub fn bootstrap_many(
+        &self,
+        blobs: &[(Sha256Hex, u64)],
+        count: usize,
+        mut load: impl FnMut(usize) -> Result<Vec<u8>, String>,
+    ) -> R<Vec<LibraryInfo>> {
+        let mut conn = self.writer();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (sha, len) in blobs {
+            let path = self.blob_path(sha);
+            match fs::metadata(&path) {
+                Ok(m) if m.is_file() && m.len() == *len => {}
+                _ => return Err(StoreError::MissingBlobs(vec![sha.to_string()])),
+            }
+            let indexed: Option<i64> = tx
+                .query_row(
+                    "SELECT byte_len FROM blobs WHERE sha256 = ?1",
+                    [sha.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match indexed {
+                Some(l) if l as u64 == *len => {}
+                Some(l) => {
+                    return Err(StoreError::conflict(
+                        "blob_conflict",
+                        format!("blob {sha} is indexed with {l} bytes, restore needs {len}"),
+                    ))
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO blobs (sha256, byte_len, rel_path) VALUES (?1, ?2, ?3)",
+                        params![sha.as_str(), *len as i64, rel(&path, &self.blob_dir)],
+                    )?;
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let raw = load(i).map_err(StoreError::Internal)?;
+            let PreparedGenesis {
+                snap,
+                history,
+                sha,
+                lib,
+            } = prepare_genesis(&raw)?;
+            if !seen.insert(snap.library_id) {
+                return Err(StoreError::bad(
+                    "duplicate_library",
+                    format!("library {lib} appears twice in one restore"),
+                ));
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM libraries WHERE library_id = ?1",
+                    [&lib],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Err(StoreError::conflict(
+                    "library_exists",
+                    format!("library {lib} already exists; a restore never merges or replaces"),
+                ));
+            }
+            let missing = missing_blobs(&tx, referenced_blobs(&snap))?;
+            if !missing.is_empty() {
+                return Err(StoreError::MissingBlobs(missing));
+            }
+            insert_genesis(&tx, &lib, &raw, &sha, &history)?;
+            out.push(LibraryInfo {
+                library_id: snap.library_id,
+                genesis_sha256: sha,
+                head_server_seq: 0,
+            });
+            let fail_after = self
+                .hooks
+                .fail_bootstrap_many_after_libraries
+                .load(Ordering::SeqCst);
+            if fail_after != 0 && fail_after == i + 1 {
+                return Err(StoreError::Internal(format!(
+                    "injected failure after {fail_after} restored libraries, before COMMIT"
+                )));
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Private staging root for restores (same filesystem as the blob store, so staged blobs
+    /// can be hard-linked into place). Created on demand.
+    pub fn restore_staging_root(&self) -> R<PathBuf> {
+        let root = self
+            .db_path
+            .parent()
+            .ok_or_else(|| StoreError::Internal("ledger has no data directory".into()))?
+            .join(RESTORE_STAGING_DIR);
+        fs::create_dir_all(&root)
+            .map_err(|e| StoreError::Internal(format!("create {}: {e}", root.display())))?;
+        Ok(root)
+    }
+
+    /// Make `staged` (a file on the store's filesystem holding exactly `byte_len` bytes hashing
+    /// to `sha`) available as blob `sha`, without touching any existing file:
+    ///
+    /// * the staged file is re-hashed (streamed) and fsynced first;
+    /// * an existing blob file is never replaced or truncated: it is re-hashed and must be
+    ///   identical (`Existing`), otherwise `blob_conflict`;
+    /// * an index row whose file is missing is refused (`blob_missing`: damaged store);
+    /// * otherwise the staged file is hard-linked into place (fails if a file appeared in the
+    ///   meantime, which is then verified as existing);
+    /// * in every successful case (including `Existing`, which may be a file left by an earlier
+    ///   attempt whose sync failed) the directory chain holding the blob is synced: the prefix
+    ///   directory (the link), the blob root (a new prefix directory) and the data directory
+    ///   (a new blob root). Any sync failure is returned as an error, so the caller never
+    ///   indexes or publishes the blob. See [`sync_dir`] for what this means on each platform.
+    ///
+    /// No index row is written: [`Self::bootstrap_many`] indexes it inside its transaction.
+    /// A failure or crash after the link leaves at most a hash-checked, unindexed,
+    /// content-addressed file (listed by [`Self::unindexed_blob_files`]); nothing references it.
+    pub fn install_blob_file(
+        &self,
+        sha: &Sha256Hex,
+        byte_len: u64,
+        staged: &Path,
+    ) -> R<BlobInstall> {
+        match hash_file(staged)? {
+            Some((len, got)) if len == byte_len && got == *sha => {}
+            _ => {
+                return Err(StoreError::bad(
+                    "hash_mismatch",
+                    format!("staged blob {sha} does not hold the verified bytes"),
+                ))
+            }
+        }
+        // Write access is needed to flush on Windows; the file is neither truncated nor written.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(staged)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| StoreError::Internal(format!("sync staged blob {sha}: {e}")))?;
+        let path = self.blob_path(sha);
+        let indexed: Option<i64> = self
+            .conn()?
+            .query_row(
+                "SELECT byte_len FROM blobs WHERE sha256 = ?1",
+                [sha.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let verify_existing = |path: &Path| -> R<BlobInstall> {
+            match hash_file(path)? {
+                Some((len, got)) if len == byte_len && got == *sha => Ok(BlobInstall::Existing),
+                Some(_) => Err(StoreError::conflict(
+                    "blob_conflict",
+                    format!("existing blob file {sha} is corrupt or differs; left untouched"),
+                )),
+                None => Err(StoreError::Internal(format!("blob {sha} vanished"))),
+            }
+        };
+        let outcome = if path.exists() {
+            verify_existing(&path)?
+        } else {
+            if indexed.is_some() {
+                return Err(StoreError::conflict(
+                    "blob_missing",
+                    format!("blob {sha} is indexed but its file is missing (damaged store)"),
+                ));
+            }
+            let dir = path.parent().expect("blob path has a parent");
+            fs::create_dir_all(dir).map_err(|e| StoreError::Internal(e.to_string()))?;
+            match fs::hard_link(staged, &path) {
+                Ok(()) => BlobInstall::Installed,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => verify_existing(&path)?,
+                Err(e) => return Err(StoreError::Internal(format!("install blob {sha}: {e}"))),
+            }
+        };
+        self.sync_blob_dirs(&path)?;
+        Ok(outcome)
+    }
+
+    /// Sync the prefix directory holding `path`, the blob root and the data directory, in that
+    /// order, stopping at the first failure.
+    fn sync_blob_dirs(&self, path: &Path) -> R<()> {
+        let fail_at = self.hooks.fail_blob_dir_sync.load(Ordering::SeqCst);
+        let mut dir = path.parent();
+        for n in 1..=3 {
+            let d = dir.expect("blob path is <data>/blobs/<prefix>/<sha>");
+            if fail_at == n {
+                return Err(StoreError::Internal(format!(
+                    "sync directory {}: injected failure",
+                    d.display()
+                )));
+            }
+            sync_dir(d)?;
+            dir = d.parent();
+        }
+        Ok(())
+    }
+
+    /// Blob files with no index row (left by a crash or failure between writing a file and
+    /// committing its index row, e.g. an interrupted restore or `put_blob`). Read-only: this
+    /// only enumerates regular files whose names are valid sha256 values and have no index
+    /// row; it does not read or hash their contents. Use [`Self::install_blob_file`] (which
+    /// re-hashes an existing file) or hash them separately before trusting one.
+    pub fn unindexed_blob_files(&self) -> R<Vec<String>> {
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        let Ok(dirs) = fs::read_dir(&self.blob_dir) else {
+            return Ok(out);
+        };
+        for d in dirs.flatten() {
+            let Ok(files) = fs::read_dir(d.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let name = f.file_name().to_string_lossy().into_owned();
+                if Sha256Hex::parse(&name).is_err() || !f.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let indexed: Option<i64> = conn
+                    .query_row("SELECT 1 FROM blobs WHERE sha256 = ?1", [&name], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                if indexed.is_none() {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     pub fn library(&self, library_id: &str) -> R<LibraryInfo> {
@@ -934,6 +1171,116 @@ impl Store {
         }
         Ok(bytes)
     }
+}
+
+/// A genesis snapshot validated exactly as `bootstrap` requires (shared by `bootstrap_many`).
+struct PreparedGenesis {
+    snap: SyncSnapshotV1,
+    history: Vec<u8>,
+    sha: String,
+    lib: String,
+}
+
+fn prepare_genesis(raw: &[u8]) -> R<PreparedGenesis> {
+    let snap: SyncSnapshotV1 =
+        from_json(raw).map_err(|e| StoreError::bad("invalid_snapshot", e))?;
+    if snap.v != SNAPSHOT_VERSION {
+        return Err(StoreError::bad(
+            "unsupported_version",
+            format!("snapshot version {}", snap.v),
+        ));
+    }
+    snap.validate()
+        .map_err(|e| StoreError::bad("invalid_snapshot", e))?;
+    let canonical = to_canonical_json(&snap).map_err(|e| StoreError::Internal(e.to_string()))?;
+    if canonical != raw {
+        return Err(StoreError::bad(
+            "non_canonical",
+            "genesis must be the canonical SyncSnapshotV1 bytes",
+        ));
+    }
+    let state =
+        LibraryState::genesis(snap.clone()).map_err(|e| StoreError::bad("invalid_snapshot", e))?;
+    let history = state
+        .history
+        .to_canonical_bytes()
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+    let lib = snap.library_id.to_string();
+    Ok(PreparedGenesis {
+        snap,
+        history,
+        sha: sha256_hex(raw).to_string(),
+        lib,
+    })
+}
+
+/// The two rows of a new library at server sequence 0 (genesis == current state).
+fn insert_genesis(
+    tx: &rusqlite::Transaction<'_>,
+    lib: &str,
+    raw: &[u8],
+    sha: &str,
+    history: &[u8],
+) -> R<()> {
+    tx.execute(
+        "INSERT INTO libraries (library_id, genesis_bytes, genesis_sha256, head_server_seq)
+         VALUES (?1, ?2, ?3, 0)",
+        params![lib, raw, sha],
+    )?;
+    tx.execute(
+        "INSERT INTO current_state
+         (library_id, through_server_seq, snapshot_bytes, snapshot_sha256, history_bytes)
+         VALUES (?1, 0, ?2, ?3, ?4)",
+        params![lib, raw, sha, history],
+    )?;
+    Ok(())
+}
+
+/// `(length, sha256)` of a file, streamed; `None` if it does not exist.
+fn hash_file(path: &Path) -> R<Option<(u64, Sha256Hex)>> {
+    use sha2::{Digest, Sha256};
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(StoreError::Internal(format!(
+                "open {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf)
+            .map_err(|e| StoreError::Internal(format!("read {}: {e}", path.display())))?;
+        if n == 0 {
+            break;
+        }
+        len += n as u64;
+        h.update(&buf[..n]);
+    }
+    let d: [u8; 32] = h.finalize().into();
+    Ok(Some((len, Sha256Hex::from_digest(&d))))
+}
+
+/// Unix: fsync the directory so entries created in it (links, subdirectories) survive power
+/// loss; failing to open or sync it is an error.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> R<()> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| StoreError::Internal(format!("sync directory {}: {e}", dir.display())))
+}
+
+/// Windows: no-op. The standard library cannot open a directory for `FlushFileBuffers`, so no
+/// directory-entry durability is requested or confirmed here; whether a new link or directory
+/// survives power loss depends on the filesystem (NTFS metadata journaling), which is neither
+/// asserted by this code nor tested.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> R<()> {
+    Ok(())
 }
 
 fn open_conn(path: &Path) -> R<Connection> {

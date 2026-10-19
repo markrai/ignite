@@ -1,0 +1,18 @@
+[package]
+name = "backup-restore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native transactional restore of a verified portable backup into a scribe-sync-server Store"
+
+[dependencies]
+backup-archive = { path = "../../core/backup-archive" }
+portable-backup = { path = "../../core/portable-backup" }
+scribe-sync-server = { workspace = true }
+sync-protocol = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+backup-export = { path = "../../tools/backup-export" }
+sync-engine = { workspace = true, features = ["testkit"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }

@@ -55,6 +55,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "backup-restore"
+version = "0.9.11"
+dependencies = [
+ "backup-archive",
+ "backup-export",
+ "portable-backup",
+ "scribe-sync-server",
+ "sha2",
+ "sync-engine",
+ "sync-protocol",
+ "zip",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

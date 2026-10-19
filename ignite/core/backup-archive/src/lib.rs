@@ -29,10 +29,12 @@ mod error;
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::Path;
 
-use portable_backup::{BackupVerifier, EntryPath, Limits, BACKUP_FORMAT, BACKUP_FORMAT_VERSION};
+use portable_backup::{
+    BackupVerifier, EntryPath, Limits, VerifiedSnapshot, BACKUP_FORMAT, BACKUP_FORMAT_VERSION,
+};
 use sha2::{Digest, Sha256};
 use sync_protocol::{BackgroundRef, LibraryId, Sha256Hex};
 
@@ -105,6 +107,63 @@ pub fn inspect_reader<R: Read + Seek>(
     r: &mut R,
     limits: &Limits,
 ) -> Result<RestorePlan, RestoreError> {
+    verify_reader_into(r, limits, &mut NoStaging)
+}
+
+/// Receives verified entries during the single verification pass, so a restore can stage
+/// exactly the bytes that were verified without re-reading the archive. Staging names must
+/// come from verified values (the sha256 / library id), never from archive entry names.
+/// Nothing staged is proof of a complete archive until [`verify_reader_into`] returns `Ok`.
+pub trait VerifiedEntrySink {
+    /// A snapshot that `BackupVerifier::add_snapshot` accepted.
+    fn snapshot(&mut self, snapshot: VerifiedSnapshot) -> Result<(), String>;
+    /// A writer that receives the bytes of the manifest-listed blob `sha256`, exactly as they
+    /// are fed to the verifier.
+    fn begin_blob(&mut self, sha256: &Sha256Hex, byte_len: u64) -> Result<Box<dyn Write>, String>;
+    /// The bytes written to `staged` passed every check (size, CRC, content hash).
+    fn blob_verified(&mut self, sha256: &Sha256Hex, staged: Box<dyn Write>) -> Result<(), String>;
+}
+
+struct NoStaging;
+
+impl VerifiedEntrySink for NoStaging {
+    fn snapshot(&mut self, _: VerifiedSnapshot) -> Result<(), String> {
+        Ok(())
+    }
+    fn begin_blob(&mut self, _: &Sha256Hex, _: u64) -> Result<Box<dyn Write>, String> {
+        Ok(Box::new(io::sink()))
+    }
+    fn blob_verified(&mut self, _: &Sha256Hex, _: Box<dyn Write>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Copies everything read through it to `out`; a write failure is recorded separately so it
+/// is reported as a staging failure rather than as archive corruption.
+struct Tee<'a, R: Read> {
+    inner: &'a mut R,
+    out: &'a mut dyn Write,
+    failed: Option<io::Error>,
+}
+
+impl<R: Read> Read for Tee<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Err(e) = self.out.write_all(&buf[..n]) {
+            let msg = e.to_string();
+            self.failed = Some(e);
+            return Err(io::Error::other(msg));
+        }
+        Ok(n)
+    }
+}
+
+/// [`inspect_reader`] that also hands every verified entry to `sink`.
+pub fn verify_reader_into<R: Read + Seek>(
+    r: &mut R,
+    limits: &Limits,
+    sink: &mut dyn VerifiedEntrySink,
+) -> Result<RestorePlan, RestoreError> {
     let container = container::parse(r, limits)?;
     let manifest_entry = container
         .entries
@@ -121,8 +180,14 @@ pub fn inspect_reader<R: Read + Seek>(
         .filter(|e| e.path != EntryPath::Manifest)
     {
         let mut reader = EntryReader::open(r, entry)?;
-        let outcome = match &entry.path {
-            EntryPath::Snapshot(id) => verifier.add_snapshot(*id, &mut reader).map(|s| {
+        match &entry.path {
+            EntryPath::Snapshot(id) => {
+                let outcome = verifier.add_snapshot(*id, &mut reader);
+                if let Some(zip_failure) = reader.failure() {
+                    return Err(zip_failure.clone());
+                }
+                let s = outcome?;
+                reader.finish()?;
                 let blobs: BTreeSet<&Sha256Hex> = s
                     .snapshot()
                     .notebooks
@@ -134,15 +199,44 @@ pub fn inspect_reader<R: Read + Seek>(
                     })
                     .collect();
                 blob_counts.insert(*id, blobs.len() as u64);
-            }),
-            EntryPath::Blob(sha) => verifier.verify_blob(sha, &mut reader),
+                sink.snapshot(s).map_err(RestoreError::staging)?;
+            }
+            EntryPath::Blob(sha) => {
+                // Only manifest-listed blobs are staged; anything else is refused by the
+                // verifier without being copied anywhere.
+                let listed = verifier
+                    .manifest()
+                    .blobs
+                    .binary_search_by(|b| b.sha256.cmp(sha))
+                    .ok()
+                    .map(|i| verifier.manifest().blobs[i].byte_len);
+                let mut staged: Box<dyn Write> = match listed {
+                    Some(len) => sink.begin_blob(sha, len).map_err(RestoreError::staging)?,
+                    None => Box::new(io::sink()),
+                };
+                let mut tee = Tee {
+                    inner: &mut reader,
+                    out: &mut *staged,
+                    failed: None,
+                };
+                let outcome = verifier.verify_blob(sha, &mut tee);
+                let write_failure = tee.failed.take();
+                if let Some(zip_failure) = reader.failure() {
+                    return Err(zip_failure.clone());
+                }
+                if let Some(e) = write_failure {
+                    return Err(RestoreError::staging(format!("stage blob {sha}: {e}")));
+                }
+                outcome?;
+                reader.finish()?;
+                staged
+                    .flush()
+                    .map_err(|e| RestoreError::staging(format!("stage blob {sha}: {e}")))?;
+                sink.blob_verified(sha, staged)
+                    .map_err(RestoreError::staging)?;
+            }
             EntryPath::Manifest => unreachable!("filtered"),
-        };
-        if let Some(zip_failure) = reader.failure() {
-            return Err(zip_failure.clone());
         }
-        outcome?;
-        reader.finish()?;
     }
     let verified = verifier.finish()?;
     let manifest = verified.manifest();

@@ -64,6 +64,8 @@ pub enum RestoreErrorKind {
     Zip(ZipErrorCode),
     /// The logical backup was refused by `portable_backup::BackupVerifier`.
     Backup(BackupErrorCode),
+    /// A [`crate::VerifiedEntrySink`] failed to stage a verified entry (never archive damage).
+    Staging,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +78,13 @@ impl RestoreError {
     pub(crate) fn zip(code: ZipErrorCode, message: impl fmt::Display) -> Self {
         Self {
             kind: RestoreErrorKind::Zip(code),
+            message: message.to_string(),
+        }
+    }
+
+    pub(crate) fn staging(message: impl fmt::Display) -> Self {
+        Self {
+            kind: RestoreErrorKind::Staging,
             message: message.to_string(),
         }
     }
@@ -103,6 +112,7 @@ impl fmt::Display for RestoreError {
             RestoreErrorKind::Io => write!(f, "io: {}", self.message),
             RestoreErrorKind::Zip(c) => write!(f, "zip {}: {}", c.as_str(), self.message),
             RestoreErrorKind::Backup(c) => write!(f, "backup {c}: {}", self.message),
+            RestoreErrorKind::Staging => write!(f, "staging: {}", self.message),
         }
     }
 }
