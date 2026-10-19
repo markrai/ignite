@@ -109,7 +109,8 @@ describe("1G-A Backup & Restore view", () => {
     expect(html).toContain('data-state="ready"');
     expect(t).toContain("Verified, awaiting confirmation");
     expect(t).toContain("5.0 MB backup \u00b7 1 library \u00b7 3 notebooks \u00b7 12 pages \u00b7 usable, expires in 14 minutes");
-    expect(t).toContain("Confirming a restore is not yet available in the browser");
+    // Without the one-time confirmation (e.g. after a reload) it can only be reviewed or discarded.
+    expect(t).toContain("this browser no longer has its one-time confirmation. To restore it, discard this prepared job and upload the backup again.");
     // Source and proposed destination are distinct and labelled as proposed.
     expect(t).toContain(`Library in backup ${SRC}`);
     expect(t).toContain(`Proposed new library ${DST}`);
@@ -312,10 +313,21 @@ const HANDLERS: RestoreActionHandlers = {
   onAskCancel: () => undefined,
   onKeep: () => undefined,
   onCancel: () => undefined,
+  onReview: () => undefined,
+  onAcknowledge: () => undefined,
+  onBack: () => undefined,
+  onConfirm: () => undefined,
 };
 
 function renderActions(state: Partial<RestoreJobsState>, actions: Partial<ActionsState> = {}, expanded: string[] = []): string {
-  const full: ActionsState = { upload: { kind: "idle" }, cancel: { confirming: null, busy: null, notice: null }, picker: 0, ...actions };
+  const full: ActionsState = {
+    upload: { kind: "idle" },
+    cancel: { confirming: null, busy: null, notice: null },
+    confirm: { kind: "idle" },
+    confirmable: null,
+    picker: 0,
+    ...actions,
+  };
   return renderToStaticMarkup(
     <RestoreJobsView
       state={{ jobs: null, loading: false, error: null, ...state }}
@@ -373,15 +385,15 @@ describe("1G-B upload panel", () => {
     expect(t).toContain("Verification complete");
     expect(t).toContain("2 libraries \u00b7 18 notebooks \u00b7 94 pages \u00b7 3 background files (3.0 MB)");
     expect(t).toContain("This is a preview. No notebooks have been restored.");
-    expect(t).toContain("Confirming a restore will be available in a later version.");
-    expect(t).toContain("If this page is reloaded it can still be reviewed or cancelled");
+    expect(t).toContain("then choose Restore libraries\u2026 to restore them as new libraries.");
+    expect(t).toContain("If this page is reloaded, its one-time confirmation is lost");
     // Shared details: both mappings, warnings and exclusions.
     expect(html.match(/data-testid="restore-library"/g)).toHaveLength(2);
     expect(t).toContain(`Library in backup ${SRC}-1 Proposed new library ${DST}-1`);
     expect(t).toContain("Notes from verification: restored libraries receive new library identities at import");
     expect(t).toContain("Not included in a backup:");
-    // Nothing can confirm.
-    expect(t).not.toMatch(/\bConfirm\b|Restore now/);
+    // Not confirmable here (no capability passed): no restore control.
+    expect(html).not.toContain('data-testid="restore-review"');
   });
 
   it("a refused archive keeps the server's code; an interrupted upload is uncertain", () => {
@@ -473,5 +485,221 @@ describe("1G-B loader: a fresh upload is never overwritten by an older list", ()
     calls[1]!.resolve([job({ job_id: "new" }), job({ job_id: "other" })]);
     await after;
     expect(l.current.jobs?.map((j) => j.job_id)).toEqual(["new", "other"]);
+  });
+});
+
+// ------------------------------------------------------------------ Slice 1G-C
+
+describe("1G-C confirmation view", () => {
+  const two = job({
+    totals: { libraries: 2, notebooks: 18, pages: 94, blobs: 3, blob_bytes: 3 * 1024 * 1024 },
+    libraries: [1, 2].map((n) => ({ ...job().libraries[0]!, source_library_id: `${SRC}-${n}`, destination_library_id: `${DST}-${n}` })),
+    warnings: ["restored libraries receive new library identities at import"],
+  });
+
+  it("Restore libraries\u2026 only for the job this browser can confirm, and only when nothing else runs", () => {
+    const yes = renderActions({ jobs: [two] }, { confirmable: two.job_id });
+    expect(yes).toContain('data-testid="restore-review"');
+    expect(text(yes)).toContain("Verified and ready. Review it, then choose Restore libraries\u2026");
+    expect(renderActions({ jobs: [two] }, { confirmable: null })).not.toContain('data-testid="restore-review"');
+    expect(renderActions({ jobs: [two] }, { confirmable: "another" })).not.toContain('data-testid="restore-review"');
+    const busy = renderActions({ jobs: [two] }, { confirmable: two.job_id, cancel: { confirming: null, busy: two.job_id, notice: null } });
+    expect(busy).not.toContain('data-testid="restore-review"');
+    expect(renderActions({ jobs: [job({ state: "executing", usable: false })] }, { confirmable: job().job_id })).not.toContain('data-testid="restore-review"');
+  });
+
+  it("the final review: exact plan, consequences, acknowledgement required, no Cancel meanwhile", () => {
+    const html = renderActions({ jobs: [two] }, { confirmable: two.job_id, confirm: { kind: "reviewing", jobId: two.job_id, acknowledged: false } });
+    const t = text(html);
+    expect(t).toContain("Confirm restoration");
+    expect(t).toContain("This backup contains: 2 libraries 18 notebooks 94 pages 3 background files");
+    expect(t).toContain("Ignite will create 2 new libraries . Your existing libraries will not be replaced, merged or deleted.");
+    expect(t).toContain(`Library in backup ${SRC}-1 Proposed new library ${DST}-1`);
+    expect(t).toContain(`Library in backup ${SRC}-2 Proposed new library ${DST}-2`);
+    expect(t).toContain("Notes from verification: restored libraries receive new library identities at import");
+    expect(t).toContain("Not included in a backup:");
+    expect(t).toContain("I understand that this will create new libraries and may result in duplicate content if I have already restored this backup.");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="restore-confirm-yes"/);
+    expect(t).toContain("Restore new libraries");
+    expect(t).toContain("Go back");
+    expect(html).not.toContain('data-testid="restore-cancel"');
+    expect(html).not.toContain('data-testid="restore-review"');
+    expect(t).not.toMatch(/\bOK\b/);
+    const ready = renderActions({ jobs: [two] }, { confirmable: two.job_id, confirm: { kind: "reviewing", jobId: two.job_id, acknowledged: true } });
+    expect(ready).not.toMatch(/disabled=""[^>]*data-testid="restore-confirm-yes"/);
+  });
+
+  it("sending: everything locked, no Cancel", () => {
+    const html = renderActions({ jobs: [two] }, { confirmable: two.job_id, confirm: { kind: "sending", jobId: two.job_id } });
+    expect(text(html)).toContain("Sending confirmation\u2026");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="restore-confirm-yes"/);
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="restore-confirm-back"/);
+    expect(html).not.toContain('data-testid="restore-cancel"');
+  });
+
+  it("accepted, uncertain and not-started notices; the accepted note gives way to the result", () => {
+    const acc = renderActions({ jobs: [two] }, { confirm: { kind: "accepted", jobId: two.job_id } });
+    expect(text(acc)).toContain("Restoration accepted. The server is restoring the verified backup.");
+    expect(acc).not.toContain('data-testid="restore-cancel"'); // the stale ready row offers no Cancel
+    const running = renderActions({ jobs: [job({ state: "executing", usable: false })] }, { confirm: { kind: "accepted", jobId: job().job_id } });
+    expect(text(running)).toContain("Restoration accepted.");
+    const done = renderActions({ jobs: [succeeded()] }, { confirm: { kind: "accepted", jobId: job().job_id } });
+    expect(text(done)).not.toContain("Restoration accepted.");
+    expect(done).toContain('data-publication="complete"');
+    const unsure = renderActions({ jobs: [two] }, { confirmable: two.job_id, confirm: { kind: "uncertain", jobId: two.job_id } });
+    expect(text(unsure)).toContain("Confirmation outcome unknown. Checking restore status.");
+    expect(unsure).not.toContain('data-testid="restore-review"'); // no second click while unresolved
+    expect(unsure).not.toContain('data-testid="restore-cancel"');
+    const notStarted = renderActions({ jobs: [two] }, { confirmable: two.job_id, confirm: { kind: "not_started", jobId: two.job_id } });
+    expect(text(notStarted)).toContain("The server has not started this restore and nothing was restored.");
+    expect(notStarted).toContain('data-testid="restore-review"'); // a new, explicit decision
+    const gone = renderActions({ jobs: [] }, { confirm: { kind: "gone", jobId: "x" } });
+    expect(text(gone)).toContain("The server no longer has this restore job or its result");
+  });
+
+  it("refusals show their reason (busy keeps the job confirmable)", () => {
+    const busy = renderActions(
+      { jobs: [two] },
+      {
+        confirmable: two.job_id,
+        confirm: { kind: "refused", jobId: two.job_id, error: { kind: "capacity", title: "Another restore is running", message: "Nothing was started.", code: "restore_busy" } },
+      },
+    );
+    expect(text(busy)).toContain("Another restore is running");
+    expect(busy).toContain('data-testid="restore-review"');
+    const mismatch = renderActions(
+      { jobs: [two] },
+      { confirm: { kind: "refused", jobId: two.job_id, error: { kind: "rejected", title: "Confirmation refused", message: "Nothing was restored.", code: "confirmation_mismatch" } } },
+    );
+    expect(text(mismatch)).toContain("Confirmation refused");
+    expect(mismatch).not.toContain('data-testid="restore-review"');
+  });
+
+  it("terminal results: complete with restored hashes; none; unknown never claimed as nothing restored", () => {
+    const ok = text(renderActions({ jobs: [succeeded()] }, {}, [job().job_id]));
+    expect(ok).toContain("1 library restored as a new library.");
+    expect(ok).toContain("Existing libraries were not replaced.");
+    expect(ok).toContain(`Restored as ${DST}`);
+    expect(ok).toContain(`Restored snapshot SHA-256 ${"ef".repeat(32)}`);
+    expect(ok).toContain("The server keeps this result for a limited time and not after it restarts.");
+    const none = text(renderActions({ jobs: [failed("none")] }));
+    expect(none).toContain("No libraries were published by this restore.");
+    const unknown = text(renderActions({ jobs: [failed("unknown")] }, {}, [job().job_id]));
+    expect(unknown).toContain("Restore outcome uncertain");
+    expect(unknown).toContain("Check the destination libraries before attempting another restore");
+    expect(unknown).toContain("duplicate libraries under different identities");
+    expect(unknown).not.toContain("No libraries were published");
+    expect(unknown).not.toMatch(/retry/i);
+  });
+
+  it("the secret has no way into the markup, whatever the confirmation state", () => {
+    const SECRET = "S3cr3tS3cr3tS3cr3tS3cr3tS3cr3tS3cr3tS3cr3t1";
+    const leaky = { ...two, confirmation: SECRET } as RestoreJob;
+    for (const confirm of [
+      { kind: "reviewing", jobId: two.job_id, acknowledged: true },
+      { kind: "sending", jobId: two.job_id },
+      { kind: "accepted", jobId: two.job_id },
+      { kind: "uncertain", jobId: two.job_id },
+    ] as const) {
+      expect(renderActions({ jobs: [leaky] }, { confirmable: two.job_id, confirm }, [two.job_id])).not.toContain(SECRET);
+    }
+  });
+});
+
+// ------------------------------------------------------------------ 1G-C corrective: coherent messages
+
+describe("1G-C corrective: the page never contradicts the confirmation state", () => {
+  const ready = job();
+  const prepared = up({ kind: "prepared", name: "b.zip", job: ready });
+  const NOTHING = "No notebooks have been restored.";
+  const AWAITING = "Verified, awaiting confirmation";
+  const LOST = "no longer has its one-time confirmation";
+
+  it("before confirming: the preview truthfully says nothing was restored", () => {
+    const t = text(renderActions({ jobs: [ready] }, { ...prepared, confirmable: ready.job_id }));
+    expect(t).toContain(NOTHING);
+    expect(t).toContain(AWAITING);
+  });
+
+  it("while sending: no claim that nothing was restored, no stale ready status", () => {
+    const html = renderActions({ jobs: [ready] }, { ...prepared, confirmable: ready.job_id, confirm: { kind: "sending", jobId: ready.job_id } });
+    const t = text(html);
+    expect(t).not.toContain(NOTHING);
+    expect(t).not.toContain(AWAITING);
+    expect(t).toContain("Sending confirmation");
+    expect(html).toContain('data-state="ready"'); // the server's state is kept as data
+  });
+
+  it("accepted, with the cached ready row: checking status, no lost-confirmation text", () => {
+    const html = renderActions({ jobs: [ready] }, { ...prepared, confirmable: null, confirm: { kind: "accepted", jobId: ready.job_id } });
+    const t = text(html);
+    expect(t).toContain("Restoration accepted. The server is restoring the verified backup.");
+    expect(t).toContain("Checking server status");
+    expect(t).not.toContain(NOTHING);
+    expect(t).not.toContain(AWAITING);
+    expect(t).not.toContain(LOST);
+    expect(html).not.toContain('data-testid="restore-cancel"');
+    expect(html).not.toContain('data-testid="restore-review"');
+  });
+
+  it("uncertain: may already be running or finished; nothing says otherwise", () => {
+    const html = renderActions(
+      { jobs: [ready], error: { kind: "transient", message: "Ignite Server is not reachable." } },
+      { ...prepared, confirmable: ready.job_id, confirm: { kind: "uncertain", jobId: ready.job_id } },
+    );
+    const t = text(html);
+    expect(t).toContain("Confirmation outcome unknown. Checking restore status.");
+    expect(t).toContain("may already be running or finished");
+    expect(t).not.toContain(NOTHING);
+    expect(t).not.toContain(AWAITING);
+    expect(t).not.toContain(LOST);
+    expect(t).not.toMatch(/nothing was restored/i);
+    expect(html).not.toContain('data-testid="restore-review"');
+    expect(html).not.toContain('data-testid="restore-cancel"');
+  });
+
+  it("not started (a fresh ready answer): the preview is true again and a new explicit review is offered", () => {
+    const html = renderActions({ jobs: [ready] }, { ...prepared, confirmable: ready.job_id, confirm: { kind: "not_started", jobId: ready.job_id } });
+    const t = text(html);
+    expect(t).toContain("The server has not started this restore and nothing was restored.");
+    expect(t).toContain(NOTHING);
+    expect(html).toContain('data-testid="restore-review"');
+  });
+
+  it("gone: never implies the publication failed", () => {
+    const t = text(renderActions({ jobs: [] }, { ...prepared, confirm: { kind: "gone", jobId: ready.job_id } }));
+    expect(t).toContain("Check the server's libraries to see whether it was restored");
+    expect(t).not.toContain(NOTHING);
+    expect(t).not.toMatch(/no libraries were published/i);
+  });
+
+  it("a refusal that started nothing (429) keeps the preview; other refusals drop it", () => {
+    const busy = text(
+      renderActions(
+        { jobs: [ready] },
+        { ...prepared, confirmable: ready.job_id, confirm: { kind: "refused", jobId: ready.job_id, error: { kind: "capacity", title: "Another restore is running", message: "Nothing was started.", code: "restore_busy" } } },
+      ),
+    );
+    expect(busy).toContain(NOTHING);
+    const already = text(
+      renderActions(
+        { jobs: [ready] },
+        { ...prepared, confirm: { kind: "refused", jobId: ready.job_id, error: { kind: "server", title: "Already confirmed", message: "Its status is shown below.", code: "already_confirmed" } } },
+      ),
+    );
+    expect(already).not.toContain(NOTHING);
+  });
+
+  it("authoritative results replace the checking state", () => {
+    const ok = renderActions({ jobs: [succeeded()] }, { confirm: { kind: "accepted", jobId: ready.job_id } });
+    expect(ok).toContain('data-publication="complete"');
+    expect(text(ok)).not.toContain("Checking server status");
+    expect(text(ok)).not.toContain("Restoration accepted.");
+    const none = renderActions({ jobs: [failed("none")] }, { confirm: { kind: "accepted", jobId: ready.job_id } });
+    expect(none).toContain('data-publication="none"');
+    expect(text(none)).toContain("No libraries were published by this restore.");
+    const unknown = renderActions({ jobs: [failed("unknown")] }, { confirm: { kind: "accepted", jobId: ready.job_id } });
+    expect(text(unknown)).toContain("Restore outcome uncertain");
+    expect(text(unknown)).not.toContain("No libraries were published");
   });
 });

@@ -1,16 +1,20 @@
-// Slice 1G-B: uploading a backup for verification and cancelling a prepared restore. Kept free
-// of React (like RestoreJobsLoader) so the rules are testable on their own:
+// Slices 1G-B/1G-C: uploading a backup for verification, cancelling a prepared restore, and
+// confirming it. Kept free of React (like RestoreJobsLoader) so the rules are testable alone:
 // * one upload at a time; a second click while one runs does nothing;
 // * the selected File is sent as the request body (never read into memory);
 // * success is shown only after a validated HTTP 201;
-// * a failure after the request may have reached the server is reported as uncertain, never
-//   as a refusal, and is never retried automatically;
+// * a failure after a request may have reached the server is reported as uncertain, never as a
+//   refusal, and nothing is ever retried automatically;
 // * the one-time confirmation from the 201 lives only in `pending` (volatile, never in `state`,
-//   never rendered, stored or logged) and is dropped when the job is cancelled, expires or
-//   becomes unusable, when access is lost, and on teardown. Confirming arrives in Slice 1G-C;
-//   until then the capability is held but unused, and a page reload loses it by design.
+//   never rendered, stored or logged), together with the immutable plan it approves (archive
+//   SHA-256 and exact mapping, from the same 201). The confirmation request is built only from
+//   that plan, only after an explicit acknowledged final action, and only while the latest
+//   server summary still shows the same ready, usable job with the same archive and mapping;
+// * it is dropped when the job is cancelled, expires, becomes unusable or differs, when access
+//   is lost, when the server accepts or definitively refuses it, and on teardown. A page reload
+//   loses it by design (the job can then only be reviewed or cancelled).
 
-import { ControlError, MAX_RESTORE_UPLOAD_BYTES, type ControlApi, type RestoreJob } from "../api/controlApi";
+import { ControlError, MAX_RESTORE_UPLOAD_BYTES, type ControlApi, type RestoreConfirmation, type RestoreJob } from "../api/controlApi";
 import { LOOPBACK_EXPLANATION, describeRestoreError, type RestoreErrorKind, type RestoreLoadError } from "./restoreJobsLoader";
 
 export type ActionErrorKind =
@@ -56,9 +60,30 @@ export interface CancelState {
   notice: CancelNotice | null;
 }
 
+export type ConfirmState =
+  | { kind: "idle" }
+  /** The final review is open; nothing has been sent. */
+  | { kind: "reviewing"; jobId: string; acknowledged: boolean }
+  | { kind: "sending"; jobId: string }
+  /** HTTP 202: the server started the restore (not a result). */
+  | { kind: "accepted"; jobId: string }
+  /** No answer: the server may or may not have started it; its status is being checked. */
+  | { kind: "uncertain"; jobId: string }
+  /** After an unanswered confirmation, the server still shows the job ready: nothing started. */
+  | { kind: "not_started"; jobId: string }
+  /** The confirmed job is no longer on the server (its result was not kept). */
+  | { kind: "gone"; jobId: string }
+  | { kind: "refused"; jobId: string; error: ActionError };
+
 export interface ActionsState {
   upload: UploadState;
   cancel: CancelState;
+  confirm: ConfirmState;
+  /**
+   * The job this browser can confirm (it holds the matching capability and the latest server
+   * summary shows the approved plan, ready and usable). Never the capability itself.
+   */
+  confirmable: string | null;
   /** Bumped when an upload finishes, so the file input is reset (re-choosing the same file works). */
   picker: number;
 }
@@ -71,6 +96,75 @@ export interface ActionHooks {
   refresh(): void;
   /** An action was refused for lack of access (401/403): drop privileged job data now. */
   accessRefused(error: RestoreLoadError): void;
+  /**
+   * The server's answer to a confirmation changed (or may have changed) the job: discard every
+   * list requested before now, fetch a fresh one, and return the list version that is now
+   * outdated (only later versions may settle the confirmation).
+   */
+  recheck(): number;
+}
+
+/** The plan a held confirmation approves, captured from the validated 201 (never mutated). */
+interface HeldPlan {
+  readonly jobId: string;
+  readonly confirmation: string;
+  readonly archiveSha256: string;
+  /** Source → destination, as the server proposed them. */
+  readonly mapping: ReadonlyArray<readonly [string, string]>;
+  /** `Date.now()` after which the prepared job has expired. */
+  readonly deadline: number;
+}
+
+function planOf(job: RestoreJob, confirmation: string): HeldPlan {
+  return Object.freeze({
+    jobId: job.job_id,
+    confirmation,
+    archiveSha256: job.archive.sha256,
+    mapping: Object.freeze(job.libraries.map((l) => Object.freeze([l.source_library_id, l.destination_library_id] as const))),
+    deadline: Date.now() + Math.max(0, job.expires_in_s) * 1000,
+  });
+}
+
+const pairKey = (source: string, destination: string) => `${source}\u0000${destination}`;
+
+/** The server's summary still describes exactly the held plan (mapping order irrelevant). */
+function matchesPlan(plan: HeldPlan, job: RestoreJob): boolean {
+  if (job.job_id !== plan.jobId || job.archive.sha256 !== plan.archiveSha256) return false;
+  const shown = new Set(job.libraries.map((l) => pairKey(l.source_library_id, l.destination_library_id)));
+  const held = new Set(plan.mapping.map(([s, d]) => pairKey(s, d)));
+  return shown.size === job.libraries.length && shown.size === held.size && [...held].every((k) => shown.has(k));
+}
+
+function describeConfirmError(e: unknown): ActionError {
+  if (!(e instanceof ControlError) || e.status === 0 || e.code === "unsupported_response") {
+    return {
+      kind: "uncertain",
+      title: "Confirmation outcome unknown",
+      message: "Checking restore status. The server may already have started this restore, so it is not sent again.",
+      code: null,
+    };
+  }
+  const code = e.code;
+  if (e.status === 401) return { kind: "session", title: "Not signed in", message: "Your administrator session is no longer valid. Nothing was restored.", code };
+  if (e.status === 403 && e.code === "confirmation_mismatch") {
+    return {
+      kind: "rejected",
+      title: "Confirmation refused",
+      message: "The server did not accept this confirmation for the prepared restore. Nothing was restored. Upload the backup again to restore it.",
+      code,
+    };
+  }
+  if (e.status === 403 && e.code === "loopback_required") return { kind: "loopback", title: "Not available from this device", message: LOOPBACK_EXPLANATION, code };
+  if (e.status === 403) return { kind: "access", title: "Confirmation refused", message: e.message, code };
+  if (e.status === 429) {
+    return { kind: "capacity", title: "Another restore is running", message: "The server restores one backup at a time. Nothing was started; confirm again when the other restore has finished.", code };
+  }
+  if (e.status === 409) return { kind: "server", title: "Already confirmed", message: "This restore was already confirmed. Its status is shown below.", code };
+  if (e.status === 410) return { kind: "server", title: "No longer available", message: `${e.message} Nothing was restored.`, code };
+  if (e.status === 404) return { kind: "server", title: "Restore job not found", message: "This restore job no longer exists. Nothing was restored by this confirmation.", code };
+  if (e.status === 503) return { kind: "server", title: "Server shutting down", message: "The server is shutting down and did not start this restore.", code };
+  if (e.status === 500) return { kind: "server", title: "Restore could not be started", message: `${e.message} Its status is shown below.`, code };
+  return { kind: "server", title: "Confirmation failed", message: e.message, code };
 }
 
 function looksLikeZip(file: { name: string; type: string }): boolean {
@@ -115,17 +209,26 @@ export function describeUploadError(e: unknown): ActionError {
 const ACCESS_LOST: readonly RestoreErrorKind[] = ["session", "loopback", "access"];
 
 export class RestoreActions {
-  private state: ActionsState = { upload: { kind: "idle" }, cancel: { confirming: null, busy: null, notice: null }, picker: 0 };
+  private state: ActionsState = {
+    upload: { kind: "idle" },
+    cancel: { confirming: null, busy: null, notice: null },
+    confirm: { kind: "idle" },
+    confirmable: null,
+    picker: 0,
+  };
   private file: File | null = null;
-  /** The one-time confirmation of the prepared job (never part of `state`). */
-  private pending: { jobId: string; confirmation: string } | null = null;
+  /** The one-time confirmation and the plan it approves (never part of `state`). */
+  private pending: HeldPlan | null = null;
   private expiry: ReturnType<typeof setTimeout> | null = null;
   private uploading = false;
+  private confirming = false;
+  /** The server version (successful lists only) that predates the last confirmation answer. */
+  private answeredAt = 0;
   private abort: AbortController | null = null;
   private disposed = false;
 
   constructor(
-    private readonly api: Pick<ControlApi, "uploadRestore" | "cancelRestore">,
+    private readonly api: Pick<ControlApi, "uploadRestore" | "cancelRestore" | "confirmRestore">,
     private readonly hooks: ActionHooks,
   ) {}
 
@@ -182,8 +285,14 @@ export class RestoreActions {
   }
 
   askCancel(jobId: string): void {
-    if (this.state.cancel.busy) return;
+    if (this.state.cancel.busy || this.confirmLocks(jobId)) return;
     this.setCancel({ confirming: jobId, busy: null, notice: null });
+  }
+
+  /** A confirmation for `jobId` is open, in flight, accepted or unresolved: no cancelling. */
+  private confirmLocks(jobId: string): boolean {
+    const c = this.state.confirm;
+    return this.confirming || (c.kind !== "idle" && c.kind !== "refused" && c.kind !== "not_started" && c.jobId === jobId);
   }
 
   keep(): void {
@@ -192,7 +301,7 @@ export class RestoreActions {
   }
 
   async cancel(jobId: string): Promise<void> {
-    if (this.state.cancel.busy || this.disposed) return;
+    if (this.state.cancel.busy || this.disposed || this.confirmLocks(jobId)) return;
     this.setCancel({ confirming: null, busy: jobId, notice: null });
     let notice: CancelNotice;
     try {
@@ -239,16 +348,142 @@ export class RestoreActions {
    * Keep the held confirmation consistent with what the server shows: dropped when access is
    * lost, and when its job is gone or no longer usable (cancelled, expired, started).
    */
-  reconcile(jobs: RestoreJob[] | null, error: RestoreErrorKind | null): void {
-    if (!this.pending) return;
-    if (error && ACCESS_LOST.includes(error)) return this.drop();
-    if (!jobs) return;
-    const held = this.pending.jobId;
-    const job = jobs.find((j) => j.job_id === held);
-    if (!job || !job.usable) {
+  reconcile(jobs: RestoreJob[] | null, error: RestoreErrorKind | null, version: number = Number.MAX_SAFE_INTEGER): void {
+    if (error && ACCESS_LOST.includes(error)) {
       this.drop();
-      if (this.state.upload.kind === "prepared" && this.state.upload.job.job_id === held) this.setUpload({ kind: "idle" });
+      return;
     }
+    if (!jobs) return;
+    // Only a successful server list answered after the last confirmation answer may settle
+    // what it did (`version` counts successful server lists only; a failed GET never does).
+    if (version > this.answeredAt) this.settleConfirmation(jobs);
+    if (!this.pending) return;
+    const plan = this.pending;
+    const job = jobs.find((j) => j.job_id === plan.jobId);
+    const usable = !!job && job.state === "ready" && job.usable;
+    if (!job || !usable || !matchesPlan(plan, job)) {
+      const differs = !!job && usable;
+      this.drop();
+      if (this.state.upload.kind === "prepared" && this.state.upload.job.job_id === plan.jobId) this.setUpload({ kind: "idle" });
+      const c = this.state.confirm;
+      if (c.kind === "reviewing" && c.jobId === plan.jobId) {
+        this.setConfirm({
+          kind: "refused",
+          jobId: plan.jobId,
+          error: {
+            kind: "server",
+            title: "Can no longer be confirmed",
+            message: differs
+              ? "The server now describes this prepared restore differently from the reviewed preview, so it cannot be confirmed. Upload the backup again."
+              : "This prepared restore is no longer ready (it expired, was cancelled or was started). Nothing was sent.",
+            code: null,
+          },
+        });
+      }
+      return;
+    }
+    if (this.state.confirmable !== plan.jobId) this.set({ ...this.state, confirmable: plan.jobId });
+  }
+
+  /** After an accepted or unanswered confirmation, follow what a fresh list shows. */
+  private settleConfirmation(jobs: RestoreJob[]): void {
+    const c = this.state.confirm;
+    if (c.kind !== "accepted" && c.kind !== "uncertain") return;
+    const job = jobs.find((j) => j.job_id === c.jobId);
+    const stillReady = !!job && job.state === "ready" && job.usable;
+    // Once it started (or vanished), the upload preview ("nothing restored") is no longer true.
+    if (!stillReady && this.state.upload.kind === "prepared" && this.state.upload.job.job_id === c.jobId) this.setUpload({ kind: "idle" });
+    if (!job) return this.setConfirm({ kind: "gone", jobId: c.jobId });
+    if (job.state === "executing") {
+      this.drop(c.jobId);
+      if (c.kind === "uncertain") this.setConfirm({ kind: "accepted", jobId: c.jobId });
+      return;
+    }
+    if (c.kind === "uncertain" && stillReady) {
+      // Not started. Another attempt needs a new, explicit decision (and a still-valid plan).
+      return this.setConfirm({ kind: "not_started", jobId: c.jobId });
+    }
+    // Finished (or withdrawn): the row shows what the server reports.
+    this.drop(c.jobId);
+    this.setConfirm({ kind: "idle" });
+  }
+
+  /** Open the final review (no request). Only for the job this browser can confirm. */
+  review(jobId: string): void {
+    if (this.disposed || this.confirming || this.state.cancel.busy) return;
+    if (this.state.confirmable !== jobId || this.pending?.jobId !== jobId) return;
+    const c = this.state.confirm;
+    if (c.kind !== "idle" && c.kind !== "refused" && c.kind !== "not_started") return;
+    this.set({ ...this.state, confirm: { kind: "reviewing", jobId, acknowledged: false }, cancel: { ...this.state.cancel, confirming: null } });
+  }
+
+  acknowledge(jobId: string, acknowledged: boolean): void {
+    const c = this.state.confirm;
+    if (c.kind === "reviewing" && c.jobId === jobId) this.setConfirm({ kind: "reviewing", jobId, acknowledged });
+  }
+
+  /** Leave the final review without sending anything. */
+  back(): void {
+    if (this.state.confirm.kind === "reviewing") this.setConfirm({ kind: "idle" });
+  }
+
+  /**
+   * The administrator's final, acknowledged action: send the held confirmation once, built
+   * from the held plan only. Never repeated automatically, whatever happens.
+   */
+  async confirm(jobId: string): Promise<void> {
+    const c = this.state.confirm;
+    if (this.confirming || this.disposed || this.state.cancel.busy) return;
+    if (c.kind !== "reviewing" || c.jobId !== jobId || !c.acknowledged) return;
+    const plan = this.pending;
+    if (!plan || plan.jobId !== jobId || this.state.confirmable !== jobId) return;
+    if (Date.now() >= plan.deadline) {
+      this.drop(jobId);
+      this.setConfirm({ kind: "refused", jobId, error: { kind: "server", title: "Expired", message: "This prepared restore expired before it was confirmed. Nothing was sent.", code: null } });
+      this.hooks.refresh();
+      return;
+    }
+    this.confirming = true;
+    this.setConfirm({ kind: "sending", jobId });
+    const body: RestoreConfirmation = {
+      v: 1,
+      confirmation: plan.confirmation,
+      archive_sha256: plan.archiveSha256,
+      destinations: plan.mapping.map(([source_library_id, destination_library_id]) => ({ source_library_id, destination_library_id })),
+    };
+    try {
+      await this.api.confirmRestore(jobId, body);
+      if (this.disposed) return;
+      this.drop(jobId); // consumed by the server
+      if (this.state.upload.kind === "prepared" && this.state.upload.job.job_id === jobId) this.setUpload({ kind: "idle" });
+      this.setConfirm({ kind: "accepted", jobId });
+      this.answered();
+    } catch (e) {
+      if (this.disposed) return;
+      const error = describeConfirmError(e);
+      if (error.kind === "uncertain") {
+        // Kept, but locked: nothing more is sent until a fresh list settles what happened.
+        this.setConfirm({ kind: "uncertain", jobId });
+        this.answered();
+      } else if (error.kind === "capacity") {
+        this.setConfirm({ kind: "refused", jobId, error }); // still ready; still confirmable later
+      } else {
+        if (ACCESS_LOST.includes(error.kind as RestoreErrorKind)) this.refuseAccess(e);
+        else this.drop(jobId);
+        this.setConfirm({ kind: "refused", jobId, error });
+        if (!ACCESS_LOST.includes(error.kind as RestoreErrorKind)) this.answered();
+      }
+    } finally {
+      this.confirming = false;
+    }
+  }
+
+  /** The server answered (or may have): only lists fetched from now on may settle it. */
+  private answered(): void {
+    // Nothing may settle while the re-check starts (it can report the old list synchronously);
+    // then only server versions after the one it outdated count.
+    this.answeredAt = Number.MAX_SAFE_INTEGER;
+    this.answeredAt = this.hooks.recheck();
   }
 
   /** A definitive 401/403 on an action: forget the capability and drop the privileged list. */
@@ -266,11 +501,18 @@ export class RestoreActions {
 
   private hold(job: RestoreJob, confirmation: string): void {
     this.drop();
-    this.pending = { jobId: job.job_id, confirmation };
+    const plan = planOf(job, confirmation);
+    this.pending = plan;
+    this.set({ ...this.state, confirmable: job.job_id });
     // Unusable once the prepared job expires (the server would refuse it anyway).
     this.expiry = setTimeout(
       () => {
+        if (this.pending !== plan) return;
         this.drop();
+        const c = this.state.confirm;
+        if (c.kind === "reviewing" && c.jobId === plan.jobId) {
+          this.setConfirm({ kind: "refused", jobId: plan.jobId, error: { kind: "server", title: "Expired", message: "This prepared restore expired before it was confirmed. Nothing was sent.", code: null } });
+        }
         if (!this.disposed) this.hooks.refresh();
       },
       Math.max(0, job.expires_in_s) * 1000,
@@ -283,6 +525,11 @@ export class RestoreActions {
     this.pending = null;
     if (this.expiry) clearTimeout(this.expiry);
     this.expiry = null;
+    if (this.state.confirmable !== null) this.set({ ...this.state, confirmable: null });
+  }
+
+  private setConfirm(confirm: ConfirmState): void {
+    this.set({ ...this.state, confirm });
   }
 
   private setUpload(upload: UploadState): void {

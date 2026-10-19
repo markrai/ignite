@@ -51,6 +51,11 @@ export class RestoreJobsLoader {
   /** Requests are numbered; answers to requests up to `staleThrough` are discarded. */
   private seq = 0;
   private staleThrough = 0;
+  /**
+   * Counts successful, non-stale server answers only: evidence of the server's current state.
+   * Failed or discarded requests and local changes (`upsert`, `refuse`) never advance it.
+   */
+  private serverLists = 0;
 
   constructor(
     private readonly load: () => Promise<RestoreJob[]>,
@@ -73,9 +78,14 @@ export class RestoreJobsLoader {
     const mine = ++this.seq;
     const stale = () => mine <= this.staleThrough;
     const run = this.load().then(
-      (jobs) => this.set(stale() ? { ...this.state, loading: false } : { jobs, loading: false, error: null }),
+      (jobs) => {
+        if (stale()) return this.set({ ...this.state, loading: false });
+        this.serverLists++;
+        this.set({ jobs, loading: false, error: null });
+      },
       (e: unknown) => {
         if (stale()) return this.set({ ...this.state, loading: false });
+        // Shown (a kept list is marked with the error), but no evidence of the server's state.
         const error = describeRestoreError(e);
         this.set({ jobs: error.kind === "transient" ? this.state.jobs : null, loading: false, error });
       },
@@ -109,6 +119,25 @@ export class RestoreJobsLoader {
   refuse(error: RestoreLoadError): void {
     this.staleThrough = this.seq;
     this.set({ jobs: null, loading: false, error });
+  }
+
+  /**
+   * How many successful server lists have been applied: a list shown at a higher version was
+   * answered by the server after one shown at a lower version. Failures, discarded answers and
+   * local changes never advance it, so it can prove what the server reported.
+   */
+  get serverVersion(): number {
+    return this.serverLists;
+  }
+
+  /**
+   * Something just changed on the server (e.g. a restore was accepted): every request already
+   * in flight is outdated and discarded. Returns the server version that is now outdated (only
+   * a later successful answer has a higher one).
+   */
+  invalidate(): number {
+    this.staleThrough = this.seq;
+    return this.serverLists;
   }
 
   dispose(): void {

@@ -3,8 +3,8 @@
 // real control API (uploading and confirming from the browser are later slices). Playwright's
 // browser connects over loopback, which the restore routes require.
 
-import type { Page, Request } from "@playwright/test";
-import { connect, test as devTest } from "./harness";
+import type { BrowserContext, Page, Request } from "@playwright/test";
+import { connect, manifest, snapshotText, test as devTest } from "./harness";
 import { asAdmin, expect, test, type ProductServer } from "./product";
 
 interface Prepared {
@@ -67,7 +67,9 @@ test("an administrator sees prepared and completed restores read-only in Server 
   const row = card.getByTestId("restore-job");
   await expect(row).toHaveAttribute("data-state", "ready");
   await expect(row.getByTestId("restore-state")).toHaveText("Verified, awaiting confirmation");
-  await expect(row).toContainText("Confirming a restore is not yet available in the browser");
+  // Prepared by the harness: this browser never held its one-time confirmation.
+  await expect(row).toContainText("this browser no longer has its one-time confirmation");
+  await expect(row.getByTestId("restore-review")).toHaveCount(0);
   await row.getByTestId("restore-toggle").click();
   await expect(row.getByTestId("restore-toggle")).toHaveAttribute("aria-expanded", "true");
   await expect(row.getByTestId("restore-source")).toHaveText(lib.source_library_id);
@@ -424,4 +426,389 @@ test("a lost upload response is reported as uncertain; the prepared job can be f
   await expect(card.getByTestId("restore-job")).toHaveCount(0);
   expect(((await product.call("GET", UPLOAD_PATH, { cookie: admin })).json as { jobs: unknown[] }).jobs).toEqual([]);
   expect(await page.content()).not.toContain(delivered!.confirmation);
+});
+
+// ------------------------------------------------------------------ Slice 1G-C: confirmed restore
+
+interface Lib {
+  library_id: string;
+  head_server_seq: number;
+  snapshot_sha256: string;
+  notebook_count: number;
+  page_count: number;
+}
+
+/** A second library: the fixture snapshot under another valid id (the id occurs once in it). */
+const SECOND_LIBRARY = "01a14ab8-8368-75bf-ae2e-f7fcd3c81bcd";
+
+async function libraries(product: ProductServer, bearer: string): Promise<Lib[]> {
+  return ((await product.call("GET", "/v1/libraries", { bearer })).json as { libraries: Lib[] }).libraries;
+}
+
+/** Two libraries (sharing the fixture background blob), as a Kindle would have synced them. */
+async function seedTwo(product: ProductServer, bearer: string): Promise<void> {
+  await product.seedFixture(bearer);
+  const second = snapshotText.replace(manifest.library_id, SECOND_LIBRARY);
+  expect((await product.call("POST", "/v1/libraries", { bearer, body: second, csrf: false })).status).toBe(201);
+}
+
+/** Upload through the browser's file input; returns the server's 201 (held by the test only). */
+async function uploadInBrowser(page: Page, zip: Uint8Array): Promise<Prepared> {
+  const card = page.getByTestId("restore-card");
+  await card.getByTestId("restore-file").setInputFiles(zipInput(zip));
+  const [resp] = await Promise.all([
+    page.waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname === UPLOAD_PATH),
+    card.getByTestId("restore-upload-button").click(),
+  ]);
+  expect(resp.status()).toBe(201);
+  await expect(card.getByTestId("restore-prepared")).toBeVisible();
+  return (await resp.json()) as Prepared;
+}
+
+const confirmPath = (id: string) => `${UPLOAD_PATH}/${id}/confirm`;
+const isConfirm = (r: Request) => r.method() === "POST" && new URL(r.url()).pathname.endsWith("/confirm");
+
+/** Open the review, acknowledge, and click the final action. */
+async function approve(page: Page) {
+  const row = page.getByTestId("restore-job");
+  await row.getByTestId("restore-review").click();
+  await row.getByTestId("restore-ack").check();
+  await row.getByTestId("restore-confirm-yes").click();
+}
+
+/** Show a job's details (they may already be open: a fresh upload opens them). */
+async function openDetails(row: ReturnType<Page["getByTestId"]>) {
+  const toggle = row.getByTestId("restore-toggle");
+  if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
+}
+
+async function finalState(page: Page): Promise<string | null> {
+  const row = page.getByTestId("restore-job");
+  await expect
+    .poll(async () => {
+      const s = await row.getAttribute("data-state");
+      if (s !== "succeeded" && s !== "failed") await page.getByTestId("restore-refresh").click();
+      return s;
+    }, { timeout: 20_000 })
+    .toMatch(/^(succeeded|failed)$/);
+  return row.getAttribute("data-state");
+}
+
+/** Everything a secret could leak into, checked without ever printing it. */
+async function exposesSecret(page: Page, context: BrowserContext, secret: string, logs: string[]): Promise<boolean> {
+  return (
+    (await page.content()).includes(secret) ||
+    page.url().includes(secret) ||
+    logs.join("\n").includes(secret) ||
+    (await browserStorage(page)).includes(secret) ||
+    JSON.stringify(await context.cookies()).includes(secret)
+  );
+}
+
+test("an administrator restores a verified two-library backup in the browser; existing libraries are untouched", async ({ page, context, product }) => {
+  const admin = await product.claimAsHarness();
+  const kindle = await product.pairKindle(admin);
+  await seedTwo(product, kindle);
+  const before = await libraries(product, kindle);
+  expect(before).toHaveLength(2);
+  const snapshotsBefore = await Promise.all(before.map(async (l) => (await product.call("GET", `/v1/libraries/${l.library_id}/snapshot`, { bearer: kindle })).json));
+  const zip = product.exportBackup(kindle);
+  await asAdmin(context, product, admin);
+  const logs: string[] = [];
+  page.on("console", (m) => logs.push(m.text()));
+  const confirmRequests: Request[] = [];
+  page.on("request", (r) => {
+    if (isConfirm(r)) confirmRequests.push(r);
+  });
+
+  await openSettings(page, product);
+  const prepared = await uploadInBrowser(page, zip);
+  const secret = prepared.confirmation;
+  expect(prepared.libraries).toHaveLength(2);
+  const approved = new Map(prepared.libraries.map((l) => [l.source_library_id, l.destination_library_id]));
+  expect([...approved.keys()].sort()).toEqual(before.map((l) => l.library_id).sort());
+  const ids = async () => (await libraries(product, kindle)).map((l) => l.library_id);
+  for (const d of approved.values()) expect(await ids()).not.toContain(d); // nothing restored yet
+
+  const row = page.getByTestId("restore-job");
+  await expect(row.getByTestId("restore-ready-note")).toContainText("Verified and ready");
+  // The review sends nothing; backing out sends nothing; the final action needs the acknowledgement.
+  await row.getByTestId("restore-review").click();
+  const panel = row.getByTestId("restore-confirm-panel");
+  await expect(panel.getByRole("heading", { name: "Confirm restoration" })).toBeVisible();
+  await expect(panel).toContainText("Ignite will create 2 new libraries");
+  await expect(panel).toContainText("Your existing libraries will not be replaced, merged or deleted.");
+  for (const [src, dst] of approved) {
+    await expect(panel.getByTestId("restore-source").filter({ hasText: src })).toHaveCount(1);
+    await expect(panel.getByTestId("restore-destination").filter({ hasText: dst })).toHaveCount(1);
+  }
+  await expect(panel.getByTestId("restore-confirm-yes")).toBeDisabled();
+  await expect(row.getByTestId("restore-cancel")).toHaveCount(0);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await shot(page, "confirm-review-desktop");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await shot(page, "confirm-review-mobile");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await panel.getByTestId("restore-confirm-back").click();
+  await expect(row.getByTestId("restore-confirm-panel")).toHaveCount(0);
+  expect(confirmRequests).toHaveLength(0);
+
+  // The final, acknowledged action: exactly one POST, carrying exactly the reviewed plan.
+  await row.getByTestId("restore-review").click();
+  await row.getByTestId("restore-ack").check();
+  const [req, resp] = await Promise.all([
+    page.waitForRequest(isConfirm),
+    page.waitForResponse((r) => isConfirm(r.request())),
+    row.getByTestId("restore-confirm-yes").click(),
+  ]);
+  expect(new URL(req.url()).pathname).toBe(confirmPath(prepared.job_id));
+  const headers = await req.allHeaders();
+  expect([headers["content-type"], headers["x-scribe-request"], headers["authorization"]]).toEqual(["application/json", "1", undefined]);
+  expect((headers["cookie"] ?? "").includes("scribe_session=")).toBe(true);
+  const body = req.postDataJSON() as { v: number; confirmation: string; archive_sha256: string; destinations: { source_library_id: string; destination_library_id: string }[] };
+  expect(body.v).toBe(1);
+  expect(body.confirmation === secret).toBe(true); // compared, never printed
+  expect(body.archive_sha256).toBe(prepared.archive.sha256);
+  expect(new Map(body.destinations.map((d) => [d.source_library_id, d.destination_library_id]))).toEqual(approved);
+  expect(resp.status()).toBe(202);
+  expect(await finalState(page)).toBe("succeeded");
+  expect(confirmRequests).toHaveLength(1);
+  await expect(row.getByTestId("restore-publication")).toHaveAttribute("data-publication", "complete");
+  await expect(row).toContainText("2 libraries restored as new libraries.");
+  await expect(row).toContainText("Existing libraries were not replaced.");
+  await openDetails(row);
+  for (const dst of approved.values()) await expect(row.getByTestId("restore-destination").filter({ hasText: dst })).toHaveCount(1);
+  await expect(row.getByTestId("restore-restored-sha")).toHaveCount(2);
+  await shot(page, "confirm-succeeded-desktop");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await shot(page, "confirm-succeeded-mobile");
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  // The restored data, through the server's real read and sync APIs.
+  const after = await libraries(product, kindle);
+  expect(after).toHaveLength(4);
+  for (const b of before) expect(after.find((l) => l.library_id === b.library_id)).toEqual(b); // unchanged
+  for (const [i, b] of before.entries()) {
+    expect((await product.call("GET", `/v1/libraries/${b.library_id}/snapshot`, { bearer: kindle })).json).toEqual(snapshotsBefore[i]);
+  }
+  const blob = await product.call("GET", `/v1/blobs/${manifest.blob.sha256}`, { bearer: kindle });
+  expect(blob.status).toBe(200);
+  for (const [src, dst] of approved) {
+    const source = (snapshotsBefore[before.findIndex((l) => l.library_id === src)] as { snapshot: Record<string, unknown> }).snapshot;
+    const lib = after.find((l) => l.library_id === dst)!;
+    const original = before.find((l) => l.library_id === src)!;
+    expect([lib.head_server_seq, lib.notebook_count, lib.page_count]).toEqual([0, original.notebook_count, original.page_count]);
+    const genesis = (await product.call("GET", `/v1/libraries/${dst}/genesis`, { bearer: kindle })).json as { genesis_sha256: string; snapshot: Record<string, unknown> };
+    expect(genesis.snapshot).toEqual({ ...source, library_id: dst }); // the archive's state, re-keyed only
+    const current = (await product.call("GET", `/v1/libraries/${dst}/snapshot`, { bearer: kindle })).json as { through_server_seq: number; snapshot_sha256: string };
+    expect([current.through_server_seq, current.snapshot_sha256]).toEqual([0, genesis.genesis_sha256]); // replay = genesis
+    const ops = (await product.call("GET", `/v1/libraries/${dst}/operations?after=0&limit=500`, { bearer: kindle })).json as { operations: unknown[] };
+    expect(ops.operations).toEqual([]);
+  }
+
+  // Never twice: the same capability is refused by the server, nothing more is created.
+  const replay = await product.call("POST", confirmPath(prepared.job_id), { cookie: admin, body });
+  expect(replay.status).toBe(409);
+  expect(await libraries(product, kindle)).toHaveLength(4);
+  expect(await exposesSecret(page, context, secret, logs)).toBe(false);
+
+  // A reload still shows the retained result (read from the server).
+  await page.reload();
+  await expect(page.getByTestId("restore-job")).toHaveAttribute("data-state", "succeeded");
+  await expect(page.getByTestId("restore-publication")).toHaveAttribute("data-publication", "complete");
+  await expect(page.getByTestId("restore-review")).toHaveCount(0);
+});
+
+test("after a reload the confirmation is gone: the job can be reviewed or cancelled, not restored", async ({ page, context, product }) => {
+  const admin = await product.claimAsHarness();
+  const kindle = await product.pairKindle(admin);
+  await product.seedFixture(kindle);
+  await asAdmin(context, product, admin);
+  await openSettings(page, product);
+  await uploadInBrowser(page, product.exportBackup(kindle));
+  await expect(page.getByTestId("restore-review")).toBeVisible();
+  await page.reload();
+  const row = page.getByTestId("restore-job");
+  await expect(row).toHaveAttribute("data-state", "ready");
+  await expect(row.getByTestId("restore-ready-note")).toContainText("this browser no longer has its one-time confirmation");
+  await expect(row.getByTestId("restore-review")).toHaveCount(0);
+  await expect(row.getByTestId("restore-cancel")).toBeVisible();
+  await shot(page, "confirm-lost-capability-desktop");
+});
+
+test("busy, already-confirmed and refused confirmations are explained; busy keeps the job confirmable", async ({ page, context, product }) => {
+  const admin = await product.claimAsHarness();
+  const kindle = await product.pairKindle(admin);
+  await product.seedFixture(kindle);
+  await asAdmin(context, product, admin);
+  await openSettings(page, product);
+  const zip = product.exportBackup(kindle);
+  const row = page.getByTestId("restore-job");
+
+  // 429: the server is busy (simulated without reaching it): nothing started, still confirmable.
+  let prepared = await uploadInBrowser(page, zip);
+  await page.route(`**${confirmPath(prepared.job_id)}`, (r) =>
+    r.fulfill({ status: 429, contentType: "application/json", body: JSON.stringify({ error: "restore_busy", message: "Another restore is running." }) }),
+  );
+  await approve(page);
+  await expect(row.getByTestId("restore-confirm-notice")).toHaveAttribute("data-kind", "refused-capacity");
+  await expect(row.getByTestId("restore-review")).toBeVisible();
+  await page.unroute(`**${confirmPath(prepared.job_id)}`);
+  // The kept capability then works with the real server.
+  await approve(page);
+  expect(await finalState(page)).toBe("succeeded");
+  await expect(page.getByTestId("restore-cancel-notice")).toHaveCount(0);
+
+  // 409: confirmed elsewhere first (the harness holds the same capability).
+  await page.getByTestId("restore-file").setInputFiles(zipInput(zip));
+  const [resp] = await Promise.all([
+    page.waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname === UPLOAD_PATH),
+    page.getByTestId("restore-upload-button").click(),
+  ]);
+  prepared = (await resp.json()) as Prepared;
+  const fresh = page.locator(`[data-testid="restore-job"][data-job-id="${prepared.job_id}"]`);
+  const first = await product.call("POST", confirmPath(prepared.job_id), {
+    cookie: admin,
+    body: {
+      v: 1,
+      confirmation: prepared.confirmation,
+      archive_sha256: prepared.archive.sha256,
+      destinations: prepared.libraries.map((l) => ({ source_library_id: l.source_library_id, destination_library_id: l.destination_library_id })),
+    },
+  });
+  expect(first.status).toBe(202);
+  await fresh.getByTestId("restore-review").click();
+  await fresh.getByTestId("restore-ack").check();
+  await fresh.getByTestId("restore-confirm-yes").click();
+  const refused = page.getByTestId("restore-confirm-notice").filter({ hasText: "Already confirmed" });
+  await expect(refused).toBeVisible();
+  await expect(page.getByTestId("restore-review")).toHaveCount(0);
+  await shot(page, "confirm-already-confirmed-desktop");
+});
+
+test("a lost 202 is reported as uncertain, never resent, and settled by the server's status", async ({ page, context, product }) => {
+  const admin = await product.claimAsHarness();
+  const kindle = await product.pairKindle(admin);
+  await product.seedFixture(kindle);
+  await asAdmin(context, product, admin);
+  await openSettings(page, product);
+  const prepared = await uploadInBrowser(page, product.exportBackup(kindle));
+  const sent: Request[] = [];
+  page.on("request", (r) => {
+    if (isConfirm(r)) sent.push(r);
+  });
+  let accepted = 0;
+  // The server receives the confirmation and accepts it; the browser never gets the answer.
+  await page.route(`**${confirmPath(prepared.job_id)}`, async (route) => {
+    const real = await route.fetch();
+    accepted = real.status();
+    await route.abort("connectionreset");
+  });
+  await approve(page);
+  const row = page.getByTestId("restore-job");
+  await expect(page.getByText("Confirmation outcome unknown. Checking restore status.").or(row.getByTestId("restore-publication"))).toBeVisible();
+  await shot(page, "confirm-uncertain-desktop");
+  expect(accepted).toBe(202);
+  expect(await finalState(page)).toBe("succeeded");
+  await expect(row.getByTestId("restore-publication")).toHaveAttribute("data-publication", "complete");
+  expect(sent).toHaveLength(1); // never resent
+  await expect(page.getByTestId("restore-prepared")).toHaveCount(0); // no stale "nothing restored" preview
+  expect((await libraries(product, kindle)).length).toBe(2); // restored exactly once
+  await expect(row.getByTestId("restore-review")).toHaveCount(0);
+});
+
+test("a real terminal failure publishes nothing and says so", async ({ page, context, product }) => {
+  const admin = await product.claimAsHarness();
+  const kindle = await product.pairKindle(admin);
+  await product.seedFixture(kindle);
+  await asAdmin(context, product, admin);
+  await openSettings(page, product);
+  const prepared = await uploadInBrowser(page, product.exportBackup(kindle));
+  // A library appears under the proposed destination identity before the restore runs.
+  const dst = prepared.libraries[0]!.destination_library_id;
+  const squatter = snapshotText.replace(manifest.library_id, dst);
+  expect((await product.call("POST", "/v1/libraries", { bearer: kindle, body: squatter, csrf: false })).status).toBe(201);
+  const before = await libraries(product, kindle);
+  await approve(page);
+  expect(await finalState(page)).toBe("failed");
+  const row = page.getByTestId("restore-job");
+  await expect(row.getByTestId("restore-publication")).toHaveAttribute("data-publication", "none");
+  await expect(row).toContainText("No libraries were published by this restore.");
+  await expect(row.getByTestId("restore-state")).toHaveText("Restoration failed");
+  await shot(page, "confirm-failed-desktop");
+  expect(await libraries(product, kindle)).toEqual(before); // nothing published or replaced
+});
+
+test("an access refusal on confirmation drops the job list at once", async ({ page, context, product }) => {
+  const admin = await product.claimAsHarness();
+  const kindle = await product.pairKindle(admin);
+  await product.seedFixture(kindle);
+  await asAdmin(context, product, admin);
+  await openSettings(page, product);
+  const prepared = await uploadInBrowser(page, product.exportBackup(kindle));
+  await page.route(`**${confirmPath(prepared.job_id)}`, (r) =>
+    r.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "unauthorized", message: "not signed in" }) }),
+  );
+  await approve(page);
+  const card = page.getByTestId("restore-card");
+  await expect(card.getByTestId("restore-error")).toHaveAttribute("data-kind", "session");
+  await expect(card.getByTestId("restore-job")).toHaveCount(0);
+  await expect(card.getByTestId("restore-upload")).toHaveCount(0);
+  // Nothing was confirmed on the server.
+  const jobs = ((await product.call("GET", UPLOAD_PATH, { cookie: admin })).json as { jobs: { state: string }[] }).jobs;
+  expect(jobs.map((j) => j.state)).toEqual(["ready"]);
+});
+
+test("an unanswered confirmation stays uncertain while status checks fail, until the server answers", async ({ page, context, product }) => {
+  const admin = await product.claimAsHarness();
+  const kindle = await product.pairKindle(admin);
+  await product.seedFixture(kindle);
+  await asAdmin(context, product, admin);
+  await openSettings(page, product);
+  const prepared = await uploadInBrowser(page, product.exportBackup(kindle)); // routes added only after the upload
+  const sent: Request[] = [];
+  page.on("request", (r) => {
+    if (isConfirm(r)) sent.push(r);
+  });
+  // After the confirmation, every status GET fails until released.
+  let failLists = false;
+  await page.route(`**${UPLOAD_PATH}`, (r) => (r.request().method() === "GET" && failLists ? r.abort("connectionreset") : r.continue()));
+  let accepted = 0;
+  await page.route(`**${confirmPath(prepared.job_id)}`, async (route) => {
+    failLists = true;
+    const real = await route.fetch(); // the server accepts it...
+    accepted = real.status();
+    await route.abort("connectionreset"); // ...but the browser never hears back
+  });
+  await approve(page);
+  const card = page.getByTestId("restore-card");
+  const row = card.getByTestId("restore-job");
+  await expect(row.getByTestId("restore-confirm-notice")).toHaveAttribute("data-kind", "uncertain");
+  await expect(card.getByTestId("restore-error")).toHaveAttribute("data-kind", "transient"); // the status check failed
+  expect(accepted).toBe(202);
+  // Still uncertain: the old "ready" row is shown as data, but nothing claims it as the status.
+  const checkUncertain = async () => {
+    await expect(row).toHaveAttribute("data-state", "ready");
+    await expect(row.getByTestId("restore-state")).toHaveText("Checking server status");
+    await expect(row.getByTestId("restore-confirm-notice")).toHaveAttribute("data-kind", "uncertain");
+    await expect(card.getByTestId("restore-prepared")).toHaveCount(0); // no "nothing restored" preview
+    await expect(card).not.toContainText("No notebooks have been restored");
+    await expect(card).not.toContainText("Verified, awaiting confirmation");
+    await expect(card).not.toContainText("has not started");
+    await expect(row.getByTestId("restore-review")).toHaveCount(0);
+    await expect(row.getByTestId("restore-cancel")).toHaveCount(0);
+  };
+  await checkUncertain();
+  await shot(page, "confirm-uncertain-status-failing-desktop");
+  // Another failing check changes nothing.
+  const [failed] = await Promise.all([page.waitForEvent("requestfailed", (r) => new URL(r.url()).pathname === UPLOAD_PATH), card.getByTestId("restore-refresh").click()]);
+  expect(failed.method()).toBe("GET");
+  await checkUncertain();
+  // The server answers: the restore had been accepted, and its actual result is shown.
+  failLists = false;
+  expect(await finalState(page)).toBe("succeeded");
+  await expect(row.getByTestId("restore-publication")).toHaveAttribute("data-publication", "complete");
+  expect(sent).toHaveLength(1); // never resent
+  expect((await libraries(product, kindle)).length).toBe(2);
 });

@@ -312,3 +312,72 @@ describe("1G-B restore upload and cancel client", () => {
     expect(post!.init.body).toBe("{}");
   });
 });
+
+// ------------------------------------------------------------------ Slice 1G-C: confirmation
+
+describe("1G-C restore confirmation client", () => {
+  const id = JOB.job_id;
+  const BODY = {
+    v: 1 as const,
+    confirmation: CONFIRMATION,
+    archive_sha256: JOB.archive.sha256,
+    destinations: [{ source_library_id: "01a0de1f-0000-7000-8000-000000000001", destination_library_id: "01a0de1f-0000-7000-8000-000000000002" }],
+  };
+  const path = `/control/v1/admin/restore/jobs/${id}/confirm`;
+
+  it("POSTs exactly the given body as JSON with the CSRF marker and cookies only; only a 202 for this job is accepted", async () => {
+    const r = recorder({ [path]: { status: 202, body: JSON.stringify({ v: 1, job_id: id, state: "executing" }) } });
+    expect(await createControlApi(r.fetchFn).confirmRestore(id, BODY)).toEqual({ job_id: id, state: "executing" });
+    const s = r.seen[0]!;
+    expect([s.url, s.init.method]).toEqual([path, "POST"]);
+    expect(JSON.parse(s.init.body as string)).toEqual(BODY);
+    const h = s.init.headers as Record<string, string>;
+    expect(h["Content-Type"]).toBe("application/json");
+    expect(h["X-Scribe-Request"]).toBe("1");
+    expect(h.Authorization).toBeUndefined();
+    expect([s.init.credentials, s.init.cache, s.init.redirect, s.init.referrerPolicy]).toEqual(["same-origin", "no-store", "error", "no-referrer"]);
+  });
+
+  it("the job id is path-encoded", async () => {
+    const r = recorder({});
+    await createControlApi(r.fetchFn).confirmRestore("a/b?c", BODY).catch(() => undefined);
+    expect(r.seen[0]!.url).toBe("/control/v1/admin/restore/jobs/a%2Fb%3Fc/confirm");
+  });
+
+  it("any other success answer is not an acceptance", async () => {
+    const answer = async (status: number, body: unknown) =>
+      ((await createControlApi(recorder({ [path]: { status, body: JSON.stringify(body) } }).fetchFn)
+        .confirmRestore(id, BODY)
+        .catch((e: unknown) => e)) as ControlError).code;
+    expect(await answer(200, { v: 1, job_id: id, state: "executing" })).toBe("unsupported_response");
+    expect(await answer(201, { v: 1, job_id: id, state: "executing" })).toBe("unsupported_response");
+    expect(await answer(202, { v: 2, job_id: id, state: "executing" })).toBe("unsupported_response");
+    expect(await answer(202, { v: 1, job_id: "other", state: "executing" })).toBe("unsupported_response");
+    expect(await answer(202, { v: 1, job_id: id, state: "succeeded" })).toBe("unsupported_response");
+  });
+
+  it("refusals keep their codes; no answer is confirm_interrupted", async () => {
+    const fail = async (status: number, error: string) =>
+      (await createControlApi(recorder({ [path]: { status, body: JSON.stringify({ error, message: "m" }) } }).fetchFn)
+        .confirmRestore(id, BODY)
+        .catch((e: unknown) => e)) as ControlError;
+    for (const [status, code] of [
+      [403, "confirmation_mismatch"],
+      [403, "loopback_required"],
+      [409, "already_confirmed"],
+      [410, "expired"],
+      [429, "restore_busy"],
+      [503, "shutting_down"],
+      [500, "internal"],
+    ] as const) {
+      const e = await fail(status, code);
+      expect([e.status, e.code]).toEqual([status, code]);
+    }
+    const lost = createControlApi(async () => {
+      throw new TypeError("network");
+    });
+    const e = (await lost.confirmRestore(id, BODY).catch((x: unknown) => x)) as ControlError;
+    expect([e.status, e.code]).toEqual([0, "confirm_interrupted"]);
+    expect(e.message).not.toContain(CONFIRMATION);
+  });
+});

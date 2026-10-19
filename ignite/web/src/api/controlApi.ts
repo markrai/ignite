@@ -305,6 +305,50 @@ export interface PreparedRestore {
   confirmation: string;
 }
 
+/** The confirmation body: the held capability plus the exact verified archive and mapping. */
+export interface RestoreConfirmation {
+  v: 1;
+  confirmation: string;
+  archive_sha256: string;
+  destinations: { source_library_id: string; destination_library_id: string }[];
+}
+
+/** HTTP 202: the server accepted the restore and started it. Not a result. */
+export interface RestoreAccepted {
+  job_id: string;
+  state: "executing";
+}
+
+/**
+ * Confirm a prepared restore. Only an exact 202 for this job is "accepted". No answer at all is
+ * `confirm_interrupted`: the server may have accepted it anyway (never resent automatically).
+ */
+async function confirmRestore(fetchFn: FetchLike, jobId: string, body: RestoreConfirmation): Promise<RestoreAccepted> {
+  let resp: Response;
+  try {
+    resp = await fetchFn(`${BASE}/admin/restore/jobs/${encodeURIComponent(jobId)}/confirm`, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json", "X-Scribe-Request": "1" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+    });
+  } catch {
+    throw new ControlError(0, "confirm_interrupted", "The connection ended before the server answered the confirmation.");
+  }
+  let json: unknown = null;
+  try {
+    json = await resp.json();
+  } catch {
+    // not JSON
+  }
+  if (!resp.ok) throw refusal(resp.status, json);
+  if (resp.status !== 202 || !isObj(json) || json.v !== 1 || json.job_id !== jobId || json.state !== "executing") throw unsupported("confirmation answer");
+  return { job_id: jobId, state: "executing" };
+}
+
 /** 32 random bytes, unpadded base64url (`control_protocol::b64url`). */
 const CONFIRMATION = /^[A-Za-z0-9_-]{43}$/;
 
@@ -409,6 +453,8 @@ export interface ControlApi {
   uploadRestore(file: Blob, signal?: AbortSignal): Promise<PreparedRestore>;
   /** Discard a prepared restore job (the server refuses one that is executing). */
   cancelRestore(jobId: string): Promise<void>;
+  /** Confirm a prepared restore with its one-time capability (202 = accepted, not completed). */
+  confirmRestore(jobId: string, body: RestoreConfirmation): Promise<RestoreAccepted>;
 }
 
 export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init)): ControlApi {
@@ -453,6 +499,7 @@ export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init
     restoreJob: async (id) =>
       parseRestoreJob(await request<unknown>(fetchFn, "GET", `/admin/restore/jobs/${encodeURIComponent(id)}`, undefined, "error")),
     uploadRestore: (file, signal) => uploadRestore(fetchFn, file, signal),
+    confirmRestore: (id, body) => confirmRestore(fetchFn, id, body),
     cancelRestore: async (id) => {
       await request(fetchFn, "DELETE", `/admin/restore/jobs/${encodeURIComponent(id)}`, undefined, "error");
     },

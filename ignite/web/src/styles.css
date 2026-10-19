@@ -554,3 +554,9 @@ body { overflow: hidden; }
 .restore-file input[type="file"] { max-width: 100%; font: inherit; }
 .restore-upload .mono { overflow-wrap: anywhere; word-break: break-all; }
 .restore-job .row-actions { flex-wrap: wrap; }
+
+/* Slice 1G-C: final review before restoring */
+.restore-confirm { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--accent); border-radius: 10px; padding: 12px; }
+.restore-confirm h3 { margin: 0; font-size: 16px; }
+.restore-ack { display: flex; gap: 8px; align-items: flex-start; }
+.restore-ack input { margin-top: 3px; flex: none; }

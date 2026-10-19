@@ -1,12 +1,12 @@
 // Server Settings → Backup & Restore. 1G-A lists this administrator's restore jobs; 1G-B adds
-// uploading a backup for verification (a preview: nothing is restored) and cancelling a prepared
-// restore. Confirming a restore comes in a later slice, so no control for it is shown. Every
+// uploading a backup for verification (a preview) and cancelling a prepared restore; 1G-C adds
+// the explicit, acknowledged confirmation and follows the server's execution and result. Every
 // server string is rendered as text. The one-time confirmation from an upload never reaches this
-// view: it stays inside RestoreActions.
+// view: it stays inside RestoreActions (the view only learns which job is confirmable).
 
 import { useEffect, useRef, useState } from "react";
 import type { ControlApi, RestoreJob, RestoreJobState } from "../api/controlApi";
-import { RestoreActions, type ActionsState, type UploadState } from "./restoreActions";
+import { RestoreActions, type ActionsState, type ConfirmState, type UploadState } from "./restoreActions";
 import { RestoreJobsLoader, type RestoreJobsState } from "./restoreJobsLoader";
 
 /** While a restore runs, its job is re-read this often (nothing is polled otherwise). */
@@ -48,10 +48,50 @@ function minutes(s: number): string {
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-function Outcome({ job }: { job: RestoreJob }) {
+const RETENTION = "The server keeps this result for a limited time and not after it restarts.";
+
+/**
+ * A confirmation of this job is being sent, was accepted, or got no answer: a cached "ready" row
+ * is then no longer a statement of the current status (the server may already be restoring it,
+ * or be done) until a fresh server list arrives. The row's `state` stays the server's.
+ */
+function checkingStatus(confirm: ConfirmState, job: RestoreJob): boolean {
+  return job.state === "ready" && (confirm.kind === "sending" || confirm.kind === "accepted" || confirm.kind === "uncertain") && confirm.jobId === job.job_id;
+}
+
+/**
+ * The upload preview's "no notebooks have been restored" is true only while nothing may have
+ * been started for its job: before confirming, during the review, after a fresh list showed it
+ * not started, or after a refusal that started nothing (429).
+ */
+function previewStillTrue(confirm: ConfirmState, jobId: string): boolean {
+  if (confirm.kind === "idle" || confirm.jobId !== jobId) return true;
+  if (confirm.kind === "reviewing" || confirm.kind === "not_started") return true;
+  return confirm.kind === "refused" && confirm.error.kind === "capacity";
+}
+
+function Outcome({ job, confirmable, checking }: { job: RestoreJob; confirmable: boolean; checking: boolean }) {
   const r = job.result;
+  if (checking) {
+    return (
+      <p className="hint" data-testid="restore-ready-note">
+        Checking the server&apos;s status for this restore. The last list showed it ready, but it may already be running or finished.
+      </p>
+    );
+  }
+  if (job.state === "ready" && job.usable && confirmable) {
+    return (
+      <p className="hint" data-testid="restore-ready-note">
+        Verified and ready. Review it, then choose Restore libraries… to create new libraries from it. This prepared restore expires in {minutes(job.expires_in_s)}.
+      </p>
+    );
+  }
   if (job.state === "ready") {
-    return <p className="hint">Confirming a restore is not yet available in the browser. This prepared restore expires in {minutes(job.expires_in_s)}.</p>;
+    return (
+      <p className="hint" data-testid="restore-ready-note">
+        This backup has been verified, but this browser no longer has its one-time confirmation. To restore it, discard this prepared job and upload the backup again.
+      </p>
+    );
   }
   if (job.state === "executing") return <p className="hint">The server is restoring this backup. This list refreshes automatically.</p>;
   if (job.state === "expired") return <p className="hint">This prepared restore expired before it was confirmed. Nothing was restored.</p>;
@@ -64,8 +104,9 @@ function Outcome({ job }: { job: RestoreJob }) {
       <div className="notice ok" data-testid="restore-publication" data-publication="complete">
         {r.report.libraries.length === 1 ? "1 library restored as a new library." : `${r.report.libraries.length} libraries restored as new libraries.`}{" "}
         {plural(r.report.blobs_installed, "background file")} added,{" "}
-        {r.report.blobs_already_present} already present.
+        {r.report.blobs_already_present} already present. Existing libraries were not replaced.
         {job.cleanup_pending && <span className="hint block">The restore is complete; the server is still removing its staged files.</span>}
+        <span className="hint block">{RETENTION}</span>
       </div>
     );
   }
@@ -86,12 +127,123 @@ function Outcome({ job }: { job: RestoreJob }) {
         <span className="hint block">Verified background files may remain on the server without being used. They are harmless and are reused by a later restore.</span>
       )}
       {job.cleanup_pending && <span className="hint block">The server is still removing this restore&apos;s staged files.</span>}
+      <span className="hint block">{RETENTION}</span>
     </div>
   );
 }
 
+/** The final review: what will happen, an explicit acknowledgement, then the one action that sends. */
+function ConfirmPanel({
+  job,
+  confirm,
+  onAcknowledge,
+  onConfirm,
+  onBack,
+}: {
+  job: RestoreJob;
+  confirm: Extract<ConfirmState, { kind: "reviewing" | "sending" }>;
+  onAcknowledge: (value: boolean) => void;
+  onConfirm: () => void;
+  onBack: () => void;
+}) {
+  const sending = confirm.kind === "sending";
+  const acknowledged = confirm.kind === "reviewing" && confirm.acknowledged;
+  const n = job.totals.libraries;
+  const headingId = `restore-confirm-heading-${job.job_id}`;
+  return (
+    <div className="restore-confirm" role="group" aria-labelledby={headingId} data-testid="restore-confirm-panel">
+      <h3 id={headingId}>Confirm restoration</h3>
+      <div>This backup contains:</div>
+      <ul className="restore-not-restored">
+        <li>{plural(n, "library", "libraries")}</li>
+        <li>{plural(job.totals.notebooks, "notebook")}</li>
+        <li>{plural(job.totals.pages, "page")}</li>
+        <li>{plural(job.totals.blobs, "background file")}</li>
+      </ul>
+      <div>
+        Ignite will create <strong>{n === 1 ? "1 new library" : `${n} new libraries`}</strong>. Your existing libraries will not be replaced, merged or deleted.
+      </div>
+      <Details job={job} id={`restore-confirm-details-${job.job_id}`} />
+      <label className="restore-ack">
+        <input type="checkbox" checked={acknowledged || sending} disabled={sending} onChange={(e) => onAcknowledge(e.currentTarget.checked)} data-testid="restore-ack" />
+        <span>I understand that this will create new libraries and may result in duplicate content if I have already restored this backup.</span>
+      </label>
+      <div className="row-actions">
+        <button className="btn primary" onClick={onConfirm} disabled={!acknowledged || sending} aria-busy={sending} data-testid="restore-confirm-yes">
+          {sending ? "Sending confirmation…" : "Restore new libraries"}
+        </button>
+        <button className="btn" onClick={onBack} disabled={sending} data-testid="restore-confirm-back">
+          Go back
+        </button>
+      </div>
+      {sending && (
+        <p className="hint" role="status">
+          Sending confirmation…
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** What the last confirmation of `confirm.jobId` led to (not shown once the row shows a result). */
+function ConfirmNotice({ confirm, job }: { confirm: ConfirmState; job: RestoreJob | null }) {
+  if (confirm.kind === "accepted") {
+    if (job && job.state !== "ready" && job.state !== "executing") return null; // the result is shown
+    return (
+      <div role="status" className="notice ok" data-testid="restore-confirm-notice" data-kind="accepted">
+        Restoration accepted. The server is restoring the verified backup.
+      </div>
+    );
+  }
+  if (confirm.kind === "uncertain") {
+    return (
+      <div role="status" className="notice warn" data-testid="restore-confirm-notice" data-kind="uncertain">
+        <strong>Confirmation outcome unknown. Checking restore status.</strong>
+        <div>The server may already have started this restore, so the confirmation is not sent again. Refresh to check its status.</div>
+      </div>
+    );
+  }
+  if (confirm.kind === "not_started") {
+    return (
+      <div role="status" className="notice warn" data-testid="restore-confirm-notice" data-kind="not_started">
+        The server has not started this restore and nothing was restored. To restore it, review it and confirm again.
+      </div>
+    );
+  }
+  if (confirm.kind === "gone") {
+    return (
+      <div role="status" className="notice warn" data-testid="restore-confirm-notice" data-kind="gone">
+        The server no longer has this restore job or its result ({RETENTION.toLowerCase().replace(/\.$/, "")}). Check the server&apos;s libraries to see whether it was
+        restored before restoring the backup again.
+      </div>
+    );
+  }
+  if (confirm.kind === "refused") {
+    return (
+      <div role="alert" className={`notice ${confirm.error.kind === "capacity" ? "warn" : "bad"}`} data-testid="restore-confirm-notice" data-kind={`refused-${confirm.error.kind}`}>
+        <strong>{confirm.error.title}</strong>
+        <div>{confirm.error.message}</div>
+        {confirm.error.code && <span className="hint block mono">{confirm.error.code}</span>}
+      </div>
+    );
+  }
+  return null;
+}
+
 /** Upload a backup for server-side verification (a preview; nothing is restored). */
-function UploadPanel({ upload, picker, onSelect, onUpload }: { upload: UploadState; picker: number; onSelect: (f: File | null) => void; onUpload: () => void }) {
+function UploadPanel({
+  upload,
+  picker,
+  confirm,
+  onSelect,
+  onUpload,
+}: {
+  upload: UploadState;
+  picker: number;
+  confirm: ConfirmState;
+  onSelect: (f: File | null) => void;
+  onUpload: () => void;
+}) {
   const busy = upload.kind === "uploading";
   return (
     <div className="restore-upload" data-testid="restore-upload" data-upload={upload.kind}>
@@ -130,7 +282,7 @@ function UploadPanel({ upload, picker, onSelect, onUpload }: { upload: UploadSta
             Uploading and verifying the backup. A large backup can take several minutes; keep this page open.
           </p>
         )}
-        {upload.kind === "prepared" && (
+        {upload.kind === "prepared" && previewStillTrue(confirm, upload.job.job_id) && (
           <div className="notice ok" data-testid="restore-prepared">
             <strong>Verification complete</strong>
             <div>
@@ -138,11 +290,12 @@ function UploadPanel({ upload, picker, onSelect, onUpload }: { upload: UploadSta
               {plural(upload.job.totals.blobs, "background file")} ({formatBytes(upload.job.totals.blob_bytes)})
             </div>
             <div>
-              <strong>This is a preview. No notebooks have been restored.</strong> Review the libraries below. Confirming a restore will be available in a later version.
+              <strong>This is a preview. No notebooks have been restored.</strong> Review the libraries below, then choose Restore libraries… to restore them as new
+              libraries.
             </div>
             <span className="hint block">
-              The prepared restore expires in {minutes(upload.job.expires_in_s)}. If this page is reloaded it can still be reviewed or cancelled, but the backup would have
-              to be uploaded again before it can be restored.
+              The prepared restore expires in {minutes(upload.job.expires_in_s)}. If this page is reloaded, its one-time confirmation is lost: it can still be reviewed or
+              cancelled, but the backup would have to be uploaded again before it can be restored.
             </span>
           </div>
         )}
@@ -221,6 +374,14 @@ function Details({ job, id }: { job: RestoreJob; id: string }) {
               <dd>
                 {plural(l.notebook_count, "notebook")}, {plural(l.page_count, "page")}
               </dd>
+              {restored?.some((r) => r.source_library_id === l.source_library_id) && (
+                <>
+                  <dt>Restored snapshot SHA-256</dt>
+                  <dd className="mono" data-testid="restore-restored-sha">
+                    {restored.find((r) => r.source_library_id === l.source_library_id)!.restored_snapshot_sha256}
+                  </dd>
+                </>
+              )}
             </dl>
           </li>
         ))}
@@ -229,7 +390,13 @@ function Details({ job, id }: { job: RestoreJob; id: string }) {
   );
 }
 
-const IDLE_ACTIONS: ActionsState = { upload: { kind: "idle" }, cancel: { confirming: null, busy: null, notice: null }, picker: 0 };
+const IDLE_ACTIONS: ActionsState = {
+  upload: { kind: "idle" },
+  cancel: { confirming: null, busy: null, notice: null },
+  confirm: { kind: "idle" },
+  confirmable: null,
+  picker: 0,
+};
 
 export interface RestoreActionHandlers {
   onSelect: (file: File | null) => void;
@@ -237,6 +404,15 @@ export interface RestoreActionHandlers {
   onAskCancel: (jobId: string) => void;
   onKeep: () => void;
   onCancel: (jobId: string) => void;
+  onReview: (jobId: string) => void;
+  onAcknowledge: (jobId: string, value: boolean) => void;
+  onBack: () => void;
+  onConfirm: (jobId: string) => void;
+}
+
+/** A confirmation for this job is open, in flight, accepted or unresolved (no other action). */
+function confirmLocks(confirm: ConfirmState, jobId: string): boolean {
+  return (confirm.kind === "reviewing" || confirm.kind === "sending" || confirm.kind === "accepted" || confirm.kind === "uncertain") && confirm.jobId === jobId;
 }
 
 export function RestoreJobsView({
@@ -256,7 +432,8 @@ export function RestoreJobsView({
   handlers?: RestoreActionHandlers;
 }) {
   const { jobs, loading, error } = state;
-  const { cancel } = actions;
+  const { cancel, confirm } = actions;
+  const confirmJobShown = confirm.kind !== "idle" && confirm.kind !== "reviewing" && confirm.kind !== "sending" && !!jobs?.some((j) => j.job_id === confirm.jobId);
   // Uploading needs restore access: hidden while it is refused (the server would refuse anyway).
   const accessRefused = error !== null && error.kind !== "transient";
   return (
@@ -277,7 +454,10 @@ export function RestoreJobsView({
           {error.kind === "transient" && jobs && <span className="hint block">Showing the last list that loaded.</span>}
         </div>
       )}
-      {handlers && !accessRefused && <UploadPanel upload={actions.upload} picker={actions.picker} onSelect={handlers.onSelect} onUpload={handlers.onUpload} />}
+      {handlers && !accessRefused && <UploadPanel upload={actions.upload} picker={actions.picker} confirm={confirm} onSelect={handlers.onSelect} onUpload={handlers.onUpload} />}
+      {handlers && confirm.kind !== "idle" && !confirmJobShown && confirm.kind !== "reviewing" && confirm.kind !== "sending" && (
+        <ConfirmNotice confirm={confirm} job={null} />
+      )}
       {cancel.notice && (
         <div role="status" className={`notice ${cancel.notice.tone}`} data-testid="restore-cancel-notice" data-tone={cancel.notice.tone}>
           {cancel.notice.text}
@@ -298,10 +478,13 @@ export function RestoreJobsView({
         <ul className="rows">
           {jobs.map((job) => {
             const open = expanded.has(job.job_id);
-            const status = stateLabel(job);
+            const checking = checkingStatus(confirm, job);
+            const status = checking
+              ? { label: confirm.kind === "sending" ? "Sending confirmation" : "Checking server status", tone: "executing" }
+              : stateLabel(job);
             const detailsId = `restore-details-${job.job_id}`;
             return (
-              <li key={job.job_id} className="restore-job" data-testid="restore-job" data-state={job.state}>
+              <li key={job.job_id} className="restore-job" data-testid="restore-job" data-state={job.state} data-job-id={job.job_id}>
                 <div className="row">
                   <div>
                     <div className="row-title">
@@ -313,14 +496,25 @@ export function RestoreJobsView({
                     <div className="hint">
                       {formatBytes(job.archive.bytes)} backup · {plural(job.totals.libraries, "library", "libraries")} · {plural(job.totals.notebooks, "notebook")} ·{" "}
                       {plural(job.totals.pages, "page")}
-                      {job.state === "ready" && <> · {job.usable ? `usable, expires in ${minutes(job.expires_in_s)}` : "no longer usable"}</>}
+                      {job.state === "ready" && !checking && <> · {job.usable ? `usable, expires in ${minutes(job.expires_in_s)}` : "no longer usable"}</>}
                     </div>
                   </div>
                   <div className="row-actions">
                     <button className="btn subtle" aria-expanded={open} aria-controls={detailsId} onClick={() => onToggle(job.job_id)} data-testid="restore-toggle">
                       {open ? "Hide details" : "Details"}
                     </button>
-                    {handlers && job.state === "ready" && job.usable && cancel.confirming !== job.job_id && (
+                    {handlers &&
+                      actions.confirmable === job.job_id &&
+                      job.state === "ready" &&
+                      job.usable &&
+                      !confirmLocks(confirm, job.job_id) &&
+                      cancel.confirming !== job.job_id &&
+                      cancel.busy !== job.job_id && (
+                        <button className="btn primary" onClick={() => handlers.onReview(job.job_id)} disabled={cancel.busy !== null} data-testid="restore-review">
+                          Restore libraries…
+                        </button>
+                      )}
+                    {handlers && job.state === "ready" && job.usable && cancel.confirming !== job.job_id && !confirmLocks(confirm, job.job_id) && (
                       <button className="btn" onClick={() => handlers.onAskCancel(job.job_id)} disabled={cancel.busy !== null} data-testid="restore-cancel">
                         {cancel.busy === job.job_id ? "Cancelling…" : "Cancel…"}
                       </button>
@@ -340,8 +534,20 @@ export function RestoreJobsView({
                     </div>
                   </div>
                 )}
-                <Outcome job={job} />
-                {open && <Details job={job} id={detailsId} />}
+                {handlers && (confirm.kind === "reviewing" || confirm.kind === "sending") && confirm.jobId === job.job_id && (
+                  <ConfirmPanel
+                    job={job}
+                    confirm={confirm}
+                    onAcknowledge={(v) => handlers.onAcknowledge(job.job_id, v)}
+                    onConfirm={() => handlers.onConfirm(job.job_id)}
+                    onBack={handlers.onBack}
+                  />
+                )}
+                {handlers && confirm.kind !== "idle" && confirm.kind !== "reviewing" && confirm.kind !== "sending" && confirm.jobId === job.job_id && (
+                  <ConfirmNotice confirm={confirm} job={job} />
+                )}
+                <Outcome job={job} confirmable={actions.confirmable === job.job_id} checking={checking} />
+                {open && !((confirm.kind === "reviewing" || confirm.kind === "sending") && confirm.jobId === job.job_id) && <Details job={job} id={detailsId} />}
               </li>
             );
           })}
@@ -372,6 +578,11 @@ export function RestoreJobs({ api }: { api: ControlApi }) {
       },
       refresh: () => void l.refreshAfter(),
       accessRefused: (e) => l.refuse(e),
+      recheck: () => {
+        const outdated = l.invalidate();
+        void l.refreshAfter();
+        return outdated;
+      },
     });
     actions.current = a;
     const first = setTimeout(() => void l.refresh(), 0);
@@ -386,7 +597,7 @@ export function RestoreJobs({ api }: { api: ControlApi }) {
 
   // The held confirmation follows what the server shows (cancelled, expired, access lost).
   useEffect(() => {
-    actions.current?.reconcile(state.jobs, state.error?.kind ?? null);
+    actions.current?.reconcile(state.jobs, state.error?.kind ?? null, loader.current?.serverVersion ?? 0);
   }, [state]);
 
   // Only while a restore runs: re-read the list until it finishes.
@@ -410,6 +621,10 @@ export function RestoreJobs({ api }: { api: ControlApi }) {
     onAskCancel: (id) => actions.current?.askCancel(id),
     onKeep: () => actions.current?.keep(),
     onCancel: (id) => void actions.current?.cancel(id),
+    onReview: (id) => actions.current?.review(id),
+    onAcknowledge: (id, v) => actions.current?.acknowledge(id, v),
+    onBack: () => actions.current?.back(),
+    onConfirm: (id) => void actions.current?.confirm(id),
   };
   return (
     <RestoreJobsView state={state} expanded={expanded} onToggle={toggle} onRefresh={() => void loader.current?.refresh()} actions={actionsState} handlers={handlers} />

@@ -2,7 +2,7 @@
 // public state, and must be dropped on cancel, expiry, unusability, lost access and teardown.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ControlError, MAX_RESTORE_UPLOAD_BYTES, type PreparedRestore, type RestoreJob } from "../src/api/controlApi";
+import { ControlError, MAX_RESTORE_UPLOAD_BYTES, type PreparedRestore, type RestoreAccepted, type RestoreConfirmation, type RestoreJob } from "../src/api/controlApi";
 import { RestoreActions, type ActionsState } from "../src/components/restoreActions";
 import { RestoreJobsLoader, type RestoreErrorKind, type RestoreJobsState } from "../src/components/restoreJobsLoader";
 
@@ -40,6 +40,8 @@ function deferred<T>() {
 function setup() {
   const uploads: { file: Blob; signal?: AbortSignal; d: ReturnType<typeof deferred<PreparedRestore>> }[] = [];
   const cancels: { id: string; d: ReturnType<typeof deferred<void>> }[] = [];
+  const confirms: { id: string; body: RestoreConfirmation; d: ReturnType<typeof deferred<RestoreAccepted>> }[] = [];
+  let rechecks = 0;
   const states: ActionsState[] = [];
   const prepared: RestoreJob[] = [];
   let refreshes = 0;
@@ -56,15 +58,21 @@ function setup() {
         cancels.push({ id, d });
         return d.promise;
       },
+      confirmRestore: (id, body) => {
+        const d = deferred<RestoreAccepted>();
+        confirms.push({ id, body, d });
+        return d.promise;
+      },
     },
     {
+      recheck: () => ++rechecks,
       onChange: (s) => states.push(s),
       onPrepared: (j) => prepared.push(j),
       refresh: () => void refreshes++,
       accessRefused: (e) => void refusals.push(e.kind),
     },
   );
-  return { a, uploads, cancels, states, prepared, refusals, refreshes: () => refreshes };
+  return { a, uploads, cancels, confirms, states, prepared, refusals, refreshes: () => refreshes, rechecks: () => rechecks };
 }
 
 const zip = (name = "ignite-backup.zip", bytes = 10) => new File([new Uint8Array(bytes)], name, { type: "application/zip" });
@@ -362,6 +370,7 @@ function wired() {
   );
   const uploads: ReturnType<typeof deferred<PreparedRestore>>[] = [];
   const cancels: ReturnType<typeof deferred<void>>[] = [];
+  const confirms: ReturnType<typeof deferred<RestoreAccepted>>[] = [];
   const a = new RestoreActions(
     {
       uploadRestore: () => {
@@ -374,8 +383,18 @@ function wired() {
         cancels.push(d);
         return d.promise;
       },
+      confirmRestore: () => {
+        const d = deferred<RestoreAccepted>();
+        confirms.push(d);
+        return d.promise;
+      },
     },
     {
+      recheck: () => {
+        const v = loader.invalidate();
+        void loader.refreshAfter();
+        return v;
+      },
       onChange: () => undefined,
       onPrepared: (j) => {
         loader.upsert(j);
@@ -385,7 +404,7 @@ function wired() {
       accessRefused: (e) => loader.refuse(e),
     },
   );
-  return { loader, a, gets, uploads, cancels, list: () => listState };
+  return { loader, a, gets, uploads, cancels, confirms, list: () => listState };
 }
 
 const settle = async () => {
@@ -472,5 +491,464 @@ describe("1G-B corrections: an action's access refusal drops privileged job data
     w.gets[1]!.resolve([job({ job_id: "a", state: "executing", usable: false })]);
     await settle();
     expect(w.list().jobs?.map((j) => [j.job_id, j.state])).toEqual([["a", "executing"]]);
+  });
+});
+
+// ------------------------------------------------------------------ Slice 1G-C: confirmation
+
+const MAPPED = job({
+  job_id: "job-1",
+  libraries: [
+    { source_library_id: "src-1", destination_library_id: "dst-1", source_snapshot_sha256: "c".repeat(64), source_snapshot_bytes: 1, source_through_server_seq: 1, notebook_count: 1, page_count: 1, blob_count: 0 },
+    { source_library_id: "src-2", destination_library_id: "dst-2", source_snapshot_sha256: "d".repeat(64), source_snapshot_bytes: 1, source_through_server_seq: 1, notebook_count: 1, page_count: 1, blob_count: 0 },
+  ],
+});
+
+/** A controller holding the confirmation of MAPPED, with the final review open and acknowledged. */
+async function reviewed() {
+  const s = setup();
+  s.a.select(zip());
+  const p = s.a.upload();
+  s.uploads[0]!.d.resolve({ job: MAPPED, confirmation: SECRET });
+  await p;
+  expect(s.a.current.confirmable).toBe("job-1");
+  s.a.review("job-1");
+  s.a.acknowledge("job-1", true);
+  return s;
+}
+
+describe("1G-C confirmation", () => {
+  it("opening and backing out of the review sends nothing; the final action needs the acknowledgement", async () => {
+    const s = setup();
+    s.a.select(zip());
+    const p = s.a.upload();
+    s.uploads[0]!.d.resolve({ job: MAPPED, confirmation: SECRET });
+    await p;
+    s.a.review("job-1");
+    expect(s.a.current.confirm).toEqual({ kind: "reviewing", jobId: "job-1", acknowledged: false });
+    await s.a.confirm("job-1"); // not acknowledged
+    expect(s.confirms).toHaveLength(0);
+    s.a.back();
+    expect(s.a.current.confirm.kind).toBe("idle");
+    await s.a.confirm("job-1"); // not reviewing
+    expect(s.confirms).toHaveLength(0);
+    s.a.review("other"); // not confirmable
+    expect(s.a.current.confirm.kind).toBe("idle");
+  });
+
+  it("the explicit action sends exactly one request, built from the plan held since the 201", async () => {
+    const s = await reviewed();
+    const c = s.a.confirm("job-1");
+    void s.a.confirm("job-1");
+    void s.a.confirm("job-1");
+    expect(s.confirms).toHaveLength(1);
+    expect(s.confirms[0]!.id).toBe("job-1");
+    expect(s.confirms[0]!.body).toEqual({
+      v: 1,
+      confirmation: SECRET,
+      archive_sha256: MAPPED.archive.sha256,
+      destinations: [
+        { source_library_id: "src-1", destination_library_id: "dst-1" },
+        { source_library_id: "src-2", destination_library_id: "dst-2" },
+      ],
+    });
+    expect(s.a.current.confirm.kind).toBe("sending");
+    s.a.askCancel("job-1");
+    void s.a.cancel("job-1");
+    expect(s.cancels).toHaveLength(0); // no cancelling while confirming
+    s.confirms[0]!.d.resolve({ job_id: "job-1", state: "executing" });
+    await c;
+    expect(s.a.current.confirm).toEqual({ kind: "accepted", jobId: "job-1" });
+    expect(s.a.holdsConfirmation("job-1")).toBe(false); // consumed
+    expect(s.a.current.confirmable).toBeNull();
+    expect(s.rechecks()).toBe(1);
+    void s.a.cancel("job-1");
+    expect(s.cancels).toHaveLength(0); // accepted: no Cancel
+    s.a.review("job-1");
+    expect(s.a.current.confirm.kind).toBe("accepted");
+    expect(visible(s)).not.toContain(SECRET);
+  });
+
+  it("a server summary that differs from the approved plan discards the capability", async () => {
+    for (const changed of [
+      job({ ...MAPPED, archive: { ...MAPPED.archive, sha256: "ff".repeat(32) } }),
+      job({ ...MAPPED, libraries: [MAPPED.libraries[0]!, { ...MAPPED.libraries[1]!, destination_library_id: "elsewhere" }] }),
+      job({ ...MAPPED, libraries: [MAPPED.libraries[0]!] }),
+    ]) {
+      const s = await reviewed();
+      s.a.reconcile([changed], null);
+      expect(s.a.holdsConfirmation("job-1")).toBe(false);
+      expect(s.a.current.confirmable).toBeNull();
+      expect(s.a.current.confirm).toMatchObject({ kind: "refused", error: { title: "Can no longer be confirmed" } });
+      await s.a.confirm("job-1");
+      expect(s.confirms).toHaveLength(0);
+    }
+    // The same plan in another order stays confirmable.
+    const s = await reviewed();
+    s.a.reconcile([job({ ...MAPPED, libraries: [...MAPPED.libraries].reverse() })], null);
+    expect(s.a.current.confirmable).toBe("job-1");
+  });
+
+  it("expiry during the review prevents submission", async () => {
+    vi.useFakeTimers();
+    const s = setup();
+    s.a.select(zip());
+    const p = s.a.upload();
+    s.uploads[0]!.d.resolve({ job: { ...MAPPED, expires_in_s: 60 }, confirmation: SECRET });
+    await p;
+    s.a.review("job-1");
+    s.a.acknowledge("job-1", true);
+    vi.advanceTimersByTime(60_000);
+    expect(s.a.current.confirm).toMatchObject({ kind: "refused", error: { title: "Expired" } });
+    await s.a.confirm("job-1");
+    expect(s.confirms).toHaveLength(0);
+  });
+
+  it("429 keeps the capability and needs another explicit attempt", async () => {
+    const s = await reviewed();
+    const c = s.a.confirm("job-1");
+    s.confirms[0]!.d.reject(new ControlError(429, "restore_busy", "busy"));
+    await c;
+    expect(s.a.holdsConfirmation("job-1")).toBe(true);
+    expect(s.a.current.confirmable).toBe("job-1");
+    expect(s.a.current.confirm).toMatchObject({ kind: "refused", error: { kind: "capacity" } });
+    expect(s.confirms).toHaveLength(1); // not retried
+    await s.a.confirm("job-1"); // the review is closed: nothing sent
+    expect(s.confirms).toHaveLength(1);
+    s.a.review("job-1");
+    s.a.acknowledge("job-1", true);
+    void s.a.confirm("job-1");
+    expect(s.confirms).toHaveLength(2);
+  });
+
+  it("definitive refusals discard the capability; mismatch differs from lost access", async () => {
+    const run = async (e: ControlError) => {
+      const s = await reviewed();
+      const c = s.a.confirm("job-1");
+      s.confirms[0]!.d.reject(e);
+      await c;
+      return s;
+    };
+    for (const [e, title] of [
+      [new ControlError(403, "confirmation_mismatch", "m"), "Confirmation refused"],
+      [new ControlError(409, "already_confirmed", "m"), "Already confirmed"],
+      [new ControlError(410, "expired", "This prepared restore expired."), "No longer available"],
+      [new ControlError(404, "not_found", "m"), "Restore job not found"],
+      [new ControlError(503, "shutting_down", "m"), "Server shutting down"],
+      [new ControlError(500, "internal", "The restore could not be started."), "Restore could not be started"],
+    ] as const) {
+      const s = await run(e);
+      expect(s.a.holdsConfirmation("job-1"), e.code).toBe(false);
+      expect(s.a.current.confirm, e.code).toMatchObject({ kind: "refused", error: { title } });
+      expect(s.refusals, e.code).toEqual([]); // not an access loss
+      expect(s.rechecks(), e.code).toBe(1); // the status is re-read
+    }
+    for (const [e, kind] of [
+      [new ControlError(401, "unauthorized", "m"), "session"],
+      [new ControlError(403, "loopback_required", "m"), "loopback"],
+      [new ControlError(403, "forbidden", "m"), "access"],
+    ] as const) {
+      const s = await run(e);
+      expect(s.a.holdsConfirmation("job-1"), e.code).toBe(false);
+      expect(s.refusals, e.code).toEqual([kind]); // privileged data dropped at once
+    }
+  });
+
+  it("a lost answer is uncertain: never resent; settled only by a list fetched afterwards", async () => {
+    const s = await reviewed();
+    const c = s.a.confirm("job-1");
+    s.confirms[0]!.d.reject(new ControlError(0, "confirm_interrupted", "lost"));
+    await c;
+    expect(s.a.current.confirm).toEqual({ kind: "uncertain", jobId: "job-1" });
+    expect(s.rechecks()).toBe(1);
+    s.a.review("job-1"); // no second attempt while unresolved
+    await s.a.confirm("job-1");
+    void s.a.cancel("job-1");
+    expect([s.confirms.length, s.cancels.length]).toEqual([1, 0]);
+    // A list from before the answer (version 1 = the recheck's outdated version) settles nothing.
+    s.a.reconcile([MAPPED], null, 1);
+    expect(s.a.current.confirm.kind).toBe("uncertain");
+    // A fresh list showing it still ready: not started; a new explicit decision is required.
+    s.a.reconcile([MAPPED], null, 2);
+    expect(s.a.current.confirm).toEqual({ kind: "not_started", jobId: "job-1" });
+    expect(s.confirms).toHaveLength(1);
+    expect(s.a.current.confirmable).toBe("job-1");
+    s.a.review("job-1");
+    expect(s.a.current.confirm.kind).toBe("reviewing");
+  });
+
+  it("a lost answer that the server had in fact accepted: the fresh list shows it running, then its result", async () => {
+    const s = await reviewed();
+    const c = s.a.confirm("job-1");
+    s.confirms[0]!.d.reject(new ControlError(0, "confirm_interrupted", "lost"));
+    await c;
+    expect(s.a.current.upload.kind).toBe("prepared");
+    s.a.reconcile([job({ ...MAPPED, state: "executing", usable: false })], null, 2);
+    expect(s.a.current.confirm).toEqual({ kind: "accepted", jobId: "job-1" });
+    expect(s.a.holdsConfirmation("job-1")).toBe(false);
+    expect(s.a.current.upload.kind).toBe("idle"); // the "nothing restored" preview is gone
+    s.a.reconcile([job({ ...MAPPED, state: "succeeded", usable: false })], null, 3);
+    expect(s.a.current.confirm.kind).toBe("idle"); // the row shows the result
+    // Unavailable status keeps the uncertainty (never success or failure).
+    const t = await reviewed();
+    const d = t.a.confirm("job-1");
+    t.confirms[0]!.d.reject(new ControlError(0, "confirm_interrupted", "lost"));
+    await d;
+    t.a.reconcile(null, "transient", 2);
+    expect(t.a.current.confirm.kind).toBe("uncertain");
+  });
+
+  it("an accepted job that disappears from a fresh list is reported as gone", async () => {
+    const s = await reviewed();
+    const c = s.a.confirm("job-1");
+    s.confirms[0]!.d.resolve({ job_id: "job-1", state: "executing" });
+    await c;
+    s.a.reconcile([MAPPED], null, 1); // an older list (still ready): ignored, never usable again
+    expect(s.a.current.confirm.kind).toBe("accepted");
+    expect(s.a.current.confirmable).toBeNull();
+    s.a.reconcile([], null, 2);
+    expect(s.a.current.confirm).toEqual({ kind: "gone", jobId: "job-1" });
+  });
+
+  it("unmount during a confirmation forgets everything and reports nothing", async () => {
+    const s = await reviewed();
+    const c = s.a.confirm("job-1");
+    const seen = s.states.length;
+    s.a.dispose();
+    expect(s.a.holdsConfirmation("job-1")).toBe(false);
+    s.confirms[0]!.d.resolve({ job_id: "job-1", state: "executing" });
+    await c;
+    expect(s.states).toHaveLength(seen);
+    expect(s.rechecks()).toBe(0);
+  });
+
+  it("a cancellation in flight blocks the review and the confirmation", async () => {
+    const s = setup();
+    s.a.select(zip());
+    const p = s.a.upload();
+    s.uploads[0]!.d.resolve({ job: MAPPED, confirmation: SECRET });
+    await p;
+    const c = s.a.cancel("job-1");
+    s.a.review("job-1");
+    expect(s.a.current.confirm.kind).toBe("idle");
+    s.cancels[0]!.d.resolve();
+    await c;
+    expect(s.a.current.confirmable).toBeNull();
+    s.a.review("job-1");
+    expect(s.a.current.confirm.kind).toBe("idle");
+  });
+});
+
+describe("1G-C: older lists cannot undo an accepted restore", () => {
+  it("after 202, a GET from before it is discarded; the fresh list decides", async () => {
+    const w = wired();
+    // Wire reconcile as the component does.
+    const reconcile = () => w.a.reconcile(w.list().jobs, w.list().error?.kind ?? null, w.loader.serverVersion);
+    w.a.select(zip());
+    const u = w.a.upload();
+    w.uploads[0]!.resolve({ job: MAPPED, confirmation: SECRET });
+    await u;
+    w.gets[0]!.resolve([MAPPED]);
+    await settle();
+    reconcile();
+    const old = w.loader.refresh(); // in flight before the confirmation (stays pending)
+    w.a.review("job-1");
+    w.a.acknowledge("job-1", true);
+    const c = w.a.confirm("job-1");
+    w.confirms[0]!.resolve({ job_id: "job-1", state: "executing" });
+    await c;
+    expect(w.a.current.confirm.kind).toBe("accepted");
+    w.gets[1]!.resolve([MAPPED]); // the old answer: still "ready"
+    await old;
+    await settle();
+    reconcile();
+    expect(w.list().jobs?.[0]?.state).toBe("ready"); // unchanged (discarded, not applied)
+    expect(w.a.current.confirm.kind).toBe("accepted");
+    expect(w.a.current.confirmable).toBeNull();
+    w.gets[2]!.resolve([job({ ...MAPPED, state: "succeeded", usable: false })]);
+    await settle();
+    reconcile();
+    expect(w.list().jobs?.[0]?.state).toBe("succeeded");
+    // A still older answer can no longer revert it.
+    expect(w.gets).toHaveLength(3);
+  });
+});
+
+// ------------------------------------------------------------------ 1G-C corrective pass
+
+/**
+ * The section's wiring exactly as RestoreJobs.tsx does it, including the effect that calls
+ * reconcile(jobs, error, serverVersion) on every list state change.
+ */
+function live() {
+  const gets: ReturnType<typeof deferred<RestoreJob[]>>[] = [];
+  const uploads: ReturnType<typeof deferred<PreparedRestore>>[] = [];
+  const confirms: { body: RestoreConfirmation; d: ReturnType<typeof deferred<RestoreAccepted>> }[] = [];
+  let list: RestoreJobsState = { jobs: null, loading: false, error: null };
+  let actions: RestoreActions | null = null;
+  const loader = new RestoreJobsLoader(
+    () => {
+      const d = deferred<RestoreJob[]>();
+      gets.push(d);
+      return d.promise;
+    },
+    (s) => {
+      list = s;
+      actions?.reconcile(s.jobs, s.error?.kind ?? null, loader.serverVersion);
+    },
+  );
+  const a = new RestoreActions(
+    {
+      uploadRestore: () => {
+        const d = deferred<PreparedRestore>();
+        uploads.push(d);
+        return d.promise;
+      },
+      cancelRestore: () => Promise.reject(new Error("unused")),
+      confirmRestore: (_id, body) => {
+        const d = deferred<RestoreAccepted>();
+        confirms.push({ body, d });
+        return d.promise;
+      },
+    },
+    {
+      onChange: () => undefined,
+      onPrepared: (j) => {
+        loader.upsert(j);
+        void loader.refreshAfter();
+      },
+      refresh: () => void loader.refreshAfter(),
+      accessRefused: (e) => loader.refuse(e),
+      recheck: () => {
+        const outdated = loader.invalidate();
+        void loader.refreshAfter();
+        return outdated;
+      },
+    },
+  );
+  actions = a;
+  return { loader, a, gets, uploads, confirms, list: () => list };
+}
+
+/** Upload MAPPED, let an authoritative GET show it ready, then review and acknowledge. */
+async function readyToConfirm() {
+  const w = live();
+  w.a.select(zip());
+  const u = w.a.upload();
+  w.uploads[0]!.resolve({ job: MAPPED, confirmation: SECRET });
+  await u;
+  await settle();
+  expect(w.gets).toHaveLength(1); // the post-upload refresh
+  w.gets[0]!.resolve([MAPPED]); // authoritative: job ready
+  await settle();
+  expect(w.list()).toMatchObject({ jobs: [{ job_id: "job-1", state: "ready" }], error: null });
+  w.a.review("job-1");
+  w.a.acknowledge("job-1", true);
+  return w;
+}
+
+/** Submit the confirmation and settle it with `outcome`. */
+async function submit(w: ReturnType<typeof live>, outcome: "lost" | "accepted") {
+  const c = w.a.confirm("job-1");
+  if (outcome === "lost") w.confirms[0]!.d.reject(new ControlError(0, "confirm_interrupted", "lost"));
+  else w.confirms[0]!.d.resolve({ job_id: "job-1", state: "executing" });
+  await c;
+  await settle();
+}
+
+const running = () => job({ ...MAPPED, state: "executing", usable: false });
+
+describe("1G-C corrective: only a successful server answer settles a confirmation", () => {
+  it("unanswered confirmation + failed status GET: stays uncertain; the old ready row is no evidence", async () => {
+    const w = await readyToConfirm();
+    const before = w.loader.serverVersion;
+    await submit(w, "lost");
+    expect(w.a.current.confirm).toEqual({ kind: "uncertain", jobId: "job-1" });
+    expect(w.gets).toHaveLength(2); // the status re-read
+    w.gets[1]!.reject(new ControlError(0, "unreachable", "Ignite Server is not reachable."));
+    await settle();
+    expect(w.list().jobs?.[0]?.state).toBe("ready"); // still shown, marked with the error
+    expect(w.list().error?.kind).toBe("transient");
+    expect(w.loader.serverVersion).toBe(before); // a failure is no server evidence
+    expect(w.a.current.confirm).toEqual({ kind: "uncertain", jobId: "job-1" }); // not "not_started"
+    expect(w.confirms).toHaveLength(1); // never resent
+    // A later successful answer settles it: the server was running it.
+    void w.loader.refresh();
+    w.gets[2]!.resolve([running()]);
+    await settle();
+    expect(w.a.current.confirm).toEqual({ kind: "accepted", jobId: "job-1" });
+    expect(w.confirms).toHaveLength(1);
+  });
+
+  it("unanswered confirmation + failed GET, then a successful ready answer: not started, new review allowed", async () => {
+    const w = await readyToConfirm();
+    await submit(w, "lost");
+    w.gets[1]!.reject(new ControlError(0, "unreachable", "down"));
+    await settle();
+    expect(w.a.current.confirm.kind).toBe("uncertain");
+    void w.loader.refresh();
+    w.gets[2]!.resolve([MAPPED]);
+    await settle();
+    expect(w.a.current.confirm).toEqual({ kind: "not_started", jobId: "job-1" });
+    expect(w.a.current.confirmable).toBe("job-1");
+    expect(w.confirms).toHaveLength(1); // nothing resent by itself
+    w.a.review("job-1");
+    expect(w.a.current.confirm).toEqual({ kind: "reviewing", jobId: "job-1", acknowledged: false }); // explicit again
+  });
+
+  it("unanswered confirmation: terminal and missing jobs in a successful answer settle it", async () => {
+    let w = await readyToConfirm();
+    await submit(w, "lost");
+    w.gets[1]!.resolve([job({ ...MAPPED, state: "succeeded", usable: false })]);
+    await settle();
+    expect(w.a.current.confirm.kind).toBe("idle"); // the row shows the server's result
+    expect(w.a.holdsConfirmation("job-1")).toBe(false);
+    w = await readyToConfirm();
+    await submit(w, "lost");
+    w.gets[1]!.resolve([]);
+    await settle();
+    expect(w.a.current.confirm).toEqual({ kind: "gone", jobId: "job-1" });
+  });
+
+  it("a local upsert during an unresolved confirmation settles nothing", async () => {
+    const w = await readyToConfirm();
+    await submit(w, "lost");
+    const v = w.loader.serverVersion;
+    w.loader.upsert(job({ job_id: "another" })); // e.g. a different upload's 201
+    await settle();
+    expect(w.loader.serverVersion).toBe(v);
+    expect(w.a.current.confirm).toEqual({ kind: "uncertain", jobId: "job-1" });
+    // The access-refusal path is local too: no server evidence either.
+    w.loader.refuse({ kind: "transient", message: "x" });
+    expect(w.loader.serverVersion).toBe(v);
+  });
+
+  it("an older answer requested before the confirmation is ignored", async () => {
+    const w = await readyToConfirm();
+    const older = w.loader.refresh(); // in flight before the confirmation
+    await submit(w, "lost");
+    w.gets[1]!.resolve([MAPPED]); // the older one answers "ready" after the confirmation
+    await older;
+    await settle();
+    expect(w.a.current.confirm.kind).toBe("uncertain");
+  });
+
+  it("accepted 202 + failed GET: stays accepted; a later successful terminal answer shows the result", async () => {
+    const w = await readyToConfirm();
+    await submit(w, "accepted");
+    expect(w.a.current.confirm).toEqual({ kind: "accepted", jobId: "job-1" });
+    w.gets[1]!.reject(new ControlError(0, "unreachable", "down"));
+    await settle();
+    expect(w.a.current.confirm).toEqual({ kind: "accepted", jobId: "job-1" }); // not undone
+    expect(w.a.current.confirmable).toBeNull(); // the old ready row can't make it usable again
+    void w.loader.refresh();
+    w.gets[2]!.resolve([running()]);
+    await settle();
+    expect(w.a.current.confirm).toEqual({ kind: "accepted", jobId: "job-1" });
+    void w.loader.refresh();
+    w.gets[3]!.resolve([job({ ...MAPPED, state: "failed", usable: false })]);
+    await settle();
+    expect(w.a.current.confirm.kind).toBe("idle"); // the row shows the failure
+    expect(w.confirms).toHaveLength(1);
   });
 });
