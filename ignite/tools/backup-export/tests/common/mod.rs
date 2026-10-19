@@ -187,9 +187,13 @@ pub struct TempDir(pub PathBuf);
 
 impl TempDir {
     pub fn new(label: &str) -> Self {
+        // Parallel tests share a process id and the clock can repeat; the counter keeps
+        // every directory (and its server ledger lock) distinct.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "backup-export-{label}-{}-{}",
+            "backup-export-{label}-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

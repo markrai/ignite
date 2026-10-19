@@ -1,0 +1,22 @@
+[package]
+name = "backup-archive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Restore side of portable backups: strict ZIP reader, full verification and a read-only RestorePlan"
+
+[dependencies]
+portable-backup = { path = "../portable-backup" }
+sync-protocol = { workspace = true }
+# Already in the lockfile through `zip` (the exporter's writer). The container is parsed by this
+# crate; flate2 only inflates validated byte ranges and crc32fast checks them.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+crc32fast = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+backup-export = { path = "../../tools/backup-export" }
+scribe-sync-server = { workspace = true }
+sync-engine = { workspace = true, features = ["testkit"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+serde_json = "1"
