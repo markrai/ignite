@@ -208,3 +208,107 @@ describe("1G-A restore jobs client (read-only)", () => {
     expect(JSON.stringify(j)).not.toContain("SECRET");
   });
 });
+
+// ------------------------------------------------------------------ Slice 1G-B: upload and cancel
+
+const CONFIRMATION = "Q".repeat(43);
+
+describe("1G-B restore upload and cancel client", () => {
+  it("streams the original File as a raw application/zip body with the CSRF marker and cookies only", async () => {
+    const r = recorder({ "/control/v1/admin/restore/jobs": { status: 201, body: JSON.stringify({ ...JOB, confirmation: CONFIRMATION }) } });
+    const file = new File([new Uint8Array([0x50, 0x4b, 3, 4, 1, 2, 3])], "ignite-backup.zip", { type: "application/zip" });
+    const prepared = await createControlApi(r.fetchFn).uploadRestore(file);
+    const s = r.seen[0]!;
+    expect(s.url).toBe("/control/v1/admin/restore/jobs");
+    expect(s.init.method).toBe("POST");
+    expect(s.init.body).toBe(file); // the File itself: not read, copied, wrapped or encoded
+    expect(s.init.body).not.toBeInstanceOf(FormData);
+    expect(typeof s.init.body).not.toBe("string");
+    const h = s.init.headers as Record<string, string>;
+    expect(h["Content-Type"]).toBe("application/zip");
+    expect(h["X-Scribe-Request"]).toBe("1");
+    expect(h.Authorization).toBeUndefined();
+    expect(h["Content-Length"]).toBeUndefined(); // left to the browser
+    expect([s.init.credentials, s.init.cache, s.init.redirect, s.init.referrerPolicy]).toEqual(["same-origin", "no-store", "error", "no-referrer"]);
+    // The capability is separated from the ordinary summary.
+    expect(prepared.confirmation).toBe(CONFIRMATION);
+    expect(prepared.job.job_id).toBe(JOB.job_id);
+    expect(JSON.stringify(prepared.job)).not.toContain(CONFIRMATION);
+  });
+
+  it("a 201 without a well-formed confirmation, or not a 201, is refused", async () => {
+    const up = (status: number, body: unknown) =>
+      createControlApi(recorder({ "/control/v1/admin/restore/jobs": { status, body: JSON.stringify(body) } }).fetchFn)
+        .uploadRestore(new File(["x"], "b.zip"))
+        .catch((e: unknown) => e as ControlError);
+    for (const bad of [undefined, "", "short", "Q".repeat(44), "Q".repeat(42) + "=", 42]) {
+      const e = (await up(201, { ...JOB, confirmation: bad })) as ControlError;
+      expect(e.code, String(bad)).toBe("unsupported_response");
+    }
+    expect(((await up(201, { ...JOB, v: 2, confirmation: CONFIRMATION })) as ControlError).code).toBe("unsupported_response");
+    expect(((await up(200, { ...JOB, confirmation: CONFIRMATION })) as ControlError).code).toBe("unsupported_response");
+  });
+
+  it("refusals keep the server's code (and archive_error); a broken connection is upload_interrupted", async () => {
+    const up = async (status: number, body: unknown) =>
+      (await createControlApi(recorder({ "/control/v1/admin/restore/jobs": { status, body: JSON.stringify(body) } }).fetchFn)
+        .uploadRestore(new File(["x"], "b.zip"))
+        .catch((e: unknown) => e)) as ControlError;
+    let e = await up(413, { error: "body_too_large", message: "limit 2147483648 bytes" });
+    expect([e.status, e.code]).toEqual([413, "body_too_large"]);
+    e = await up(422, { error: "archive_invalid", archive_error: "zip_not_zip", message: "not a ZIP archive" });
+    expect([e.status, e.code, e.detail, e.message]).toEqual([422, "archive_invalid", "zip_not_zip", "not a ZIP archive"]);
+    e = await up(429, { error: "too_many_jobs", message: "Too many prepared restores." });
+    expect([e.status, e.code]).toEqual([429, "too_many_jobs"]);
+    e = await up(507, { error: "insufficient_storage", message: "not enough space" });
+    expect([e.status, e.code]).toEqual([507, "insufficient_storage"]);
+    const broken = createControlApi(async () => {
+      throw new TypeError("network");
+    });
+    e = (await broken.uploadRestore(new File(["x"], "b.zip")).catch((x: unknown) => x)) as ControlError;
+    expect([e.status, e.code]).toEqual([0, "upload_interrupted"]);
+    const stop = new AbortController();
+    stop.abort();
+    const aborted = createControlApi(async (_u, init) => {
+      if (init.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      throw new Error("unreachable");
+    });
+    e = (await aborted.uploadRestore(new File(["x"], "b.zip"), stop.signal).catch((x: unknown) => x)) as ControlError;
+    expect(e.code).toBe("aborted");
+  });
+
+  it("cancel is a DELETE with the CSRF marker and no body; refusals keep their codes", async () => {
+    const id = JOB.job_id;
+    const r = recorder({ [`/control/v1/admin/restore/jobs/${id}`]: { status: 200, body: JSON.stringify({ ok: true, job_id: id }) } });
+    await createControlApi(r.fetchFn).cancelRestore(id);
+    const s = r.seen[0]!;
+    expect([s.url, s.init.method, s.init.body]).toEqual([`/control/v1/admin/restore/jobs/${id}`, "DELETE", undefined]);
+    const h = s.init.headers as Record<string, string>;
+    expect(h["X-Scribe-Request"]).toBe("1");
+    expect(h["Content-Type"]).toBeUndefined();
+    expect(h.Authorization).toBeUndefined();
+    expect(s.init.credentials).toBe("same-origin");
+    const fail = async (status: number, body: unknown) =>
+      (await createControlApi(recorder({ [`/control/v1/admin/restore/jobs/${id}`]: { status, body: JSON.stringify(body) } }).fetchFn)
+        .cancelRestore(id)
+        .catch((e: unknown) => e)) as ControlError;
+    expect((await fail(410, { error: "expired", message: "expired" })).status).toBe(410); // an error, not an answer
+    expect((await fail(409, { error: "job_executing", message: "running" })).code).toBe("job_executing");
+    expect((await fail(500, { error: "cleanup_failed", message: "retrying" })).code).toBe("cleanup_failed");
+  });
+
+  it("ordinary control calls are unchanged: POSTs stay JSON, GETs carry no CSRF marker", async () => {
+    const r = recorder({
+      "/control/v1/admin/devices": { status: 200, body: '{"devices":[]}' },
+      "/control/v1/admin/devices/d/revoke": { status: 200, body: '{"ok":true}' },
+    });
+    const api = createControlApi(r.fetchFn);
+    await api.devices();
+    await api.revoke("d");
+    const [get, post] = r.seen;
+    expect((get!.init.headers as Record<string, string>)["X-Scribe-Request"]).toBeUndefined();
+    expect(get!.init.body).toBeUndefined();
+    expect((post!.init.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
+    expect(post!.init.body).toBe("{}");
+  });
+});

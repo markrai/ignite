@@ -67,7 +67,7 @@ describe("read-only API boundary", () => {
     await expect(api.blob("../x")).rejects.toThrow();
   });
 
-  it("S3B boundary: the only mutating request is replicaApi's operations POST", () => {
+  it("S3B boundary: notebook data is mutated only by replicaApi's operations POST", () => {
     const src = join(import.meta.dirname, "../src");
     const files: string[] = [];
     const walk = (d: string) => {
@@ -82,8 +82,11 @@ describe("read-only API boundary", () => {
     for (const f of files) {
       const text = readFileSync(f, "utf8");
       const r = rel(f);
-      expect(text, r).not.toMatch(/method:\s*["'](PUT|PATCH|DELETE)["']/i);
-      if (r !== "api/replicaApi.ts") expect(text, r).not.toMatch(/method:\s*["']POST["']/i);
+      // The control-plane client (claim, pairing, administration, 1G-B restore upload/cancel)
+      // mutates only /control/v1, never notebook data (pinned in control.test.ts).
+      const control = r === "api/controlApi.ts";
+      if (!control) expect(text, r).not.toMatch(/method:\s*["'](PUT|PATCH|DELETE)["']/i);
+      if (r !== "api/replicaApi.ts" && !control) expect(text, r).not.toMatch(/method:\s*["']POST["']/i);
       expect(text, r).not.toMatch(/new\s+(XMLHttpRequest|WebSocket|EventSource)\b|sendBeacon\s*\(/);
       const pwa = r === "pwa/registerUpdate.ts";
       if (!pwa) {

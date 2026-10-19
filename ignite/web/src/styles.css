@@ -547,3 +547,10 @@ body { overflow: hidden; }
   .restore-details .kv { grid-template-columns: 1fr; gap: 2px; }
   .restore-details .kv dd { margin-bottom: 6px; }
 }
+
+/* Slice 1G-B: upload a backup for verification, cancel a prepared restore */
+.restore-upload { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 10px; margin-top: 4px; }
+.restore-upload h3 { margin: 0; font-size: 16px; }
+.restore-file input[type="file"] { max-width: 100%; font: inherit; }
+.restore-upload .mono { overflow-wrap: anywhere; word-break: break-all; }
+.restore-job .row-actions { flex-wrap: wrap; }

@@ -271,10 +271,81 @@ export class ControlError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    /** A finer server code when there is one (e.g. `archive_error` of a refused backup). */
+    readonly detail: string | null = null,
   ) {
     super(message);
     this.name = "ControlError";
   }
+}
+
+/** The server's refusal as a ControlError (its `error`, `message` and, if any, `archive_error`). */
+function refusal(status: number, json: unknown): ControlError {
+  const e = (isObj(json) ? json : {}) as { error?: unknown; message?: unknown; archive_error?: unknown };
+  return new ControlError(
+    status,
+    typeof e.error === "string" ? e.error : "http_error",
+    typeof e.message === "string" ? e.message : `Server error ${status}`,
+    typeof e.archive_error === "string" ? e.archive_error : null,
+  );
+}
+
+/**
+ * The server's compressed-upload ceiling for restore backups (`RestoreLimits::max_upload_bytes`,
+ * 2 GiB). Checked locally to explain an oversized file early; the server stays authoritative.
+ */
+export const MAX_RESTORE_UPLOAD_BYTES = 2 * 1024 ** 3;
+
+/**
+ * A just-verified restore job plus its one-time confirmation capability. The capability exists
+ * only in the 201 answer to the upload (GET never returns it) and is needed to confirm.
+ */
+export interface PreparedRestore {
+  job: RestoreJob;
+  confirmation: string;
+}
+
+/** 32 random bytes, unpadded base64url (`control_protocol::b64url`). */
+const CONFIRMATION = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * Stream `file` to the server as the raw request body (never read into memory here). A failure
+ * after the request may have reached the server is `upload_interrupted`: it may still have
+ * prepared the job.
+ */
+async function uploadRestore(fetchFn: FetchLike, file: Blob, signal?: AbortSignal): Promise<PreparedRestore> {
+  let resp: Response;
+  try {
+    resp = await fetchFn(BASE + "/admin/restore/jobs", {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/zip", "X-Scribe-Request": "1" },
+      body: file,
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+      signal,
+    });
+  } catch {
+    if (signal?.aborted) throw new ControlError(0, "aborted", "The upload was stopped.");
+    throw new ControlError(
+      0,
+      "upload_interrupted",
+      "The upload was interrupted before the server answered. The server may still have prepared this restore.",
+    );
+  }
+  let json: unknown = null;
+  try {
+    json = await resp.json();
+  } catch {
+    // not JSON
+  }
+  if (!resp.ok) throw refusal(resp.status, json);
+  if (resp.status !== 201 || !isObj(json)) throw unsupported("upload");
+  // Taken out once; the rest is the ordinary summary, parsed by the one strict parser.
+  const { confirmation, ...summary } = json;
+  if (typeof confirmation !== "string" || !CONFIRMATION.test(confirmation)) throw unsupported("confirmation");
+  return { job: parseRestoreJob(summary), confirmation };
 }
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -282,12 +353,17 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 const BASE = "/control/v1";
 
 /** `gone`: whether HTTP 410 is a normal answer (pairing polls) or an error (restore jobs). */
-async function request<T>(fetchFn: FetchLike, method: "GET" | "POST", path: string, body?: unknown, gone: "answer" | "error" = "answer"): Promise<T> {
+async function request<T>(
+  fetchFn: FetchLike,
+  method: "GET" | "POST" | "DELETE",
+  path: string,
+  body?: unknown,
+  gone: "answer" | "error" = "answer",
+): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (method === "POST") {
-    headers["X-Scribe-Request"] = "1";
-    headers["Content-Type"] = "application/json";
-  }
+  // Every mutation carries the CSRF marker; only POST has a (JSON) body.
+  if (method !== "GET") headers["X-Scribe-Request"] = "1";
+  if (method === "POST") headers["Content-Type"] = "application/json";
   let resp: Response;
   try {
     resp = await fetchFn(BASE + path, {
@@ -308,10 +384,7 @@ async function request<T>(fetchFn: FetchLike, method: "GET" | "POST", path: stri
   } catch {
     // non-JSON (e.g. a developer sync server without a control plane)
   }
-  if (!resp.ok && (resp.status !== 410 || gone === "error")) {
-    const e = (json ?? {}) as { error?: string; message?: string };
-    throw new ControlError(resp.status, e.error ?? "http_error", e.message ?? `Server error ${resp.status}`);
-  }
+  if (!resp.ok && (resp.status !== 410 || gone === "error")) throw refusal(resp.status, json);
   return json as T;
 }
 
@@ -332,6 +405,10 @@ export interface ControlApi {
   restoreJobs(): Promise<RestoreJob[]>;
   /** One of this administrator's restore jobs (404 unknown/foreign, 410 expired/cancelled). */
   restoreJob(jobId: string): Promise<RestoreJob>;
+  /** Upload a backup ZIP (the `File` itself is the body) and get its verified summary. */
+  uploadRestore(file: Blob, signal?: AbortSignal): Promise<PreparedRestore>;
+  /** Discard a prepared restore job (the server refuses one that is executing). */
+  cancelRestore(jobId: string): Promise<void>;
 }
 
 export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init)): ControlApi {
@@ -375,6 +452,10 @@ export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init
     },
     restoreJob: async (id) =>
       parseRestoreJob(await request<unknown>(fetchFn, "GET", `/admin/restore/jobs/${encodeURIComponent(id)}`, undefined, "error")),
+    uploadRestore: (file, signal) => uploadRestore(fetchFn, file, signal),
+    cancelRestore: async (id) => {
+      await request(fetchFn, "DELETE", `/admin/restore/jobs/${encodeURIComponent(id)}`, undefined, "error");
+    },
   };
 }
 

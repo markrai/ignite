@@ -2,6 +2,7 @@
 // refresh rules are testable on their own:
 // * never two requests at once (a refresh while one is in flight joins it);
 // * nothing is applied after `dispose` (the section unmounted);
+// * a list requested before newer data arrived (`upsert`) is discarded, never applied over it;
 // * a transient failure keeps the last list (marked with the error); a refused session or
 //   access drops it, so a revoked administrator does not keep seeing privileged data.
 
@@ -47,6 +48,9 @@ export class RestoreJobsLoader {
   private state: RestoreJobsState = { jobs: null, loading: false, error: null };
   private inFlight: Promise<void> | null = null;
   private disposed = false;
+  /** Requests are numbered; answers to requests up to `staleThrough` are discarded. */
+  private seq = 0;
+  private staleThrough = 0;
 
   constructor(
     private readonly load: () => Promise<RestoreJob[]>,
@@ -66,9 +70,12 @@ export class RestoreJobsLoader {
     if (this.disposed) return Promise.resolve();
     if (this.inFlight) return this.inFlight;
     this.set({ ...this.state, loading: true });
+    const mine = ++this.seq;
+    const stale = () => mine <= this.staleThrough;
     const run = this.load().then(
-      (jobs) => this.set({ jobs, loading: false, error: null }),
+      (jobs) => this.set(stale() ? { ...this.state, loading: false } : { jobs, loading: false, error: null }),
       (e: unknown) => {
+        if (stale()) return this.set({ ...this.state, loading: false });
         const error = describeRestoreError(e);
         this.set({ jobs: error.kind === "transient" ? this.state.jobs : null, loading: false, error });
       },
@@ -77,6 +84,31 @@ export class RestoreJobsLoader {
       this.inFlight = null;
     });
     return this.inFlight;
+  }
+
+  /** A fresh list that is not overtaken by a request already in flight. */
+  refreshAfter(): Promise<void> {
+    return this.inFlight ? this.inFlight.then(() => this.refresh()) : this.refresh();
+  }
+
+  /**
+   * Show a job the server just returned (a verified upload) before the next list arrives. Any
+   * list requested earlier is outdated: it is discarded when it answers.
+   */
+  upsert(job: RestoreJob): void {
+    this.staleThrough = this.seq;
+    const others = (this.state.jobs ?? []).filter((j) => j.job_id !== job.job_id);
+    this.set({ ...this.state, jobs: [job, ...others], error: null });
+  }
+
+  /**
+   * An action was refused for lack of access: drop the list now, show why, and discard every
+   * request already in flight (an earlier successful answer must not bring the list back). A
+   * later refresh that the server answers again restores it as usual.
+   */
+  refuse(error: RestoreLoadError): void {
+    this.staleThrough = this.seq;
+    this.set({ jobs: null, loading: false, error });
   }
 
   dispose(): void {

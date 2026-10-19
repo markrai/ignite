@@ -4,7 +4,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { ControlError, type RestoreJob } from "../src/api/controlApi";
-import { RestoreJobsView, formatBytes } from "../src/components/RestoreJobs";
+import { RestoreJobsView, formatBytes, type RestoreActionHandlers } from "../src/components/RestoreJobs";
+import type { ActionsState, UploadState } from "../src/components/restoreActions";
 import { LOOPBACK_EXPLANATION, RestoreJobsLoader, type RestoreJobsState } from "../src/components/restoreJobsLoader";
 
 const SRC = "01a0de1f-0000-7000-8000-000000000001";
@@ -98,7 +99,7 @@ describe("1G-A Backup & Restore view", () => {
     expect(loading).toMatch(/data-testid="restore-refresh"[^>]*disabled|disabled[^>]*data-testid="restore-refresh"/);
     const empty = text(render({ jobs: [] }));
     expect(empty).toContain("No restore jobs yet.");
-    expect(empty).toContain("will be added in a later version");
+    expect(empty).toContain("Upload an Ignite backup to verify it");
     expect(empty).not.toMatch(/upload now|backup was created/i);
   });
 
@@ -300,5 +301,177 @@ describe("1G-A restore jobs loader", () => {
     calls[1]!.resolve([job({ state: "executing" })]);
     await p;
     expect(l.executing).toBe(true);
+  });
+});
+
+// ------------------------------------------------------------------ Slice 1G-B
+
+const HANDLERS: RestoreActionHandlers = {
+  onSelect: () => undefined,
+  onUpload: () => undefined,
+  onAskCancel: () => undefined,
+  onKeep: () => undefined,
+  onCancel: () => undefined,
+};
+
+function renderActions(state: Partial<RestoreJobsState>, actions: Partial<ActionsState> = {}, expanded: string[] = []): string {
+  const full: ActionsState = { upload: { kind: "idle" }, cancel: { confirming: null, busy: null, notice: null }, picker: 0, ...actions };
+  return renderToStaticMarkup(
+    <RestoreJobsView
+      state={{ jobs: null, loading: false, error: null, ...state }}
+      expanded={new Set(expanded)}
+      onToggle={() => undefined}
+      onRefresh={() => undefined}
+      actions={full}
+      handlers={HANDLERS}
+    />,
+  );
+}
+
+const up = (upload: UploadState) => ({ upload });
+
+describe("1G-B upload panel", () => {
+  it("no file selected: a native file input, upload disabled", () => {
+    const html = renderActions({ jobs: [] });
+    expect(html).toContain('type="file"');
+    expect(html).toContain('accept=".zip,application/zip"');
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="restore-upload-button"/);
+    expect(text(html)).toContain("Upload and verify");
+  });
+
+  it("a selected file shows its name and size and enables upload", () => {
+    const html = renderActions({ jobs: [] }, up({ kind: "selected", name: "ignite-backup.zip", size: 12_400_000, warning: null }));
+    expect(text(html)).toContain("ignite-backup.zip \u00b7 12 MB");
+    expect(html).not.toMatch(/disabled=""[^>]*data-testid="restore-upload-button"/);
+  });
+
+  it("empty or oversized files are refused before anything is sent", () => {
+    const html = renderActions({ jobs: [] }, up({ kind: "invalid", name: "empty.zip", size: 0, message: "This file is empty. Choose an Ignite backup (.zip)." }));
+    expect(html).toContain('data-testid="restore-file-invalid"');
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="restore-upload-button"/);
+  });
+
+  it("uploading: indeterminate, controls disabled, no percentage", () => {
+    const html = renderActions({ jobs: [] }, up({ kind: "uploading", name: "b.zip", size: 1024 }));
+    const t = text(html);
+    expect(t).toContain("Uploading and verifying\u2026");
+    expect(t).toContain("keep this page open");
+    expect(t).not.toMatch(/\d+\s*%/);
+    expect(html).toMatch(/<input[^>]*type="file"[^>]*disabled=""|<input[^>]*disabled=""[^>]*type="file"/);
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="restore-upload-button"/);
+    expect(html).toContain('aria-busy="true"');
+  });
+
+  it("a verified preview: real counts, and an explicit statement that nothing was restored", () => {
+    const many = job({
+      totals: { libraries: 2, notebooks: 18, pages: 94, blobs: 3, blob_bytes: 3 * 1024 * 1024 },
+      libraries: [1, 2].map((n) => ({ ...job().libraries[0]!, source_library_id: `${SRC}-${n}`, destination_library_id: `${DST}-${n}` })),
+      warnings: ["restored libraries receive new library identities at import"],
+    });
+    const html = renderActions({ jobs: [many] }, up({ kind: "prepared", name: "b.zip", job: many }), [many.job_id]);
+    const t = text(html);
+    expect(t).toContain("Verification complete");
+    expect(t).toContain("2 libraries \u00b7 18 notebooks \u00b7 94 pages \u00b7 3 background files (3.0 MB)");
+    expect(t).toContain("This is a preview. No notebooks have been restored.");
+    expect(t).toContain("Confirming a restore will be available in a later version.");
+    expect(t).toContain("If this page is reloaded it can still be reviewed or cancelled");
+    // Shared details: both mappings, warnings and exclusions.
+    expect(html.match(/data-testid="restore-library"/g)).toHaveLength(2);
+    expect(t).toContain(`Library in backup ${SRC}-1 Proposed new library ${DST}-1`);
+    expect(t).toContain("Notes from verification: restored libraries receive new library identities at import");
+    expect(t).toContain("Not included in a backup:");
+    // Nothing can confirm.
+    expect(t).not.toMatch(/\bConfirm\b|Restore now/);
+  });
+
+  it("a refused archive keeps the server's code; an interrupted upload is uncertain", () => {
+    const rejected = text(
+      renderActions(
+        { jobs: [] },
+        up({ kind: "failed", name: "bad.zip", size: 9, error: { kind: "rejected", title: "Backup could not be verified", message: "not a ZIP archive Nothing was prepared.", code: "archive_invalid: zip_not_zip" } }),
+      ),
+    );
+    expect(rejected).toContain("Backup could not be verified");
+    expect(rejected).toContain("archive_invalid: zip_not_zip");
+    const html = renderActions(
+      { jobs: [] },
+      up({ kind: "failed", name: "b.zip", size: 9, error: { kind: "uncertain", title: "Upload outcome unknown", message: "Refresh the list before uploading again.", code: null } }),
+    );
+    expect(html).toContain('data-kind="uncertain"');
+    expect(text(html)).toContain("Refresh the list before uploading again.");
+  });
+
+  it("no upload control when restore access is refused", () => {
+    for (const kind of ["session", "loopback", "access"] as const) {
+      expect(renderActions({ error: { kind, message: "refused" } }), kind).not.toContain('data-testid="restore-upload"');
+    }
+    expect(renderActions({ jobs: [job()], error: { kind: "transient", message: "down" } })).toContain('data-testid="restore-upload"');
+  });
+});
+
+describe("1G-B cancel controls", () => {
+  it("only a usable prepared job offers Cancel", () => {
+    const html = renderActions({
+      jobs: [
+        job({ job_id: "r" }),
+        job({ job_id: "x", state: "ready", usable: false }),
+        job({ job_id: "e", state: "executing", usable: false }),
+        succeeded({ job_id: "s" }),
+        failed("none", { job_id: "f" }),
+        job({ job_id: "c", state: "cleanup_pending", usable: false }),
+      ],
+    });
+    expect(html.match(/data-testid="restore-cancel"/g)).toHaveLength(1);
+  });
+
+  it("asks before discarding, disables while busy, and reports the outcome", () => {
+    const asking = renderActions({ jobs: [job()] }, { cancel: { confirming: job().job_id, busy: null, notice: null } });
+    expect(text(asking)).toContain("Discard this prepared restore? Nothing has been restored and no library will change.");
+    expect(asking).toContain('data-testid="restore-cancel-yes"');
+    expect(asking).not.toContain('data-testid="restore-cancel"'); // the question replaces the button
+    const busy = renderActions({ jobs: [job()] }, { cancel: { confirming: null, busy: job().job_id, notice: null } });
+    expect(busy).toMatch(/<button[^>]*disabled=""[^>]*data-testid="restore-cancel"/);
+    expect(text(busy)).toContain("Cancelling\u2026");
+    const done = renderActions({ jobs: [] }, { cancel: { confirming: null, busy: null, notice: { jobId: "j", tone: "bad", text: "This restore has started and can no longer be cancelled." } } });
+    expect(done).toContain('data-tone="bad"');
+    expect(text(done)).toContain("can no longer be cancelled");
+  });
+});
+
+describe("1G-B confirmation secret", () => {
+  it("the view has no input for it, so no rendering can contain it", () => {
+    const SECRET = "S3cr3tS3cr3tS3cr3tS3cr3tS3cr3tS3cr3tS3cr3t1";
+    const prepared = job();
+    // Even a summary object carrying an extra field would not be rendered field by field.
+    const leaky = { ...prepared, confirmation: SECRET } as RestoreJob;
+    const html = renderActions({ jobs: [leaky] }, up({ kind: "prepared", name: "b.zip", job: leaky }), [prepared.job_id]);
+    expect(html).not.toContain(SECRET);
+  });
+});
+
+describe("1G-B loader: a fresh upload is never overwritten by an older list", () => {
+  it("upsert shows the job at once; a list requested before it is discarded; the next list applies", async () => {
+    const calls: ReturnType<typeof deferred>[] = [];
+    const l = new RestoreJobsLoader(
+      () => {
+        const d = deferred();
+        calls.push(d);
+        return d.promise;
+      },
+      () => undefined,
+    );
+    const old = l.refresh(); // in flight before the upload finished
+    l.upsert(job({ job_id: "new" }));
+    expect(l.current.jobs?.map((j) => j.job_id)).toEqual(["new"]);
+    const after = l.refreshAfter();
+    calls[0]!.resolve([]); // the old list (without the new job)
+    await old;
+    expect(l.current.jobs?.map((j) => j.job_id)).toEqual(["new"]); // not overwritten
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toHaveLength(2); // a fresh request followed
+    calls[1]!.resolve([job({ job_id: "new" }), job({ job_id: "other" })]);
+    await after;
+    expect(l.current.jobs?.map((j) => j.job_id)).toEqual(["new", "other"]);
   });
 });

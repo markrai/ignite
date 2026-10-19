@@ -1,9 +1,12 @@
-// Slice 1G-A: Server Settings → Backup & Restore. Read-only: lists this administrator's restore
-// jobs (GET only). Uploading, confirming and cancelling come in later slices, so no control for
-// them is shown. Every server string is rendered as text.
+// Server Settings → Backup & Restore. 1G-A lists this administrator's restore jobs; 1G-B adds
+// uploading a backup for verification (a preview: nothing is restored) and cancelling a prepared
+// restore. Confirming a restore comes in a later slice, so no control for it is shown. Every
+// server string is rendered as text. The one-time confirmation from an upload never reaches this
+// view: it stays inside RestoreActions.
 
 import { useEffect, useRef, useState } from "react";
 import type { ControlApi, RestoreJob, RestoreJobState } from "../api/controlApi";
+import { RestoreActions, type ActionsState, type UploadState } from "./restoreActions";
 import { RestoreJobsLoader, type RestoreJobsState } from "./restoreJobsLoader";
 
 /** While a restore runs, its job is re-read this often (nothing is polled otherwise). */
@@ -87,6 +90,79 @@ function Outcome({ job }: { job: RestoreJob }) {
   );
 }
 
+/** Upload a backup for server-side verification (a preview; nothing is restored). */
+function UploadPanel({ upload, picker, onSelect, onUpload }: { upload: UploadState; picker: number; onSelect: (f: File | null) => void; onUpload: () => void }) {
+  const busy = upload.kind === "uploading";
+  return (
+    <div className="restore-upload" data-testid="restore-upload" data-upload={upload.kind}>
+      <h3>Upload backup</h3>
+      <label className="restore-file">
+        <span className="hint block">Ignite backup file (.zip)</span>
+        <input
+          key={picker}
+          type="file"
+          accept=".zip,application/zip"
+          disabled={busy}
+          onChange={(e) => onSelect(e.currentTarget.files?.[0] ?? null)}
+          data-testid="restore-file"
+          aria-describedby="restore-upload-status"
+        />
+      </label>
+      {(upload.kind === "selected" || upload.kind === "invalid" || upload.kind === "uploading" || upload.kind === "failed") && (
+        <div className="hint" data-testid="restore-file-info">
+          <span className="mono">{upload.name}</span> · {formatBytes(upload.size)}
+        </div>
+      )}
+      {upload.kind === "selected" && upload.warning && <div className="notice warn">{upload.warning}</div>}
+      {upload.kind === "invalid" && (
+        <div role="alert" className="notice bad" data-testid="restore-file-invalid">
+          {upload.message}
+        </div>
+      )}
+      <div className="row-actions">
+        <button className="btn primary" onClick={onUpload} disabled={upload.kind !== "selected"} aria-busy={busy} data-testid="restore-upload-button">
+          {busy ? "Uploading and verifying…" : "Upload and verify"}
+        </button>
+      </div>
+      <div id="restore-upload-status" role="status" aria-live="polite">
+        {busy && (
+          <p className="hint" data-testid="restore-uploading">
+            Uploading and verifying the backup. A large backup can take several minutes; keep this page open.
+          </p>
+        )}
+        {upload.kind === "prepared" && (
+          <div className="notice ok" data-testid="restore-prepared">
+            <strong>Verification complete</strong>
+            <div>
+              {plural(upload.job.totals.libraries, "library", "libraries")} · {plural(upload.job.totals.notebooks, "notebook")} · {plural(upload.job.totals.pages, "page")} ·{" "}
+              {plural(upload.job.totals.blobs, "background file")} ({formatBytes(upload.job.totals.blob_bytes)})
+            </div>
+            <div>
+              <strong>This is a preview. No notebooks have been restored.</strong> Review the libraries below. Confirming a restore will be available in a later version.
+            </div>
+            <span className="hint block">
+              The prepared restore expires in {minutes(upload.job.expires_in_s)}. If this page is reloaded it can still be reviewed or cancelled, but the backup would have
+              to be uploaded again before it can be restored.
+            </span>
+          </div>
+        )}
+        {upload.kind === "failed" && (
+          <div
+            role="alert"
+            className={`notice ${upload.error.kind === "uncertain" || upload.error.kind === "capacity" ? "warn" : "bad"}`}
+            data-testid="restore-upload-error"
+            data-kind={upload.error.kind}
+          >
+            <strong>{upload.error.title}</strong>
+            <div>{upload.error.message}</div>
+            {upload.error.code && <span className="hint block mono">{upload.error.code}</span>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Details({ job, id }: { job: RestoreJob; id: string }) {
   const restored = job.result?.outcome === "succeeded" ? job.result.report.libraries : null;
   const destination = (source: string, proposed: string) => restored?.find((l) => l.source_library_id === source)?.library_id ?? proposed;
@@ -153,18 +229,36 @@ function Details({ job, id }: { job: RestoreJob; id: string }) {
   );
 }
 
+const IDLE_ACTIONS: ActionsState = { upload: { kind: "idle" }, cancel: { confirming: null, busy: null, notice: null }, picker: 0 };
+
+export interface RestoreActionHandlers {
+  onSelect: (file: File | null) => void;
+  onUpload: () => void;
+  onAskCancel: (jobId: string) => void;
+  onKeep: () => void;
+  onCancel: (jobId: string) => void;
+}
+
 export function RestoreJobsView({
   state,
   expanded,
   onToggle,
   onRefresh,
+  actions = IDLE_ACTIONS,
+  handlers,
 }: {
   state: RestoreJobsState;
   expanded: ReadonlySet<string>;
   onToggle: (jobId: string) => void;
   onRefresh: () => void;
+  /** Upload and cancel state (never the one-time confirmation). Omitted: read-only. */
+  actions?: ActionsState;
+  handlers?: RestoreActionHandlers;
 }) {
   const { jobs, loading, error } = state;
+  const { cancel } = actions;
+  // Uploading needs restore access: hidden while it is refused (the server would refuse anyway).
+  const accessRefused = error !== null && error.kind !== "transient";
   return (
     <section className="settings-card" data-testid="restore-card" aria-labelledby="restore-heading">
       <div className="card-head">
@@ -183,6 +277,12 @@ export function RestoreJobsView({
           {error.kind === "transient" && jobs && <span className="hint block">Showing the last list that loaded.</span>}
         </div>
       )}
+      {handlers && !accessRefused && <UploadPanel upload={actions.upload} picker={actions.picker} onSelect={handlers.onSelect} onUpload={handlers.onUpload} />}
+      {cancel.notice && (
+        <div role="status" className={`notice ${cancel.notice.tone}`} data-testid="restore-cancel-notice" data-tone={cancel.notice.tone}>
+          {cancel.notice.text}
+        </div>
+      )}
       {!jobs && !error && (
         <p className="hint" data-testid="restore-loading">
           Loading restore jobs…
@@ -191,7 +291,7 @@ export function RestoreJobsView({
       {jobs && jobs.length === 0 && (
         <div data-testid="restore-empty">
           <p>No restore jobs yet.</p>
-          <p className="hint">Uploading a backup from the browser will be added in a later version.</p>
+          <p className="hint">Upload an Ignite backup to verify it and preview what it would restore.</p>
         </div>
       )}
       {jobs && jobs.length > 0 && (
@@ -220,8 +320,26 @@ export function RestoreJobsView({
                     <button className="btn subtle" aria-expanded={open} aria-controls={detailsId} onClick={() => onToggle(job.job_id)} data-testid="restore-toggle">
                       {open ? "Hide details" : "Details"}
                     </button>
+                    {handlers && job.state === "ready" && job.usable && cancel.confirming !== job.job_id && (
+                      <button className="btn" onClick={() => handlers.onAskCancel(job.job_id)} disabled={cancel.busy !== null} data-testid="restore-cancel">
+                        {cancel.busy === job.job_id ? "Cancelling…" : "Cancel…"}
+                      </button>
+                    )}
                   </div>
                 </div>
+                {handlers && cancel.confirming === job.job_id && (
+                  <div className="notice warn" role="group" aria-label="Discard this prepared restore?" data-testid="restore-cancel-confirm">
+                    <div>Discard this prepared restore? Nothing has been restored and no library will change. To restore this backup later, upload it again.</div>
+                    <div className="row-actions">
+                      <button className="btn primary" onClick={() => handlers.onCancel(job.job_id)} disabled={cancel.busy !== null} data-testid="restore-cancel-yes">
+                        Discard prepared restore
+                      </button>
+                      <button className="btn" onClick={handlers.onKeep} disabled={cancel.busy !== null} data-testid="restore-cancel-no">
+                        Keep
+                      </button>
+                    </div>
+                  </div>
+                )}
                 <Outcome job={job} />
                 {open && <Details job={job} id={detailsId} />}
               </li>
@@ -236,19 +354,40 @@ export function RestoreJobsView({
 /** The Backup & Restore section (its own loading and refresh, independent of the rest). */
 export function RestoreJobs({ api }: { api: ControlApi }) {
   const [state, setState] = useState<RestoreJobsState>({ jobs: null, loading: false, error: null });
+  const [actionsState, setActionsState] = useState<ActionsState>(IDLE_ACTIONS);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const loader = useRef<RestoreJobsLoader | null>(null);
+  // Holds the one-time confirmation of a fresh upload (inside RestoreActions, never in state).
+  const actions = useRef<RestoreActions | null>(null);
 
   useEffect(() => {
     const l = new RestoreJobsLoader(() => api.restoreJobs(), setState);
     loader.current = l;
+    const a = new RestoreActions(api, {
+      onChange: setActionsState,
+      onPrepared: (job) => {
+        l.upsert(job);
+        setExpanded((s) => new Set(s).add(job.job_id));
+        void l.refreshAfter();
+      },
+      refresh: () => void l.refreshAfter(),
+      accessRefused: (e) => l.refuse(e),
+    });
+    actions.current = a;
     const first = setTimeout(() => void l.refresh(), 0);
     return () => {
       clearTimeout(first);
       l.dispose();
+      a.dispose(); // aborts an upload in flight and forgets the confirmation
       if (loader.current === l) loader.current = null;
+      if (actions.current === a) actions.current = null;
     };
   }, [api]);
+
+  // The held confirmation follows what the server shows (cancelled, expired, access lost).
+  useEffect(() => {
+    actions.current?.reconcile(state.jobs, state.error?.kind ?? null);
+  }, [state]);
 
   // Only while a restore runs: re-read the list until it finishes.
   const executing = state.jobs?.some((j) => j.state === "executing") ?? false;
@@ -265,5 +404,14 @@ export function RestoreJobs({ api }: { api: ControlApi }) {
       return next;
     });
 
-  return <RestoreJobsView state={state} expanded={expanded} onToggle={toggle} onRefresh={() => void loader.current?.refresh()} />;
+  const handlers: RestoreActionHandlers = {
+    onSelect: (f) => actions.current?.select(f),
+    onUpload: () => void actions.current?.upload(),
+    onAskCancel: (id) => actions.current?.askCancel(id),
+    onKeep: () => actions.current?.keep(),
+    onCancel: (id) => void actions.current?.cancel(id),
+  };
+  return (
+    <RestoreJobsView state={state} expanded={expanded} onToggle={toggle} onRefresh={() => void loader.current?.refresh()} actions={actionsState} handlers={handlers} />
+  );
 }
