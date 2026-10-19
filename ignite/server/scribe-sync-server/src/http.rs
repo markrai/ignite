@@ -120,6 +120,7 @@ fn store_error(e: StoreError) -> Reply {
             )
         }
         StoreError::Internal(m) => error(500, "internal", m),
+        StoreError::CommitUncertain(m) => error(500, "commit_uncertain", m),
     }
 }
 

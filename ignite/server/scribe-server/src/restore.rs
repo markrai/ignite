@@ -1,10 +1,23 @@
-//! Slice 1F-B1: administrative backup upload and inspection (no restoration yet).
+//! Slice 1F: administrative backup upload, inspection (B1) and confirmed restoration (B2).
 //!
 //! ```text
-//! POST   /control/v1/admin/restore/jobs        raw ZIP (application/zip), streamed → 201 summary
-//! GET    /control/v1/admin/restore/jobs/{id}   the owner's prepared summary
-//! DELETE /control/v1/admin/restore/jobs/{id}   cancel: forget the job, delete its staged archive
+//! POST   /control/v1/admin/restore/jobs              raw ZIP (application/zip), streamed → 201
+//! GET    /control/v1/admin/restore/jobs              the caller's own jobs (no secrets)
+//! GET    /control/v1/admin/restore/jobs/{id}         one of the caller's jobs (incl. its result)
+//! DELETE /control/v1/admin/restore/jobs/{id}         cancel a ready job / dismiss a finished one
+//! POST   /control/v1/admin/restore/jobs/{id}/confirm one-time confirmation → 202, runs the restore
 //! ```
+//!
+//! Job states: `ready` → (confirm) `executing` → `succeeded` | `failed`; a ready job can instead
+//! be cancelled or expire (then `cleanup_pending` until its staging is deleted). Confirmation
+//! consumes the job's one-time secret under the job mutex, so exactly one request can start
+//! it. The restore runs on a worker thread owned by [`RestoreJobs`] (joined when the server's
+//! [`Sweeper`] is dropped) with the server's own `Arc<Store>`, through
+//! `backup_restore::restore_backup` bound to the reviewed archive's SHA-256 and length and to
+//! the job's immutable mapping. The terminal result is kept in memory for
+//! [`RestoreLimits::terminal_ttl_ms`] after the job's staging is deleted, so a client that lost
+//! the 202 can read it. It is not durable: after a server crash the ledger itself (libraries
+//! present or not) is the only record of whether a restore committed.
 //!
 //! Caller (every route, checked from headers before any body byte is read): a **loopback** TCP
 //! peer (defense in depth only: a local proxy could relay remote traffic; `X-Forwarded-*` is
@@ -31,7 +44,7 @@
 //! directory still cannot be removed), and files can only be deleted as far as the operating
 //! system allows (e.g. a file another process holds open on Windows).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -41,15 +54,16 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use backup_archive::{inspect_backup, RestoreErrorKind, RestorePlan};
+use backup_restore::{restore_backup, ImportError, ImportErrorKind, RestoreOptions, RestoreReport};
 use control_protocol::{ClientType, Role};
 use portable_backup::Limits;
 use scribe_sync_server::{
     ControlReply, RequestInfo, Store, StoreError, UploadSlot, UploadTicket, UploadedBody,
 };
 use serde_json::json;
-use sync_protocol::LibraryId;
+use sync_protocol::{LibraryId, Sha256Hex};
 
-use crate::control::{new_id, verifier, Clock, Principal};
+use crate::control::{ct_eq, new_id, verifier, Clock, Principal};
 use crate::fsutil::random_bytes;
 use crate::plane::{cookie_value, csrf_ok, err, has_authorization, json, EventSink, Plane};
 
@@ -72,7 +86,9 @@ pub struct RestoreLimits {
     pub idle_timeout: Duration,
     pub upload_deadline: Duration,
     pub sweep_interval: Duration,
-    /// What the archive may expand to; enforced while inspecting, not just from the manifest.
+    /// How long a finished job's result stays readable (after its staging is deleted).
+    pub terminal_ttl_ms: u64,
+    /// What the archive may expand to; enforced while inspecting and restoring.
     pub verify: Limits,
 }
 
@@ -86,6 +102,7 @@ impl Default for RestoreLimits {
             idle_timeout: Duration::from_secs(30),
             upload_deadline: Duration::from_secs(30 * 60),
             sweep_interval: Duration::from_secs(30),
+            terminal_ttl_ms: 15 * 60 * 1000,
             verify: verification_limits(),
         }
     }
@@ -118,10 +135,14 @@ pub struct RestoreHooks {
     pub fail_cleanup: Arc<AtomicBool>,
     /// Pause a sweep's orphan cleanup after it has begun and before anything is deleted.
     pub orphan_cleanup_gate: Mutex<Option<Arc<CleanupGate>>>,
+    /// Pause a confirmed restore's worker after it started and before the engine runs.
+    pub execution_gate: Mutex<Option<Arc<CleanupGate>>>,
+    /// Pause a worker registration before it takes the registry mutex.
+    pub registration_gate: Mutex<Option<Arc<CleanupGate>>>,
 }
 
-/// Test rendezvous for [`RestoreHooks::orphan_cleanup_gate`]: the sweep signals `started`, then
-/// waits for `resume`.
+/// Test rendezvous for the hooks' gates: the paused code signals `started`, then waits (at most
+/// 10 s) for `resume`.
 pub struct CleanupGate {
     started: Mutex<mpsc::Sender<()>>,
     resume: Mutex<mpsc::Receiver<()>>,
@@ -156,7 +177,7 @@ impl std::fmt::Debug for CleanupGate {
     }
 }
 
-/// Prepared-job lifecycle. 1F-B1 only creates `Ready` jobs; 1F-B2 adds execution.
+/// Job lifecycle (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobState {
     Ready,
@@ -179,20 +200,24 @@ impl JobState {
 struct Job {
     owner: String,
     dir: PathBuf,
-    /// The verified staged archive (read by 1F-B2's confirmation).
-    #[allow(dead_code)]
+    /// The verified staged archive.
     archive: PathBuf,
     plan: RestorePlan,
     /// Immutable proposal: source → fresh destination, in plan order.
     mapping: Vec<(LibraryId, LibraryId)>,
-    /// SHA-256 of the one-time confirmation secret (returned once, never stored; 1F-B2).
-    #[allow(dead_code)]
-    confirmation_verifier: [u8; 32],
+    /// SHA-256 of the one-time confirmation secret (the secret itself is returned once and
+    /// never stored); `None` once consumed.
+    confirmation_verifier: Option<[u8; 32]>,
     expires_ms: u64,
     state: JobState,
     /// Cancelled or expired ([`CANCELLED`] / [`EXPIRED`]): unusable, kept only until its
     /// staging directory is deleted.
     retired: Option<&'static str>,
+    /// Its staging directory still exists (counted against capacity until deleted).
+    holds_staging: bool,
+    /// Terminal (`Succeeded`/`Failed`) only.
+    finished_ms: Option<u64>,
+    outcome: Option<serde_json::Value>,
 }
 
 const CANCELLED: &str = "cancelled";
@@ -207,7 +232,19 @@ impl Job {
     fn usable(&self, now: u64) -> bool {
         self.retired.is_none() && self.state == JobState::Ready && self.expires_ms > now
     }
+
+    fn terminal(&self) -> bool {
+        matches!(self.state, JobState::Succeeded | JobState::Failed)
+    }
+
+    /// A finished job whose result retention has run out (and whose staging is gone).
+    fn result_expired(&self, now: u64, ttl: u64) -> bool {
+        self.terminal() && !self.holds_staging && self.finished_ms.is_some_and(|f| f + ttl <= now)
+    }
 }
+
+/// A job id and its staging directory.
+type JobDir = (String, PathBuf);
 
 /// What one sweep did (for event lines).
 #[derive(Debug, Default)]
@@ -216,8 +253,10 @@ pub struct SweepReport {
     pub expired: Vec<String>,
     /// Retired jobs whose staging is now deleted and which are forgotten.
     pub removed: Vec<String>,
-    /// Retired jobs whose staging could not be deleted (retried next sweep).
+    /// Retired or finished jobs whose staging could not be deleted (retried next sweep).
     pub cleanup_failed: Vec<String>,
+    /// Finished jobs whose result retention ran out.
+    pub results_expired: Vec<String>,
     /// Failed uploads' directories still waiting for deletion.
     pub orphans_pending: usize,
 }
@@ -244,6 +283,29 @@ pub struct RestoreJobs {
     /// Failed uploads' staging directories their drop guard could not delete. An entry leaves
     /// this list only after its directory was deleted, so it is counted until then.
     orphans: Arc<Mutex<Vec<Orphan>>>,
+    /// The server's ledger: attached once the transport has started, released by
+    /// [`RestoreJobs::join_workers`] after the last worker finished.
+    store: Mutex<Option<Arc<Store>>>,
+    /// The single restore-execution slot.
+    executing: Arc<AtomicBool>,
+    /// Restore workers (at most one running) and whether shutdown has begun.
+    workers: Mutex<Workers>,
+}
+
+/// Worker registry. A worker is spawned and registered under this one mutex, and shutdown
+/// closes the registry under it before draining, so every worker that was ever started is
+/// joined, and none can start after shutdown began (it is refused before spawning).
+#[derive(Default)]
+struct Workers {
+    handles: Vec<JoinHandle<()>>,
+    closed: bool,
+}
+
+/// Why a restore worker was not started (the job is then failed, nothing published).
+#[derive(Debug)]
+pub enum StartRefused {
+    ShuttingDown,
+    Spawn(io::Error),
 }
 
 /// Synchronization invariant (capacity is never undercounted, never double-counted):
@@ -252,12 +314,25 @@ pub struct RestoreJobs {
 ///   after deleting the directory, so `pending_cleanup()` counts it throughout;
 /// * the drop guard that registers an orphan runs while its upload still holds the single
 ///   upload permit, so no other upload can be admitted in between;
-/// * a retired job stays in `jobs` until its directory was deleted (`clean_retired`);
+/// * a retired job stays in `jobs` until its directory was deleted (`clean_retired`); a
+///   finished job's `holds_staging` is cleared only after its directory was deleted;
+/// * an `Executing` job's staging is never deleted: the sweeper and DELETE only touch retired
+///   or finished jobs, and every state change is made under the `jobs` mutex;
 /// * lock order is `jobs` then `orphans` (`occupied`); no code takes `jobs` while holding
-///   `orphans`, and no lock is held while deleting.
+///   `orphans` or `workers`, `workers` is never taken while holding `jobs`, and no lock is held
+///   while deleting, restoring or joining a worker.
 struct Orphan {
     path: PathBuf,
     cleaning: bool,
+}
+
+/// The single restore-execution slot; released on drop.
+struct ExecSlot(Arc<AtomicBool>);
+
+impl Drop for ExecSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// The single upload slot; released on drop.
@@ -355,7 +430,65 @@ impl RestoreJobs {
             uploading: Arc::new(AtomicBool::new(false)),
             jobs: Mutex::new(HashMap::new()),
             orphans: Arc::new(Mutex::new(Vec::new())),
+            store: Mutex::new(None),
+            executing: Arc::new(AtomicBool::new(false)),
+            workers: Mutex::new(Workers::default()),
         }
+    }
+
+    /// Give confirmed restores the server's ledger (the same `Arc` the transport serves).
+    pub fn attach_store(&self, store: Arc<Store>) {
+        *self.store.lock().unwrap() = Some(store);
+    }
+
+    /// Is a restore running right now?
+    pub fn restore_in_progress(&self) -> bool {
+        self.executing.load(Ordering::SeqCst)
+    }
+
+    /// Begin shutdown: refuse every later worker, then wait for every registered one (the
+    /// ledger and staging outlive them). No lock is held while joining.
+    pub fn join_workers(&self) {
+        let handles = {
+            let mut w = self.workers.lock().unwrap();
+            w.closed = true;
+            std::mem::take(&mut w.handles)
+        };
+        for h in handles {
+            let _ = h.join();
+        }
+        // No worker can start any more: let the ledger (and its process lock) go.
+        self.store.lock().unwrap().take();
+    }
+
+    /// Has shutdown begun (no new restore worker can start)?
+    pub fn shutting_down(&self) -> bool {
+        self.workers.lock().unwrap().closed
+    }
+
+    /// Spawn `work` on a restore worker thread and register it for joining, atomically with
+    /// respect to [`Self::join_workers`]. Refused (and `work` dropped unrun, releasing what it
+    /// owns) once shutdown began or if the thread cannot be spawned. `work` must not take the
+    /// registry mutex (it is held while spawning).
+    pub fn register_worker(
+        &self,
+        work: impl FnOnce() + Send + 'static,
+    ) -> Result<(), StartRefused> {
+        let gate = self.hooks.registration_gate.lock().unwrap().clone();
+        if let Some(g) = gate {
+            g.pause();
+        }
+        let mut w = self.workers.lock().unwrap();
+        if w.closed {
+            return Err(StartRefused::ShuttingDown);
+        }
+        w.handles.retain(|h| !h.is_finished());
+        let handle = std::thread::Builder::new()
+            .name("restore-worker".into())
+            .spawn(work)
+            .map_err(StartRefused::Spawn)?;
+        w.handles.push(handle);
+        Ok(())
     }
 
     /// Failed uploads' staging directories still waiting for deletion.
@@ -379,10 +512,26 @@ impl RestoreJobs {
         true
     }
 
-    /// Capacity in use: every held job (usable or awaiting cleanup) and every orphan.
+    /// Capacity in use: every job still holding staging (ready, executing, awaiting cleanup,
+    /// or finished with its staging not yet deleted) and every orphan. A finished job whose
+    /// staging is deleted keeps only its in-memory result and uses no capacity.
     fn occupied(&self, jobs: &HashMap<String, Job>, owner: &str) -> (usize, usize) {
-        let mine = jobs.values().filter(|j| j.owner == owner).count();
-        (jobs.len() + self.pending_cleanup(), mine)
+        let held = jobs.values().filter(|j| j.holds_staging);
+        let mine = held.clone().filter(|j| j.owner == owner).count();
+        (held.count() + self.pending_cleanup(), mine)
+    }
+
+    /// Delete a finished job's staging; clear `holds_staging` only once that succeeded.
+    fn clean_finished(&self, id: &str, dir: &Path) -> bool {
+        if self.remove_dir(dir).is_err() {
+            return false;
+        }
+        if let Some(j) = self.jobs.lock().unwrap().get_mut(id) {
+            if j.terminal() {
+                j.holds_staging = false;
+            }
+        }
+        true
     }
 
     pub fn staging_root(&self) -> &Path {
@@ -399,14 +548,15 @@ impl RestoreJobs {
         self.uploading.load(Ordering::SeqCst)
     }
 
-    /// Retire every expired `Ready` job, then delete the staging of every retired job and of
-    /// every orphaned upload; whatever cannot be deleted stays (and counts) for the next sweep.
-    /// Jobs in any other state are never touched (1F-B2: an executing restore owns its
-    /// staging).
+    /// Retire every expired `Ready` job, forget finished jobs whose result retention ran out,
+    /// then delete the staging of every retired job, every finished job and every orphaned
+    /// upload; whatever cannot be deleted stays (and counts) for the next sweep. An
+    /// `Executing` job is never touched: it owns its staging.
     pub fn sweep(&self) -> SweepReport {
         let now = (self.clock)();
+        let ttl = self.limits.terminal_ttl_ms;
         let mut report = SweepReport::default();
-        let retired: Vec<(String, PathBuf)> = {
+        let (retired, finished): (Vec<JobDir>, Vec<JobDir>) = {
             let mut jobs = self.jobs.lock().unwrap();
             for (id, j) in jobs.iter_mut() {
                 if j.retired.is_none() && j.state == JobState::Ready && j.expires_ms <= now {
@@ -414,15 +564,35 @@ impl RestoreJobs {
                     report.expired.push(id.clone());
                 }
             }
-            jobs.iter()
-                .filter(|(_, j)| j.retired.is_some())
-                .map(|(id, j)| (id.clone(), j.dir.clone()))
-                .collect()
+            let gone: Vec<String> = jobs
+                .iter()
+                .filter(|(_, j)| j.result_expired(now, ttl))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in gone {
+                jobs.remove(&id);
+                report.results_expired.push(id);
+            }
+            let dirs = |f: fn(&Job) -> bool| {
+                jobs.iter()
+                    .filter(|(_, j)| f(j))
+                    .map(|(id, j)| (id.clone(), j.dir.clone()))
+                    .collect::<Vec<_>>()
+            };
+            (
+                dirs(|j| j.retired.is_some()),
+                dirs(|j| j.terminal() && j.holds_staging),
+            )
         };
         for (id, dir) in retired {
             if self.clean_retired(&id, &dir) {
                 report.removed.push(id);
             } else {
+                report.cleanup_failed.push(id);
+            }
+        }
+        for (id, dir) in finished {
+            if !self.clean_finished(&id, &dir) {
                 report.cleanup_failed.push(id);
             }
         }
@@ -524,12 +694,19 @@ impl RestoreJobs {
         } else {
             j.state.as_str()
         };
+        // Ready: until the prepared job expires; finished: until its result is forgotten.
+        let until = match j.finished_ms {
+            Some(f) => f + self.limits.terminal_ttl_ms,
+            None => j.expires_ms,
+        };
         json!({
             "v": 1,
             "job_id": id,
             "state": state,
             "usable": j.usable(now),
-            "expires_in_s": j.expires_ms.saturating_sub(now) / 1000,
+            "cleanup_pending": j.retired.is_some() || (j.terminal() && j.holds_staging),
+            "result": j.outcome,
+            "expires_in_s": until.saturating_sub(now) / 1000,
             "archive": {
                 "sha256": p.archive_sha256.as_str(),
                 "bytes": p.archive_bytes,
@@ -570,12 +747,14 @@ impl RestoreJobs {
 pub struct Sweeper {
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    jobs: Option<Arc<RestoreJobs>>,
 }
 
 impl Sweeper {
     pub fn start(jobs: Arc<RestoreJobs>, events: EventSink) -> Self {
         let (tx, rx) = mpsc::channel::<()>();
         let interval = jobs.limits.sweep_interval;
+        let owned = Arc::clone(&jobs);
         let thread = std::thread::Builder::new()
             .name("restore-sweeper".into())
             .spawn(move || {
@@ -587,15 +766,21 @@ impl Sweeper {
         Self {
             stop: Some(tx),
             thread: Some(thread),
+            jobs: Some(owned),
         }
     }
 }
 
 impl Drop for Sweeper {
+    /// Stops the sweeper, then waits for a running restore: the worker holds the ledger
+    /// (`Arc<Store>`) and its staging until it has recorded its result.
     fn drop(&mut self) {
         drop(self.stop.take());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+        if let Some(j) = self.jobs.take() {
+            j.join_workers();
         }
     }
 }
@@ -604,6 +789,11 @@ fn log_sweep(events: &EventSink, r: &SweepReport) {
     for id in &r.expired {
         events(&format!(
             "scribe-server event=restore_job_expired job_id={id}"
+        ));
+    }
+    for id in &r.results_expired {
+        events(&format!(
+            "scribe-server event=restore_result_expired job_id={id}"
         ));
     }
     for id in &r.cleanup_failed {
@@ -775,11 +965,7 @@ impl Plane {
                 return err(500, "internal", "could not read the staged upload")
             }
             Err(e) => {
-                let code = match e.kind {
-                    RestoreErrorKind::Zip(c) => format!("zip_{}", c.as_str()),
-                    RestoreErrorKind::Backup(c) => format!("backup_{}", c.as_str()),
-                    _ => "invalid".into(),
-                };
+                let code = archive_code(e.kind);
                 self.event(
                     "restore_upload_refused",
                     &[("by", &up.owner), ("archive_error", &code)],
@@ -833,10 +1019,13 @@ impl Plane {
             archive: up.archive.clone(),
             plan,
             mapping,
-            confirmation_verifier: verifier(&secret),
+            confirmation_verifier: Some(verifier(&secret)),
             expires_ms: now + jobs.limits.job_ttl_ms,
             state: JobState::Ready,
             retired: None,
+            holds_staging: true,
+            finished_ms: None,
+            outcome: None,
         };
         let mut out = jobs.summary(&id, &job, now);
         out["confirmation"] = json!(confirmation);
@@ -855,7 +1044,13 @@ impl Plane {
 
     /// `GET /control/v1/admin/restore/jobs` (the caller's own jobs) and
     /// `GET`/`DELETE /control/v1/admin/restore/jobs/{id}` (CSRF already checked by `handle`).
-    pub(crate) fn restore_route(&self, req: &RequestInfo, rest: &[&str]) -> ControlReply {
+    pub(crate) fn restore_route(
+        &self,
+        ledger: &Store,
+        req: &RequestInfo,
+        rest: &[&str],
+        body: &[u8],
+    ) -> ControlReply {
         let p = match self.restore_principal(req) {
             Ok(p) => p,
             Err(r) => return r,
@@ -863,6 +1058,7 @@ impl Plane {
         match (rest, req.method.as_str()) {
             (["jobs"], "GET") => self.restore_list(&p),
             (["jobs", id], method @ ("GET" | "DELETE")) => self.restore_job(&p, id, method),
+            (["jobs", id, "confirm"], "POST") => self.restore_confirm(ledger, req, &p, id, body),
             _ => err(404, "not_found", "unknown admin route"),
         }
     }
@@ -897,6 +1093,34 @@ impl Plane {
             } else {
                 err(409, "job_executing", "This restore is running.")
             };
+        }
+        if job.terminal() {
+            if job.result_expired(now, self.restore.limits.terminal_ttl_ms) {
+                table.remove(id);
+                return err(404, "not_found", "No such restore job.");
+            }
+            if method == "GET" {
+                return json(200, &self.restore.summary(id, job, now));
+            }
+            // Dismiss a finished job: its staging first, then the record.
+            let (held, dir) = (job.holds_staging, job.dir.clone());
+            drop(table);
+            if held && !self.restore.clean_finished(id, &dir) {
+                self.event("restore_cleanup_failed", &[("job_id", id)]);
+                return err(
+                    500,
+                    "cleanup_failed",
+                    "The restore's staged data could not be deleted yet. Deletion is retried automatically.",
+                );
+            }
+            let mut table = self.restore.jobs.lock().unwrap();
+            if table
+                .get(id)
+                .is_some_and(|j| j.terminal() && !j.holds_staging)
+            {
+                table.remove(id);
+            }
+            return json(200, &json!({ "ok": true, "job_id": id }));
         }
         if method == "GET" && job.usable(now) {
             return json(200, &self.restore.summary(id, job, now));
@@ -937,6 +1161,387 @@ impl Plane {
     }
 }
 
+/// `zip_<code>` / `backup_<code>` for an archive refusal.
+fn archive_code(kind: RestoreErrorKind) -> String {
+    match kind {
+        RestoreErrorKind::Zip(c) => format!("zip_{}", c.as_str()),
+        RestoreErrorKind::Backup(c) => format!("backup_{}", c.as_str()),
+        _ => "invalid".into(),
+    }
+}
+
+/// What a confirmed restore needs, copied out of the job under its mutex.
+struct Execution {
+    id: String,
+    archive: PathBuf,
+    dir: PathBuf,
+    mapping: BTreeMap<LibraryId, LibraryId>,
+    archive_sha256: Sha256Hex,
+    archive_bytes: u64,
+}
+
+fn success_outcome(r: &RestoreReport) -> serde_json::Value {
+    json!({
+        "outcome": "succeeded",
+        "publication": "complete",
+        "report": {
+            "archive_sha256": r.archive_sha256.as_str(),
+            "archive_bytes": r.archive_bytes,
+            "libraries": r.libraries.iter().map(|l| json!({
+                "source_library_id": l.source_library_id.to_string(),
+                "library_id": l.library_id.to_string(),
+                "source_snapshot_sha256": l.source_snapshot_sha256.as_str(),
+                "restored_snapshot_sha256": l.restored_snapshot_sha256.as_str(),
+                "notebook_count": l.notebook_count,
+                "page_count": l.page_count,
+            })).collect::<Vec<_>>(),
+            "blobs_installed": r.blobs_installed,
+            "blobs_already_present": r.blobs_already_present,
+        },
+    })
+}
+
+/// Whether a failed restore published its libraries. `restore_backup` publishes only through
+/// `Store::bootstrap_many`'s single `COMMIT`; every other failure happens before it or rolls the
+/// transaction back, so nothing of this restore is visible (`"none"`). A failing `COMMIT`
+/// itself cannot be classified by the caller (`"unknown"`: the ledger is the authority).
+/// Destinations that exist are never counted: they may predate the restore.
+fn publication_of(e: &ImportError) -> &'static str {
+    match &e.kind {
+        ImportErrorKind::Store(code) if code == "commit_uncertain" => "unknown",
+        _ => "none",
+    }
+}
+
+/// A failed restore: a stable code, a message without paths or archive contents, whether this
+/// restore published anything (`"none"` or `"unknown"`, see [`publication_of`]), and
+/// `unindexed_blob_files_possible`, true when the failure can happen after verified blob files
+/// were installed (Slice 1E: harmless, reused by a later restore).
+fn failure_outcome(e: &ImportError, publication: &str) -> serde_json::Value {
+    let (code, message, after_install): (String, String, bool) = match &e.kind {
+        ImportErrorKind::Mapping => ("mapping_invalid".into(), e.message.clone(), false),
+        ImportErrorKind::Conflict => ("conflict".into(), e.message.clone(), true),
+        ImportErrorKind::Archive(k) => (
+            format!("archive_invalid_{}", archive_code(*k)),
+            e.message.clone(),
+            false,
+        ),
+        ImportErrorKind::ArchiveMismatch => (
+            "archive_changed".into(),
+            "The staged archive is not the one that was reviewed; nothing was restored.".into(),
+            false,
+        ),
+        ImportErrorKind::TooLarge => (
+            "archive_too_large".into(),
+            "The staged archive exceeds the restore limit.".into(),
+            false,
+        ),
+        ImportErrorKind::Store(c) => (
+            format!("store_{c}"),
+            "The ledger refused or failed to publish the restore.".into(),
+            true,
+        ),
+        ImportErrorKind::Io => (
+            "io_error".into(),
+            "A filesystem error stopped the restore.".into(),
+            true,
+        ),
+        ImportErrorKind::Interrupted => (
+            "interrupted".into(),
+            "The restore was interrupted.".into(),
+            true,
+        ),
+    };
+    json!({
+        "outcome": "failed",
+        "error": code,
+        "message": message,
+        "publication": publication,
+        "unindexed_blob_files_possible": after_install,
+    })
+}
+
+impl RestoreJobs {
+    /// Start the worker for a claimed job. It owns the execution slot and the ledger `Arc`;
+    /// if it is refused, both are released without running anything.
+    fn spawn_worker(
+        self: &Arc<Self>,
+        store: Arc<Store>,
+        events: EventSink,
+        ex: Execution,
+        slot: ExecSlot,
+    ) -> Result<(), StartRefused> {
+        let jobs = Arc::clone(self);
+        self.register_worker(move || jobs.execute(&store, &events, ex, slot))
+    }
+
+    /// The worker: restore the reviewed archive with the approved mapping, record the terminal
+    /// result, then delete the job's staging (retried by the sweeper if that fails). The slot
+    /// is released only after the result is recorded.
+    fn execute(&self, store: &Store, events: &EventSink, ex: Execution, slot: ExecSlot) {
+        let gate = self.hooks.execution_gate.lock().unwrap().clone();
+        if let Some(g) = gate {
+            g.pause();
+        }
+        let options = RestoreOptions {
+            limits: self.limits.verify,
+            max_archive_bytes: Some(self.limits.max_upload_bytes),
+            expected_archive_sha256: Some(ex.archive_sha256.clone()),
+            expected_archive_bytes: Some(ex.archive_bytes),
+            ..RestoreOptions::default()
+        };
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            restore_backup(store, &ex.archive, &ex.mapping, &options)
+        }));
+        let (state, outcome) = match &run {
+            Ok(Ok(report)) => (JobState::Succeeded, success_outcome(report)),
+            Ok(Err(e)) => (JobState::Failed, failure_outcome(e, publication_of(e))),
+            // The engine stopped at an unknown point: publication cannot be ruled out.
+            Err(_) => {
+                let e = ImportError {
+                    kind: ImportErrorKind::Store("internal".into()),
+                    message: "restore worker panicked".into(),
+                };
+                (JobState::Failed, failure_outcome(&e, "unknown"))
+            }
+        };
+        let line = match &run {
+            Ok(Ok(r)) => format!(
+                "scribe-server event=restore_succeeded job_id={} libraries={} blobs_installed={}",
+                ex.id,
+                r.libraries.len(),
+                r.blobs_installed
+            ),
+            _ => format!(
+                "scribe-server event=restore_failed job_id={} error={}",
+                ex.id,
+                outcome["error"].as_str().unwrap_or("internal")
+            ),
+        };
+        if let Some(j) = self.jobs.lock().unwrap().get_mut(&ex.id) {
+            j.state = state;
+            j.finished_ms = Some((self.clock)());
+            j.outcome = Some(outcome);
+        }
+        events(&line);
+        if !self.clean_finished(&ex.id, &ex.dir) {
+            events(&format!(
+                "scribe-server event=restore_cleanup_failed job_id={}",
+                ex.id
+            ));
+        }
+        drop(slot);
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmRequest {
+    v: u32,
+    confirmation: String,
+    archive_sha256: String,
+    destinations: Vec<ConfirmDestination>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmDestination {
+    source_library_id: String,
+    destination_library_id: String,
+}
+
+impl Plane {
+    /// `POST /control/v1/admin/restore/jobs/{id}/confirm`: the caller (already checked, CSRF
+    /// included) confirms exactly the reviewed archive and mapping with the one-time secret.
+    /// Under the job mutex the job is checked and moved `Ready` → `Executing`, consuming the
+    /// secret; the restore then runs on the worker and this returns 202.
+    fn restore_confirm(
+        &self,
+        ledger: &Store,
+        req: &RequestInfo,
+        p: &Principal,
+        id: &str,
+        body: &[u8],
+    ) -> ControlReply {
+        let media = req
+            .content_type
+            .as_deref()
+            .and_then(|c| c.split(';').next())
+            .map(str::trim);
+        if !media.is_some_and(|m| m.eq_ignore_ascii_case("application/json")) {
+            return err(
+                400,
+                "wrong_content_type",
+                "the confirmation must be sent as application/json",
+            );
+        }
+        let Ok(c) = serde_json::from_slice::<ConfirmRequest>(body) else {
+            return err(
+                400,
+                "bad_request",
+                "expected {v, confirmation, archive_sha256, destinations}",
+            );
+        };
+        if c.v != 1 {
+            return err(400, "unsupported_version", "confirmation version must be 1");
+        }
+        let id_ok = |s: &str| s.len() <= 36;
+        if c.confirmation.len() > 64
+            || c.archive_sha256.len() > 64
+            || c.destinations.len() > self.restore.limits.verify.max_libraries
+            || !c
+                .destinations
+                .iter()
+                .all(|d| id_ok(&d.source_library_id) && id_ok(&d.destination_library_id))
+        {
+            return err(400, "bad_request", "a confirmation field is too long");
+        }
+        let Some(store) = self.restore.store.lock().unwrap().clone() else {
+            return if self.restore.shutting_down() {
+                err(
+                    503,
+                    "shutting_down",
+                    "The server is shutting down; nothing was restored.",
+                )
+            } else {
+                err(500, "internal", "restore is not available yet")
+            };
+        };
+        if !std::ptr::eq(store.as_ref(), ledger) {
+            return err(500, "internal", "ledger mismatch");
+        }
+        // Always hashed, so a malformed secret costs the same as a wrong one.
+        let presented =
+            verifier(&control_protocol::b64url_decode(&c.confirmation).unwrap_or_default());
+        let offered: BTreeSet<(String, String)> = c
+            .destinations
+            .iter()
+            .map(|d| {
+                (
+                    d.source_library_id.clone(),
+                    d.destination_library_id.clone(),
+                )
+            })
+            .collect();
+        let now = self.store.now();
+        let mut table = self.restore.jobs.lock().unwrap();
+        // Unknown and foreign-owned jobs are indistinguishable.
+        let Some(job) = table.get_mut(id).filter(|j| j.owner == p.device_id) else {
+            return err(404, "not_found", "No such restore job.");
+        };
+        match job.retired {
+            Some(CANCELLED) => {
+                return err(410, "cancelled", "This prepared restore was cancelled.")
+            }
+            Some(_) => {
+                return err(
+                    410,
+                    "expired",
+                    "This prepared restore expired. Upload the backup again.",
+                )
+            }
+            None => {}
+        }
+        if job.state != JobState::Ready {
+            return err(
+                409,
+                "already_confirmed",
+                "This restore was already confirmed.",
+            );
+        }
+        if job.expires_ms <= now {
+            return err(
+                410,
+                "expired",
+                "This prepared restore expired. Upload the backup again.",
+            );
+        }
+        // One combined answer: which part did not match is not disclosed.
+        let approved: BTreeSet<(String, String)> = job
+            .mapping
+            .iter()
+            .map(|(s, d)| (s.to_string(), d.to_string()))
+            .collect();
+        let secret_ok = job
+            .confirmation_verifier
+            .is_some_and(|v| ct_eq(&presented, &v));
+        let archive_ok = c.archive_sha256 == job.plan.archive_sha256.as_str();
+        let mapping_ok = offered.len() == c.destinations.len() && offered == approved;
+        if !(secret_ok & archive_ok & mapping_ok) {
+            return err(
+                403,
+                "confirmation_mismatch",
+                "The confirmation does not match this prepared restore.",
+            );
+        }
+        // The execution slot is taken before the secret is consumed: a busy server leaves the
+        // job ready to be confirmed later.
+        if self
+            .restore
+            .executing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return err(
+                429,
+                "restore_busy",
+                "Another restore is running. Confirm again when it has finished.",
+            );
+        }
+        let slot = ExecSlot(Arc::clone(&self.restore.executing));
+        job.state = JobState::Executing;
+        job.confirmation_verifier = None;
+        let ex = Execution {
+            id: id.to_string(),
+            archive: job.archive.clone(),
+            dir: job.dir.clone(),
+            mapping: job.mapping.iter().copied().collect(),
+            archive_sha256: job.plan.archive_sha256.clone(),
+            archive_bytes: job.plan.archive_bytes,
+        };
+        drop(table);
+        self.event("restore_confirmed", &[("job_id", id), ("by", &p.device_id)]);
+        if let Err(refused) = self
+            .restore
+            .spawn_worker(store, self.events.clone(), ex, slot)
+        {
+            // Nothing ran; the slot was released with the refused work. The secret stays
+            // consumed: the job is finished (failed), never left executing.
+            let (status, code, message) = match refused {
+                StartRefused::ShuttingDown => (
+                    503,
+                    "shutting_down",
+                    "The server is shutting down; nothing was restored.",
+                ),
+                StartRefused::Spawn(_) => (
+                    500,
+                    "internal",
+                    "The restore could not be started; nothing was restored.",
+                ),
+            };
+            let mut table = self.restore.jobs.lock().unwrap();
+            if let Some(j) = table.get_mut(id) {
+                j.state = JobState::Failed;
+                j.finished_ms = Some(now);
+                j.outcome = Some(json!({
+                    "outcome": "failed",
+                    "error": code,
+                    "message": message,
+                    "publication": "none",
+                    "unindexed_blob_files_possible": false,
+                }));
+            }
+            drop(table);
+            self.event("restore_failed", &[("job_id", id), ("error", code)]);
+            return err(status, code, message);
+        }
+        json(
+            202,
+            &json!({ "v": 1, "job_id": id, "state": JobState::Executing.as_str() }),
+        )
+    }
+}
+
 /// One fresh, unused identity per archive library (never a source id of this archive, never
 /// an existing library, never repeated).
 fn propose_destinations(
@@ -974,4 +1579,111 @@ fn propose_destinations(
         out.push((l.source_library_id, id));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jobs() -> RestoreJobs {
+        RestoreJobs::new(
+            std::env::temp_dir().join("scribe-restore-unit-unused"),
+            Arc::new(|| 0),
+            RestoreLimits::default(),
+        )
+    }
+
+    fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !f() {
+            assert!(std::time::Instant::now() < end, "timed out: {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_registered_worker_and_refuses_later_ones() {
+        let jobs = Arc::new(jobs());
+        let (release, wait) = mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&finished);
+        jobs.register_worker(move || {
+            let _ = wait.recv();
+            f.store(true, Ordering::SeqCst);
+        })
+        .unwrap();
+        let j = Arc::clone(&jobs);
+        let f = Arc::clone(&finished);
+        let shutdown = std::thread::spawn(move || {
+            j.join_workers();
+            f.load(Ordering::SeqCst)
+        });
+        wait_until("shutdown began", || jobs.shutting_down());
+        release.send(()).unwrap();
+        assert!(
+            shutdown.join().unwrap(),
+            "join_workers returned only after the worker"
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        assert!(matches!(
+            jobs.register_worker(move || r.store(true, Ordering::SeqCst)),
+            Err(StartRefused::ShuttingDown)
+        ));
+        assert!(!ran.load(Ordering::SeqCst), "a refused worker never runs");
+    }
+
+    #[test]
+    fn a_registration_racing_shutdown_cannot_escape_joining() {
+        let jobs = Arc::new(jobs());
+        let (gate, started, resume) = CleanupGate::new();
+        *jobs.hooks.registration_gate.lock().unwrap() = Some(gate);
+        let ran = Arc::new(AtomicBool::new(false));
+        // What the work owns (e.g. the execution slot) must be released if it is refused.
+        let owned = Arc::new(());
+        let (j, r, o) = (Arc::clone(&jobs), Arc::clone(&ran), Arc::clone(&owned));
+        let registering = std::thread::spawn(move || {
+            j.register_worker(move || {
+                let _keep = o;
+                r.store(true, Ordering::SeqCst);
+            })
+        });
+        // The registration has begun; shutdown drains the registry before it completes.
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        jobs.join_workers();
+        resume.send(()).unwrap();
+        let result = registering.join().unwrap();
+        assert!(
+            matches!(result, Err(StartRefused::ShuttingDown)),
+            "{result:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "no worker escaped shutdown");
+        assert_eq!(Arc::strong_count(&owned), 1, "the refused work was dropped");
+        assert!(jobs.workers.lock().unwrap().handles.is_empty());
+    }
+
+    #[test]
+    fn publication_is_unknown_only_for_an_uncertain_commit() {
+        let e = |kind| ImportError {
+            kind,
+            message: String::new(),
+        };
+        for kind in [
+            ImportErrorKind::Mapping,
+            ImportErrorKind::Conflict,
+            ImportErrorKind::ArchiveMismatch,
+            ImportErrorKind::TooLarge,
+            ImportErrorKind::Io,
+            ImportErrorKind::Interrupted,
+            ImportErrorKind::Store("internal".into()),
+            ImportErrorKind::Store("missing_blobs".into()),
+        ] {
+            assert_eq!(publication_of(&e(kind.clone())), "none", "{kind:?}");
+        }
+        let uncertain = e(ImportErrorKind::Store("commit_uncertain".into()));
+        assert_eq!(publication_of(&uncertain), "unknown");
+        let out = failure_outcome(&uncertain, publication_of(&uncertain));
+        assert_eq!(out["publication"], "unknown");
+        assert!(out.get("libraries_published").is_none());
+    }
 }

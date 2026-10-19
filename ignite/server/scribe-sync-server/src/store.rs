@@ -94,12 +94,27 @@ CREATE TABLE IF NOT EXISTS blobs (
 /// is a protocol/sequencing/storage condition.
 #[derive(Debug)]
 pub enum StoreError {
-    BadRequest { code: &'static str, message: String },
-    NotFound { code: &'static str, message: String },
-    Conflict { code: &'static str, message: String },
-    Semantic { index: usize, error: SemanticError },
+    BadRequest {
+        code: &'static str,
+        message: String,
+    },
+    NotFound {
+        code: &'static str,
+        message: String,
+    },
+    Conflict {
+        code: &'static str,
+        message: String,
+    },
+    Semantic {
+        index: usize,
+        error: SemanticError,
+    },
     MissingBlobs(Vec<String>),
     Internal(String),
+    /// `COMMIT` of [`Store::bootstrap_many`] itself failed: SQLite may or may not have made
+    /// the transaction durable, so whether its libraries were published is unknown.
+    CommitUncertain(String),
 }
 
 impl StoreError {
@@ -132,6 +147,7 @@ impl std::fmt::Display for StoreError {
             Self::Semantic { index, error } => write!(f, "envelope {index}: {error}"),
             Self::MissingBlobs(v) => write!(f, "missing blobs: {v:?}"),
             Self::Internal(m) => write!(f, "internal: {m}"),
+            Self::CommitUncertain(m) => write!(f, "commit outcome unknown: {m}"),
         }
     }
 }
@@ -153,6 +169,9 @@ pub struct FaultHooks {
     pub fail_drop_response_after_commit: AtomicBool,
     /// `bootstrap_many`: fail after inserting this many libraries, before `COMMIT` (0 = off).
     pub fail_bootstrap_many_after_libraries: AtomicUsize,
+    /// `bootstrap_many`: commit, then report `CommitUncertain` (the ambiguous case in which the
+    /// libraries were in fact published).
+    pub fail_bootstrap_many_after_commit: AtomicBool,
     /// `install_blob_file`: fail its Nth directory sync (1 = blob's prefix directory,
     /// 2 = blob root, 3 = data directory; 0 = off), on every platform.
     pub fail_blob_dir_sync: AtomicUsize,
@@ -424,8 +443,9 @@ impl Store {
     ///    `libraries` + `current_state` rows are inserted at sequence 0;
     /// 3. `COMMIT` — only after every library was inserted.
     ///
-    /// Any error rolls the whole transaction back: no library and no index row from this call
-    /// becomes visible. Readers (WAL snapshots) see either none or all of the new libraries.
+    /// Any error before `COMMIT` rolls the whole transaction back: no library and no index row
+    /// from this call becomes visible. A failing `COMMIT` is reported as `CommitUncertain`.
+    /// Readers (WAL snapshots) see either none or all of the new libraries.
     /// Blob *files* are outside this transaction; see `install_blob_file`.
     pub fn bootstrap_many(
         &self,
@@ -517,7 +537,18 @@ impl Store {
                 )));
             }
         }
-        tx.commit()?;
+        // The one point at which a failure leaves publication unknown to the caller.
+        tx.commit()
+            .map_err(|e| StoreError::CommitUncertain(format!("sqlite: {e}")))?;
+        if self
+            .hooks
+            .fail_bootstrap_many_after_commit
+            .load(Ordering::SeqCst)
+        {
+            return Err(StoreError::CommitUncertain(
+                "injected failure after COMMIT".into(),
+            ));
+        }
         Ok(out)
     }
 

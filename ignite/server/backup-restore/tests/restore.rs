@@ -770,3 +770,39 @@ fn install_blob_file_never_trusts_or_overwrites() {
     ));
     assert!(!blob_file(&data.0, &sha2).exists());
 }
+
+#[test]
+fn an_unexpected_archive_identity_is_refused_before_anything_is_installed() {
+    let backup = Backup::create();
+    let bytes = std::fs::read(&backup.path).unwrap();
+    let (sha, len) = (sha256_hex(&bytes), bytes.len() as u64);
+    let other = sha256_hex(b"another archive");
+    for (want_sha, want_len) in [
+        (Some(other.clone()), None),
+        (None, Some(len + 1)),
+        (Some(other), Some(len)),
+        (Some(sha.clone()), Some(len - 1)),
+    ] {
+        let data = TempDir::new("identity");
+        let store = Store::open(&data.0).unwrap();
+        assert!(store.bootstrap(&unrelated_library()).unwrap().1);
+        let o = RestoreOptions {
+            expected_archive_sha256: want_sha,
+            expected_archive_bytes: want_len,
+            ..opts()
+        };
+        // Store byte-identical (no blob file, no index row, no library), also after reopening.
+        let (got, _) = fails_without_change(&data, store, &backup.path, &mapping(), &o);
+        assert_eq!(got, K::ArchiveMismatch);
+    }
+    // The expected archive restores normally.
+    let data = TempDir::new("identity-ok");
+    let store = Store::open(&data.0).unwrap();
+    let o = RestoreOptions {
+        expected_archive_sha256: Some(sha.clone()),
+        expected_archive_bytes: Some(len),
+        ..opts()
+    };
+    let report = restore_backup(&store, &backup.path, &mapping(), &o).unwrap();
+    assert_eq!((report.archive_sha256, report.archive_bytes), (sha, len));
+}

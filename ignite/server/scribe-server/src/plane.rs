@@ -491,7 +491,7 @@ impl ControlPlane for Plane {
                 r
             }
             // Restore routes have their own, stricter caller rule (see `restore`).
-            (["admin", "restore", rest @ ..], _) => self.restore_route(req, rest),
+            (["admin", "restore", rest @ ..], _) => self.restore_route(ledger, req, rest, body),
             (["admin", rest @ ..], _) => match self.principal(req) {
                 Some((p, _)) if p.role == Role::Admin => {
                     if rest == ["server"] && method == "GET" {

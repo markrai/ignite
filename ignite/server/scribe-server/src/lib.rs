@@ -127,7 +127,7 @@ pub fn serve_with_restore_limits(
         lan: Some(lan),
         restore: Arc::clone(&restore_jobs),
     });
-    let restore_sweeper = restore::Sweeper::start(restore_jobs, plane.events.clone());
+    let restore_sweeper = restore::Sweeper::start(Arc::clone(&restore_jobs), plane.events.clone());
     let handle = ServerHandle::start_with(
         config.server.listen,
         ledger,
@@ -137,6 +137,9 @@ pub fn serve_with_restore_limits(
             control: Some(plane.clone() as Arc<dyn scribe_sync_server::ControlPlane>),
         },
     )?;
+    // Confirmed restores run with the transport's own ledger `Arc` (one `Store`, one process
+    // lock); `restore_sweeper` joins a running restore before the ledger can be dropped.
+    restore_jobs.attach_store(Arc::clone(&handle.store));
     let advertisement = if config.discovery.advertise {
         match discovery::Advertisement::start(
             id.server_id,

@@ -55,6 +55,9 @@ pub enum ImportErrorKind {
     Archive(ArchiveKind),
     /// The archive exceeds the acquisition bound.
     TooLarge,
+    /// The acquired archive is not the one the caller expected (`RestoreOptions::
+    /// expected_archive_sha256` / `expected_archive_bytes`); nothing was installed.
+    ArchiveMismatch,
     /// The store refused publication (code from `StoreError`).
     Store(String),
     /// Local filesystem failure while acquiring or staging.
@@ -103,6 +106,9 @@ impl From<StoreError> for ImportError {
             StoreError::Internal(_) => {
                 Self::new(ImportErrorKind::Store("internal".into()), message)
             }
+            StoreError::CommitUncertain(_) => {
+                Self::new(ImportErrorKind::Store("commit_uncertain".into()), message)
+            }
         }
     }
 }
@@ -132,6 +138,11 @@ pub struct RestoreOptions {
     pub limits: Limits,
     /// Largest archive accepted for acquisition; `None` derives a bound from `limits`.
     pub max_archive_bytes: Option<u64>,
+    /// When set, the private copy must hash to exactly this (e.g. the archive an administrator
+    /// reviewed); checked right after acquisition, before verification or any installation.
+    pub expected_archive_sha256: Option<Sha256Hex>,
+    /// When set, the private copy must have exactly this many bytes.
+    pub expected_archive_bytes: Option<u64>,
     #[doc(hidden)]
     pub fail_point: Option<FailPoint>,
     /// Tests only: run `f(staging_dir)` at `point` and continue (e.g. to tamper with staged
@@ -145,6 +156,8 @@ impl Default for RestoreOptions {
         Self {
             limits: Limits::DEFAULT,
             max_archive_bytes: None,
+            expected_archive_sha256: None,
+            expected_archive_bytes: None,
             fail_point: None,
             staging_hook: None,
         }
@@ -206,6 +219,21 @@ pub fn restore_backup(
         .max_archive_bytes
         .unwrap_or_else(|| default_max_archive_bytes(&options.limits));
     let (archive_bytes, archive_sha256) = acquire(archive, &staging.path("archive.zip"), max)?;
+    if options
+        .expected_archive_sha256
+        .as_ref()
+        .is_some_and(|want| *want != archive_sha256)
+        || options
+            .expected_archive_bytes
+            .is_some_and(|want| want != archive_bytes)
+    {
+        return Err(ImportError::new(
+            ImportErrorKind::ArchiveMismatch,
+            format!(
+                "the archive ({archive_bytes} bytes, sha256 {archive_sha256}) is not the expected one"
+            ),
+        ));
+    }
 
     // 2. Verify the copy completely, staging re-keyed snapshots and verified blob bytes.
     let mut sink = StagingSink {
