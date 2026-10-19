@@ -62,6 +62,210 @@ export interface ServerStatusAdmin {
   pending_requests: number;
 }
 
+// --- Slice 1F/1G-A: backup restore jobs (read-only in the browser) ------------------------
+//
+// Mirrors the summaries `scribe-server` returns for `GET /control/v1/admin/restore/jobs[/{id}]`
+// (ignite/server/scribe-server/src/restore.rs). Those never contain the one-time confirmation
+// secret, and `parseRestoreJob` copies known fields only, so nothing else can reach the UI.
+
+/** `expired`: a ready job past its deadline that the server has not withdrawn yet. */
+export type RestoreJobState = "ready" | "executing" | "succeeded" | "failed" | "expired" | "cleanup_pending";
+/** `complete`: published; `none`: this restore published nothing; `unknown`: COMMIT outcome unknown. */
+export type Publication = "complete" | "none" | "unknown";
+
+export interface RestoreArchive {
+  sha256: string;
+  bytes: number;
+  format: string;
+  format_version: number;
+  snapshot_version: number;
+}
+
+export interface RestoreLibraryPlan {
+  source_library_id: string;
+  /** Proposed until a restore succeeds; never an existing library. */
+  destination_library_id: string;
+  source_snapshot_sha256: string;
+  source_snapshot_bytes: number;
+  source_through_server_seq: number;
+  notebook_count: number;
+  page_count: number;
+  blob_count: number;
+}
+
+export interface RestoredLibrary {
+  source_library_id: string;
+  library_id: string;
+  source_snapshot_sha256: string;
+  restored_snapshot_sha256: string;
+  notebook_count: number;
+  page_count: number;
+}
+
+export type RestoreResult =
+  | {
+      outcome: "succeeded";
+      publication: "complete";
+      report: {
+        archive_sha256: string;
+        archive_bytes: number;
+        libraries: RestoredLibrary[];
+        blobs_installed: number;
+        blobs_already_present: number;
+      };
+    }
+  | {
+      outcome: "failed";
+      error: string;
+      message: string;
+      publication: "none" | "unknown";
+      unindexed_blob_files_possible: boolean;
+    };
+
+export interface RestoreJob {
+  job_id: string;
+  state: RestoreJobState;
+  /** Ready, not expired, not withdrawn (confirmation is not available in the browser yet). */
+  usable: boolean;
+  /** Staged files are still being deleted (a finished restore keeps its result). */
+  cleanup_pending: boolean;
+  /** Ready: until the prepared job expires; finished: until its result is forgotten. */
+  expires_in_s: number;
+  archive: RestoreArchive;
+  scope: string;
+  not_restored: string[];
+  totals: { libraries: number; notebooks: number; pages: number; blobs: number; blob_bytes: number };
+  libraries: RestoreLibraryPlan[];
+  warnings: string[];
+  /** Present once the job is `succeeded` or `failed`. */
+  result: RestoreResult | null;
+}
+
+const JOB_STATES: readonly string[] = ["ready", "executing", "succeeded", "failed", "expired", "cleanup_pending"];
+
+function unsupported(what: string): ControlError {
+  return new ControlError(0, "unsupported_response", `The server returned an unexpected restore response (${what}).`);
+}
+
+type Obj = Record<string, unknown>;
+const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
+function str(o: Obj, k: string): string {
+  const v = o[k];
+  if (typeof v !== "string") throw unsupported(k);
+  return v;
+}
+function num(o: Obj, k: string): number {
+  const v = o[k];
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) throw unsupported(k);
+  return v;
+}
+function bool(o: Obj, k: string): boolean {
+  const v = o[k];
+  if (typeof v !== "boolean") throw unsupported(k);
+  return v;
+}
+function obj(o: Obj, k: string): Obj {
+  const v = o[k];
+  if (!isObj(v)) throw unsupported(k);
+  return v;
+}
+function list(o: Obj, k: string): unknown[] {
+  const v = o[k];
+  if (!Array.isArray(v)) throw unsupported(k);
+  return v;
+}
+const strings = (o: Obj, k: string): string[] =>
+  list(o, k).map((x) => {
+    if (typeof x !== "string") throw unsupported(k);
+    return x;
+  });
+
+function parseResult(v: unknown): RestoreResult | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw unsupported("result");
+  if (v.outcome === "succeeded" && v.publication === "complete") {
+    const r = obj(v, "report");
+    return {
+      outcome: "succeeded",
+      publication: "complete",
+      report: {
+        archive_sha256: str(r, "archive_sha256"),
+        archive_bytes: num(r, "archive_bytes"),
+        libraries: list(r, "libraries").map((l) => {
+          if (!isObj(l)) throw unsupported("report.libraries");
+          return {
+            source_library_id: str(l, "source_library_id"),
+            library_id: str(l, "library_id"),
+            source_snapshot_sha256: str(l, "source_snapshot_sha256"),
+            restored_snapshot_sha256: str(l, "restored_snapshot_sha256"),
+            notebook_count: num(l, "notebook_count"),
+            page_count: num(l, "page_count"),
+          };
+        }),
+        blobs_installed: num(r, "blobs_installed"),
+        blobs_already_present: num(r, "blobs_already_present"),
+      },
+    };
+  }
+  if (v.outcome === "failed" && (v.publication === "none" || v.publication === "unknown")) {
+    return {
+      outcome: "failed",
+      error: str(v, "error"),
+      message: str(v, "message"),
+      publication: v.publication,
+      unindexed_blob_files_possible: bool(v, "unindexed_blob_files_possible"),
+    };
+  }
+  throw unsupported("result");
+}
+
+/** Validate one job summary (version 1), keeping only the fields above. */
+export function parseRestoreJob(v: unknown): RestoreJob {
+  if (!isObj(v) || v.v !== 1) throw unsupported("version");
+  const state = str(v, "state");
+  if (!JOB_STATES.includes(state)) throw unsupported("state");
+  const a = obj(v, "archive");
+  const t = obj(v, "totals");
+  return {
+    job_id: str(v, "job_id"),
+    state: state as RestoreJobState,
+    usable: bool(v, "usable"),
+    cleanup_pending: bool(v, "cleanup_pending"),
+    expires_in_s: num(v, "expires_in_s"),
+    archive: {
+      sha256: str(a, "sha256"),
+      bytes: num(a, "bytes"),
+      format: str(a, "format"),
+      format_version: num(a, "format_version"),
+      snapshot_version: num(a, "snapshot_version"),
+    },
+    scope: str(v, "scope"),
+    not_restored: strings(v, "not_restored"),
+    totals: {
+      libraries: num(t, "libraries"),
+      notebooks: num(t, "notebooks"),
+      pages: num(t, "pages"),
+      blobs: num(t, "blobs"),
+      blob_bytes: num(t, "blob_bytes"),
+    },
+    libraries: list(v, "libraries").map((l) => {
+      if (!isObj(l)) throw unsupported("libraries");
+      return {
+        source_library_id: str(l, "source_library_id"),
+        destination_library_id: str(l, "destination_library_id"),
+        source_snapshot_sha256: str(l, "source_snapshot_sha256"),
+        source_snapshot_bytes: num(l, "source_snapshot_bytes"),
+        source_through_server_seq: num(l, "source_through_server_seq"),
+        notebook_count: num(l, "notebook_count"),
+        page_count: num(l, "page_count"),
+        blob_count: num(l, "blob_count"),
+      };
+    }),
+    warnings: strings(v, "warnings"),
+    result: parseResult(v.result),
+  };
+}
+
 export class ControlError extends Error {
   constructor(
     readonly status: number,
@@ -77,7 +281,8 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
 const BASE = "/control/v1";
 
-async function request<T>(fetchFn: FetchLike, method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+/** `gone`: whether HTTP 410 is a normal answer (pairing polls) or an error (restore jobs). */
+async function request<T>(fetchFn: FetchLike, method: "GET" | "POST", path: string, body?: unknown, gone: "answer" | "error" = "answer"): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (method === "POST") {
     headers["X-Scribe-Request"] = "1";
@@ -103,7 +308,7 @@ async function request<T>(fetchFn: FetchLike, method: "GET" | "POST", path: stri
   } catch {
     // non-JSON (e.g. a developer sync server without a control plane)
   }
-  if (!resp.ok && resp.status !== 410) {
+  if (!resp.ok && (resp.status !== 410 || gone === "error")) {
     const e = (json ?? {}) as { error?: string; message?: string };
     throw new ControlError(resp.status, e.error ?? "http_error", e.message ?? `Server error ${resp.status}`);
   }
@@ -123,6 +328,10 @@ export interface ControlApi {
   server(): Promise<ServerStatusAdmin>;
   /** Clear this browser's session cookie (the device record stays until revoked). */
   logout(): Promise<void>;
+  /** This administrator's restore jobs (read-only; never a confirmation secret). */
+  restoreJobs(): Promise<RestoreJob[]>;
+  /** One of this administrator's restore jobs (404 unknown/foreign, 410 expired/cancelled). */
+  restoreJob(jobId: string): Promise<RestoreJob>;
 }
 
 export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init)): ControlApi {
@@ -159,6 +368,13 @@ export function createControlApi(fetchFn: FetchLike = (i, init) => fetch(i, init
     logout: async () => {
       await request(fetchFn, "POST", "/session/logout");
     },
+    restoreJobs: async () => {
+      const v = await request<unknown>(fetchFn, "GET", "/admin/restore/jobs", undefined, "error");
+      if (!isObj(v) || v.v !== 1 || !Array.isArray(v.jobs)) throw unsupported("job list");
+      return v.jobs.map(parseRestoreJob);
+    },
+    restoreJob: async (id) =>
+      parseRestoreJob(await request<unknown>(fetchFn, "GET", `/admin/restore/jobs/${encodeURIComponent(id)}`, undefined, "error")),
   };
 }
 

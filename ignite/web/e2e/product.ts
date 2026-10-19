@@ -5,9 +5,9 @@
 
 import { test as base, expect, type BrowserContext } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { manifest, REPO_ROOT, snapshotText, WEB_DIR, WEB_DIST } from "./harness";
 
 const FIX = join(WEB_DIR, "tests/fixtures");
@@ -18,6 +18,17 @@ export function productBin(): string {
   );
 }
 
+/**
+ * The real backup exporter (`ignite-backup-export`): `IGNITE_BACKUP_EXPORT_BIN`, else Cargo's
+ * debug build, honouring `CARGO_TARGET_DIR` as `cargo build` in the global setup does.
+ */
+export function exportBin(): string {
+  const custom = process.env.IGNITE_BACKUP_EXPORT_BIN;
+  if (custom) return custom;
+  const target = process.env.CARGO_TARGET_DIR ? resolve(REPO_ROOT, process.env.CARGO_TARGET_DIR) : join(REPO_ROOT, "target");
+  return join(target, "debug", process.platform === "win32" ? "ignite-backup-export.exe" : "ignite-backup-export");
+}
+
 export interface ProductServer {
   url: string;
   host: string;
@@ -25,7 +36,11 @@ export interface ProductServer {
   setupCode: string;
   serverId(): Promise<string>;
   /** Harness-side control-plane call with an optional admin cookie / bearer. */
-  call(method: string, path: string, opts?: { cookie?: string; bearer?: string; body?: unknown; csrf?: boolean }): Promise<{ status: number; json: unknown; setCookie: string | null }>;
+  call(
+    method: string,
+    path: string,
+    opts?: { cookie?: string; bearer?: string; body?: unknown; csrf?: boolean; contentType?: string },
+  ): Promise<{ status: number; json: unknown; setCookie: string | null }>;
   /** Claim via HTTP (harness as the first admin); returns the admin cookie value. */
   claimAsHarness(): Promise<string>;
   /** Pair the harness "Kindle" (approved with `adminCookie`); returns its credential. */
@@ -33,6 +48,8 @@ export interface ProductServer {
   /** Seed the fixture library with a device credential (genesis + blob). */
   seedFixture(bearer: string): Promise<void>;
   head(bearer: string): Promise<number>;
+  /** A real Slice 1C backup of this server (`ignite-backup-export`, credential via env only). */
+  exportBackup(bearer: string): Uint8Array;
   operations(bearer: string): Promise<{ server_seq: number; envelope: string }[]>;
   restart(): Promise<void>;
 }
@@ -84,6 +101,7 @@ async function startProduct(): Promise<{ server: ProductServer; stop: () => void
     if (opts.bearer) headers.Authorization = `Bearer ${opts.bearer}`;
     if (opts.csrf ?? method !== "GET") headers["X-Scribe-Request"] = "1";
     let body: BodyInit | undefined;
+    if (opts.contentType) headers["Content-Type"] = opts.contentType;
     if (opts.body instanceof Uint8Array) body = opts.body as Uint8Array<ArrayBuffer>;
     else if (typeof opts.body === "string") body = opts.body;
     else if (opts.body !== undefined) {
@@ -127,6 +145,13 @@ async function startProduct(): Promise<{ server: ProductServer; stop: () => void
       const blob = new Uint8Array(readFileSync(join(FIX, manifest.blob.file)));
       expect((await call("PUT", `/v1/blobs/${manifest.blob.sha256}`, { bearer, body: blob, csrf: false })).status).toBeLessThan(300);
       expect((await call("POST", "/v1/libraries", { bearer, body: snapshotText, csrf: false })).status).toBe(201);
+    },
+    exportBackup(bearer) {
+      const out = join(dir, `backup-${Date.now()}.zip`);
+      const bin = exportBin();
+      if (!existsSync(bin)) throw new Error(`backup exporter missing: ${bin} (set IGNITE_BACKUP_EXPORT_BIN or build -p backup-export)`);
+      execFileSync(bin, ["--server", url, "--out", out], { env: { ...process.env, IGNITE_BACKUP_BEARER: bearer }, stdio: "pipe" });
+      return new Uint8Array(readFileSync(out));
     },
     async head(bearer) {
       return ((await call("GET", `/v1/libraries/${manifest.library_id}`, { bearer })).json as { head_server_seq: number }).head_server_seq;
