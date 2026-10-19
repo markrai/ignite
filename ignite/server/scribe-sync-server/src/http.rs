@@ -442,6 +442,9 @@ pub struct RequestInfo {
     /// without a CORS preflight, which this server never grants).
     pub scribe_request: Option<String>,
     pub user_agent: Option<String>,
+    pub content_type: Option<String>,
+    /// `Content-Length` as received (unparsed).
+    pub content_length: Option<String>,
 }
 
 impl RequestInfo {
@@ -466,6 +469,8 @@ impl RequestInfo {
             host: h("host"),
             scribe_request: h("x-scribe-request"),
             user_agent: h("user-agent"),
+            content_type: h("content-type"),
+            content_length: h("content-length"),
         }
     }
 
@@ -494,10 +499,260 @@ pub trait ControlPlane: Send + Sync + 'static {
     fn accept(&self, _local: SocketAddr, _peer: SocketAddr) -> bool {
         true
     }
+    /// Is this `/control/...` request a streaming upload (instead of the 64 KiB in-memory
+    /// path)? Headers only, no I/O. Default: no streaming routes.
+    fn upload_route(&self, _req: &RequestInfo) -> bool {
+        false
+    }
+    /// Authorize and prepare a streaming upload. Blocking; called before any body byte is
+    /// read. An `Err` reply is sent with `Connection: close` and the body is never read (so an
+    /// `Expect: 100-continue` client is never told to send it).
+    fn begin_upload(&self, _store: &Store, _req: &RequestInfo) -> Result<UploadSlot, ControlReply> {
+        Err(control_error(404, "not_found", "unknown control route"))
+    }
+    /// The whole body was written to the slot's sink and flushed; the sink is closed. Blocking.
+    fn finish_upload(
+        &self,
+        _store: &Store,
+        _req: &RequestInfo,
+        _ticket: UploadTicket,
+        _body: UploadedBody,
+    ) -> ControlReply {
+        control_error(404, "not_found", "unknown control route")
+    }
+}
+
+/// Plane-owned state of one streaming upload (e.g. the private file's cleanup guard and the
+/// concurrency permit). The transport drops it on every failure path, after the sink.
+pub type UploadTicket = Box<dyn std::any::Any + Send>;
+
+/// A streaming upload accepted by [`ControlPlane::begin_upload`].
+pub struct UploadSlot {
+    /// Where the body goes (written off the reactor, in arrival order).
+    pub sink: Box<dyn std::io::Write + Send>,
+    /// Refused (413) as soon as more bytes than this arrive, whatever `Content-Length` said.
+    pub max_bytes: u64,
+    /// Longest wait for the next body frame.
+    pub idle_timeout: Duration,
+    /// Longest whole transfer (including waiting for a slow sink).
+    pub deadline: Duration,
+    pub ticket: UploadTicket,
+}
+
+/// A completely received upload body.
+#[derive(Clone, Debug)]
+pub struct UploadedBody {
+    pub bytes: u64,
+    pub sha256: sync_protocol::Sha256Hex,
+}
+
+/// Chunks queued between the connection task and the blocking writer (backpressure: the
+/// connection stops reading while the queue is full).
+const UPLOAD_QUEUE: usize = 8;
+/// Largest queued chunk. Each body frame (whatever size hyper hands over) is copied into
+/// chunks of at most this size, so a queued chunk never keeps a larger frame buffer alive.
+pub const UPLOAD_CHUNK: usize = 64 * 1024;
+/// Most upload payload bytes ever waiting in the queue: 512 KiB. Besides the queue, one
+/// upload holds at most the frame being split (bounded by hyper's read buffer), the chunk
+/// the writer is writing, and the plane's sink buffer.
+pub const MAX_QUEUED_UPLOAD_BYTES: usize = UPLOAD_QUEUE * UPLOAD_CHUNK;
+
+/// `data` as owned chunks of at most `max` bytes, in order.
+fn bounded_chunks(data: &[u8], max: usize) -> impl Iterator<Item = Bytes> + '_ {
+    data.chunks(max).map(Bytes::copy_from_slice)
 }
 
 /// Largest control-plane request body.
 pub const MAX_CONTROL_BODY: usize = 64 * 1024;
+
+fn control_error(status: u16, code: &str, message: &str) -> ControlReply {
+    ControlReply {
+        status,
+        content_type: "application/json",
+        body: serde_json::to_vec(&serde_json::json!({ "error": code, "message": message }))
+            .expect("serializable"),
+        headers: Vec::new(),
+    }
+}
+
+/// A reply sent before or while an upload body is unread: the connection is closed afterwards
+/// instead of reading (draining) what is left of a possibly enormous body.
+fn closing(mut reply: ControlReply) -> hyper::Response<Full<Bytes>> {
+    reply.headers.push(("Connection", "close".into()));
+    respond_control(reply)
+}
+
+enum Chunk {
+    Data(Bytes),
+    End,
+}
+
+enum StreamFailure {
+    TooLarge,
+    Body,
+    Idle,
+    Deadline,
+    WriterGone,
+}
+
+/// Read body frames into the writer queue, enforcing the byte cap, idle timeout and deadline.
+async fn stream_body(
+    body: &mut Incoming,
+    tx: &tokio::sync::mpsc::Sender<Chunk>,
+    max: u64,
+    idle: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(), StreamFailure> {
+    let mut total = 0u64;
+    loop {
+        let now = tokio::time::Instant::now();
+        let wait = idle.min(deadline.saturating_duration_since(now));
+        let frame = match tokio::time::timeout(wait, body.frame()).await {
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                return Err(StreamFailure::Deadline)
+            }
+            Err(_) => return Err(StreamFailure::Idle),
+            Ok(None) => break,
+            Ok(Some(Err(_))) => return Err(StreamFailure::Body),
+            Ok(Some(Ok(f))) => f,
+        };
+        let Ok(data) = frame.into_data() else {
+            continue; // trailers carry no content
+        };
+        total = total.saturating_add(data.len() as u64);
+        if total > max {
+            return Err(StreamFailure::TooLarge);
+        }
+        for chunk in bounded_chunks(&data, UPLOAD_CHUNK) {
+            match tokio::time::timeout_at(deadline, tx.send(Chunk::Data(chunk))).await {
+                Err(_) => return Err(StreamFailure::Deadline),
+                Ok(Err(_)) => return Err(StreamFailure::WriterGone),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+    match tokio::time::timeout_at(deadline, tx.send(Chunk::End)).await {
+        Err(_) => Err(StreamFailure::Deadline),
+        Ok(Err(_)) => Err(StreamFailure::WriterGone),
+        Ok(Ok(())) => Ok(()),
+    }
+}
+
+/// Blocking writer: drains the queue into the sink while hashing. A closed queue without
+/// `End` (connection dropped, limit, timeout) is an abort. The sink is always closed before
+/// the ticket is released, so the plane's cleanup never races an open file.
+fn write_upload(
+    mut sink: Box<dyn std::io::Write + Send>,
+    ticket: UploadTicket,
+    mut rx: tokio::sync::mpsc::Receiver<Chunk>,
+) -> Result<(UploadedBody, UploadTicket), Option<std::io::Error>> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut bytes = 0u64;
+    let result = loop {
+        match rx.blocking_recv() {
+            Some(Chunk::Data(b)) => {
+                if let Err(e) = sink.write_all(&b) {
+                    break Err(Some(e));
+                }
+                h.update(&b);
+                bytes += b.len() as u64;
+            }
+            Some(Chunk::End) => break sink.flush().map_err(Some),
+            None => break Err(None),
+        }
+    };
+    drop(rx);
+    drop(sink);
+    match result {
+        Ok(()) => {
+            let d: [u8; 32] = h.finalize().into();
+            Ok((
+                UploadedBody {
+                    bytes,
+                    sha256: sync_protocol::Sha256Hex::from_digest(&d),
+                },
+                ticket,
+            ))
+        }
+        Err(e) => {
+            drop(ticket);
+            Err(e)
+        }
+    }
+}
+
+fn storage_full(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::StorageFull
+        || e.kind() == std::io::ErrorKind::QuotaExceeded
+        || matches!(e.raw_os_error(), Some(28) if cfg!(unix))
+        || matches!(e.raw_os_error(), Some(39 | 112) if cfg!(windows))
+}
+
+/// A streaming control upload: authorize from headers, then stream the body to the plane's
+/// sink through a bounded queue and a blocking writer, then let the plane finish it.
+async fn serve_upload(
+    control: Arc<dyn ControlPlane>,
+    store: Arc<Store>,
+    info: RequestInfo,
+    mut body: Incoming,
+) -> hyper::Response<Full<Bytes>> {
+    let internal = || control_error(500, "internal", "upload failed");
+    let begin = {
+        let (control, store, info) = (Arc::clone(&control), Arc::clone(&store), info.clone());
+        tokio::task::spawn_blocking(move || control.begin_upload(&store, &info)).await
+    };
+    let slot = match begin {
+        Ok(Ok(slot)) => slot,
+        Ok(Err(reply)) => return closing(reply),
+        Err(_) => return closing(internal()),
+    };
+    let UploadSlot {
+        sink,
+        max_bytes,
+        idle_timeout,
+        deadline,
+        ticket,
+    } = slot;
+    let deadline = tokio::time::Instant::now() + deadline;
+    let (tx, rx) = tokio::sync::mpsc::channel(UPLOAD_QUEUE);
+    // If this future is dropped (client gone), `tx` is dropped with it and the writer aborts
+    // on its own: it never outlives the queue.
+    let writer = tokio::task::spawn_blocking(move || write_upload(sink, ticket, rx));
+    let streamed = stream_body(&mut body, &tx, max_bytes, idle_timeout, deadline).await;
+    drop(tx);
+    let written = writer.await;
+    let failure = match (streamed, written) {
+        (Ok(()), Ok(Ok((uploaded, ticket)))) => {
+            let reply = tokio::task::spawn_blocking(move || {
+                control.finish_upload(&store, &info, ticket, uploaded)
+            })
+            .await
+            .unwrap_or_else(|_| internal());
+            return respond_control(reply);
+        }
+        (_, Ok(Err(Some(e)))) if storage_full(&e) => control_error(
+            507,
+            "insufficient_storage",
+            "not enough space to store the upload",
+        ),
+        (_, Ok(Err(Some(_)))) | (Err(StreamFailure::WriterGone), _) => internal(),
+        (Err(StreamFailure::TooLarge), _) => {
+            control_error(413, "body_too_large", &format!("limit {max_bytes} bytes"))
+        }
+        (Err(StreamFailure::Body), _) => {
+            control_error(400, "bad_body", "the request body could not be read")
+        }
+        (Err(StreamFailure::Idle), _) => {
+            control_error(408, "upload_idle_timeout", "no upload data arrived in time")
+        }
+        (Err(StreamFailure::Deadline), _) => {
+            control_error(408, "upload_deadline", "the upload took too long")
+        }
+        _ => internal(),
+    };
+    closing(failure)
+}
 
 fn respond_control(reply: ControlReply) -> hyper::Response<Full<Bytes>> {
     let mut b = hyper::Response::builder()
@@ -565,6 +820,10 @@ async fn serve_request(
         if path == "/control" || path.starts_with("/control/") {
             let (parts, body) = req.into_parts();
             let info = RequestInfo::from_parts(&parts, peer);
+            if control.upload_route(&info) {
+                let control = Arc::clone(control);
+                return Ok(serve_upload(control, store, info, body).await);
+            }
             let body = match Limited::new(body, MAX_CONTROL_BODY).collect().await {
                 Ok(c) => c.to_bytes(),
                 Err(_) => {
@@ -788,5 +1047,109 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    /// Records every write the upload writer makes.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl std::io::Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn data(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn frames_are_split_into_bounded_chunks_in_order() {
+        assert_eq!(MAX_QUEUED_UPLOAD_BYTES, 512 * 1024);
+        for n in [
+            0,
+            1,
+            UPLOAD_CHUNK - 1,
+            UPLOAD_CHUNK,
+            UPLOAD_CHUNK + 1,
+            3 * UPLOAD_CHUNK + 17,
+        ] {
+            let d = data(n);
+            let chunks: Vec<Bytes> = bounded_chunks(&d, UPLOAD_CHUNK).collect();
+            assert_eq!(chunks.len(), n.div_ceil(UPLOAD_CHUNK), "{n}");
+            assert!(chunks
+                .iter()
+                .all(|c| !c.is_empty() && c.len() <= UPLOAD_CHUNK));
+            assert_eq!(chunks.concat(), d, "{n}: order and content preserved");
+        }
+    }
+
+    /// Run the blocking writer on its own thread and feed it `frames`, split as the connection
+    /// task splits them; `end` sends the end marker, otherwise the queue is just dropped.
+    type Written = Result<(UploadedBody, UploadTicket), Option<std::io::Error>>;
+
+    fn run_writer(frames: &[Vec<u8>], end: bool) -> (Written, Recorder, Arc<AtomicBool>) {
+        let rec = Recorder::default();
+        let released = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::mpsc::channel(UPLOAD_QUEUE);
+        let sink = Box::new(rec.clone());
+        let ticket: UploadTicket = Box::new(DropFlag(Arc::clone(&released)));
+        let writer = std::thread::spawn(move || write_upload(sink, ticket, rx));
+        for f in frames {
+            for c in bounded_chunks(f, UPLOAD_CHUNK) {
+                tx.blocking_send(Chunk::Data(c)).ok().unwrap();
+            }
+        }
+        if end {
+            tx.blocking_send(Chunk::End).ok().unwrap();
+        }
+        drop(tx);
+        (writer.join().unwrap(), rec, released)
+    }
+
+    #[test]
+    fn the_writer_receives_bounded_chunks_and_hashes_exactly_the_body() {
+        // One frame far larger than a chunk, then small and odd-sized ones.
+        let frames = vec![data(5 * UPLOAD_CHUNK + 3), data(10), data(UPLOAD_CHUNK + 1)];
+        let body = frames.concat();
+        let (r, rec, released) = run_writer(&frames, true);
+        let (uploaded, ticket) = r.unwrap();
+        assert_eq!(uploaded.bytes, body.len() as u64);
+        assert_eq!(uploaded.sha256, sync_protocol::sha256_hex(&body));
+        let writes = rec.0.lock().unwrap();
+        assert!(writes.iter().all(|w| w.len() <= UPLOAD_CHUNK));
+        assert_eq!(writes.concat(), body, "every byte, in order");
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the ticket goes to finish_upload"
+        );
+        drop(ticket);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_queue_closed_without_the_end_marker_is_an_abort() {
+        let (r, _, released) = run_writer(&[data(3 * UPLOAD_CHUNK)], false);
+        assert!(matches!(r, Err(None)));
+        assert!(released.load(Ordering::SeqCst), "the ticket's cleanup ran");
     }
 }

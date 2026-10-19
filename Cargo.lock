@@ -901,19 +901,26 @@ dependencies = [
 name = "scribe-server"
 version = "0.9.11"
 dependencies = [
+ "backup-archive",
+ "backup-export",
+ "backup-restore",
  "control-protocol",
  "ctrlc",
  "getrandom 0.3.4",
  "if-addrs",
  "mdns-sd",
+ "portable-backup",
  "rusqlite",
  "scribe-sync-server",
  "serde",
  "serde_json",
  "sha2",
+ "sync-engine",
+ "sync-protocol",
  "toml",
  "ureq",
  "uuid",
+ "zip",
 ]
 
 [[package]]

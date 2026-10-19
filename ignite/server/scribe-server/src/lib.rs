@@ -7,6 +7,7 @@
 //! <state_dir>/server.json      ServerId (durable identity)
 //! <state_dir>/control.sqlite   control plane (devices, pairing, claim state)
 //! <state_dir>/ledger/          notebook ledger (scribe-sync-server Store: ledger.sqlite3, blobs/)
+//! <state_dir>/ledger/restore-staging/job-*   private restore staging (removed at startup)
 //! ```
 
 pub mod config;
@@ -16,6 +17,7 @@ pub mod fsutil;
 pub mod identity;
 pub mod netpolicy;
 pub mod plane;
+pub mod restore;
 
 use std::sync::Arc;
 
@@ -30,6 +32,8 @@ pub struct Running {
     pub handle: ServerHandle,
     pub plane: Arc<Plane>,
     pub advertisement: Option<discovery::Advertisement>,
+    /// Expires prepared restore jobs; stopped (joined) when dropped.
+    pub restore_sweeper: restore::Sweeper,
 }
 
 /// Prepare state (identity + control DB); used by `init` and `serve`.
@@ -69,10 +73,45 @@ pub fn serve_with_policy(
     events: EventSink,
     lan: Arc<netpolicy::LanPolicy>,
 ) -> Result<Running, String> {
+    serve_with_restore_limits(
+        config,
+        clock,
+        events,
+        lan,
+        restore::RestoreLimits::default(),
+    )
+}
+
+/// [`serve_with_policy`] with explicit restore limits (tests use small sizes and timeouts).
+pub fn serve_with_restore_limits(
+    config: &Config,
+    clock: Clock,
+    events: EventSink,
+    lan: Arc<netpolicy::LanPolicy>,
+    restore_limits: restore::RestoreLimits,
+) -> Result<Running, String> {
     let (id, _, control) = prepare(config, clock.clone())?;
     let ledger_dir = config.ledger_dir();
     fsutil::ensure_private_dir(&ledger_dir)?;
     let ledger = Store::open(&ledger_dir).map_err(|e| format!("ledger: {e:?}"))?;
+    // Abandoned restore staging (a crash, or prepared jobs of the previous process). Safe only
+    // here: `Store::open` holds the ledger's exclusive process lock and nothing is served yet.
+    let removed = backup_restore::remove_restore_staging(&ledger)
+        .map_err(|e| format!("restore staging cleanup: {e}"))?;
+    if removed > 0 {
+        events(&format!(
+            "scribe-server event=restore_staging_removed count={removed}"
+        ));
+    }
+    let staging_root = ledger
+        .restore_staging_root()
+        .map_err(|e| format!("restore staging: {e:?}"))?;
+    fsutil::ensure_private_dir(&staging_root)?;
+    let restore_jobs = Arc::new(restore::RestoreJobs::new(
+        staging_root,
+        clock.clone(),
+        restore_limits,
+    ));
     let web_root = match &config.server.web_root {
         Some(p) => Some(WebRoot::new(p, &[&config.server.state_dir])?),
         None => None,
@@ -86,7 +125,9 @@ pub fn serve_with_policy(
         limiter: RateLimiter::new(),
         events,
         lan: Some(lan),
+        restore: Arc::clone(&restore_jobs),
     });
+    let restore_sweeper = restore::Sweeper::start(restore_jobs, plane.events.clone());
     let handle = ServerHandle::start_with(
         config.server.listen,
         ledger,
@@ -119,6 +160,7 @@ pub fn serve_with_policy(
         handle,
         plane,
         advertisement,
+        restore_sweeper,
     })
 }
 

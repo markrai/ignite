@@ -23,10 +23,13 @@ use control_protocol::{
     ServerId, ServerStatus, SessionInfo, StatusResponse, CONTROL_VERSION, CSRF_HEADER,
     PAIRING_TTL_S, SESSION_COOKIE,
 };
-use scribe_sync_server::{ControlPlane, ControlReply, RequestInfo, Store};
+use scribe_sync_server::{
+    ControlPlane, ControlReply, RequestInfo, Store, UploadSlot, UploadTicket, UploadedBody,
+};
 use serde::Serialize;
 
 use crate::control::{ControlError, ControlStore, Principal};
+use crate::restore::RestoreJobs;
 
 pub type EventSink = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -82,9 +85,11 @@ pub struct Plane {
     pub events: EventSink,
     /// D1.1 network boundary (None = accept everything; tests of other behavior only).
     pub lan: Option<std::sync::Arc<crate::netpolicy::LanPolicy>>,
+    /// Slice 1F: prepared backup-restore jobs (`/control/v1/admin/restore/*`).
+    pub restore: Arc<RestoreJobs>,
 }
 
-fn json<T: Serialize>(status: u16, v: &T) -> ControlReply {
+pub(crate) fn json<T: Serialize>(status: u16, v: &T) -> ControlReply {
     ControlReply {
         status,
         content_type: "application/json",
@@ -93,7 +98,7 @@ fn json<T: Serialize>(status: u16, v: &T) -> ControlReply {
     }
 }
 
-fn err(status: u16, code: &str, message: &str) -> ControlReply {
+pub(crate) fn err(status: u16, code: &str, message: &str) -> ControlReply {
     json(
         status,
         &serde_json::json!({ "error": code, "message": message }),
@@ -110,7 +115,7 @@ fn clear_cookie() -> String {
     format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
 }
 
-fn cookie_value(cookie: Option<&str>) -> Option<&str> {
+pub(crate) fn cookie_value(cookie: Option<&str>) -> Option<&str> {
     cookie?
         .split(';')
         .map(str::trim)
@@ -120,6 +125,11 @@ fn cookie_value(cookie: Option<&str>) -> Option<&str> {
 
 fn bearer(auth: Option<&str>) -> Option<&str> {
     auth?.strip_prefix("Bearer ").map(str::trim)
+}
+
+/// Any `Authorization` header at all (restore routes accept the session cookie only).
+pub(crate) fn has_authorization(req: &RequestInfo) -> bool {
+    req.authorization.is_some()
 }
 
 /// `Origin` (if present) must name the same host as `Host`, and the CSRF marker is required.
@@ -155,7 +165,7 @@ fn peer_ip(req: &RequestInfo) -> String {
 }
 
 impl Plane {
-    fn event(&self, what: &str, fields: &[(&str, &str)]) {
+    pub(crate) fn event(&self, what: &str, fields: &[(&str, &str)]) {
         let mut line = format!("scribe-server event={what}");
         for (k, v) in fields {
             line.push_str(&format!(" {k}={v}"));
@@ -480,6 +490,8 @@ impl ControlPlane for Plane {
                 r.headers.push(("Set-Cookie", clear_cookie()));
                 r
             }
+            // Restore routes have their own, stricter caller rule (see `restore`).
+            (["admin", "restore", rest @ ..], _) => self.restore_route(req, rest),
             (["admin", rest @ ..], _) => match self.principal(req) {
                 Some((p, _)) if p.role == Role::Admin => {
                     if rest == ["server"] && method == "GET" {
@@ -512,6 +524,24 @@ impl ControlPlane for Plane {
             );
         }
         false
+    }
+
+    fn upload_route(&self, req: &RequestInfo) -> bool {
+        Self::is_restore_upload(req)
+    }
+
+    fn begin_upload(&self, _ledger: &Store, req: &RequestInfo) -> Result<UploadSlot, ControlReply> {
+        self.restore_begin_upload(req)
+    }
+
+    fn finish_upload(
+        &self,
+        ledger: &Store,
+        req: &RequestInfo,
+        ticket: UploadTicket,
+        body: UploadedBody,
+    ) -> ControlReply {
+        self.restore_finish_upload(ledger, req, ticket, body)
     }
 
     fn authorize_sync(&self, req: &RequestInfo) -> Result<(), (u16, &'static str, &'static str)> {

@@ -25,7 +25,16 @@ mdns-sd = { version = "0.21", default-features = false }
 # D1.1: portable interface inventory for the shared LAN policy (same version mdns-sd uses).
 if-addrs = "0.15"
 ctrlc = { version = "3.4", features = ["termination"] }
+# Slice 1F: administrative backup upload/inspection (strict reader, verifier limits) and the
+# restore engine's staging cleanup.
+backup-archive = { path = "../../core/backup-archive" }
+backup-restore = { path = "../backup-restore" }
+portable-backup = { path = "../../core/portable-backup" }
+sync-protocol = { workspace = true }
 
 [dev-dependencies]
+backup-export = { path = "../../tools/backup-export" }
+sync-engine = { workspace = true, features = ["testkit"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 ureq = { version = "2", default-features = false, features = ["json"] }
 serde_json = "1"
