@@ -420,3 +420,80 @@ fn a_failed_directory_sync_indexes_nothing_until_a_retry_succeeds() {
         assert_eq!(observe(&data.0).files, expected);
     }
 }
+
+/// testkit's genesis (it references the background blob) under a new library id.
+fn restored_genesis(n: u64) -> Vec<u8> {
+    let mut g = testkit::genesis();
+    g.library_id = sync_protocol::LibraryId::from_uuid(testkit::uuid7(9, n)).unwrap();
+    g.to_canonical_bytes().unwrap()
+}
+
+#[test]
+fn bootstrap_many_accepts_only_consistent_blob_index_rows() {
+    let (bg, _) = testkit::blob_background();
+    let bg_sha = sha256_hex(&bg);
+    let (new_sha, new_bytes) = upload(40);
+    let new_sha = sync_protocol::Sha256Hex::parse(&new_sha).unwrap();
+    // The unindexed blob comes first, so its row is inserted before the existing (possibly
+    // inconsistent) background row is checked.
+    let batch = [
+        (new_sha.clone(), new_bytes.len() as u64),
+        (bg_sha.clone(), bg.len() as u64),
+    ];
+    for edit in [
+        None,
+        Some("rel_path = 'elsewhere'"),
+        Some("rel_path = upper(rel_path)"),
+        Some("byte_len = 1"),
+    ] {
+        let data = TempDir::new("many-index");
+        let store = store_with_unrelated(&data.0);
+        let staged = data.0.join("staged");
+        std::fs::write(&staged, &new_bytes).unwrap();
+        store
+            .install_blob_file(&new_sha, new_bytes.len() as u64, &staged)
+            .unwrap();
+        std::fs::remove_file(&staged).unwrap();
+        if let Some(set) = edit {
+            rusqlite::Connection::open(data.0.join("ledger.sqlite3"))
+                .unwrap()
+                .execute(
+                    &format!("UPDATE blobs SET {set} WHERE sha256 = ?1"),
+                    [bg_sha.as_str()],
+                )
+                .unwrap();
+        }
+        let before = observe(&data.0);
+        let r = store.bootstrap_many(&batch, 2, |i| Ok(restored_genesis(i as u64 + 1)));
+        let ids = [1, 2].map(|n| {
+            sync_protocol::LibraryId::from_uuid(testkit::uuid7(9, n))
+                .unwrap()
+                .to_string()
+        });
+        let Some(set) = edit else {
+            // Consistent existing row accepted; the missing row inserted with the canonical path.
+            assert_eq!(r.unwrap().len(), 2);
+            assert_published(&store, &data.0, new_sha.as_str(), &new_bytes);
+            assert_published(&store, &data.0, bg_sha.as_str(), &bg);
+            for id in &ids {
+                assert!(store.verify_replay(id).unwrap());
+            }
+            continue;
+        };
+        let e = r.unwrap_err();
+        assert!(is_conflict(&e, "blob_conflict"), "{set}: {e}");
+        // The whole batch rolled back: the earlier-inserted index row too; the inconsistent
+        // row, every file and every existing library left exactly as they were.
+        assert_eq!(index_row(&data.0, new_sha.as_str()), None, "{set}");
+        assert_eq!(observe(&data.0), before, "{set}");
+        drop(store);
+        let store = Store::open(&data.0).unwrap();
+        assert_eq!(observe(&data.0), before, "{set}: after reopening");
+        for id in &ids {
+            assert!(matches!(
+                store.library(id),
+                Err(StoreError::NotFound { .. })
+            ));
+        }
+    }
+}

@@ -414,7 +414,9 @@ impl Store {
     ///
     /// 1. every `blobs` entry must already be a file in the blob store with exactly
     ///    `byte_len` bytes (callers install and verify them first, see
-    ///    [`Self::install_blob_file`]); its index row is inserted (or must already agree);
+    ///    [`Self::install_blob_file`]); its index row is inserted with the canonical relative
+    ///    path, or an existing row must agree on both `byte_len` and `rel_path` (else
+    ///    `blob_conflict`, the row left untouched);
     /// 2. for each of the `count` libraries, `load(i)` yields canonical genesis bytes, validated
     ///    exactly as [`Self::bootstrap`] validates them; the library id must not exist yet
     ///    (an identical existing genesis is a conflict too: never merged, never idempotent) and
@@ -439,25 +441,29 @@ impl Store {
                 Ok(m) if m.is_file() && m.len() == *len => {}
                 _ => return Err(StoreError::MissingBlobs(vec![sha.to_string()])),
             }
-            let indexed: Option<i64> = tx
+            let rel_path = rel(&path, &self.blob_dir);
+            let indexed: Option<(i64, String)> = tx
                 .query_row(
-                    "SELECT byte_len FROM blobs WHERE sha256 = ?1",
+                    "SELECT byte_len, rel_path FROM blobs WHERE sha256 = ?1",
                     [sha.as_str()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
             match indexed {
-                Some(l) if l as u64 == *len => {}
-                Some(l) => {
+                Some((l, p)) if l == *len as i64 && p == rel_path => {}
+                Some((l, p)) => {
                     return Err(StoreError::conflict(
                         "blob_conflict",
-                        format!("blob {sha} is indexed with {l} bytes, restore needs {len}"),
+                        format!(
+                            "blob {sha} is indexed as {l} bytes at {p:?}, restore needs {len} \
+                             bytes at {rel_path:?}; index left untouched"
+                        ),
                     ))
                 }
                 None => {
                     tx.execute(
                         "INSERT INTO blobs (sha256, byte_len, rel_path) VALUES (?1, ?2, ?3)",
-                        params![sha.as_str(), *len as i64, rel(&path, &self.blob_dir)],
+                        params![sha.as_str(), *len as i64, rel_path],
                     )?;
                 }
             }
