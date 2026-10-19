@@ -17,8 +17,8 @@ pub mod web;
 
 pub use auth::{generate_token, TokenVerifier};
 pub use http::{
-    ControlPlane, ControlReply, RequestInfo, ServerConfig, ServerHandle, UploadSlot, UploadTicket,
-    UploadedBody,
+    ControlPlane, ControlReply, DownloadSlot, RequestInfo, ServerConfig, ServerHandle, UploadSlot,
+    UploadTicket, UploadedBody,
 };
 pub use store::{BlobInstall, Store, StoreError};
 pub use web::WebRoot;

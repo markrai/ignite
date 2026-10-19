@@ -521,6 +521,34 @@ pub trait ControlPlane: Send + Sync + 'static {
     ) -> ControlReply {
         control_error(404, "not_found", "unknown control route")
     }
+    /// Is this `/control/...` request a streamed file download? Headers only, no I/O.
+    /// Default: no download routes.
+    fn download_route(&self, _req: &RequestInfo) -> bool {
+        false
+    }
+    /// Authorize and open a download. Blocking. An `Err` reply is sent as an ordinary
+    /// control reply (JSON); nothing of the file is sent.
+    fn begin_download(
+        &self,
+        _store: &Store,
+        _req: &RequestInfo,
+    ) -> Result<DownloadSlot, ControlReply> {
+        Err(control_error(404, "not_found", "unknown control route"))
+    }
+}
+
+/// A file the plane has authorized for download, already open. The transport sends exactly
+/// `length` bytes from its start in chunks of at most `chunk` bytes, then drops `ticket`
+/// (also when the client disconnects early), which closes nothing else.
+pub struct DownloadSlot {
+    pub file: std::fs::File,
+    pub length: u64,
+    pub content_type: &'static str,
+    /// Extra response headers (e.g. `Content-Disposition`), chosen by the plane.
+    pub headers: Vec<(&'static str, String)>,
+    pub chunk: usize,
+    /// Plane-owned state held for as long as the file is being sent.
+    pub ticket: Box<dyn std::any::Any + Send>,
 }
 
 /// Plane-owned state of one streaming upload (e.g. the private file's cleanup guard and the
@@ -565,6 +593,204 @@ fn bounded_chunks(data: &[u8], max: usize) -> impl Iterator<Item = Bytes> + '_ {
 
 /// Largest control-plane request body.
 pub const MAX_CONTROL_BODY: usize = 64 * 1024;
+
+/// Chunks queued between a download's file reader and its connection (backpressure: the
+/// reader stops while the connection has not taken them).
+const DOWNLOAD_QUEUE: usize = 2;
+
+/// The body of every response: an in-memory buffer (every ordinary reply, unchanged) or a
+/// streamed file (control-plane downloads only).
+pub enum ResponseBody {
+    Full(Full<Bytes>),
+    File(FileBody),
+}
+
+impl hyper::body::Body for ResponseBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        match self.get_mut() {
+            Self::Full(b) => std::pin::Pin::new(b)
+                .poll_frame(cx)
+                .map(|f| f.map(|r| r.map_err(|never| match never {}))),
+            Self::File(f) => std::pin::Pin::new(f).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Full(b) => b.is_end_stream(),
+            Self::File(f) => f.remaining == 0,
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            Self::Full(b) => b.size_hint(),
+            Self::File(f) => hyper::body::SizeHint::with_exact(f.remaining),
+        }
+    }
+}
+
+/// A file sent in bounded chunks. A separate task reads each chunk with a short
+/// `spawn_blocking` call (no thread is held while the client is slow) and hands it over a
+/// bounded queue. Dropping the body (the client went away) closes the queue: the reader task
+/// stops, closing the file and dropping the plane's ticket.
+pub struct FileBody {
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>,
+    remaining: u64,
+}
+
+impl FileBody {
+    /// Start sending `slot`'s file (must be called inside the runtime).
+    fn spawn(slot: DownloadSlot) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(DOWNLOAD_QUEUE);
+        let DownloadSlot {
+            file,
+            length,
+            chunk,
+            ticket,
+            ..
+        } = slot;
+        let chunk = chunk.max(1) as u64;
+        tokio::spawn(async move {
+            let _ticket = ticket;
+            let mut file = Some(file);
+            let mut left = length;
+            while left > 0 {
+                let n = left.min(chunk) as usize;
+                let f = file.take().expect("file is returned after each read");
+                let read = tokio::task::spawn_blocking(move || {
+                    let mut f = f;
+                    let mut buf = vec![0u8; n];
+                    let r = std::io::Read::read_exact(&mut f, &mut buf).map(|()| buf);
+                    (f, r)
+                })
+                .await;
+                let Ok((f, r)) = read else { break };
+                file = Some(f);
+                match r {
+                    Ok(buf) => {
+                        left -= n as u64;
+                        if tx.send(Ok(Bytes::from(buf))).await.is_err() {
+                            break; // the client is gone
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            rx,
+            remaining: length,
+        }
+    }
+}
+
+impl hyper::body::Body for FileBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        let error = match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(Ok(b))) => {
+                self.remaining = self.remaining.saturating_sub(b.len() as u64);
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b))));
+            }
+            std::task::Poll::Ready(Some(Err(e))) => e,
+            // The reader stopped early: the response is cut short (never padded or faked).
+            std::task::Poll::Ready(None) => std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "download source ended early",
+            ),
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+        // Terminal: the error is reported once, later polls see the end, and closing the queue
+        // stops the reader task (which closes the file and drops the plane's ticket).
+        self.remaining = 0;
+        self.rx.close();
+        std::task::Poll::Ready(Some(Err(error)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.remaining)
+    }
+}
+
+/// A control-plane download: authorize and open (off the reactor), then stream the file.
+async fn serve_download(
+    control: Arc<dyn ControlPlane>,
+    store: Arc<Store>,
+    info: RequestInfo,
+) -> hyper::Response<ResponseBody> {
+    let begin = tokio::task::spawn_blocking(move || control.begin_download(&store, &info)).await;
+    let slot = match begin {
+        Ok(Ok(slot)) => slot,
+        Ok(Err(reply)) => return respond_control(reply).map(ResponseBody::Full),
+        Err(_) => {
+            return respond_control(control_error(500, "internal", "download failed"))
+                .map(ResponseBody::Full)
+        }
+    };
+    let mut b = hyper::Response::builder()
+        .status(200)
+        .header(hyper::header::CONTENT_TYPE, slot.content_type)
+        .header(hyper::header::CONTENT_LENGTH, slot.length)
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Referrer-Policy", "no-referrer")
+        // Ranges are not supported: always the whole verified file.
+        .header(hyper::header::ACCEPT_RANGES, "none");
+    for (k, v) in &slot.headers {
+        b = b.header(*k, v.as_str());
+    }
+    b.body(ResponseBody::File(FileBody::spawn(slot)))
+        .expect("download response parts are valid")
+}
+
+/// Every connection's service: control-plane downloads are streamed; everything else is
+/// [`serve_request`], unchanged (an in-memory body).
+async fn serve(
+    store: Arc<Store>,
+    config: Arc<ServerConfig>,
+    peer: Option<SocketAddr>,
+    req: hyper::Request<Incoming>,
+) -> Result<hyper::Response<ResponseBody>, Infallible> {
+    if let Some(control) = &config.control {
+        let path = req.uri().path();
+        if path.starts_with("/control/") {
+            let (parts, body) = req.into_parts();
+            let info = RequestInfo::from_parts(&parts, peer);
+            if control.download_route(&info) {
+                return Ok(serve_download(Arc::clone(control), store, info).await);
+            }
+            let req = hyper::Request::from_parts(parts, body);
+            return serve_request(store, config, peer, req)
+                .await
+                .map(|r| r.map(ResponseBody::Full));
+        }
+    }
+    serve_request(store, config, peer, req)
+        .await
+        .map(|r| r.map(ResponseBody::Full))
+}
 
 fn control_error(status: u16, code: &str, message: &str) -> ControlReply {
     ControlReply {
@@ -997,7 +1223,7 @@ impl ServerHandle {
                         let config = Arc::clone(&accept_config);
                         tokio::spawn(async move {
                             let service = service_fn(move |req| {
-                                serve_request(Arc::clone(&store), Arc::clone(&config), Some(peer), req)
+                                serve(Arc::clone(&store), Arc::clone(&config), Some(peer), req)
                             });
                             let _ = http1::Builder::new()
                                 .keep_alive(true)
@@ -1152,5 +1378,179 @@ mod upload_tests {
         let (r, _, released) = run_writer(&[data(3 * UPLOAD_CHUNK)], false);
         assert!(matches!(r, Err(None)));
         assert!(released.load(Ordering::SeqCst), "the ticket's cleanup ran");
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// The next frame's data or error; `None` at the end. A body that neither yields nor ends
+    /// within a second fails the test (it must never hang after an error).
+    async fn next(b: &mut FileBody) -> Option<Result<Bytes, std::io::Error>> {
+        tokio::time::timeout(Duration::from_secs(1), b.frame())
+            .await
+            .expect("the body answered")
+            .map(|r| r.map(|f| f.into_data().expect("data frame")))
+    }
+
+    fn temp_file(label: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "file-body-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn slot(path: &std::path::Path, length: u64, chunk: usize) -> (DownloadSlot, Arc<AtomicBool>) {
+        let released = Arc::new(AtomicBool::new(false));
+        let slot = DownloadSlot {
+            file: std::fs::File::open(path).unwrap(),
+            length,
+            content_type: "application/zip",
+            headers: Vec::new(),
+            chunk,
+            ticket: Box::new(DropFlag(Arc::clone(&released))),
+        };
+        (slot, released)
+    }
+
+    async fn released(flag: &AtomicBool) {
+        for _ in 0..200 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the download ticket was never released");
+    }
+
+    #[test]
+    fn a_reader_error_is_reported_once_then_the_body_ends() {
+        rt().block_on(async {
+            let (tx, rx) = tokio::sync::mpsc::channel(DOWNLOAD_QUEUE);
+            let mut body = FileBody { rx, remaining: 10 };
+            tx.send(Ok(Bytes::from_static(b"abc"))).await.unwrap();
+            tx.send(Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "read refused",
+            )))
+            .await
+            .unwrap();
+            assert_eq!(next(&mut body).await.unwrap().unwrap(), &b"abc"[..]);
+            let e = next(&mut body).await.unwrap().unwrap_err();
+            assert_eq!(
+                (e.kind(), e.to_string()),
+                (ErrorKind::PermissionDenied, "read refused".into())
+            );
+            // Terminal: no second error, no hang, even though the producer is still there.
+            assert!(next(&mut body).await.is_none());
+            assert!(next(&mut body).await.is_none());
+            assert!(hyper::body::Body::is_end_stream(&body));
+            assert_eq!(hyper::body::Body::size_hint(&body).exact(), Some(0));
+            // The producer is told to stop.
+            assert!(tx.send(Ok(Bytes::from_static(b"more"))).await.is_err());
+        });
+    }
+
+    #[test]
+    fn a_producer_that_ends_early_is_one_unexpected_eof_then_the_end() {
+        rt().block_on(async {
+            let (tx, rx) = tokio::sync::mpsc::channel(DOWNLOAD_QUEUE);
+            let mut body = FileBody { rx, remaining: 10 };
+            tx.send(Ok(Bytes::from_static(b"abc"))).await.unwrap();
+            drop(tx);
+            assert_eq!(next(&mut body).await.unwrap().unwrap(), &b"abc"[..]);
+            let e = next(&mut body).await.unwrap().unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+            assert!(next(&mut body).await.is_none());
+            assert!(next(&mut body).await.is_none());
+            assert!(hyper::body::Body::is_end_stream(&body));
+        });
+    }
+
+    #[test]
+    fn a_file_shorter_than_advertised_sends_only_real_bytes_then_ends() {
+        let path = temp_file("short", b"0123456789");
+        rt().block_on(async {
+            let (slot, flag) = slot(&path, 16, 4);
+            let mut body = FileBody::spawn(slot);
+            let mut got = Vec::new();
+            let e = loop {
+                match next(&mut body).await.expect("an error before the end") {
+                    Ok(b) => got.extend_from_slice(&b),
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+            assert_eq!(
+                got, b"01234567",
+                "whole chunks of the real file only, never padding"
+            );
+            assert!(next(&mut body).await.is_none());
+            assert!(next(&mut body).await.is_none());
+            released(&flag).await;
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_complete_file_is_sent_exactly_with_its_length() {
+        let path = temp_file("full", b"0123456789");
+        rt().block_on(async {
+            let (slot, flag) = slot(&path, 10, 4);
+            let mut body = FileBody::spawn(slot);
+            assert_eq!(hyper::body::Body::size_hint(&body).exact(), Some(10));
+            let mut sizes = Vec::new();
+            let mut got = Vec::new();
+            while let Some(b) = next(&mut body).await {
+                let b = b.unwrap();
+                sizes.push(b.len());
+                got.extend_from_slice(&b);
+            }
+            assert_eq!(sizes, vec![4, 4, 2]);
+            assert_eq!(got, b"0123456789");
+            assert!(hyper::body::Body::is_end_stream(&body));
+            released(&flag).await;
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dropped_body_stops_the_reader_and_releases_the_ticket() {
+        let path = temp_file("dropped", &[7u8; 64]);
+        rt().block_on(async {
+            let (slot, flag) = slot(&path, 64, 4);
+            let mut body = FileBody::spawn(slot);
+            assert_eq!(next(&mut body).await.unwrap().unwrap().len(), 4);
+            drop(body);
+            released(&flag).await;
+        });
+        let _ = std::fs::remove_file(&path);
     }
 }

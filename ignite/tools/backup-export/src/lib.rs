@@ -17,5 +17,7 @@
 mod export;
 mod source;
 
-pub use export::{export_backup, ExportError, ExportErrorKind, ExportReport};
+pub use export::{
+    export_backup, export_backup_with, ExportError, ExportErrorKind, ExportOptions, ExportReport,
+};
 pub use source::{Credential, HttpSource, ReadOnlySource, Secret, SourceError, SourceResponse};

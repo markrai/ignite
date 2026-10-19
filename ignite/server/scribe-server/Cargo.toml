@@ -29,11 +29,12 @@ ctrlc = { version = "3.4", features = ["termination"] }
 # restore engine's staging cleanup.
 backup-archive = { path = "../../core/backup-archive" }
 backup-restore = { path = "../backup-restore" }
+# Slice 1G-D1: the server builds its downloadable backup with the existing exporter.
+backup-export = { path = "../../tools/backup-export" }
 portable-backup = { path = "../../core/portable-backup" }
 sync-protocol = { workspace = true }
 
 [dev-dependencies]
-backup-export = { path = "../../tools/backup-export" }
 sync-engine = { workspace = true, features = ["testkit"] }
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 ureq = { version = "2", default-features = false, features = ["json"] }

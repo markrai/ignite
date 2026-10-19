@@ -1,9 +1,10 @@
 //! Export pipeline: list → snapshots → blobs (all GET, spooled to a private staging directory)
 //! → deterministic ZIP → re-read and verify with `BackupVerifier` → publish without overwriting.
 
+use std::cell::Cell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, ErrorKind, Read, Write};
+use std::io::{self, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use portable_backup::{
@@ -42,6 +43,9 @@ pub enum ExportErrorKind {
     Backup(BackupErrorCode),
     /// Local filesystem or ZIP failure.
     Io,
+    /// The export would write more into its staging directory than
+    /// [`ExportOptions::max_staging_bytes`] allows.
+    StagingLimit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +98,17 @@ pub struct ExportReport {
     pub archive_sha256: Sha256Hex,
 }
 
+/// Optional bounds of [`export_backup_with`]. The default bounds nothing beyond `Limits`
+/// (what [`export_backup`] and the command-line tool use).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportOptions {
+    /// Most bytes the export may write into its staging directory in total: staged snapshots
+    /// and blobs plus the ZIP being built (publishing is a hard link and writes nothing). Each
+    /// write is charged before it is made, so the staging never holds more than this; the
+    /// export then fails with [`ExportErrorKind::StagingLimit`] and its staging is removed.
+    pub max_staging_bytes: Option<u64>,
+}
+
 /// Export every library `source` lists into a new ZIP at `destination`.
 ///
 /// Read-only towards the source (GET only). Each library is captured from its own snapshot
@@ -107,12 +122,24 @@ pub fn export_backup(
     destination: &Path,
     limits: &Limits,
 ) -> R<ExportReport> {
+    export_backup_with(source, destination, limits, &ExportOptions::default())
+}
+
+/// [`export_backup`] with optional bounds (the same archive bytes whenever it succeeds).
+pub fn export_backup_with(
+    source: &dyn ReadOnlySource,
+    destination: &Path,
+    limits: &Limits,
+    options: &ExportOptions,
+) -> R<ExportReport> {
     let (dir, file_name) = check_destination(destination)?;
-    let staging = Staging::create(&dir, &file_name)?;
+    let staging = Staging::create(&dir, &file_name, options.max_staging_bytes)?;
     let manifest = fetch_all(source, &staging, limits)?;
     let manifest_bytes = manifest.to_canonical_bytes(limits)?;
     let archive = staging.path("archive.zip");
-    write_zip(&archive, &staging, &manifest, &manifest_bytes)?;
+    // A refused ZIP write surfaces through the ZIP writer as an I/O error: report the limit.
+    write_zip(&archive, &staging, &manifest, &manifest_bytes)
+        .map_err(|e| staging.budget.reported(e))?;
     verify_zip(&archive, &manifest, &manifest_bytes, limits)?;
     let (archive_bytes, archive_sha256) = hash_file(&archive)?;
     publish(&archive, destination, &dir)?;
@@ -199,14 +226,62 @@ fn sync_dir(dir: &Path) {
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) {}
 
+/// Bytes written into the staging directory so far, against an optional ceiling.
+struct Budget {
+    max: Option<u64>,
+    used: Cell<u64>,
+    exceeded: Cell<bool>,
+}
+
+impl Budget {
+    fn new(max: Option<u64>) -> Self {
+        Self {
+            max,
+            used: Cell::new(0),
+            exceeded: Cell::new(false),
+        }
+    }
+
+    /// Account for `n` more bytes before writing them; refused (nothing charged) past `max`.
+    fn charge(&self, n: u64) -> io::Result<()> {
+        let next = self.used.get().saturating_add(n);
+        if self.max.is_some_and(|m| next > m) {
+            self.exceeded.set(true);
+            return Err(io::Error::other("staging budget exceeded"));
+        }
+        self.used.set(next);
+        Ok(())
+    }
+
+    fn error(&self) -> ExportError {
+        ExportError::new(
+            ExportErrorKind::StagingLimit,
+            format!(
+                "the export needs more than its {}-byte staging budget",
+                self.max.unwrap_or(u64::MAX)
+            ),
+        )
+    }
+
+    /// `e`, or the budget error if a refused write caused it.
+    fn reported(&self, e: ExportError) -> ExportError {
+        if self.exceeded.get() {
+            self.error()
+        } else {
+            e
+        }
+    }
+}
+
 /// Private working directory beside the destination (same filesystem, so the final hard link
 /// works). Removed on every exit path, success included.
 struct Staging {
     dir: PathBuf,
+    budget: Budget,
 }
 
 impl Staging {
-    fn create(dir: &Path, file_name: &str) -> R<Self> {
+    fn create(dir: &Path, file_name: &str, max_bytes: Option<u64>) -> R<Self> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -216,11 +291,18 @@ impl Staging {
             std::process::id()
         ));
         fs::create_dir(&path).map_err(io_err(format!("create staging {}", path.display())))?;
-        let s = Self { dir: path };
+        let s = Self {
+            dir: path,
+            budget: Budget::new(max_bytes),
+        };
         for sub in ["libraries", "blobs"] {
             fs::create_dir(s.dir.join(sub)).map_err(io_err("create staging"))?;
         }
         Ok(s)
+    }
+
+    fn charge(&self, n: u64) -> R<()> {
+        self.budget.charge(n).map_err(|_| self.budget.error())
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -361,9 +443,23 @@ fn fetch_all(
                 ),
             ));
         }
+        staging.charge(bytes.len() as u64)?;
         write_new(&staging.snapshot(id), bytes)?;
     }
     let manifest = builder.finish(limits)?;
+    // The blobs' declared sizes are known now: refuse before downloading any of them.
+    let declared = manifest
+        .blobs
+        .iter()
+        .fold(0u64, |a, b| a.saturating_add(b.byte_len));
+    let budget = &staging.budget;
+    if budget
+        .max
+        .is_some_and(|m| budget.used.get().saturating_add(declared) > m)
+    {
+        budget.exceeded.set(true);
+        return Err(budget.error());
+    }
     for blob in &manifest.blobs {
         fetch_blob(source, staging, blob)?;
     }
@@ -447,6 +543,7 @@ fn fetch_blob(source: &dyn ReadOnlySource, staging: &Staging, blob: &ManifestBlo
             ));
         }
         hasher.update(&chunk[..n]);
+        staging.charge(n as u64)?;
         out.write_all(&chunk[..n])
             .map_err(io_err("write staged blob"))?;
     }
@@ -497,7 +594,12 @@ fn write_zip(
     manifest: &BackupManifestV1,
     manifest_bytes: &[u8],
 ) -> R<()> {
-    let file = create_new(archive)?;
+    let file = Charged {
+        file: create_new(archive)?,
+        budget: &staging.budget,
+        pos: 0,
+        charged: 0,
+    };
     let mut zip = ZipWriter::new(BufWriter::new(file));
     let opts = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
@@ -525,7 +627,41 @@ fn write_zip(
     let file = buf
         .into_inner()
         .map_err(|e| ExportError::new(ExportErrorKind::Io, format!("flush ZIP: {}", e.error())))?;
-    file.sync_all().map_err(io_err("sync ZIP"))
+    file.file.sync_all().map_err(io_err("sync ZIP"))
+}
+
+/// The ZIP file, charging the staging budget for every byte that extends it (the ZIP writer
+/// seeks back to patch headers; rewriting bytes already charged is free).
+struct Charged<'a> {
+    file: File,
+    budget: &'a Budget,
+    pos: u64,
+    /// Highest end offset already charged.
+    charged: u64,
+}
+
+impl Write for Charged<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let end = self.pos.saturating_add(buf.len() as u64);
+        if end > self.charged {
+            self.budget.charge(end - self.charged)?;
+            self.charged = end;
+        }
+        let n = self.file.write(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for Charged<'_> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.pos = self.file.seek(to)?;
+        Ok(self.pos)
+    }
 }
 
 /// Re-read the finalized archive: exactly the expected entries in the expected order, then
@@ -616,4 +752,40 @@ fn hash_file(path: &Path) -> R<(u64, Sha256Hex)> {
     }
     let digest: [u8; 32] = hasher.finalize().into();
     Ok((total, Sha256Hex::from_digest(&digest)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_zip_file_is_charged_for_growth_only_and_never_written_past_the_budget() {
+        let dir =
+            std::env::temp_dir().join(format!("backup-export-charged-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.bin");
+        let budget = Budget::new(Some(100));
+        let mut f = Charged {
+            file: File::create(&path).unwrap(),
+            budget: &budget,
+            pos: 0,
+            charged: 0,
+        };
+        f.write_all(&[1; 60]).unwrap();
+        // Patching earlier bytes (as the ZIP writer does for local headers) costs nothing.
+        f.seek(SeekFrom::Start(10)).unwrap();
+        f.write_all(&[2; 50]).unwrap();
+        assert_eq!(budget.used.get(), 60);
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(&[3; 40]).unwrap();
+        assert_eq!(budget.used.get(), 100);
+        // One byte more is refused before it reaches the file.
+        assert!(f.write_all(&[4]).is_err());
+        assert!(budget.exceeded.get());
+        drop(f);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 100);
+        let e = budget.reported(ExportError::new(ExportErrorKind::Io, "write ZIP: refused"));
+        assert_eq!(e.kind, ExportErrorKind::StagingLimit);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -24,11 +24,13 @@ use control_protocol::{
     PAIRING_TTL_S, SESSION_COOKIE,
 };
 use scribe_sync_server::{
-    ControlPlane, ControlReply, RequestInfo, Store, UploadSlot, UploadTicket, UploadedBody,
+    ControlPlane, ControlReply, DownloadSlot, RequestInfo, Store, UploadSlot, UploadTicket,
+    UploadedBody,
 };
 use serde::Serialize;
 
 use crate::control::{ControlError, ControlStore, Principal};
+use crate::export::ExportJobs;
 use crate::restore::RestoreJobs;
 
 pub type EventSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -87,6 +89,8 @@ pub struct Plane {
     pub lan: Option<std::sync::Arc<crate::netpolicy::LanPolicy>>,
     /// Slice 1F: prepared backup-restore jobs (`/control/v1/admin/restore/*`).
     pub restore: Arc<RestoreJobs>,
+    /// Slice 1G-D1: prepared backup exports (`/control/v1/admin/backup/*`).
+    pub exports: Arc<ExportJobs>,
 }
 
 pub(crate) fn json<T: Serialize>(status: u16, v: &T) -> ControlReply {
@@ -492,6 +496,8 @@ impl ControlPlane for Plane {
             }
             // Restore routes have their own, stricter caller rule (see `restore`).
             (["admin", "restore", rest @ ..], _) => self.restore_route(ledger, req, rest, body),
+            // Backup exports share the restore caller rule (see `export`).
+            (["admin", "backup", rest @ ..], _) => self.export_route(req, rest),
             (["admin", rest @ ..], _) => match self.principal(req) {
                 Some((p, _)) if p.role == Role::Admin => {
                     if rest == ["server"] && method == "GET" {
@@ -542,6 +548,18 @@ impl ControlPlane for Plane {
         body: UploadedBody,
     ) -> ControlReply {
         self.restore_finish_upload(ledger, req, ticket, body)
+    }
+
+    fn download_route(&self, req: &RequestInfo) -> bool {
+        Self::is_export_download(req)
+    }
+
+    fn begin_download(
+        &self,
+        _ledger: &Store,
+        req: &RequestInfo,
+    ) -> Result<DownloadSlot, ControlReply> {
+        self.export_begin_download(req)
     }
 
     fn authorize_sync(&self, req: &RequestInfo) -> Result<(), (u16, &'static str, &'static str)> {

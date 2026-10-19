@@ -160,7 +160,7 @@ impl CleanupGate {
         (gate, started_rx, resume_tx)
     }
 
-    fn pause(&self) {
+    pub(crate) fn pause(&self) {
         let _ = self.started.lock().unwrap().send(());
         // Bounded, so a broken test fails instead of hanging the server.
         let _ = self
@@ -833,14 +833,14 @@ impl Plane {
             return Err(err(
                 403,
                 "loopback_required",
-                "Backup restore is only available on the server itself (or an SSH tunnel to it).",
+                "Backup administration is only available on the server itself (or an SSH tunnel to it).",
             ));
         }
         if has_authorization(req) {
             return Err(err(
                 403,
                 "browser_session_required",
-                "Backup restore requires an administrator browser session, not a bearer credential.",
+                "Backup administration requires an administrator browser session, not a bearer credential.",
             ));
         }
         let Some(cookie) = cookie_value(req.cookie.as_deref()) else {

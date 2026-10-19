@@ -8,11 +8,13 @@
 //! <state_dir>/control.sqlite   control plane (devices, pairing, claim state)
 //! <state_dir>/ledger/          notebook ledger (scribe-sync-server Store: ledger.sqlite3, blobs/)
 //! <state_dir>/ledger/restore-staging/job-*   private restore staging (removed at startup)
+//! <state_dir>/ledger/export-staging/job-export-*   private backup exports (removed at startup)
 //! ```
 
 pub mod config;
 pub mod control;
 pub mod discovery;
+pub mod export;
 pub mod fsutil;
 pub mod identity;
 pub mod netpolicy;
@@ -34,6 +36,8 @@ pub struct Running {
     pub advertisement: Option<discovery::Advertisement>,
     /// Expires prepared restore jobs; stopped (joined) when dropped.
     pub restore_sweeper: restore::Sweeper,
+    /// Expires backup exports; when dropped, waits for an export being prepared.
+    pub export_sweeper: export::Sweeper,
 }
 
 /// Prepare state (identity + control DB); used by `init` and `serve`.
@@ -90,6 +94,25 @@ pub fn serve_with_restore_limits(
     lan: Arc<netpolicy::LanPolicy>,
     restore_limits: restore::RestoreLimits,
 ) -> Result<Running, String> {
+    serve_with_limits(
+        config,
+        clock,
+        events,
+        lan,
+        restore_limits,
+        export::ExportLimits::default(),
+    )
+}
+
+/// [`serve_with_restore_limits`] with explicit export limits too.
+pub fn serve_with_limits(
+    config: &Config,
+    clock: Clock,
+    events: EventSink,
+    lan: Arc<netpolicy::LanPolicy>,
+    restore_limits: restore::RestoreLimits,
+    export_limits: export::ExportLimits,
+) -> Result<Running, String> {
     let (id, _, control) = prepare(config, clock.clone())?;
     let ledger_dir = config.ledger_dir();
     fsutil::ensure_private_dir(&ledger_dir)?;
@@ -112,6 +135,20 @@ pub fn serve_with_restore_limits(
         clock.clone(),
         restore_limits,
     ));
+    // Backup exports of the previous process are never resumed or offered again.
+    let export_root = ledger_dir.join(export::EXPORT_STAGING_DIR);
+    let removed = export::remove_export_staging(&export_root)?;
+    if removed > 0 {
+        events(&format!(
+            "scribe-server event=export_staging_removed count={removed}"
+        ));
+    }
+    fsutil::ensure_private_dir(&export_root)?;
+    let export_jobs = Arc::new(export::ExportJobs::new(
+        export_root,
+        clock.clone(),
+        export_limits,
+    ));
     let web_root = match &config.server.web_root {
         Some(p) => Some(WebRoot::new(p, &[&config.server.state_dir])?),
         None => None,
@@ -126,8 +163,10 @@ pub fn serve_with_restore_limits(
         events,
         lan: Some(lan),
         restore: Arc::clone(&restore_jobs),
+        exports: Arc::clone(&export_jobs),
     });
     let restore_sweeper = restore::Sweeper::start(Arc::clone(&restore_jobs), plane.events.clone());
+    let export_sweeper = export::Sweeper::start(Arc::clone(&export_jobs), plane.events.clone());
     let handle = ServerHandle::start_with(
         config.server.listen,
         ledger,
@@ -140,6 +179,7 @@ pub fn serve_with_restore_limits(
     // Confirmed restores run with the transport's own ledger `Arc` (one `Store`, one process
     // lock); `restore_sweeper` joins a running restore before the ledger can be dropped.
     restore_jobs.attach_store(Arc::clone(&handle.store));
+    export_jobs.attach_store(Arc::clone(&handle.store));
     let advertisement = if config.discovery.advertise {
         match discovery::Advertisement::start(
             id.server_id,
@@ -164,6 +204,7 @@ pub fn serve_with_restore_limits(
         plane,
         advertisement,
         restore_sweeper,
+        export_sweeper,
     })
 }
 
