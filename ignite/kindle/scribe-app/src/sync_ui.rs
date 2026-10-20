@@ -92,7 +92,8 @@ pub fn counts(l: &LibraryChoice) -> String {
     )
 }
 
-/// Whether this build offers Restore from Server (see the `restore_from_server` feature).
+/// Whether this build offers Restore from Server: the `restore_from_server` feature, which the
+/// official ARM release build enables (and host tests).
 pub const RESTORE_FROM_SERVER: bool = cfg!(any(test, feature = "restore_from_server"));
 
 pub const RESTORE_QUESTION: &str = "Restore this library?";

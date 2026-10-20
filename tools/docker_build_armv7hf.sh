@@ -9,7 +9,9 @@ rustup target add armv7-unknown-linux-gnueabihf
 cd /src
 # Remap container paths so panic locations cannot embed the Docker mount or cargo home.
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=/src=. --remap-path-prefix=/usr/local/cargo/registry=deps --remap-path-prefix=/usr/local/cargo/git=deps"
-cargo build -p ink-probe -p scribe-app -p scribe-lifecycle --locked --release --target armv7-unknown-linux-gnueabihf
+# Official customer build: Restore from Server is part of the release (its Vega-sized hardware
+# memory test passed). No other optional feature (e.g. the supervisor test harness) is enabled.
+cargo build -p ink-probe -p scribe-app -p scribe-lifecycle --locked --release --target armv7-unknown-linux-gnueabihf   --features scribe-app/restore_from_server
 
 for name in ink-probe scribe-app scribe-lifecycle; do
   BIN=target/armv7-unknown-linux-gnueabihf/release/$name

@@ -37,6 +37,7 @@ Version number: `ignite/VERSION`.
 ## Provenance
 
 - Rust binaries: built from the tagged source via `tools/docker_build_armv7hf.sh`
+  (with the `scribe-app/restore_from_server` feature: Home → Sync → Restore from server)
   inside `rust:1-bullseye` with path remapping for reproducibility *of paths*,
   not bit-for-bit guarantees across Docker versions.
 - Dropbear: pinned tarball digest + upstream signing key fingerprint in
