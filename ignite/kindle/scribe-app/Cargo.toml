@@ -20,6 +20,10 @@ required-features = ["kindle_supervisor_harness"]
 # Narrow, non-production gate: exposes DisposableStreamPermit construction and the
 # isolated harness binary. Ordinary scribe-app / Scriptlet builds must omit this.
 kindle_supervisor_harness = []
+# 1H-D3 hardware gate: offers Home → Sync → "Restore from server". Off in ordinary Kindle
+# releases until a Vega-sized adoption has passed its memory test on the device. Startup
+# recovery of an interrupted adoption is always built in.
+restore_from_server = []
 
 [dependencies]
 notebook-core = { workspace = true, features = ["mint"] }

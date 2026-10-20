@@ -111,6 +111,7 @@ fn dummy_state(cursor: u64, acked: u64, next: u64) -> SyncStateV1 {
         next_client_seq: next,
         server_base_url: None,
         server_cursor: cursor,
+        server_id: None,
     }
 }
 

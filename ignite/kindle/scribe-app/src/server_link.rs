@@ -14,9 +14,16 @@
 //!   re-pair,
 //! * health: `/control/v1/status` with the credential; `session == null` on the right server
 //!   means the credential was revoked (→ "Pair again"), transport failure means Offline,
-//! * feeding the existing sync uploader (`OutboundSync::set_link`).
+//! * feeding the existing sync uploader (`OutboundSync::set_link`),
+//! * 1H-D2 **Restore from Server** (`LinkCmd::BeginRestore` …): choose a server, pair with it
+//!   *provisionally* (the credential stays in memory: never saved, never given to sync), list its
+//!   libraries (`GET /v1/libraries`), confirm, then a job thread stops sync, verifies and adopts
+//!   the library (`sync_adopt`), publishing the provisional pairing as the device's server
+//!   profile in the same commit. Until the commit the original profile, library and sync are
+//!   untouched; afterwards the runtime restarts and startup recovery owns completion.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -29,7 +36,10 @@ use control_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::{Aperture, DiscoveredServer, MdnsBrowser, ServerTable};
+use crate::sync_adopt::{AdoptError, AdoptErrorKind, AdoptionOutcome};
+use crate::sync_materialize::DeviceGeometry;
 use crate::sync_outbound::SyncConfigV1;
+use sync_protocol::LibraryId;
 
 pub const PROFILE_FILE: &str = "server-profile.json";
 pub const DEVICE_FILE: &str = "device.json";
@@ -228,8 +238,63 @@ pub struct LinkView {
     pub paired_server: Option<ServerId>,
     /// One-line restrained notice (e.g. "Request expired. Try again.").
     pub notice: Option<String>,
+    /// Restore from Server in progress (the Sync screen shows this flow instead).
+    pub restore: Option<RestorePhase>,
+    /// The app must restart now (sync was stopped for a restore; see module docs).
+    pub restart: bool,
     /// Bumps on every visible change (the UI repaints only then).
     pub version: u64,
+}
+
+/// What a restore needs from the runtime: the installation it replaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreContext {
+    pub library_root: PathBuf,
+    pub sync_dir: PathBuf,
+    pub device: DeviceGeometry,
+}
+
+/// One library on the selected server. The server has no library names: libraries are labelled
+/// by position ("Library 1", …) with their counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryChoice {
+    pub library_id: LibraryId,
+    pub label: String,
+    pub notebooks: usize,
+    pub pages: usize,
+    /// This Kindle already holds this library (nothing to restore).
+    pub on_this_kindle: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestorePhase {
+    ChooseServer,
+    /// Provisional pairing (comparison code); the active profile is untouched.
+    Pairing {
+        server_name: String,
+        code: String,
+    },
+    Loading {
+        server_name: String,
+    },
+    Libraries {
+        server_name: String,
+        libraries: Vec<LibraryChoice>,
+    },
+    Confirm {
+        server_name: String,
+        library: LibraryChoice,
+    },
+    /// After confirmation; `cancellable` until the replacement commits.
+    Working {
+        status: String,
+        cancellable: bool,
+    },
+    Failed {
+        message: String,
+    },
+    /// Published; the app restarts.
+    Done,
 }
 
 #[derive(Clone, Debug)]
@@ -241,12 +306,24 @@ pub enum LinkCmd {
     ManualUrl(String),
     /// Re-check the paired server now (also implied by entering the Sync screen).
     CheckNow,
+    /// 1H-D2 Restore from Server (see module docs).
+    BeginRestore(RestoreContext),
+    RestoreSelectServer(ServerId),
+    RestoreSelectLibrary(LibraryId),
+    RestoreConfirm,
+    /// Leave the flow before confirmation, or cancel the preparation before it commits.
+    RestoreCancel,
+    /// Acknowledge a failure.
+    RestoreDismiss,
 }
 
 /// Where sync connections go (the sync uploader, or a test double).
 pub trait LinkSink: Send {
     fn set_link(&mut self, link: Option<SyncConfigV1>);
     fn auth_revoked(&mut self) -> bool;
+    /// Stop the sync engine for good (a restore replaces its library; the app restarts after).
+    /// Test doubles without an engine keep the default.
+    fn stop_sync(&mut self) {}
 }
 
 /// The running app's sink: the global `OutboundSync`.
@@ -258,6 +335,9 @@ impl LinkSink for GlobalSync {
     }
     fn auth_revoked(&mut self) -> bool {
         crate::sync_outbound::with_global(|s| s.auth_revoked()).unwrap_or(false)
+    }
+    fn stop_sync(&mut self) {
+        crate::sync_outbound::shutdown_global(Duration::from_millis(1500));
     }
 }
 
@@ -321,7 +401,40 @@ struct PairingSession {
     request_id: String,
     secret: String,
     next_poll: Instant,
+    /// For a restore: approval yields an in-memory credential, never a saved profile.
+    provisional: bool,
 }
+
+/// The server a restore reads from, with a credential (provisional, or the active profile's).
+struct RestoreTarget {
+    server: DiscoveredServer,
+    credential: String,
+}
+
+enum JobEvent {
+    Status(&'static str),
+    Committed,
+    Finished(Box<Result<AdoptionOutcome, AdoptError>>),
+}
+
+struct RestoreJob {
+    cancel: Arc<AtomicBool>,
+    events: Receiver<JobEvent>,
+    committed: bool,
+    profile: ServerProfileV1,
+}
+
+struct RestoreFlow {
+    ctx: RestoreContext,
+    target: Option<RestoreTarget>,
+    libraries: Vec<LibraryChoice>,
+    job: Option<RestoreJob>,
+    /// Sync was stopped for the job: the app must restart to resume it.
+    sync_stopped: bool,
+}
+
+#[cfg(test)]
+pub(crate) static RESTORE_FAULTS: Mutex<Vec<(PathBuf, &'static str)>> = Mutex::new(Vec::new());
 
 struct Worker<S: LinkSink, D: DiscoverySource> {
     dir: PathBuf,
@@ -337,6 +450,7 @@ struct Worker<S: LinkSink, D: DiscoverySource> {
     last_rediscover: Option<Instant>,
     linked: Option<String>,
     display_name: String,
+    restore: Option<RestoreFlow>,
 }
 
 impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
@@ -374,6 +488,7 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
                 token: p.credential.clone(),
                 debug_drop_first_ack: false,
                 debug_crash_point: None,
+                server_id: Some(p.server_id),
             }),
             _ => None,
         };
@@ -397,6 +512,9 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
             }
             LinkCmd::CheckNow => self.next_health = Instant::now(),
             LinkCmd::CancelPairing => {
+                if self.pairing.as_ref().is_some_and(|p| p.provisional) {
+                    return;
+                }
                 self.pairing = None;
                 let phase = self.idle_phase();
                 self.publish(|v| v.phase = phase);
@@ -421,48 +539,67 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
                 },
             },
             LinkCmd::Pair(id) => {
+                if self.restore.is_some() {
+                    return;
+                }
                 let Some(server) = self.servers().into_iter().find(|s| s.server_id == id) else {
                     return;
                 };
-                let body = serde_json::to_string(&PairingCreate {
-                    client_type: ClientType::Kindle,
-                    client_id: Some(client_id(&self.dir)),
-                    display_name: self.display_name.clone(),
-                })
-                .unwrap_or_default();
-                match call::<PairingCreated>(&server.endpoint, "POST", "/pairing", None, Some(body))
-                {
-                    Ok((_, c)) => {
-                        log(format!(
-                            "pairing requested server_id={} request_id={}",
-                            server.server_id, c.request_id
-                        ));
-                        let phase = LinkPhase::Pairing {
-                            server_name: server.name.clone(),
-                            code: c.comparison_code.clone(),
+                self.request_pairing(server, false);
+            }
+            LinkCmd::BeginRestore(ctx) => self.begin_restore(ctx),
+            LinkCmd::RestoreSelectServer(id) => self.restore_select_server(id),
+            LinkCmd::RestoreSelectLibrary(id) => self.restore_select_library(id),
+            LinkCmd::RestoreConfirm => self.restore_confirm(),
+            LinkCmd::RestoreCancel => self.restore_cancel(),
+            LinkCmd::RestoreDismiss => self.restore_dismiss(),
+        }
+    }
+
+    fn request_pairing(&mut self, server: DiscoveredServer, provisional: bool) {
+        let body = serde_json::to_string(&PairingCreate {
+            client_type: ClientType::Kindle,
+            client_id: Some(client_id(&self.dir)),
+            display_name: self.display_name.clone(),
+        })
+        .unwrap_or_default();
+        match call::<PairingCreated>(&server.endpoint, "POST", "/pairing", None, Some(body)) {
+            Ok((_, c)) => {
+                log(format!(
+                    "pairing requested server_id={} request_id={}",
+                    server.server_id, c.request_id
+                ));
+                let (name, code) = (server.name.clone(), c.comparison_code.clone());
+                self.pairing = Some(PairingSession {
+                    server,
+                    request_id: c.request_id,
+                    secret: c.request_secret,
+                    next_poll: Instant::now() + POLL_EVERY,
+                    provisional,
+                });
+                self.publish(|v| {
+                    if provisional {
+                        v.restore = Some(RestorePhase::Pairing {
+                            server_name: name,
+                            code,
+                        });
+                    } else {
+                        v.phase = LinkPhase::Pairing {
+                            server_name: name,
+                            code,
                         };
-                        self.pairing = Some(PairingSession {
-                            server,
-                            request_id: c.request_id,
-                            secret: c.request_secret,
-                            next_poll: Instant::now() + POLL_EVERY,
-                        });
-                        self.publish(|v| {
-                            v.phase = phase;
-                            v.notice = None;
-                        });
                     }
-                    Err(CallError::Status(409, _)) => {
-                        self.publish(|v| {
-                            v.notice = Some(
-                                "That server is not set up yet. Open it in a browser first.".into(),
-                            )
-                        });
-                    }
-                    Err(_) => self.publish(|v| {
-                        v.notice = Some("Could not reach that server. Try again.".into())
-                    }),
-                }
+                    v.notice = None;
+                });
+            }
+            Err(CallError::Status(409, _)) => {
+                self.publish(|v| {
+                    v.notice =
+                        Some("That server is not set up yet. Open it in a browser first.".into())
+                });
+            }
+            Err(_) => {
+                self.publish(|v| v.notice = Some("Could not reach that server. Try again.".into()))
             }
         }
     }
@@ -502,6 +639,19 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
                     self.pairing = None;
                     return;
                 };
+                if s.provisional {
+                    let server = s.server.clone();
+                    log(format!(
+                        "provisional pairing approved server_id={} request_id={} (not saved)",
+                        server.server_id, s.request_id
+                    ));
+                    self.pairing = None;
+                    self.restore_target_ready(RestoreTarget {
+                        server,
+                        credential: cred,
+                    });
+                    return;
+                }
                 let p = ServerProfileV1 {
                     v: 1,
                     server_id: s.server.server_id,
@@ -547,10 +697,15 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
                     PairingState::Expired => "The request expired. Try again.",
                     _ => "That request can no longer be used. Try again.",
                 };
+                let provisional = s.provisional;
                 self.pairing = None;
                 let phase = self.idle_phase();
                 self.publish(|v| {
-                    v.phase = phase;
+                    if provisional {
+                        v.restore = Some(RestorePhase::ChooseServer);
+                    } else {
+                        v.phase = phase;
+                    }
                     v.notice = Some(msg.into());
                 });
             }
@@ -559,6 +714,9 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
     }
 
     fn health(&mut self) {
+        if self.restore.as_ref().is_some_and(|f| f.sync_stopped) {
+            return;
+        }
         let Some(p) = self.profile.clone() else {
             return;
         };
@@ -642,6 +800,347 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
         }
     }
 
+    // ------------------------------------------------------------------ restore (1H-D2)
+
+    fn restore_phase(&self) -> Option<RestorePhase> {
+        self.view.lock().unwrap().restore.clone()
+    }
+
+    fn set_restore(&self, phase: Option<RestorePhase>, notice: Option<String>) {
+        self.publish(|v| {
+            v.restore = phase;
+            v.notice = notice;
+        });
+    }
+
+    fn begin_restore(&mut self, ctx: RestoreContext) {
+        if self.restore.is_some() {
+            return;
+        }
+        if self.pairing.as_ref().is_some_and(|p| !p.provisional) {
+            self.pairing = None; // an ordinary pairing attempt yields to the restore flow
+        }
+        self.restore = Some(RestoreFlow {
+            ctx,
+            target: None,
+            libraries: Vec::new(),
+            job: None,
+            sync_stopped: false,
+        });
+        self.screen = true;
+        self.disc.start();
+        let phase = self.idle_phase();
+        self.publish(|v| {
+            v.phase = phase;
+            v.restore = Some(RestorePhase::ChooseServer);
+            v.notice = None;
+        });
+        log("restore: choose server");
+    }
+
+    fn restore_select_server(&mut self, id: ServerId) {
+        if self.restore_phase() != Some(RestorePhase::ChooseServer) || self.pairing.is_some() {
+            return;
+        }
+        let Some(server) = self.servers().into_iter().find(|s| s.server_id == id) else {
+            return;
+        };
+        let revoked = matches!(self.view.lock().unwrap().phase, LinkPhase::Revoked { .. });
+        match self.profile.clone() {
+            // Already paired with that server: its credential reads the library list.
+            Some(p) if p.server_id == id && !revoked => self.restore_target_ready(RestoreTarget {
+                server,
+                credential: p.credential,
+            }),
+            _ => self.request_pairing(server, true),
+        }
+    }
+
+    /// Credential in hand: list the server's libraries.
+    fn restore_target_ready(&mut self, target: RestoreTarget) {
+        let Some(sync_dir) = self.restore.as_ref().map(|f| f.ctx.sync_dir.clone()) else {
+            return;
+        };
+        let name = target.server.name.clone();
+        self.set_restore(
+            Some(RestorePhase::Loading {
+                server_name: name.clone(),
+            }),
+            None,
+        );
+        let listed =
+            crate::sync_adopt::list_server_libraries(&target.server.endpoint, &target.credential);
+        // The library this Kindle syncs now (any server): offered, but not restorable.
+        let local = crate::sync_outbound::read_json::<crate::sync_outbound::SyncStateV1>(
+            &sync_dir.join(crate::sync_outbound::STATE_FILE),
+        )
+        .ok()
+        .map(|s| s.library_id);
+        match listed {
+            Ok(libs) if !libs.is_empty() => {
+                let libraries: Vec<LibraryChoice> = libs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| LibraryChoice {
+                        library_id: l.library_id,
+                        label: format!("Library {}", i + 1),
+                        notebooks: l.notebook_count,
+                        pages: l.page_count,
+                        on_this_kindle: local == Some(l.library_id),
+                    })
+                    .collect();
+                if let Some(f) = self.restore.as_mut() {
+                    f.libraries = libraries.clone();
+                    f.target = Some(target);
+                }
+                self.set_restore(
+                    Some(RestorePhase::Libraries {
+                        server_name: name,
+                        libraries,
+                    }),
+                    None,
+                );
+            }
+            Ok(_) => self.set_restore(
+                Some(RestorePhase::ChooseServer),
+                Some("That server has no libraries to restore.".into()),
+            ),
+            Err(e) => {
+                log(format!("restore: library list failed: {e}"));
+                self.set_restore(Some(RestorePhase::ChooseServer), Some(friendly(&e, false)));
+            }
+        }
+    }
+
+    fn restore_select_library(&mut self, id: LibraryId) {
+        let Some(RestorePhase::Libraries { server_name, .. }) = self.restore_phase() else {
+            return;
+        };
+        let Some(library) = self
+            .restore
+            .as_ref()
+            .and_then(|f| f.libraries.iter().find(|l| l.library_id == id).cloned())
+        else {
+            return;
+        };
+        self.set_restore(
+            Some(RestorePhase::Confirm {
+                server_name,
+                library,
+            }),
+            None,
+        );
+    }
+
+    fn restore_confirm(&mut self) {
+        let Some(RestorePhase::Confirm { library, .. }) = self.restore_phase() else {
+            return; // repeated taps: only the Confirm state starts a job
+        };
+        if library.on_this_kindle {
+            return;
+        }
+        let Some(flow) = self.restore.as_mut() else {
+            return;
+        };
+        let (Some(target), None) = (flow.target.as_ref(), flow.job.as_ref()) else {
+            return;
+        };
+        let profile = ServerProfileV1 {
+            v: 1,
+            server_id: target.server.server_id,
+            server_name: target.server.name.clone(),
+            credential: target.credential.clone(),
+            last_endpoint: target.server.endpoint.clone(),
+            paired_ms: now_ms(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let ctx = flow.ctx.clone();
+        let device_dir = self.dir.clone();
+        let (job_profile, job_cancel) = (profile.clone(), Arc::clone(&cancel));
+        let library_id = library.library_id;
+        flow.job = Some(RestoreJob {
+            cancel,
+            events: rx,
+            committed: false,
+            profile,
+        });
+        flow.sync_stopped = true;
+        // Sync stops before anything is downloaded: the old library never syncs again in
+        // this run, and the new pairing is never fed to it.
+        self.set_link(None);
+        self.sink.stop_sync();
+        self.set_restore(
+            Some(RestorePhase::Working {
+                status: "Downloading library...".into(),
+                cancellable: true,
+            }),
+            None,
+        );
+        log(format!("restore: confirmed library={library_id}"));
+        let spawned = std::thread::Builder::new()
+            .name("restore-job".into())
+            .spawn(move || {
+                run_restore_job(
+                    &ctx,
+                    &device_dir,
+                    &job_profile,
+                    library_id,
+                    &job_cancel,
+                    &tx,
+                )
+            });
+        if let Err(e) = spawned {
+            log(format!("restore: could not start: {e}"));
+            if let Some(f) = self.restore.as_mut() {
+                f.job = None;
+            }
+            self.set_restore(
+                Some(RestorePhase::Failed {
+                    message: "The restore could not start. Nothing was changed.".into(),
+                }),
+                None,
+            );
+        }
+    }
+
+    fn restore_cancel(&mut self) {
+        let Some(flow) = self.restore.as_ref() else {
+            return;
+        };
+        if let Some(job) = &flow.job {
+            if !job.committed {
+                job.cancel.store(true, Ordering::SeqCst);
+                self.set_restore(
+                    Some(RestorePhase::Working {
+                        status: "Cancelling...".into(),
+                        cancellable: false,
+                    }),
+                    None,
+                );
+            }
+            return; // after the commit, completion is not cancellable
+        }
+        if matches!(self.restore_phase(), Some(RestorePhase::Failed { .. })) {
+            return self.restore_dismiss();
+        }
+        // Before confirmation: drop the flow and its provisional credential; nothing changed.
+        if self.pairing.as_ref().is_some_and(|p| p.provisional) {
+            self.pairing = None;
+        }
+        self.restore = None;
+        self.next_health = Instant::now();
+        let phase = self.idle_phase();
+        self.publish(|v| {
+            v.restore = None;
+            v.phase = phase;
+            v.notice = None;
+        });
+        log("restore: cancelled before confirmation");
+    }
+
+    fn restore_dismiss(&mut self) {
+        if !matches!(self.restore_phase(), Some(RestorePhase::Failed { .. })) {
+            return;
+        }
+        if self.restore.as_ref().is_some_and(|f| f.sync_stopped) {
+            self.publish(|v| v.restart = true); // sync resumes only by restarting
+            return;
+        }
+        self.restore = None;
+        let phase = self.idle_phase();
+        self.publish(|v| {
+            v.restore = None;
+            v.phase = phase;
+        });
+    }
+
+    fn poll_restore_job(&mut self) {
+        let Some(job) = self.restore.as_mut().and_then(|f| f.job.as_mut()) else {
+            return;
+        };
+        let mut finished = None;
+        let mut status = None;
+        while let Ok(ev) = job.events.try_recv() {
+            match ev {
+                JobEvent::Status(s) => status = Some(s),
+                JobEvent::Committed => {
+                    job.committed = true;
+                    status = Some("Finishing...");
+                }
+                JobEvent::Finished(r) => finished = Some(*r),
+            }
+        }
+        let committed = job.committed;
+        let profile = job.profile.clone();
+        let cancelling = job.cancel.load(Ordering::SeqCst);
+        if let Some(r) = finished {
+            if let Some(f) = self.restore.as_mut() {
+                f.job = None;
+            }
+            match r {
+                Ok(AdoptionOutcome::Adopted(rep)) => {
+                    log(format!(
+                        "restore: adopted library={} server_id={} replica={}",
+                        rep.library_id, rep.server_id, rep.replica_id
+                    ));
+                    let id = profile.server_id;
+                    self.profile = Some(profile);
+                    self.publish(|v| {
+                        v.restore = Some(RestorePhase::Done);
+                        v.paired_server = Some(id);
+                        v.restart = true;
+                    });
+                }
+                Ok(AdoptionOutcome::AlreadyAdopted { .. }) => self.set_restore(
+                    Some(RestorePhase::Failed {
+                        message: "This library is already on this Kindle.".into(),
+                    }),
+                    None,
+                ),
+                Err(e) if e.kind == AdoptErrorKind::Cancelled => {
+                    log("restore: cancelled; restarting");
+                    self.publish(|v| {
+                        v.restore = Some(RestorePhase::Working {
+                            status: "Cancelled. Restarting...".into(),
+                            cancellable: false,
+                        });
+                        v.restart = true;
+                    });
+                }
+                Err(e) if committed => {
+                    // Committed: startup recovery completes it.
+                    log(format!("restore: interrupted after commit: {e}"));
+                    self.publish(|v| {
+                        v.restore = Some(RestorePhase::Working {
+                            status: "Finishing after restart...".into(),
+                            cancellable: false,
+                        });
+                        v.restart = true;
+                    });
+                }
+                Err(e) => {
+                    log(format!("restore: failed: {e}"));
+                    self.set_restore(
+                        Some(RestorePhase::Failed {
+                            message: friendly(&e, true),
+                        }),
+                        None,
+                    );
+                }
+            }
+            return;
+        }
+        if let Some(st) = status {
+            self.publish(|v| {
+                v.restore = Some(RestorePhase::Working {
+                    status: st.into(),
+                    cancellable: !committed && !cancelling,
+                })
+            });
+        }
+    }
+
     fn tick(&mut self) {
         if let Some(until) = self.rediscover_until {
             let found = self
@@ -656,6 +1155,7 @@ impl<S: LinkSink, D: DiscoverySource> Worker<S, D> {
             }
         }
         self.poll_pairing();
+        self.poll_restore_job();
         self.health();
         let servers = self.servers();
         let searching = self.searching();
@@ -693,6 +1193,8 @@ impl ServerLink {
             servers: Vec::new(),
             paired_server: profile.as_ref().map(|p| p.server_id),
             notice: None,
+            restore: None,
+            restart: false,
             version: 1,
         }));
         let (tx, rx): (Sender<Option<LinkCmd>>, Receiver<Option<LinkCmd>>) = mpsc::channel();
@@ -710,6 +1212,7 @@ impl ServerLink {
             last_rediscover: None,
             linked: None,
             display_name: display_name.to_string(),
+            restore: None,
         };
         if let Some(p) = &w.profile {
             log(format!(
@@ -753,6 +1256,94 @@ impl ServerLink {
             let _ = t.join();
         }
     }
+}
+
+/// A short user-facing message for a refused restore (no IDs, hashes or internal terms).
+fn friendly(e: &AdoptError, after_confirm: bool) -> String {
+    let unchanged = if after_confirm {
+        " Nothing was changed."
+    } else {
+        ""
+    };
+    match e.kind {
+        AdoptErrorKind::Unreachable => format!("Could not reach the server.{unchanged}"),
+        AdoptErrorKind::Unauthorized => {
+            format!("The server did not accept this Kindle. Pair again.{unchanged}")
+        }
+        AdoptErrorKind::ServerMismatch
+        | AdoptErrorKind::LibraryMismatch
+        | AdoptErrorKind::GenesisMismatch
+        | AdoptErrorKind::InvalidSnapshot => {
+            format!("The server's copy could not be verified.{unchanged}")
+        }
+        AdoptErrorKind::Unsupported => {
+            format!("This Kindle cannot open that library.{unchanged}")
+        }
+        AdoptErrorKind::InsufficientStorage => {
+            format!("Not enough free space on this Kindle.{unchanged}")
+        }
+        AdoptErrorKind::Busy => "Another restore is in progress.".into(),
+        AdoptErrorKind::Cancelled => "Restore cancelled.".into(),
+        AdoptErrorKind::Local => format!("The restore could not be completed.{unchanged}"),
+    }
+}
+
+/// The restore job (its own thread): download + verify, then adopt with the pairing.
+fn run_restore_job(
+    ctx: &RestoreContext,
+    device_dir: &Path,
+    profile: &ServerProfileV1,
+    library_id: LibraryId,
+    cancel: &AtomicBool,
+    tx: &Sender<JobEvent>,
+) {
+    use crate::sync_adopt::{adopt_library, fetch_adoption_source, AdoptOptions, AdoptProfile};
+    let target = crate::sync_adopt::AdoptionTarget {
+        server_id: profile.server_id,
+        library_id,
+    };
+    let res = fetch_adoption_source(&profile.last_endpoint, &profile.credential, target).and_then(
+        |src| {
+            let _ = tx.send(JobEvent::Status("Preparing library..."));
+            let hook = |p: &str| -> Result<(), String> {
+                match p {
+                    "after_verify" => {
+                        let _ = tx.send(JobEvent::Status("Saving library..."));
+                    }
+                    // The plan is durable when this point is reached: committed.
+                    "after_plan" => {
+                        let _ = tx.send(JobEvent::Committed);
+                    }
+                    _ => {}
+                }
+                #[cfg(test)]
+                if RESTORE_FAULTS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(d, at)| *d == ctx.sync_dir && *at == p)
+                {
+                    return Err(format!("injected crash at {p}"));
+                }
+                Ok(())
+            };
+            adopt_library(
+                &ctx.library_root,
+                &ctx.sync_dir,
+                &src,
+                &AdoptOptions {
+                    hook: &hook,
+                    cancel: Some(cancel),
+                    profile: Some(AdoptProfile {
+                        device_dir,
+                        profile,
+                    }),
+                    ..AdoptOptions::new(ctx.device)
+                },
+            )
+        },
+    );
+    let _ = tx.send(JobEvent::Finished(Box::new(res)));
 }
 
 static GLOBAL: Mutex<Option<ServerLink>> = Mutex::new(None);

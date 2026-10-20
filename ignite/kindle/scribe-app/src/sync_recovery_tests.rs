@@ -1295,6 +1295,7 @@ fn an_exchange_whose_reply_never_comes_fails_within_the_deadline() {
         token: "0".repeat(64),
         debug_drop_first_ack: false,
         debug_crash_point: None,
+        server_id: None,
     };
     let agent = agent();
     let first = send(&agent, &cfg, "POST", "/x", b"{}");

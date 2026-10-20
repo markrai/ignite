@@ -282,6 +282,7 @@ pub(super) fn write_config(sync_dir: &Path, url: &str, token: &str, drop_ack: bo
             token: token.to_string(),
             debug_drop_first_ack: drop_ack,
             debug_crash_point: None,
+            server_id: None,
         },
     )
     .unwrap();
@@ -434,6 +435,7 @@ fn config_debug_never_shows_token() {
         token: "f".repeat(64),
         debug_drop_first_ack: false,
         debug_crash_point: None,
+        server_id: None,
     };
     assert!(!format!("{c:?}").contains(&c.token));
     assert_eq!(redact(&format!("x {} y", c.token), &c), "x <redacted> y");

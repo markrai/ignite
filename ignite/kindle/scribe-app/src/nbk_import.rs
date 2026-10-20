@@ -48,8 +48,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::library::{
     allocate_fresh_notebook_id, create_notebook_at_durable, delete_notebook_durable,
-    quarantine_notebook_dir, read_notebook_manifest_read_only, DeleteNotebookHooks,
-    LibraryRepository, MAX_TITLE_CHARS,
+    open_library_read_only, quarantine_notebook_dir, read_notebook_manifest_read_only,
+    DeleteNotebookHooks, LibraryRepository, MAX_TITLE_CHARS,
 };
 use crate::notebook::{insert_page_after_durable, InsertPageHooks};
 use crate::pressure_curve::STYLE_PRESSURE_WIDTH_V1;
@@ -856,6 +856,57 @@ pub fn recover_interrupted(
         let _ = fail(&mut ledger, &mut r, why);
     }
     Ok(log)
+}
+
+/// Library adoption (`sync_adopt`): carry this Kindle's import ledger from the library `from`
+/// into the adopted library `to` (staged, not yet live). Receipts are device history — which
+/// Amazon notebooks were already imported here — so every receipt is kept and its source stays
+/// ineligible. A receipt's destination is re-resolved through the notebook's global sync
+/// identity (`from` local name → global ID → `to` local name), never copied as a local name;
+/// the destination's provenance marker moves with it. When the adopted library does not hold
+/// that notebook the destination is cleared. An interrupted (`pending`) receipt becomes
+/// `failed` (retryable). Returns how many receipts were carried.
+pub(crate) fn carry_receipts(from: &Path, to: &Path) -> Result<usize, String> {
+    let old = Ledger::open(from)?;
+    if old.data.receipts.is_empty() {
+        return Ok(0);
+    }
+    let from_ids = crate::sync_local::read_identity(from)?;
+    let to_ids = crate::sync_local::read_identity(to)?
+        .ok_or("REFUSE IMPORT LEDGER: the adopted library has no sync identity")?;
+    let to_local: BTreeMap<_, _> = to_ids.notebooks.iter().map(|(l, g)| (*g, l)).collect();
+    let (from_lib, to_lib) = (open_library_read_only(from)?, open_library_read_only(to)?);
+    let mut carried = ReceiptsV1 {
+        v: 1,
+        receipts: BTreeMap::new(),
+    };
+    for (key, r) in &old.data.receipts {
+        let mut r = r.clone();
+        let old_dest = r.dest_notebook_id.take();
+        let new_dest = old_dest
+            .as_deref()
+            .and_then(|l| from_ids.as_ref()?.notebooks.get(l))
+            .and_then(|g| to_local.get(g))
+            .map(|l| l.to_string());
+        if let (Some(od), Some(nd)) = (&old_dest, &new_dest) {
+            let marker = from_lib.notebook_dir(od).join(ORIGIN_MARKER);
+            if let Ok(b) = fs::read(&marker) {
+                let m: Option<ImportOriginV1> = serde_json::from_slice(&b).ok();
+                if m.is_some_and(|m| m.origin_id == r.origin_id) {
+                    write_atomic(&to_lib.notebook_dir(nd).join(ORIGIN_MARKER), &b)?;
+                }
+            }
+        }
+        if r.state == ReceiptState::Pending {
+            r.state = ReceiptState::Failed;
+            r.error = Some("interrupted before the library was restored".into());
+        }
+        r.dest_notebook_id = new_dest;
+        carried.receipts.insert(key.clone(), r);
+    }
+    let bytes = serde_json::to_vec_pretty(&carried).map_err(|e| e.to_string())?;
+    write_atomic(&Ledger::path_for(to), &bytes)?;
+    Ok(carried.receipts.len())
 }
 
 #[cfg(test)]

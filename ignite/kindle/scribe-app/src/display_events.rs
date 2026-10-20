@@ -9,10 +9,16 @@
 //!
 //! A reader thread only bumps atomic generation counters. No framebuffer, storage, or UI work
 //! happens off the main loop.
+//!
+//! The pipe also proves the host is alive: the host closes it before every deliberate stop,
+//! and it closes when the host dies. EOF therefore ends the hosted session cleanly (the
+//! session's stop flag) — a child never outlives its host holding the singleton, the stylus
+//! grab or the panel. One reader serves the whole process; each page session (including an
+//! in-process restart) retargets it at its own counters and stop flag.
 
 use std::io::BufRead;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const RELAY_INVALIDATE: &str = "display-invalidate";
 pub const RELAY_RESTORE: &str = "display-restore";
@@ -78,17 +84,54 @@ impl DisplayEventReceiver {
     }
 }
 
-/// Spawn the stdin reader. EOF (host closed the pipe) simply ends the thread.
-pub fn spawn_stdin_reader(counters: Arc<DisplayEventCounters>) {
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else {
-                break;
-            };
+/// Where relay lines go: the current page session's counters and stop flag.
+type RelayTarget = (Arc<DisplayEventCounters>, Arc<AtomicBool>);
+
+static RELAY_TARGET: Mutex<Option<RelayTarget>> = Mutex::new(None);
+static RELAY_STARTED: AtomicBool = AtomicBool::new(false);
+static HOST_GONE: AtomicBool = AtomicBool::new(false);
+
+/// Feed relay lines from `input` to the current target until EOF (or a read error).
+fn relay_until_eof(input: impl BufRead, target: &Mutex<Option<RelayTarget>>) {
+    for line in input.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if let Some((counters, _)) = target.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             counters.apply_line(&line);
         }
+    }
+}
+
+/// The host closed the relay pipe: end the current session and never restart in-process.
+fn host_gone(target: &Mutex<Option<RelayTarget>>, gone: &AtomicBool) {
+    gone.store(true, Ordering::SeqCst);
+    if let Some((_, stop)) = target.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Route the stdin relay to this page session (`counters`, and `stop` on host EOF), starting
+/// the one process-wide reader on first use.
+pub fn spawn_stdin_reader(counters: Arc<DisplayEventCounters>, stop: Arc<AtomicBool>) {
+    *RELAY_TARGET.lock().unwrap_or_else(|p| p.into_inner()) = Some((counters, stop));
+    if HOST_GONE.load(Ordering::SeqCst) {
+        host_gone(&RELAY_TARGET, &HOST_GONE);
+        return;
+    }
+    if RELAY_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        relay_until_eof(std::io::stdin().lock(), &RELAY_TARGET);
+        println!("display_events=host relay closed; ending the hosted session");
+        host_gone(&RELAY_TARGET, &HOST_GONE);
     });
+}
+
+/// The hosting `scribe-lifecycle` has gone (its relay pipe closed): no in-process restart.
+pub fn host_relay_closed() -> bool {
+    HOST_GONE.load(Ordering::SeqCst)
 }
 
 /// Map one `lipc-wait-event` output line for powerd to a relay line (the event name may be
@@ -150,6 +193,45 @@ pub fn stop_powerd_watcher() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_follows_the_current_session_and_eof_stops_it() {
+        let target: Mutex<Option<RelayTarget>> = Mutex::new(None);
+        let gone = AtomicBool::new(false);
+        let (first, stop1) = (
+            Arc::new(DisplayEventCounters::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        *target.lock().unwrap() = Some((Arc::clone(&first), Arc::clone(&stop1)));
+        relay_until_eof(
+            std::io::Cursor::new(
+                "display-invalidate
+",
+            ),
+            &target,
+        );
+        assert_eq!(first.snapshot(), (1, 0));
+        // An in-process restart retargets the same reader: lines reach only the new session.
+        let (second, stop2) = (
+            Arc::new(DisplayEventCounters::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        *target.lock().unwrap() = Some((Arc::clone(&second), Arc::clone(&stop2)));
+        relay_until_eof(
+            std::io::Cursor::new(
+                "display-restore
+unknown
+",
+            ),
+            &target,
+        );
+        assert_eq!((first.snapshot(), second.snapshot()), ((1, 0), (0, 1)));
+        // EOF = the host is gone: the current session stops (the previous one is untouched).
+        assert!(!stop2.load(Ordering::SeqCst));
+        host_gone(&target, &gone);
+        assert!(stop2.load(Ordering::SeqCst) && gone.load(Ordering::SeqCst));
+        assert!(!stop1.load(Ordering::SeqCst));
+    }
+
     use super::*;
 
     #[test]

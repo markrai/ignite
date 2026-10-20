@@ -65,6 +65,13 @@ pub enum UiCommand {
     SyncCancelPairing,
     /// D1: manual server address typed on the keyboard (fallback when discovery is blocked).
     SyncManualUrl(String),
+    /// 1H-D2 Restore from Server (handled by the server link; see `server_link`).
+    SyncRestoreBegin,
+    SyncRestoreServer(control_protocol::ServerId),
+    SyncRestoreLibrary(sync_protocol::LibraryId),
+    SyncRestoreConfirm,
+    SyncRestoreCancel,
+    SyncRestoreDismiss,
     /// Home → Tools screen.
     OpenTools,
     /// Settings tab: Tools (keep scan state).
@@ -122,6 +129,22 @@ pub enum UiCommand {
     OpenLinkPopup {
         link_id: sync_protocol::LinkId,
     },
+}
+
+impl UiCommand {
+    /// 1H-D2: the server-link command of a Restore-from-Server step. `SyncRestoreBegin` carries
+    /// the runtime's installation and is built there.
+    pub fn restore_link_cmd(&self) -> Option<crate::server_link::LinkCmd> {
+        use crate::server_link::LinkCmd;
+        Some(match self {
+            UiCommand::SyncRestoreServer(id) => LinkCmd::RestoreSelectServer(*id),
+            UiCommand::SyncRestoreLibrary(id) => LinkCmd::RestoreSelectLibrary(*id),
+            UiCommand::SyncRestoreConfirm => LinkCmd::RestoreConfirm,
+            UiCommand::SyncRestoreCancel => LinkCmd::RestoreCancel,
+            UiCommand::SyncRestoreDismiss => LinkCmd::RestoreDismiss,
+            _ => return None,
+        })
+    }
 }
 
 /// Notebook-view facts needed to resolve chrome and page-menu taps.
@@ -598,11 +621,17 @@ impl UiState {
         let Some(view) = &self.sync_view else {
             return UiCommand::None;
         };
-        match SyncLayout::new(geo, view).hit(p.x, p.y) {
+        match SyncLayout::new(geo, view).hit_view(view, p.x, p.y) {
             None => UiCommand::None,
             Some(SyncHit::Back) => UiCommand::GoHome,
             Some(SyncHit::Pair(id)) => UiCommand::SyncPair(id),
             Some(SyncHit::CancelPairing) => UiCommand::SyncCancelPairing,
+            Some(SyncHit::Restore) => UiCommand::SyncRestoreBegin,
+            Some(SyncHit::RestoreServer(id)) => UiCommand::SyncRestoreServer(id),
+            Some(SyncHit::RestoreLibrary(id)) => UiCommand::SyncRestoreLibrary(id),
+            Some(SyncHit::RestoreConfirm) => UiCommand::SyncRestoreConfirm,
+            Some(SyncHit::RestoreCancel) => UiCommand::SyncRestoreCancel,
+            Some(SyncHit::RestoreOk) => UiCommand::SyncRestoreDismiss,
             Some(SyncHit::ManualUrl) => {
                 self.modal = Some(Modal::TitleEntry {
                     purpose: TitlePurpose::ServerUrl,

@@ -128,7 +128,7 @@ pub fn profile_for(render: &RenderProfileRef) -> Result<RenderProfile, String> {
 impl LocalMaterializer<'_> {
     /// Exact background bytes + (width, height, stride) for a page spec. Blobs must already be
     /// verified into `blob_dir`; they are re-hashed here (never trust a file name).
-    fn background(&self, bg: &BackgroundRef) -> Result<(Vec<u8>, PanelDims), String> {
+    pub(crate) fn background(&self, bg: &BackgroundRef) -> Result<(Vec<u8>, PanelDims), String> {
         let d = self.device;
         match bg {
             // The page header always carries this panel's line_length (the runtime refuses any

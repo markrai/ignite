@@ -111,6 +111,7 @@ fn write_config(sync: &Path, url: &str, token: &str) {
         token: token.to_string(),
         debug_drop_first_ack: false,
         debug_crash_point: None,
+        server_id: None,
     };
     let mut bytes = to_canonical_json(&cfg).unwrap();
     bytes.push(b'\n');

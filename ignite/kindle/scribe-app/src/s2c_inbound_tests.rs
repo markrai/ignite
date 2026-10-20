@@ -143,6 +143,7 @@ fn config(k: &Kindle, url: &str, token: &str) {
             token: token.to_string(),
             debug_drop_first_ack: false,
             debug_crash_point: None,
+            server_id: None,
         },
     )
     .unwrap();
@@ -1124,6 +1125,7 @@ fn pending_local_op_invalid_after_rebase_fails_closed() {
         token: srv.token.clone(),
         debug_drop_first_ack: false,
         debug_crash_point: None,
+        server_id: None,
     };
     assert!(super::inbound::pull_once(&s.shared, &agent(), &cfg)
         .ok()
@@ -2458,6 +2460,7 @@ fn inbound_replace_conflicts_with_local_erase_of_the_same_root() {
         token: srv.token.clone(),
         debug_drop_first_ack: false,
         debug_crash_point: None,
+        server_id: None,
     };
     assert!(super::inbound::pull_once(&s.shared, &agent(), &cfg)
         .ok()

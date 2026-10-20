@@ -42,28 +42,44 @@ fn main() -> ExitCode {
         // A second invocation leaves the live instance alone (never SIGTERM, never paint).
         match run_with_singleton(Path::new(DEFAULT_LOCK_PATH), || {
             let stop = Arc::new(AtomicBool::new(false));
-            let stop_c = Arc::clone(&stop);
+            let signalled = Arc::new(AtomicBool::new(false));
+            let (stop_c, signalled_c) = (Arc::clone(&stop), Arc::clone(&signalled));
             if let Err(e) = ctrlc::set_handler(move || {
                 eprintln!("signal=caught requesting shutdown");
+                signalled_c.store(true, Ordering::SeqCst);
                 stop_c.store(true, Ordering::SeqCst);
             }) {
                 eprintln!("warning: ctrlc handler: {e}");
             }
-            let cfg = match runtime::default_config(du_interval_us, du_override, &args) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return 1;
+            loop {
+                let cfg = match runtime::default_config(du_interval_us, du_override, &args) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 1;
+                    }
+                };
+                let code = runtime::run_page_session(cfg, Arc::clone(&stop));
+                // S2B: bounded stop of background sync after the pen session is released (never
+                // delays the input/panel shutdown; the durable outbox survives for the next
+                // launch). D1: stop the server link first (closes discovery + the firewall
+                // aperture).
+                scribe_app::server_link::shutdown_global();
+                scribe_app::display_events::stop_powerd_watcher();
+                scribe_app::sync_outbound::shutdown_global(std::time::Duration::from_millis(1500));
+                // 1H-D2: a library restore restarts the session cleanly in this process (same
+                // singleton lock); startup recovery then completes it. A signal, or the host
+                // closing its relay (it is stopping or gone), always wins.
+                if runtime::take_restart_request()
+                    && !signalled.load(Ordering::SeqCst)
+                    && !scribe_app::display_events::host_relay_closed()
+                {
+                    println!("session_restart=library_restore");
+                    stop.store(false, Ordering::SeqCst);
+                    continue;
                 }
-            };
-            let code = runtime::run_page_session(cfg, stop);
-            // S2B: bounded stop of background sync after the pen session is released (never
-            // delays the input/panel shutdown; the durable outbox survives for the next launch).
-            // D1: stop the server link first (closes discovery + the firewall aperture).
-            scribe_app::server_link::shutdown_global();
-            scribe_app::display_events::stop_powerd_watcher();
-            scribe_app::sync_outbound::shutdown_global(std::time::Duration::from_millis(1500));
-            code
+                break code;
+            }
         }) {
             Ok(run) => ExitCode::from(process_exit_code(run)),
             Err(e) => {

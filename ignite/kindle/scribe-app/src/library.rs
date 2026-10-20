@@ -621,6 +621,26 @@ fn create_initial_library(
     geo: &FbGeometry,
     background: &[u8],
 ) -> Result<(), String> {
+    create_library_with_first_notebook(root, &default_title(1), profile, geo, background)
+}
+
+/// Create a new library whose only notebook is `notebook-1` titled `title`, with one page of
+/// `background` (panel `geo`) and `profile`. Sync adoption uses it to start a library directly
+/// as the first notebook of the canonical state it then materializes (no placeholder notebook).
+pub fn create_library_with_first_notebook(
+    root: &Path,
+    title: &str,
+    profile: &RenderProfile,
+    geo: &FbGeometry,
+    background: &[u8],
+) -> Result<(), String> {
+    validate_title(title)?;
+    if library_manifest_path(root).exists() {
+        return Err(format!(
+            "REFUSE LIBRARY CREATE: {} already holds a library",
+            root.display()
+        ));
+    }
     let notebooks = root.join(NOTEBOOKS_DIR);
     fs::create_dir_all(&notebooks).map_err(|e| e.to_string())?;
     let id = "notebook-1";
@@ -632,7 +652,7 @@ fn create_initial_library(
         ));
     }
     if let Err(e) = create_notebook_files_with_profile(&dir, id, profile, geo, background)
-        .and_then(|()| write_notebook_info(&dir, &default_title(1)))
+        .and_then(|()| write_notebook_info(&dir, title))
     {
         let _ = fs::remove_dir_all(&dir);
         return Err(e);

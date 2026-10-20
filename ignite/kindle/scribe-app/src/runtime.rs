@@ -2199,6 +2199,8 @@ struct UiExec<'a> {
     import_run: &'a mut Option<ImportRun>,
     /// Replica-local preferences.json (outside the library).
     prefs_path: &'a Path,
+    /// `--sync-dir` (Restore from Server replaces it with the library).
+    sync_dir: Option<&'a Path>,
     lasso: &'a mut LassoState,
     overlay: &'a mut TouchOverlayDirty,
     cached_move_ids: &'a mut Option<HashSet<String>>,
@@ -2465,6 +2467,20 @@ fn folder_mutation(
         }
     }
     present_ui(x, ctrl, None)
+}
+
+/// 1H-D2: set when a library restore needs the page session restarted (the binary's session
+/// loop runs it again in the same process; startup recovery then completes the restore).
+static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Consume a pending session-restart request.
+pub fn take_restart_request() -> bool {
+    RESTART_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// A Restore-from-Server flow is on screen: no developer library operations meanwhile.
+fn restore_flow_open(ui: &UiState) -> bool {
+    ui.view == AppView::Sync && ui.sync_view.as_ref().is_some_and(|v| v.restore.is_some())
 }
 
 /// Repaint whatever the UI state says is on screen. GC16 FULL unless `region` (keyboard).
@@ -3178,6 +3194,37 @@ fn execute_ui_command(
             });
             present_ui(x, ctrl, None)
         }
+        UiCommand::SyncRestoreBegin => {
+            // 1H-D2: the server link runs the whole flow; this installation is what it replaces.
+            // 1H-D3: only in builds that offer it (the button is not drawn otherwise).
+            if let Some(sync_dir) = x.sync_dir.filter(|_| crate::sync_ui::RESTORE_FROM_SERVER) {
+                let ctx = crate::server_link::RestoreContext {
+                    library_root: x.library.root().to_path_buf(),
+                    sync_dir: sync_dir.to_path_buf(),
+                    device: crate::sync_outbound::DeviceGeometry {
+                        width: x.geo.xres,
+                        height: x.geo.yres,
+                        line_length: x.geo.line_length,
+                    },
+                };
+                crate::server_link::with_global(|l| {
+                    l.send(crate::server_link::LinkCmd::BeginRestore(ctx))
+                });
+                println!("sync_restore=begin");
+            }
+            Ok(())
+        }
+        cmd @ (UiCommand::SyncRestoreServer(_)
+        | UiCommand::SyncRestoreLibrary(_)
+        | UiCommand::SyncRestoreConfirm
+        | UiCommand::SyncRestoreCancel
+        | UiCommand::SyncRestoreDismiss) => {
+            if let Some(link_cmd) = cmd.restore_link_cmd() {
+                println!("sync_restore_step={link_cmd:?}");
+                crate::server_link::with_global(|l| l.send(link_cmd));
+            }
+            Ok(())
+        }
         UiCommand::GoHome => {
             if x.ui.view == AppView::Sync {
                 crate::server_link::with_global(|l| {
@@ -3646,7 +3693,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     }
     let display_counters = Arc::new(DisplayEventCounters::default());
     if cfg.display_events_stdin {
-        spawn_stdin_reader(Arc::clone(&display_counters));
+        spawn_stdin_reader(Arc::clone(&display_counters), Arc::clone(&stop));
         println!("display_events=stdin relay (goingToScreenSaver→invalidate, exitingScreenSaver→restore)");
     } else if crate::display_events::spawn_powerd_watcher(Arc::clone(&display_counters)) {
         // Not hosted (e.g. an SSH-launched session): watch the same two powerd events directly.
@@ -3663,6 +3710,25 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     // F11: a brand-new library/notebook gets plain paper. The live framebuffer at launch shows
     // Amazon UI (and later Home/modals/chrome), so it is never a durable background source.
     let bg_capture = paper_background(&g);
+
+    // 1H-D1: finish (or discard) an interrupted library adoption before the library is opened,
+    // so neither an empty new library nor sync is ever started over a half-published one.
+    if let Some(sync_dir) = &cfg.sync_dir {
+        match crate::sync_adopt::recover_interrupted_adoption(
+            &cfg.data_dir,
+            sync_dir,
+            cfg.device_dir.as_deref(),
+        ) {
+            Ok(crate::sync_adopt::AdoptionRecovery::None) => {}
+            Ok(r) => println!("adoption_recovery={r:?}"),
+            Err(e) => {
+                let e = format!("REFUSE LIBRARY OPEN: interrupted library adoption: {e}");
+                eprintln!("{e}");
+                drop(src);
+                return abort_after_loading(e);
+            }
+        }
+    }
 
     crate::launch_clock::mark("library_open_start");
     let library_open =
@@ -3978,6 +4044,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     stop: &stop,
                     import_run: &mut import_run,
                     prefs_path: &prefs_path,
+                    sync_dir: cfg.sync_dir.as_deref(),
                     lasso: &mut lasso,
                     overlay: &mut overlay,
                     cached_move_ids: &mut cached_move_ids,
@@ -4100,6 +4167,18 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                 continue;
             }
         }
+        // 1H-D2: a restore stopped sync (finished, cancelled after confirmation, or failed and
+        // acknowledged): restart the session cleanly once its last state has been painted.
+        if ui.view == AppView::Sync
+            && !stop.load(Ordering::SeqCst)
+            && crate::server_link::with_global(|l| l.view().restart) == Some(true)
+            && ui.sync_view.as_ref().is_some_and(|v| v.restart)
+        {
+            println!("sync_restore=restart_requested");
+            RESTART_REQUESTED.store(true, Ordering::SeqCst);
+            stop.store(true, Ordering::SeqCst);
+            continue;
+        }
 
         // S2C inbound materialization: only at the same safe point as structural work, never
         // under a gesture, a pending command or an open modal, and never while the display is
@@ -4166,6 +4245,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         // Developer-only triggers (diagnostics/tests). Not part of the product UI.
         let mut handled_library_op = false;
         if structure_eligible
+            && !restore_flow_open(&ui)
             && !matches!(
                 lasso,
                 LassoState::LassoDrawing { .. } | LassoState::Moving { .. }

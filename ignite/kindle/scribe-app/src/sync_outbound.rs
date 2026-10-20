@@ -16,7 +16,7 @@
 //! |---|---|
 //! | `config.json` | `{v, server_base_url, token}` — developer-provisioned; never logged |
 //! | `replica.json` | S1 replica identity |
-//! | `sync-state.json` | `{v:2, library_id, replica_id, genesis_sha256, genesis_uploaded, acked_client_seq, next_client_seq, server_base_url, server_cursor}` |
+//! | `sync-state.json` | `{v:2, library_id, replica_id, genesis_sha256, genesis_uploaded, acked_client_seq, next_client_seq, server_base_url, server_cursor, server_id?}` |
 //! | `genesis.json` | canonical `SyncSnapshotV1` at the sync epoch (exact bytes the server gets) |
 //! | `base-state.json` | **ServerBaseState**: canonical reducer state through `server_cursor` |
 //! | `outbox.jsonl` | append-only operation journal (records below), compacted after ACK |
@@ -59,6 +59,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use control_protocol::ServerId;
 use serde::{Deserialize, Serialize};
 use sync_engine::{HistoryV1, LibraryState};
 use sync_protocol::{
@@ -141,6 +142,10 @@ pub struct SyncConfigV1 {
     /// (e.g. `after_stroke_journal`), leaving the inbox + marker for recovery on restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_crash_point: Option<String>,
+    /// D1 product mode: the paired server's identity (from the server profile). An epoch bound
+    /// to a server (`SyncStateV1::server_id`) only uses links that name that server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<ServerId>,
 }
 
 impl std::fmt::Debug for SyncConfigV1 {
@@ -148,6 +153,7 @@ impl std::fmt::Debug for SyncConfigV1 {
         f.debug_struct("SyncConfigV1")
             .field("server_base_url", &self.server_base_url)
             .field("token", &"<redacted>")
+            .field("server_id", &self.server_id)
             .finish()
     }
 }
@@ -169,6 +175,16 @@ pub struct SyncStateV1 {
     /// S2C: highest contiguous `server_seq` whose canonical effect is durably in the
     /// ServerBaseState **and** reconciled into the Kindle files (see `sync_inbound`).
     pub server_cursor: u64,
+    /// The server this epoch belongs to (set by library adoption, `sync_adopt`). Absent for
+    /// epochs established by uploading a genesis, which stay usable with any link as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<ServerId>,
+}
+
+/// Whether `link` may carry this epoch's traffic: an epoch bound to a server refuses a link to
+/// any other (or an unidentified) server.
+fn link_permitted(state: &SyncStateV1, link: &SyncConfigV1) -> bool {
+    state.server_id.is_none_or(|id| link.server_id == Some(id))
 }
 
 /// S2C ServerBaseState: canonical reducer state through `server_cursor`.
@@ -339,7 +355,7 @@ fn parse_journal_from(mut r: impl std::io::BufRead) -> Result<ParsedJournal, Str
 // ------------------------------------------------------------------------------------------
 // Durable helpers
 
-fn sync_dir_fsync(dir: &Path) {
+pub(crate) fn sync_dir_fsync(dir: &Path) {
     #[cfg(unix)]
     if let Ok(f) = File::open(dir) {
         let _ = f.sync_all();
@@ -348,7 +364,7 @@ fn sync_dir_fsync(dir: &Path) {
     let _ = dir;
 }
 
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = dir.join(format!("{name}.tmp"));
     {
@@ -363,7 +379,7 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn write_json<T: Serialize>(dir: &Path, name: &str, v: &T) -> Result<(), String> {
+pub(crate) fn write_json<T: Serialize>(dir: &Path, name: &str, v: &T) -> Result<(), String> {
     let mut bytes = to_canonical_json(v).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     write_atomic(dir, name, &bytes)
@@ -426,7 +442,7 @@ fn read_base_state(path: &Path) -> Result<BaseStateV2, String> {
         .map_err(|e| format!("{}: parse: {e}", path.display()))
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     from_json(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -1083,6 +1099,13 @@ impl OutboundSync {
             .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
         lock.try_lock()
             .map_err(|e| format!("REFUSE SYNC: {} is in use ({e})", sync_dir.display()))?;
+        // Checked under the lock: an adoption publishes only after taking it.
+        if crate::sync_adopt::adoption_pending(sync_dir) {
+            return Err(format!(
+                "REFUSE SYNC: a library adoption into {} is pending; recover it first",
+                sync_dir.display()
+            ));
+        }
         let config: Option<SyncConfigV1> =
             match read_json::<SyncConfigV1>(&sync_dir.join(CONFIG_FILE)) {
                 Ok(c) if c.v == 1 => Some(c),
@@ -1096,6 +1119,15 @@ impl OutboundSync {
         crate::launch_clock::mark("sync_epoch_begin");
         let (state, store) = establish_epoch(library_root, sync_dir, replica.replica_id, &config)?;
         crate::launch_clock::mark("sync_epoch_end");
+        let config = config.filter(|c| {
+            let ok = link_permitted(&state, c);
+            if !ok {
+                log(
+                    "REFUSE LINK: this sync epoch belongs to another server (offline capture only)",
+                );
+            }
+            ok
+        });
         let device = device_geometry(library_root);
         let accepted = load_accepted(
             sync_dir,
@@ -1243,6 +1275,13 @@ impl OutboundSync {
     pub fn set_link(&self, link: Option<SyncConfigV1>) {
         {
             let mut g = self.shared.lock().unwrap();
+            let link = link.filter(|c| {
+                let ok = link_permitted(&g.state, c);
+                if !ok {
+                    log("REFUSE LINK: this sync epoch belongs to another server");
+                }
+                ok
+            });
             g.product_mode = true;
             if link.is_some() {
                 g.auth_revoked = false;
@@ -2523,6 +2562,7 @@ fn establish_epoch(
         next_client_seq: 1,
         server_base_url: config.as_ref().map(|c| c.server_base_url.clone()),
         server_cursor: 0,
+        server_id: None,
     };
     // The state file is written last: its existence marks the epoch as established.
     write_json(dir, STATE_FILE, &state)?;
@@ -2531,6 +2571,50 @@ fn establish_epoch(
         state.library_id, state.genesis_sha256
     ));
     Ok((state, store))
+}
+
+/// Library adoption (`sync_adopt`): establish an epoch in the empty `dir` for a library that
+/// already exists on `server_id`, whose genesis is `genesis_bytes` (verified canonical bytes of
+/// `genesis`). Unlike a new epoch nothing is uploaded: the genesis is marked uploaded, the
+/// ServerBaseState is the genesis at server_seq 0 and ordinary inbound sync pulls the tail.
+/// Client sequencing starts at 1 under `replica_id`. The state file is written last.
+pub(crate) fn establish_adopted_epoch(
+    dir: &Path,
+    replica_id: ReplicaId,
+    server_id: ServerId,
+    genesis_bytes: &[u8],
+    genesis: &SyncSnapshotV1,
+    blobs: &[&[u8]],
+) -> Result<SyncStateV1, String> {
+    if dir.join(STATE_FILE).exists() {
+        return Err(format!(
+            "REFUSE ADOPT: {} already holds a sync epoch",
+            dir.display()
+        ));
+    }
+    for b in blobs {
+        store_blob(dir, b)?;
+    }
+    let base = LibraryState::genesis(genesis.clone()).map_err(|e| e.to_string())?;
+    write_atomic(dir, GENESIS_FILE, genesis_bytes)?;
+    initial_base_store(dir, base, 0)?;
+    write_atomic(dir, OUTBOX_FILE, b"")?;
+    write_atomic(dir, HISTORY_FILE, b"")?;
+    write_atomic(dir, INBOX_FILE, b"")?;
+    let state = SyncStateV1 {
+        v: SYNC_STATE_VERSION,
+        library_id: genesis.library_id,
+        replica_id,
+        genesis_sha256: sha256_hex(genesis_bytes),
+        genesis_uploaded: true,
+        acked_client_seq: 0,
+        next_client_seq: 1,
+        server_base_url: None,
+        server_cursor: 0,
+        server_id: Some(server_id),
+    };
+    write_json(dir, STATE_FILE, &state)?;
+    Ok(state)
 }
 
 /// Install a trustworthy next `client_seq` from a valid parsed outbox (no unresolved prep).

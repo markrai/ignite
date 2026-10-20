@@ -494,6 +494,7 @@ fn wrong_library_and_replica_are_refused() {
         next_client_seq: 2,
         server_base_url: None,
         server_cursor: 0,
+        server_id: None,
     };
     fs::write(
         sync.join(crate::sync_outbound::STATE_FILE),

@@ -16,6 +16,9 @@ pub mod evdev_ioctl;
 pub mod fb_polarity;
 pub mod fb_sample;
 pub mod fbdev_abi;
+/// `statvfs` (the only unsafe call; Unix only).
+#[allow(unsafe_code)]
+pub mod fs_space;
 pub mod gate_b;
 pub mod hwtcon_abi;
 pub mod marker;

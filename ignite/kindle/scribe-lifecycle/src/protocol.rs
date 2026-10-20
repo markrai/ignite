@@ -40,12 +40,20 @@ pub const KINDLE_HOME_APP_URI: &str = "app://com.lab126.KPPMainApp";
 /// Must stay in lockstep with `scribe_app::singleton::EXIT_ALREADY_RUNNING`.
 pub const CHILD_EXIT_ALREADY_RUNNING: i32 = 79;
 
-/// Whether an *unrequested* child wait status should ask appmgrd to start Kindle Home.
+/// Why an *unrequested* child exit happened (for the host log). Every such exit hands the panel
+/// back to Kindle Home: this host is in front, and it has no child left to draw.
 ///
-/// - `Some(0)` / `Some(1)` / signal (`None`) → yes (session ended or failed).
-/// - `Some(CHILD_EXIT_ALREADY_RUNNING)` → no (another live `scribe-app` already owns the panel).
-pub fn should_handoff_kindle_home(child_exit_code: Option<i32>) -> bool {
-    child_exit_code != Some(CHILD_EXIT_ALREADY_RUNNING)
+/// - `Some(CHILD_EXIT_ALREADY_RUNNING)` → `"already_running"`: the child lost the singleton and
+///   never drew. The lock owner is not this host's child, and a host only starts when appmgrd
+///   considers Ignite stopped, so that owner was never activated and has no claim on the panel.
+///   Keeping the host in front would only leave a blank screen.
+/// - `Some(0)` / `Some(1)` / signal (`None`) → `"session_ended"`: the session ended or failed.
+pub fn unrequested_exit_reason(child_exit_code: Option<i32>) -> &'static str {
+    if child_exit_code == Some(CHILD_EXIT_ALREADY_RUNNING) {
+        "already_running"
+    } else {
+        "session_ended"
+    }
 }
 
 /// Child flag that enables the stdin display-event relay in `scribe-app`.
@@ -104,33 +112,27 @@ mod tests {
     }
 
     #[test]
-    fn already_running_child_does_not_handoff_home() {
+    fn a_singleton_loser_is_reported_distinctly() {
         assert_eq!(CHILD_EXIT_ALREADY_RUNNING, 79);
-        assert!(
-            !should_handoff_kindle_home(Some(CHILD_EXIT_ALREADY_RUNNING)),
-            "singleton loser is a no-op launch"
+        assert_eq!(
+            unrequested_exit_reason(Some(CHILD_EXIT_ALREADY_RUNNING)),
+            "already_running"
         );
     }
 
     #[test]
-    fn normal_and_failed_child_exits_still_handoff_home() {
-        assert!(
-            should_handoff_kindle_home(Some(0)),
-            "hosted session ended normally"
-        );
-        assert!(
-            should_handoff_kindle_home(Some(1)),
-            "startup/session failure still hands the panel back"
-        );
-        assert!(
-            should_handoff_kindle_home(None),
-            "signal/crash still hands the panel back"
-        );
-        for other in [2, 64, 75, 78, 80, 255] {
-            assert!(
-                should_handoff_kindle_home(Some(other)),
-                "unrelated exit {other} must not be treated as already-running"
-            );
+    fn every_other_unrequested_exit_is_a_session_end() {
+        for code in [
+            Some(0),
+            Some(1),
+            None,
+            Some(2),
+            Some(64),
+            Some(78),
+            Some(80),
+            Some(255),
+        ] {
+            assert_eq!(unrequested_exit_reason(code), "session_ended", "{code:?}");
         }
     }
 }

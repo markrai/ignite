@@ -283,6 +283,7 @@ fn compare_reports_match_then_differ_without_printing_the_token() {
         token: token.clone(),
         debug_drop_first_ack: false,
         debug_crash_point: None,
+        server_id: None,
     };
     fs::write(sync.join(CONFIG_FILE), serde_json::to_vec(&cfg).unwrap()).unwrap();
     let s = OutboundSync::open(&root, &sync).unwrap();
@@ -352,6 +353,7 @@ fn remote_op_submits_every_kind_as_a_second_replica() {
         token: token.clone(),
         debug_drop_first_ack: false,
         debug_crash_point: None,
+        server_id: None,
     };
     fs::write(sync.join(CONFIG_FILE), serde_json::to_vec(&cfg).unwrap()).unwrap();
     let s = OutboundSync::open(&root, &sync).unwrap();

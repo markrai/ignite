@@ -68,6 +68,7 @@ pub mod settings_ui;
 pub mod singleton;
 pub mod sleep_ui;
 pub mod store;
+pub mod sync_adopt;
 pub mod sync_local;
 pub mod sync_materialize;
 pub mod sync_outbound;

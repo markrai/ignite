@@ -129,6 +129,7 @@ fn dummy_sync_state(library_id: LibraryId, next: u64, cursor: u64) -> SyncStateV
         next_client_seq: next,
         server_base_url: None,
         server_cursor: cursor,
+        server_id: None,
     }
 }
 

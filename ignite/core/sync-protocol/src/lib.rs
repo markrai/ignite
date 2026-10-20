@@ -31,7 +31,7 @@ pub use binding::{
     reconcile_identity, IdentityFileV1, LiveLayout, NotebookBinding, PageBinding, Reconciled,
     IDENTITY_FILE_VERSION,
 };
-pub use canonical::{from_json, sha256_hex, to_canonical_json};
+pub use canonical::{canonical_sha256, from_json, sha256_hex, to_canonical_json};
 pub use content::{
     normalize_text_content, validate_text_content, validate_title, BackgroundEncoding,
     BackgroundFormat, BackgroundRef, PressureCurveRef, RenderProfileRef, Sha256Hex, StrokeStyle,

@@ -634,3 +634,34 @@ fn replace_stroke_lineages_rejects_malformed_payloads() {
     .validate()
     .is_err());
 }
+
+#[test]
+fn hashing_an_invalid_snapshot_is_refused_like_encoding_it() {
+    let mut bad = snapshot();
+    let dup = bad.notebooks[0].clone();
+    bad.notebooks.push(dup); // duplicate notebook id
+    assert!(bad.to_canonical_bytes().is_err());
+    assert!(snapshot_sha256(&bad).is_err());
+    // A valid snapshot keeps the byte-identical hash.
+    let good = snapshot();
+    assert_eq!(
+        snapshot_sha256(&good).unwrap(),
+        sync_protocol::sha256_hex(&good.to_canonical_bytes().unwrap())
+    );
+}
+
+#[test]
+fn streamed_snapshot_hash_equals_the_hash_of_the_canonical_bytes() {
+    let mut s = snapshot();
+    // Floats, text and an empty page: every encoding path the canonical form takes.
+    s.notebooks[0].pages[0].texts = vec![ok_text(7)];
+    let bytes = s.to_canonical_bytes().unwrap();
+    assert_eq!(
+        snapshot_sha256(&s).unwrap(),
+        sync_protocol::sha256_hex(&bytes)
+    );
+    assert_eq!(
+        sync_protocol::canonical_sha256(&s).unwrap(),
+        sync_protocol::sha256_hex(&bytes)
+    );
+}

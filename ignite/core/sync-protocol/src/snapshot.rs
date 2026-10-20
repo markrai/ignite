@@ -14,7 +14,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::canonical::{from_json, sha256_hex, to_canonical_json};
+use crate::canonical::{from_json, to_canonical_json};
 use crate::content::{
     validate_title, BackgroundRef, RenderProfileRef, Sha256Hex, StrokeStyle, SyncPageLink,
     SyncStroke, SyncText,
@@ -173,7 +173,13 @@ impl SyncSnapshotV1 {
     }
 }
 
-/// SHA-256 over the canonical snapshot bytes. Same semantic snapshot ⇒ same hash.
+/// SHA-256 over the canonical snapshot bytes. Same semantic snapshot ⇒ same hash. Refuses an
+/// invalid snapshot, exactly like [`SyncSnapshotV1::to_canonical_bytes`].
+///
+/// Hashed while serializing (the same `serde_json` encoder as
+/// [`SyncSnapshotV1::to_canonical_bytes`]), so a large library never needs its canonical bytes
+/// in memory just to be hashed.
 pub fn snapshot_sha256(snapshot: &SyncSnapshotV1) -> Result<Sha256Hex> {
-    Ok(sha256_hex(&snapshot.to_canonical_bytes()?))
+    snapshot.validate()?;
+    crate::canonical::canonical_sha256(snapshot)
 }

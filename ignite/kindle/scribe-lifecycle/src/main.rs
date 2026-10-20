@@ -22,7 +22,7 @@ mod unix_main {
     use crate::lipc::{ChildSupervisor, LIPCcode, LifecycleState, LipcHandle, LipcLib, LIPC_OK};
     use crate::protocol::{
         ack_value, relay_line_for_powerd_event, request_id_from_payload, result_property,
-        runresult_value, should_handoff_kindle_home, CHILD_DISPLAY_EVENTS_FLAG,
+        runresult_value, unrequested_exit_reason, CHILD_DISPLAY_EVENTS_FLAG,
         EVENT_EXITING_SCREENSAVER, EVENT_GOING_TO_SCREENSAVER, KINDLE_HOME_APP_URI, POWERD,
     };
     use std::ffi::CStr;
@@ -340,9 +340,9 @@ mod unix_main {
     /// Watch one child. Deliberate stops (pause/unload) reap it inside `stop_child_sigterm`
     /// while holding the supervisor lock, so this only ever sees an UNREQUESTED exit.
     ///
-    /// - Session ended (`0`) or failed (`1` / signal): hand the panel back to Kindle Home.
-    /// - Singleton loser (`CHILD_EXIT_ALREADY_RUNNING`): another live `scribe-app` already
-    ///   owns the panel — do not paint Home over it.
+    /// Every unrequested exit hands the panel back to Kindle Home (see
+    /// [`unrequested_exit_reason`]): a singleton loser included, since this host would otherwise
+    /// stay in front with nothing to draw.
     fn watch_child(pid: u32) {
         loop {
             std::thread::sleep(Duration::from_millis(200));
@@ -369,14 +369,9 @@ mod unix_main {
                     }
                 }
             };
-            if !should_handoff_kindle_home(status.code()) {
-                state().log(&format!(
-                    "child_exit already_running=true handoff_kindle_home=false pid={pid} status={status}"
-                ));
-                return;
-            }
             state().log(&format!(
-                "child_exited_unexpectedly pid={pid} status={status} action=handoff_kindle_home"
+                "child_exited_unexpectedly pid={pid} status={status} reason={} action=handoff_kindle_home",
+                unrequested_exit_reason(status.code())
             ));
             handoff_to_kindle_home();
             return;
