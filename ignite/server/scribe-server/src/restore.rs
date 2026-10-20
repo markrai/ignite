@@ -109,14 +109,18 @@ impl Default for RestoreLimits {
 }
 
 /// Conservative expansion limits for archives received over HTTP (far below
-/// `Limits::DEFAULT`, which allows ~66 GiB). A Kindle page background is ~4.6 MB and a whole
-/// library snapshot is typically well under 1 MiB, so these leave ample headroom.
+/// `Limits::DEFAULT`, which allows ~66 GiB). A Kindle page background is ~4.6 MB. Library
+/// snapshots grow with handwriting: a real library of 24 notebooks / 71 pages is ~77 MB of
+/// canonical JSON, so the per-snapshot cap is 128 MiB. The server-side export verifies with
+/// these same limits, so it never offers an archive that a restore would refuse.
 pub const fn verification_limits() -> Limits {
     Limits {
         max_manifest_bytes: 8 << 20,
         max_libraries: 64,
-        // One snapshot is held in memory while it is verified: this bounds the inspector.
-        max_snapshot_bytes: 64 << 20,
+        // One snapshot is held in memory (raw bytes, parsed form and canonical re-encoding)
+        // while it is verified and re-keyed: this bounds the inspector and the restore. A full
+        // restore of a snapshot just under this cap peaked near 0.5 GiB of process memory.
+        max_snapshot_bytes: 128 << 20,
         max_total_snapshot_bytes: 512 << 20,
         max_blobs: 10_000,
         max_blob_bytes: 32 << 20,

@@ -568,6 +568,37 @@ fn compression_bombs_and_resource_limits_are_bounded() {
     assert_eq!(kind(inspect_bytes(&bytes, &tiny)), K::Zip(Z::LimitExceeded));
 }
 
+#[test]
+fn snapshot_limits_are_exact_boundaries() {
+    // The per-snapshot cap admits a snapshot of exactly its size and refuses one byte more,
+    // from the declaration alone; the cumulative cap likewise for their sum.
+    let entries = logical_entries();
+    let bytes = RawZip::of(&entries).build();
+    let sizes: Vec<u64> = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("libraries/"))
+        .map(|(_, d)| d.len() as u64)
+        .collect();
+    assert_eq!(sizes.len(), 2);
+    let largest = *sizes.iter().max().unwrap();
+    let total: u64 = sizes.iter().sum();
+    let with = |f: &dyn Fn(&mut Limits)| {
+        let mut l = Limits::DEFAULT;
+        f(&mut l);
+        inspect_bytes(&bytes, &l)
+    };
+    assert!(with(&|l| l.max_snapshot_bytes = largest).is_ok());
+    assert_eq!(
+        kind(with(&|l| l.max_snapshot_bytes = largest - 1)),
+        K::Zip(Z::LimitExceeded)
+    );
+    assert!(with(&|l| l.max_total_snapshot_bytes = total).is_ok());
+    assert_eq!(
+        kind(with(&|l| l.max_total_snapshot_bytes = total - 1)),
+        K::Zip(Z::LimitExceeded)
+    );
+}
+
 // --------------------------------------------------------------------------- semantics
 
 fn replace(entries: &mut [(String, Vec<u8>)], name: &str, data: Vec<u8>) {
