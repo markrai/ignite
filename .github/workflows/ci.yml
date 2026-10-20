@@ -57,7 +57,7 @@ jobs:
         with:
           key: armv7
       - name: cargo check (Kindle target)
-        run: cargo check -p scribe-app -p scribe-lifecycle -p ink-probe --locked --target armv7-unknown-linux-gnueabihf
+        run: cargo check -p scribe-app -p scribe-lifecycle -p ink-probe --locked --target armv7-unknown-linux-gnueabihf --features scribe-app/restore_from_server
 
   kindle-installer:
     name: Kindle installer pytest

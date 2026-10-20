@@ -1,7 +1,7 @@
 {
   "name": "ignite-web",
   "private": true,
-  "version": "0.9.11",
+  "version": "0.9.12",
   "description": "ignite-web: browser notebook replica with optional self-hosted sync",
   "type": "module",
   "scripts": {
