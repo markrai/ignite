@@ -5,10 +5,10 @@
 
 import { test as base, expect, type BrowserContext } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { manifest, REPO_ROOT, snapshotText, WEB_DIR, WEB_DIST } from "./harness";
+import { manifest, REPO_ROOT, snapshotText, stopAndRemove, WEB_DIR, WEB_DIST } from "./harness";
 
 const FIX = join(WEB_DIR, "tests/fixtures");
 
@@ -59,7 +59,7 @@ export interface ProductServer {
   restart(): Promise<void>;
 }
 
-async function startProduct(): Promise<{ server: ProductServer; stop: () => void }> {
+async function startProduct(): Promise<{ server: ProductServer; stop: () => Promise<void> }> {
   const dir = mkdtempSync(join(tmpdir(), "scribe-d1-e2e-"));
   const configPath = join(dir, "config.toml");
   const state = join(dir, "state").replace(/\\/g, "/");
@@ -210,22 +210,24 @@ async function startProduct(): Promise<{ server: ProductServer; stop: () => void
   };
   return {
     server,
-    stop: () => {
-      child.kill();
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch {
-        // Windows may hold files briefly after kill
-      }
-    },
+    stop: () => stopAndRemove(child, dir),
   };
 }
 
-export const test = base.extend<{ product: ProductServer }>({
+export const test = base.extend<{ product: ProductServer; recovery: ProductServer }>({
   product: async ({}, use) => {
     const s = await startProduct();
     await use(s.server);
-    s.stop();
+    await s.stop();
+  },
+  /**
+   * A second, independent Scribe Server (its own identity, state directory, config, process and
+   * port), started only by tests that ask for it: the empty server a backup is recovered into.
+   */
+  recovery: async ({}, use) => {
+    const s = await startProduct();
+    await use(s.server);
+    await s.stop();
   },
 });
 

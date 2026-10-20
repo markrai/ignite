@@ -72,7 +72,7 @@ export interface SnapshotDoc {
   };
 }
 
-async function start(): Promise<{ server: SyncServer; stop: () => void }> {
+async function start(): Promise<{ server: SyncServer; stop: () => Promise<void> }> {
   const dir = mkdtempSync(join(tmpdir(), "scribe-s3a-e2e-"));
   const verifier = join(dir, "verifier");
   const token = execFileSync(serverBin(), ["new-token", "--verifier-out", verifier], {
@@ -180,15 +180,31 @@ async function start(): Promise<{ server: SyncServer; stop: () => void }> {
   };
   return {
     server,
-    stop: () => {
-      child.kill();
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch {
-        // Windows may hold the ledger briefly after kill; temp dir is disposable.
-      }
-    },
+    stop: () => stopAndRemove(child, dir),
   };
+}
+
+/**
+ * Stop a disposable server and delete its temporary directory. The process is awaited first:
+ * Windows keeps its files locked until it has exited, and removing them right after `kill()`
+ * used to fail silently and leave the directory behind.
+ */
+export async function stopAndRemove(child: ChildProcessWithoutNullStreams, dir: string): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null) {
+    await new Promise<void>((ok) => {
+      const timer = setTimeout(ok, 10_000);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        ok();
+      });
+      child.kill();
+    });
+  }
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (e) {
+    console.warn(`could not remove disposable server directory ${dir}: ${String(e)}`);
+  }
 }
 
 export interface Traffic {
@@ -200,7 +216,7 @@ export const test = base.extend<{ server: SyncServer; traffic: Traffic }>({
   server: async ({}, use) => {
     const s = await start();
     await use(s.server);
-    s.stop();
+    await s.stop();
   },
   traffic: async ({ page }, use) => {
     const t: Traffic = { requests: [], consoleErrors: [] };
