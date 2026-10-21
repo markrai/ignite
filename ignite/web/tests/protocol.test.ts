@@ -214,7 +214,8 @@ describe("text geometry is validated in Rust's f32 arithmetic", () => {
         expect(withText({ x: fmt(box.x), y: fmt(box.y), width: fmt(box.width) }), `x=${x}`).not.toThrow();
       }
     }
-  });
+    // 8,002 full-snapshot validations exceed the 5 s default on slower CI runners.
+  }, 20_000);
 
   it("an anchor that rounds onto the page edge as f32 still yields a valid box", () => {
     const box = placeTextBox(CANONICAL_PAGE_WIDTH - 1e-4, CANONICAL_PAGE_HEIGHT - 1e-4);
