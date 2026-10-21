@@ -1,9 +1,12 @@
 # Ignite continuous integration — no secrets, no deploy, no device contact.
+# Only an explicitly pushed v<version> tag publishes a GitHub Release (job `release`), and only
+# after every other job has passed.
 name: CI
 
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -147,11 +150,26 @@ jobs:
         run: bash deployment/linux/test-staging.sh dist/ignite-server-linux
       - name: CARGO_TARGET_DIR binary location
         run: bash deployment/linux/test-cargo-target-dir.sh
+      - name: ignite-update (mock releases, staging)
+        run: bash deployment/linux/test-update.sh dist/ignite-server-linux
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+          bash deployment/linux/package-release.sh dist/ignite-server-linux dist/release
+          v="$(tr -d '[:space:]' <ignite/VERSION)"
+          test -f "dist/release/ignite-server-$v-linux-$(uname -m).tar.gz"
+          (cd dist/release && sha256sum -c ./*.sha256)
       - name: Upload Linux bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: ignite-server-linux-bundle
           path: dist/ignite-server-linux/
+          retention-days: 7
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-linux-release
+          path: dist/release/
           retention-days: 7
 
   # Docker image + host-network disposable accept (separate from unit tests; Linux Engine only).
@@ -232,3 +250,59 @@ jobs:
         run: bash deployment/linux/docker/test-compose-static.sh
       - name: Docker accept evidence/ownership safety
         run: bash deployment/linux/docker/test-accept-safety.sh
+
+  # Publishes the tested Linux server bundle for an explicitly pushed v<version> tag only.
+  # Never runs for branch pushes or pull requests; never replaces an existing release.
+  release:
+    name: GitHub Release (tags only)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs:
+      - rust-test
+      - recovery-isolation
+      - armv7-check
+      - kindle-installer
+      - ignite-web
+      - ignite-server-linux
+      - ignite-server-docker
+      - ignite-server-firewall
+      - ignite-accept-regressions
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release asset artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ignite-server-linux-release
+          path: dist/release
+      - name: Verify tag, source, binary and bundle versions agree
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          v="$(tr -d '[:space:]' <ignite/VERSION)"
+          [ "$tag" = "v$v" ] || { echo "tag $tag != v$v (ignite/VERSION)" >&2; exit 1; }
+          top="ignite-server-$v-linux-x86_64"
+          cd dist/release
+          [ "$(ls)" = "$(printf '%s\n' "$top.tar.gz" "$top.tar.gz.sha256")" ] || { ls >&2; exit 1; }
+          sha256sum -c "$top.tar.gz.sha256"
+          tar -xzf "$top.tar.gz"
+          grep -qx "version=$v" "$top/.ignite-bundle"
+          grep -qx "arch=x86_64" "$top/.ignite-bundle"
+          [ "$("$top/scribe-server" --version | tr -d '[:space:]')" = "$v" ]
+          rm -rf "$top"
+      - name: Publish (refuses to replace an existing release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; its assets are not replaced" >&2
+            exit 1
+          fi
+          pre=()
+          case "$tag" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$tag" dist/release/* --verify-tag "${pre[@]}" \
+            --title "Ignite ${tag#v}" \
+            --notes "Ignite Server ${tag#v} for Linux x86_64. Update an installed server with: sudo ignite-update"

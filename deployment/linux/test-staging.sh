@@ -195,6 +195,32 @@ for seam in fail-daemon-reload fail-enable; do
   [ "$sid_seam" = "$sid_rb" ] || fail "server id changed after $seam rollback"
 done
 
+# Updater promotion failure (binary, web and unit already promoted): everything rolls back,
+# the updater included.
+echo "# updater-v1" >>"$ROOT_RB/usr/local/bin/ignite-update"
+echo "# updater-v2" >>"$UP_BUNDLE/ignite-update"
+cp -a "$ROOT_RB/usr/local/bin/scribe-server" "$BASE/bin.before"
+cp -a "$ROOT_RB/etc/systemd/system/scribe-server.service" "$BASE/unit.before"
+cp -a "$ROOT_RB/usr/share/scribe-server/web/ROLLBACK_MARK" "$BASE/web.before"
+cp -a "$ROOT_RB/usr/local/bin/ignite-update" "$BASE/updater.before"
+if "$UP_BUNDLE/install.sh" --root="$ROOT_RB" --port="$PORT_RB" --test-seam=fail-updater \
+    >"$BASE/seam-updater.out" 2>"$BASE/seam-updater.err"; then
+  fail "fail-updater seam reported success"
+fi
+grep -q "updater promote" "$BASE/seam-updater.err" || fail "fail-updater reason unclear"
+grep -q "restored: binary,web,unit,updater" "$BASE/seam-updater.err" || fail "fail-updater restore report"
+cmp -s "$BASE/bin.before" "$ROOT_RB/usr/local/bin/scribe-server" || fail "binary not restored after fail-updater"
+cmp -s "$BASE/unit.before" "$ROOT_RB/etc/systemd/system/scribe-server.service" || fail "unit not restored after fail-updater"
+cmp -s "$BASE/web.before" "$ROOT_RB/usr/share/scribe-server/web/ROLLBACK_MARK" || fail "web not restored after fail-updater"
+cmp -s "$BASE/updater.before" "$ROOT_RB/usr/local/bin/ignite-update" || fail "updater not restored after fail-updater"
+for left in usr/local/bin/ignite-update.new usr/local/bin/ignite-update.old usr/local/bin/scribe-server.old; do
+  [ ! -e "$ROOT_RB/$left" ] || fail "fail-updater left $left"
+done
+# The same bundle then installs completely, updater included.
+"$UP_BUNDLE/install.sh" --root="$ROOT_RB" --port="$PORT_RB" >/dev/null || fail "install after fail-updater"
+cmp -s "$UP_BUNDLE/ignite-update" "$ROOT_RB/usr/local/bin/ignite-update" || fail "updater not replaced"
+[ ! -e "$ROOT_RB/usr/local/bin/ignite-update.old" ] || fail "updater rollback copy left after success"
+
 # Purge deletes everything (isolated marked root only).
 "$BUNDLE/uninstall.sh" --root="$ROOT" --purge >/dev/null
 [ ! -e "$ROOT/var/lib/scribe-server" ] && [ ! -e "$ROOT/etc/scribe-server" ] || fail "purge left data"

@@ -8,6 +8,8 @@ fail() { echo "BUNDLE FAIL: $*" >&2; exit 1; }
 [ -x "$BUNDLE/scribe-server" ] || fail "binary missing/not executable"
 [ -x "$BUNDLE/install.sh" ] || fail "install.sh missing"
 [ -x "$BUNDLE/uninstall.sh" ] || fail "uninstall.sh missing"
+[ -x "$BUNDLE/ignite-update" ] || fail "ignite-update missing"
+grep -qx "arch=$(uname -m)" "$BUNDLE/.ignite-bundle" || fail "bundle metadata arch"
 [ -f "$BUNDLE/firewall.sh" ] || fail "firewall.sh missing"
 [ -f "$BUNDLE/path-safety.sh" ] || fail "path-safety.sh missing"
 [ -f "$BUNDLE/scribe-server.service" ] || fail "unit missing"

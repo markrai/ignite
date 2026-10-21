@@ -56,6 +56,7 @@ if find "$STAGE/web" \( -type l -o -type b -o -type c -o -type p -o -type s \) -
 fi
 
 install -m 0755 "$HERE_ABS/install.sh" "$HERE_ABS/uninstall.sh" "$STAGE/"
+install -m 0755 "$HERE_ABS/update.sh" "$STAGE/ignite-update"
 install -m 0644 "$HERE_ABS/firewall.sh" "$HERE_ABS/scribe-server.service" "$HERE_ABS/path-safety.sh" "$STAGE/"
 
 VERSION="$("$STAGE/scribe-server" --version 2>/dev/null || true)"
@@ -73,6 +74,7 @@ Ignite Server (Linux portable self-hosting) — version ${VERSION}
   sudo ./install.sh                 install or upgrade; prints the URL and a one-time setup code
   sudo ./uninstall.sh               remove the service (keeps /var/lib/scribe-server)
   sudo ./uninstall.sh --purge       remove everything, including notebook data
+  sudo ignite-update                later updates, from the official GitHub Releases
 
 Browser UI: ignite-web (PWA id /ignite-web)
 Trusted LAN only: plain HTTP with authenticated devices. Never forward a router port to it.
@@ -80,7 +82,7 @@ Trusted LAN only: plain HTTP with authenticated devices. Never forward a router 
 A binary built on one Linux host is not automatically compatible with every
 libc version or CPU architecture — build or obtain a bundle for the target host.
 TXT
-printf 'ignite-bundle=1\nversion=%s\n' "$VERSION" >"$STAGE/$IGNITE_BUNDLE_MARKER"
+printf 'ignite-bundle=1\nversion=%s\narch=%s\n' "$VERSION" "$(uname -m)" >"$STAGE/$IGNITE_BUNDLE_MARKER"
 
 # Re-validate existing out-dir immediately before promote (TOCTOU).
 if [ -e "$OUT_ABS" ]; then

@@ -3,10 +3,11 @@
 #
 #   sudo ./install.sh                       install/upgrade, start the service, print URL + setup code
 #   sudo ./install.sh --firewall=dry-run    show the firewall change without making it
+#   (also installs the bundle's updater as /usr/local/bin/ignite-update)
 #   ./install.sh --root=DIR                 staging install into DIR (tests: no host systemd/firewall)
 #
 # Staging-only test seams (require --root=):
-#   --test-seam=fail-daemon-reload|fail-enable|fail-restart|fail-health
+#   --test-seam=fail-updater|fail-daemon-reload|fail-enable|fail-restart|fail-health
 set -euo pipefail
 
 BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,8 +38,8 @@ die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 if [ -n "$TEST_SEAM" ]; then
   [ -n "$ROOT" ] || die "--test-seam requires --root= (staging only)"
   case "$TEST_SEAM" in
-    fail-daemon-reload|fail-enable|fail-restart|fail-health) ;;
-    *) die "--test-seam must be fail-daemon-reload, fail-enable, fail-restart, or fail-health" ;;
+    fail-updater|fail-daemon-reload|fail-enable|fail-restart|fail-health) ;;
+    *) die "--test-seam must be fail-updater, fail-daemon-reload, fail-enable, fail-restart, or fail-health" ;;
   esac
 fi
 
@@ -68,6 +69,7 @@ if [ -n "$ROOT" ]; then
 fi
 
 BIN_DST="$ROOT/usr/local/bin/scribe-server"
+UPDATER_DST="$ROOT/usr/local/bin/ignite-update"
 SHARE="$ROOT/usr/share/scribe-server"
 WEB_DST="$SHARE/web"
 ETC="$ROOT/etc/scribe-server"
@@ -213,16 +215,21 @@ WEB_NEW="$WEB_DST.new"
 WEB_OLD="$WEB_DST.old"
 UNIT_NEW="$UNIT_DST.new"
 UNIT_OLD="$UNIT_DST.old"
+UPDATER_NEW="$UPDATER_DST.new"
+UPDATER_OLD="$UPDATER_DST.old"
+UPDATER_PROMOTED=0
 
 RESTORED_BIN=0
 RESTORED_WEB=0
 RESTORED_UNIT=0
+RESTORED_UPDATER=0
 RECOVERY_RESTART_OK=""
 
 restore_previous() {
   RESTORED_BIN=0
   RESTORED_WEB=0
   RESTORED_UNIT=0
+  RESTORED_UPDATER=0
   if [ -n "$ROOT" ]; then
     if ! ignite_assert_staging_destinations_safe "$ROOT"; then
       echo "install.sh: rollback skipped; staging root unsafe (symlink or escape)" >&2
@@ -241,7 +248,13 @@ restore_previous() {
   elif [ ! -f "$UNIT_DST" ] && [ -f "$UNIT_NEW" ]; then
     rm -f "$UNIT_NEW"
   fi
-  rm -f "$BIN_NEW" "$UNIT_NEW"
+  # The updater is restored with the binary it belongs to (or removed if it was new).
+  if [ -f "$UPDATER_OLD" ]; then
+    if mv -f "$UPDATER_OLD" "$UPDATER_DST"; then RESTORED_UPDATER=1; fi
+  elif [ "$UPDATER_PROMOTED" = 1 ]; then
+    rm -f "$UPDATER_DST"
+  fi
+  rm -f "$BIN_NEW" "$UNIT_NEW" "$UPDATER_NEW"
   rm -rf "$WEB_NEW"
 }
 
@@ -250,6 +263,7 @@ describe_restore() {
   [ "$RESTORED_BIN" = 1 ] && parts+=("binary")
   [ "$RESTORED_WEB" = 1 ] && parts+=("web")
   [ "$RESTORED_UNIT" = 1 ] && parts+=("unit")
+  [ "$RESTORED_UPDATER" = 1 ] && parts+=("updater")
   if [ "${#parts[@]}" -eq 0 ]; then
     echo "no prior components were available to restore"
   else
@@ -285,6 +299,11 @@ validate_bundle_web "$WEB_NEW"
 
 install -d -m 0755 "$(dirname "$UNIT_DST")"
 install -m 0644 "$BUNDLE/scribe-server.service" "$UNIT_NEW"
+# Bundles from before ignite-update have none; an installed one is then left as it is.
+rm -f "$UPDATER_NEW"
+if [ -f "$BUNDLE/ignite-update" ]; then
+  install -m 0755 "$BUNDLE/ignite-update" "$UPDATER_NEW"
+fi
 
 # Save previous components before any live replacement.
 if [ -f "$BIN_DST" ]; then cp -a "$BIN_DST" "$BIN_OLD"; fi
@@ -293,6 +312,8 @@ if [ -d "$WEB_DST" ]; then
   cp -a "$WEB_DST" "$WEB_OLD"
 fi
 if [ -f "$UNIT_DST" ]; then cp -a "$UNIT_DST" "$UNIT_OLD"; fi
+rm -f "$UPDATER_OLD"
+if [ -f "$UPDATER_NEW" ] && [ -f "$UPDATER_DST" ]; then cp -a "$UPDATER_DST" "$UPDATER_OLD"; fi
 
 mv -f "$BIN_NEW" "$BIN_DST"
 rm -rf "$WEB_DST"
@@ -300,6 +321,13 @@ if ! mv "$WEB_NEW" "$WEB_DST"; then
   fail_upgrade "web promote"
 fi
 mv -f "$UNIT_NEW" "$UNIT_DST"
+# A new inode: a running ignite-update keeps reading the copy it started from.
+if [ -f "$UPDATER_NEW" ]; then
+  if [ "$TEST_SEAM" = fail-updater ] || ! mv -f "$UPDATER_NEW" "$UPDATER_DST"; then
+    fail_upgrade "updater promote"
+  fi
+  UPDATER_PROMOTED=1
+fi
 [ -f "$BUNDLE/README.txt" ] && install -m 0644 "$BUNDLE/README.txt" "$SHARE/README.txt"
 
 # --- config (first install only) ------------------------------------------------------------
@@ -378,7 +406,7 @@ fi
 
 # Success — drop rollback copies only after verification.
 rm -rf "$WEB_OLD"
-rm -f "$BIN_OLD" "$UNIT_OLD"
+rm -f "$BIN_OLD" "$UNIT_OLD" "$UPDATER_OLD"
 
 # --- firewall -------------------------------------------------------------------------------
 FW_RECORD="$(sed -n 's/^firewall=//p' "$INSTALL_STATE" 2>/dev/null || true)"

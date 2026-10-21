@@ -1,7 +1,9 @@
 # Ignite Server — portable Linux self-hosting
 
-**Status:** Portable Linux systemd bundle (source-built) and optional **Docker Compose /
-Portainer** packaging (Linux host networking). These are alternative deployment paths;
+**Status:** Portable Linux systemd bundle, published on
+[GitHub Releases](https://github.com/markrai/ignite/releases) (or built from source), kept up to
+date with `sudo ignite-update`; optional **Docker Compose / Portainer** packaging (Linux host
+networking). These are alternative deployment paths;
 Compose does **not** assume the native installer has configured the host firewall.
 
 Public names: **Ignite Server** (host binary + service) and **ignite-web** (browser UI).
@@ -19,11 +21,12 @@ On-disk paths and discovery identity remain compatible with existing installs:
 
 ## Prerequisites
 
-- Linux on **x86_64**, **aarch64**, or **armv7l**
+- Linux on **x86_64** for published release bundles; **aarch64** and **armv7l** installs are
+  supported from a bundle built from source on (or for) that host
 - systemd (for production installs; staging tests use `--root`)
 - Optional: **ufw** or **firewalld** (installer scopes rules; never flushes custom nft/iptables)
 - From source builds: Rust stable, Node 20+, `wasm32-unknown-unknown` target
-- `curl` on the host (used for post-install health checks)
+- `curl` on the host (post-install health checks and `ignite-update` downloads)
 
 A binary / bundle built on one Linux host is **not** automatically compatible with
 every libc version or CPU architecture. Build the bundle on (or for) the target
@@ -33,7 +36,25 @@ relying on it.
 Trusted **LAN only**. Ignite Server speaks **plain HTTP**. Do not forward a router
 port to it. Do not expose it on the public Internet.
 
-## Build a bundle from source
+## Get a release bundle
+
+Each Ignite release publishes a tested Linux server bundle on
+[GitHub Releases](https://github.com/markrai/ignite/releases):
+`ignite-server-<version>-linux-x86_64.tar.gz` and its `.sha256` checksum.
+
+```bash
+v=X.Y.Z   # the version shown on the Releases page
+curl -fLO "https://github.com/markrai/ignite/releases/download/v$v/ignite-server-$v-linux-x86_64.tar.gz"
+curl -fLO "https://github.com/markrai/ignite/releases/download/v$v/ignite-server-$v-linux-x86_64.tar.gz.sha256"
+sha256sum -c "ignite-server-$v-linux-x86_64.tar.gz.sha256"
+tar -xzf "ignite-server-$v-linux-x86_64.tar.gz"
+cd "ignite-server-$v-linux-x86_64"
+```
+
+Then continue with [First installation](#first-installation). After that, updates are one
+command: `sudo ignite-update` (see [Updating](#updating)).
+
+## Build a bundle from source (developers)
 
 ```bash
 # From the repository root (Linux)
@@ -58,10 +79,10 @@ bash deployment/linux/make-bundle.sh \
 
 ## First installation
 
-Copy the bundle directory to the host, then:
+From an extracted release bundle (or a source-built bundle copied to the host):
 
 ```bash
-cd dist/ignite-server-linux   # or wherever the bundle lives
+cd ignite-server-<version>-linux-x86_64   # or dist/ignite-server-linux
 sudo ./install.sh
 ```
 
@@ -75,8 +96,9 @@ Useful flags:
 | `--root=DIR` | Staging install (tests; no systemd / no firewall / no `scribe` user) |
 
 First install creates the unprivileged `scribe` account, state directory, config,
-systemd unit, opens ownership-scoped LAN firewall rules when applicable, and prints
-the browser URL plus a **one-time setup code** while the server is unclaimed.
+systemd unit, opens ownership-scoped LAN firewall rules when applicable, installs the updater
+as `/usr/local/bin/ignite-update`, and prints the browser URL plus a **one-time setup code**
+while the server is unclaimed.
 
 ## Browser access
 
@@ -97,17 +119,75 @@ interfaces. Pairing and credentials are control-plane concepts; notebook sync us
 /etc/scribe-server/install-state   installer bookkeeping (version, port, firewall)
 /var/lib/scribe-server/            ServerId, control.sqlite, ledger/, blobs/
 /usr/local/bin/scribe-server       product binary
+/usr/local/bin/ignite-update       updater (replaced by every install/update)
 /usr/share/scribe-server/web/      ignite-web static assets
+/var/backups/ignite-server/        recovery backups taken by ignite-update (0700; never pruned)
 ```
 
 Back up `/var/lib/scribe-server` (and `/etc/scribe-server`) before major host changes.
 
-## Upgrading
+## Updating
 
-Re-run `sudo ./install.sh` from a newer bundle on the same machine. Upgrade replaces
-the binary, web assets, and unit file, then restarts the service. It preserves
-ServerId, claim state, devices, sessions, config, ledger, and blobs. No new setup
-code is printed for an already-claimed server.
+```bash
+sudo ignite-update           # check, confirm, back up, install, verify
+ignite-update --check        # only report whether an update is available (exit 10 if so)
+sudo ignite-update --yes     # skip the confirmation prompt (never skips a check or the backup)
+```
+
+Updates come only from the official, published, **stable** GitHub Releases of `markrai/ignite`
+(downloaded over HTTPS; no GitHub account, `gh`, Git checkout or build toolchain is needed).
+Prereleases are never installed, an older release never replaces a newer installation, and an
+installation that is already current exits without restarting anything.
+
+`ignite-update`:
+
+1. reads the installed version and architecture and asks GitHub for the latest stable release;
+2. downloads that release's bundle for this architecture and verifies its SHA-256 checksum,
+   its contents (regular files only, nothing outside the bundle directory), its metadata
+   version/architecture and that its `scribe-server` runs here and reports the release version
+   — all before the running service is touched;
+3. records the ServerId and claimed state;
+4. stops the service and writes a recovery backup to
+   `/var/backups/ignite-server/<time>-<old>-to-<new>.XXXX/` (mode 0700): `state.tar.gz`
+   (`/var/lib/scribe-server` and `/etc/scribe-server`), `software.tar.gz` (binary, ignite-web,
+   unit, updater), `SHA256SUMS` and `RESTORE.txt`; the backup is checksummed and its file
+   counts compared with the originals before anything is installed;
+5. runs the bundle's own `install.sh --firewall=none`, which keeps the existing firewall rules
+   and ownership record, and restarts the service;
+6. verifies the service is active, the expected version runs, the ServerId and claimed state
+   are unchanged, the server answers with its identity, and ignite-web is installed;
+7. reports success and the backup location.
+
+Only one update runs at a time. Earlier backups are never deleted; remove old ones yourself
+when you no longer need them.
+
+**If something fails:** a failure before installation (download, checksum, contents,
+compatibility, backup, disk space) changes nothing and restarts the service if it had been
+stopped. If the installer itself fails, it restores the previous binary, web assets and unit and
+restarts the service (below); `ignite-update` reports which. Server data (databases, ledger,
+blobs) is **not** rolled back automatically: the new version may already have opened it. To
+return to the previous version, follow `RESTORE.txt` in the reported backup directory.
+
+### Installations from before ignite-update
+
+A server installed from a bundle without `ignite-update` gets it with its next install. Do this
+once, from the first release that contains `ignite-update` (download and verify it as in
+[Get a release bundle](#get-a-release-bundle)), then run the updater shipped in that bundle:
+
+```bash
+cd ignite-server-<version>-linux-x86_64
+sudo ./ignite-update
+```
+
+It follows exactly the steps above (backup included) and installs itself as
+`/usr/local/bin/ignite-update`; from then on use `sudo ignite-update`.
+
+### Installing a bundle by hand
+
+Re-running `sudo ./install.sh` from a newer bundle (for example a source build) also upgrades.
+It replaces the binary, web assets, unit file and updater, then restarts the service. It
+preserves ServerId, claim state, devices, sessions, config, ledger, and blobs. No new setup
+code is printed for an already-claimed server. It takes no backup; `ignite-update` does.
 
 If `systemctl daemon-reload`, `enable`, `restart`, or the post-start health check
 fails after live components were replaced, the installer restores the previous
@@ -126,11 +206,12 @@ restore path used after promotion. End-to-end validation against a real host
 ## Uninstall
 
 ```bash
-sudo ./uninstall.sh          # removes service/binary/web/firewall ownership; keeps data
+sudo ./uninstall.sh          # removes service/binary/web/updater/firewall ownership; keeps data
 sudo ./uninstall.sh --purge  # also deletes state, config, and the scribe account
 ```
 
-Ordinary uninstall is data-preserving so a later reinstall resumes the same identity.
+Ordinary uninstall is data-preserving so a later reinstall resumes the same identity. Neither
+form deletes `/var/backups/ignite-server/`.
 
 ## Firewall behavior
 
@@ -201,7 +282,9 @@ override `listen` (and the healthcheck URL) together.
 
 ### Backup, restore, upgrades
 
-Back up the Docker volume for `/var/lib/scribe-server` plus any host config override.
+`ignite-update` is for the native systemd installation only; Compose deployments update by
+building and starting a newer image. Back up the Docker volume for `/var/lib/scribe-server`
+plus any host config override.
 Restore onto the same volume and start a current image. Do not run
 `docker compose down -v` unless you intend to destroy customer data. Disposable
 acceptance proves restart/recreate with the **same** image, including a paired-client
@@ -213,6 +296,7 @@ Full operator notes: [`deployment/linux/docker/README.md`](../deployment/linux/d
 ## What this packaging does not include
 
 - Publishing images to Docker Hub / GHCR
+- Automatic (unattended) updates; `ignite-update` runs only when an administrator runs it
 - Automatic container updaters
 - Reverse-proxy / automatic HTTPS configuration
 - Privileged sudoers deploy automation (`scribe-deploy`)
@@ -227,6 +311,7 @@ bash deployment/linux/test-bundle.sh dist/ignite-server-linux
 bash deployment/linux/test-path-safety.sh dist/ignite-server-linux
 bash deployment/linux/test-staging.sh dist/ignite-server-linux
 bash deployment/linux/test-cargo-target-dir.sh
+bash deployment/linux/test-update.sh dist/ignite-server-linux   # ignite-update, mock releases
 
 # Firewall ownership (disposable NET_ADMIN container only — never the dev host)
 bash deployment/linux/ci-firewall.sh
@@ -243,3 +328,18 @@ IGNITE_DOCKER_ACCEPT=local bash deployment/linux/docker/accept-disposable.sh
 
 See [Disposable acceptance](../deployment/linux/docker/README.md#disposable-acceptance) for
 Windows/WSL details, cleanup guarantees, and result fields.
+
+## Publishing a release (maintainers)
+
+Releases are published by CI, never from an ordinary push to `main`:
+
+1. Set the release version in `ignite/VERSION`, the Rust workspace and `ignite/web`
+   (`npm version <v> --no-git-tag-version`), and merge it to `main`.
+2. Push an annotated tag `v<version>` for that commit.
+3. The CI workflow runs every job; only if all pass does the `release` job check that the tag,
+   `ignite/VERSION`, the binary and the bundle metadata agree, and publish
+   `ignite-server-<version>-linux-x86_64.tar.gz` plus `.sha256` as a new GitHub Release
+   (`-` in the tag marks a prerelease, which `ignite-update` ignores).
+
+The job refuses to touch a release that already exists; replacing published assets is a manual
+release-management decision.

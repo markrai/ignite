@@ -57,9 +57,16 @@ C:\dev\project\ignite\          (outer workspace / this repository root)
 
 ## Self-hosted Ignite Server
 
-Build and install a portable Linux bundle (Ignite Server + ignite-web) from source:
+Install Ignite Server (with ignite-web) from the Linux bundle on
+[GitHub Releases](https://github.com/markrai/ignite/releases), then keep it current with:
 
-see [`docs/self-hosting.md`](docs/self-hosting.md). Trusted LAN / plain HTTP only.
+```bash
+sudo ignite-update
+```
+
+Updates come from the official published releases; the updater verifies the download and takes
+a recovery backup before installing. Installation, updating and building a bundle from source
+are described in [`docs/self-hosting.md`](docs/self-hosting.md). Trusted LAN / plain HTTP only.
 Optional Linux Docker Compose / Portainer packaging (host networking) lives under
 [`deployment/linux/docker/`](deployment/linux/docker/).
 

@@ -81,6 +81,9 @@ fi
 safe_rm "$ROOT/usr/local/bin/scribe-server" -f || true
 safe_rm "$ROOT/usr/local/bin/scribe-server.old" -f || true
 safe_rm "$ROOT/usr/local/bin/scribe-server.new" -f || true
+safe_rm "$ROOT/usr/local/bin/ignite-update" -f || true
+safe_rm "$ROOT/usr/local/bin/ignite-update.new" -f || true
+safe_rm "$ROOT/usr/local/bin/ignite-update.old" -f || true
 if [ -n "$ROOT" ]; then
   if [ -e "$ROOT/usr/share/scribe-server" ] || [ -L "$ROOT/usr/share/scribe-server" ]; then
     ignite_assert_path_under_staging_root "$ROOT" "usr/share/scribe-server" || exit 1

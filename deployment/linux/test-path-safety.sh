@@ -178,7 +178,7 @@ bash "$HERE/make-bundle.sh" "$FAKE/scribe-server" "$FAKE/web" "$SAFE_OUT" >/dev/
 SYN_REPO="$BASE/home/runner/work/ignite/ignite"
 mkdir -p "$SYN_REPO/deployment/linux" "$SYN_REPO/dist" "$SYN_REPO/build"
 cp -a "$HERE/make-bundle.sh" "$HERE/path-safety.sh" \
-  "$HERE/install.sh" "$HERE/uninstall.sh" "$HERE/firewall.sh" \
+  "$HERE/install.sh" "$HERE/uninstall.sh" "$HERE/update.sh" "$HERE/firewall.sh" \
   "$HERE/scribe-server.service" "$SYN_REPO/deployment/linux/"
 cp -a "$FAKE/scribe-server" "$SYN_REPO/build/scribe-server"
 cp -a "$FAKE/web" "$SYN_REPO/build/web"
