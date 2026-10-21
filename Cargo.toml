@@ -42,7 +42,7 @@ default-members = [
 [workspace.package]
 edition = "2021"
 license = "AGPL-3.0-only"
-version = "0.9.12"
+version = "0.9.13"
 
 [workspace.dependencies]
 notebook-core = { path = "ignite/core/notebook-core", default-features = false }
