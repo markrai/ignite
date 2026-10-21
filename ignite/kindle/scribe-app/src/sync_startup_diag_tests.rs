@@ -434,3 +434,53 @@ fn supplied_geometry_changes_no_startup_decision_or_file() {
         assert_eq!(sync1, sync0, "verified reopen leaves sync state unchanged");
     }
 }
+
+// ------------------------------------------------------------------ Slice 19B.3B: per-page cost
+
+#[test]
+fn full_start_reports_per_page_snapshot_cost_matching_the_journals() {
+    let e = env("diag-pages");
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let full = take_last_line().unwrap();
+    stop(s);
+    assert_eq!(
+        field(&full, "path"),
+        Some("missing_stamp_fallback"),
+        "{full}"
+    );
+    // The fixture: one notebook, one page; the snapshot read exactly its two journals (the
+    // genesis build of the new epoch and the full reconcile each processed it once).
+    let page = e.lib.join("notebooks").join("notebook-1").join("page-1");
+    let bytes = fs::metadata(page.join("strokes.jsonl")).unwrap().len()
+        + fs::metadata(page.join("edits.jsonl")).map_or(0, |m| m.len());
+    let pages = num(&full, "snapshot_pages") as u64;
+    assert_eq!(pages, 2, "genesis + reconcile: {full}");
+    assert_eq!(
+        num(&full, "snapshot_journal_bytes") as u64,
+        bytes * pages,
+        "{full}"
+    );
+    assert_eq!(
+        num(&full, "snapshot_journal_bytes_max") as u64,
+        bytes,
+        "{full}"
+    );
+    for k in [
+        "snapshot_page_ms_min",
+        "snapshot_page_ms_median",
+        "snapshot_page_ms_p90",
+        "snapshot_page_ms_max",
+        "snapshot_page_read_ms",
+        "snapshot_page_parse_ms",
+    ] {
+        assert_ne!(field(&full, k), Some("-"), "{k}: {full}");
+    }
+    assert!(num(&full, "snapshot_page_ms_min") <= num(&full, "snapshot_page_ms_max"));
+    // No snapshot on the verified fast path.
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let fast = take_last_line().unwrap();
+    stop(s);
+    assert_eq!(field(&fast, "path"), Some("verified_fast_path"), "{fast}");
+    assert_eq!(field(&fast, "snapshot_pages"), Some("-"), "{fast}");
+    assert_eq!(field(&fast, "snapshot_page_ms_median"), Some("-"), "{fast}");
+}

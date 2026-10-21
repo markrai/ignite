@@ -99,6 +99,8 @@ const TIMERS: &[&str] = &[
     "replay_apply",
     "validate_census",
     "stamp_census",
+    "snapshot_page_read",
+    "snapshot_page_parse",
 ];
 
 const COUNTS: &[&str] = &[
@@ -132,6 +134,9 @@ const COUNTS: &[&str] = &[
     "stamp_census_size_only",
     "stamp_census_bytes_hashed",
     "derived_ops",
+    "snapshot_pages",
+    "snapshot_journal_bytes",
+    "snapshot_journal_bytes_max",
 ];
 
 /// Memory sample points, in order.
@@ -152,6 +157,11 @@ struct Diag {
     timers: Vec<(&'static str, Duration)>,
     counts: Vec<(&'static str, u64)>,
     mem: Vec<(&'static str, Option<u64>, Option<u64>)>,
+    /// Slice 19B.3B: one entry per page `build_snapshot` processed (total duration only; no
+    /// page identity is kept).
+    page_samples: Vec<Duration>,
+    /// The page currently between [`page_begin`] and [`page_end`]: (read, parse/replay, bytes).
+    page_open: Option<(Duration, Duration, u64)>,
     path: Option<&'static str>,
     /// Slice 19B.2B: deferred confirmed-base decision (`selected`, `not_requested`, or the
     /// refusal reason code).
@@ -286,6 +296,20 @@ impl Diag {
             ms(scan.saturating_sub(cb))
         });
         push("replay_other_ms", opt(other));
+        // Slice 19B.3B: per-page `page_snapshot` distribution (nearest-rank percentiles).
+        let mut pages = self.page_samples.clone();
+        pages.sort();
+        let pick = |q: f64| -> Option<String> {
+            if pages.is_empty() {
+                return None;
+            }
+            let rank = ((q * pages.len() as f64).ceil() as usize).clamp(1, pages.len());
+            Some(ms(pages[rank - 1]))
+        };
+        push("snapshot_page_ms_min", opt(pages.first().map(|d| ms(*d))));
+        push("snapshot_page_ms_median", opt(pick(0.5)));
+        push("snapshot_page_ms_p90", opt(pick(0.9)));
+        push("snapshot_page_ms_max", opt(pages.last().map(|d| ms(*d))));
         for c in COUNTS {
             push(c, opt(get(&self.counts, c)));
         }
@@ -354,6 +378,8 @@ fn begin_as(prefix: &'static str) -> Startup {
             timers: Vec::new(),
             counts: Vec::new(),
             mem: Vec::new(),
+            page_samples: Vec::new(),
+            page_open: None,
             path: None,
             defer: None,
             prefix,
@@ -401,6 +427,43 @@ pub(crate) fn defer(why: &'static str) {
 /// Record the reconcile path (`FastPathReason::as_str`).
 pub(crate) fn path(p: &'static str) {
     with(|d| d.path = Some(p));
+}
+
+/// Slice 19B.3B: `build_snapshot` starts one page (the journal loader then reports into it).
+pub(crate) fn page_begin() {
+    with(|d| d.page_open = Some((Duration::ZERO, Duration::ZERO, 0)));
+}
+
+/// Journal I/O of the page in progress: file read time, parse + edit-replay time, bytes.
+/// A no-op outside [`page_begin`]..[`page_end`] (other callers of the loader are not counted).
+pub(crate) fn page_io(read: Duration, parse: Duration, bytes: u64) {
+    with(|d| {
+        if let Some(p) = d.page_open.as_mut() {
+            p.0 += read;
+            p.1 += parse;
+            p.2 += bytes;
+        }
+    });
+}
+
+/// `build_snapshot` finished one page in `total` (inclusive of its journal I/O).
+pub(crate) fn page_end(total: Duration) {
+    with(|d| {
+        let (read, parse, bytes) = d.page_open.take().unwrap_or_default();
+        d.page_samples.push(total);
+        bump(&mut d.timers, "snapshot_page_read", read);
+        bump(&mut d.timers, "snapshot_page_parse", parse);
+        bump(&mut d.counts, "snapshot_pages", 1);
+        bump(&mut d.counts, "snapshot_journal_bytes", bytes);
+        match d
+            .counts
+            .iter_mut()
+            .find(|(n, _)| *n == "snapshot_journal_bytes_max")
+        {
+            Some((_, m)) => *m = (*m).max(bytes),
+            None => d.counts.push(("snapshot_journal_bytes_max", bytes)),
+        }
+    });
 }
 
 /// Record one census walk. `stamp` = the walk inside the stamp write, else the fast-path check.
@@ -583,6 +646,33 @@ mod tests {
             "emit_format_ms={}",
             field(&l, "emit_format_ms").unwrap()
         )));
+    }
+
+    #[test]
+    fn page_samples_aggregate_without_identity() {
+        let s = begin();
+        enter("snapshot");
+        page_io(Duration::from_millis(1), Duration::from_millis(2), 10); // outside a page: ignored
+        for (i, ms_) in [5u64, 1, 9, 3, 7].iter().enumerate() {
+            page_begin();
+            page_io(
+                Duration::from_millis(1),
+                Duration::from_millis(*ms_),
+                100 + i as u64,
+            );
+            page_end(Duration::from_millis(*ms_ + 1));
+        }
+        s.finish();
+        let l = take_last_line().unwrap();
+        assert_eq!(field(&l, "snapshot_pages"), Some("5"));
+        assert_eq!(field(&l, "snapshot_journal_bytes"), Some("510"));
+        assert_eq!(field(&l, "snapshot_journal_bytes_max"), Some("104"));
+        assert_eq!(field(&l, "snapshot_page_ms_min"), Some("2.0"));
+        assert_eq!(field(&l, "snapshot_page_ms_median"), Some("6.0"));
+        assert_eq!(field(&l, "snapshot_page_ms_p90"), Some("10.0"));
+        assert_eq!(field(&l, "snapshot_page_ms_max"), Some("10.0"));
+        assert_eq!(field(&l, "snapshot_page_read_ms"), Some("5.0"));
+        assert_eq!(field(&l, "snapshot_page_parse_ms"), Some("25.0"));
     }
 
     #[test]

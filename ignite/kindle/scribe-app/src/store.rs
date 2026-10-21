@@ -2050,10 +2050,21 @@ pub fn load_page_journals_read_only(
         ));
     }
     let render_profile = validate_header(&header)?;
+    // Slice 19B.3B: journal read vs parse/replay time (reported only inside a startup
+    // `build_snapshot` page; a no-op for every other caller).
+    let t0 = std::time::Instant::now();
     let raw = fs::read(journal_path(&dir)).map_err(|e| e.to_string())?;
+    let t1 = std::time::Instant::now();
     let (base, stroke_tail) = parse_stroke_journal(&raw)?;
+    let t2 = std::time::Instant::now();
     let edit_raw = fs::read(edits_path(&dir)).map_err(|e| e.to_string())?;
+    let t3 = std::time::Instant::now();
     let (visible, edit_tail) = replay_edit_journal(base, &edit_raw)?;
+    crate::sync_startup_diag::page_io(
+        (t1 - t0) + (t3 - t2),
+        (t2 - t1) + t3.elapsed(),
+        (raw.len() + edit_raw.len()) as u64,
+    );
     Ok(PageJournals {
         header,
         strokes: visible.strokes,
