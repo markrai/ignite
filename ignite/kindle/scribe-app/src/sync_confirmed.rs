@@ -49,6 +49,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sync_engine::{HistoryV1, LibraryState};
@@ -240,6 +241,33 @@ impl ConfirmedLog {
                 .map_err(|e| format!("truncate torn tail of {}: {e}", path.display()))?;
         }
         let mut file = file;
+        file.seek(SeekFrom::Start(scan.valid_len))
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            index: scan.index.clone(),
+            len: scan.valid_len,
+        })
+    }
+
+    /// Open an **existing** log for appending after a scan, writing nothing: never creates the
+    /// file and refuses a torn tail instead of truncating it (Slice 19B.2B deferred loader,
+    /// which must stay read-only even if it outlives its instance).
+    pub(crate) fn open_existing(path: &Path, scan: &LogScan) -> Result<Self, String> {
+        if scan.torn_tail {
+            return Err(format!(
+                "{} has a torn tail (only a synchronous start truncates it)",
+                path.display()
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
         file.seek(SeekFrom::Start(scan.valid_len))
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -611,38 +639,159 @@ pub(crate) fn collect_unreferenced_pages(
 /// A promoted checkpoint: state, its server_seq, and each page's content address.
 pub(crate) type LoadedCheckpoint = (LibraryState, u64, HashMap<PageId, Sha256Hex>);
 
+/// Slice 19A: totals of one manifest read ([`read_checkpoint_head`]), reported once to the
+/// startup breakdown when dropped (so a failed read still reports). No-op outside startup.
+#[derive(Default)]
+struct CheckpointHeadStats {
+    present: bool,
+    manifest_bytes: u64,
+    manifest_read: std::time::Duration,
+    manifest_parse: std::time::Duration,
+}
+
+impl Drop for CheckpointHeadStats {
+    fn drop(&mut self) {
+        use crate::sync_startup_diag as diag;
+        diag::count("ckpt_present", u64::from(self.present));
+        if !self.present {
+            return;
+        }
+        diag::count("ckpt_manifest_bytes", self.manifest_bytes);
+        diag::time("ckpt_manifest_read", self.manifest_read);
+        diag::time("ckpt_manifest_parse", self.manifest_parse);
+    }
+}
+
+/// Slice 19A: totals of one page phase ([`materialize_checkpoint`]), reported when dropped.
+#[derive(Default)]
+struct CheckpointPageStats {
+    pages: u64,
+    page_bytes: u64,
+    read: std::time::Duration,
+    sha: std::time::Duration,
+    parse: std::time::Duration,
+    validate: std::time::Duration,
+}
+
+impl Drop for CheckpointPageStats {
+    fn drop(&mut self) {
+        use crate::sync_startup_diag as diag;
+        diag::count("ckpt_pages", self.pages);
+        diag::count("ckpt_page_bytes", self.page_bytes);
+        diag::time("ckpt_read", self.read);
+        diag::time("ckpt_sha", self.sha);
+        diag::time("ckpt_parse", self.parse);
+        diag::time("ckpt_validate", self.validate);
+    }
+}
+
+/// A promoted checkpoint's manifest, parsed and version-checked, before any page file is read.
+/// Its page references and `through_server_seq` are **claims only**: page contents are
+/// verified against their addresses, and the state validated, solely by
+/// [`materialize_checkpoint`]. Nothing may treat a head as a trusted ServerBaseState.
+pub(crate) struct CheckpointHead {
+    manifest: CheckpointManifestV3,
+}
+
+impl CheckpointHead {
+    /// The server_seq the manifest claims to cover.
+    pub(crate) fn through(&self) -> u64 {
+        self.manifest.through_server_seq
+    }
+
+    /// Whether the pages directory holds a file this manifest does not reference (startup's
+    /// [`collect_unreferenced_pages`] would remove it). Read-only.
+    pub(crate) fn unreferenced_pages_exist(&self, sync_dir: &Path) -> Result<bool, String> {
+        let keep: HashSet<&str> = self
+            .manifest
+            .notebooks
+            .iter()
+            .flat_map(|n| n.pages.iter().map(|r| r.sha256.as_str()))
+            .collect();
+        let pages_dir = sync_dir.join(CHECKPOINT_DIR).join(CHECKPOINT_PAGES);
+        let rd = match fs::read_dir(&pages_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
+        for e in rd {
+            let e = e.map_err(|e| e.to_string())?;
+            if !keep.contains(e.file_name().to_string_lossy().as_ref()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Load the promoted checkpoint: every page file is read once and verified against its
-/// content address; the result is validated as a reducer state.
+/// content address; the result is validated as a reducer state. Exactly
+/// [`read_checkpoint_head`] followed by [`materialize_checkpoint`].
 pub(crate) fn load_checkpoint(sync_dir: &Path) -> Result<Option<LoadedCheckpoint>, String> {
-    let dir = sync_dir.join(CHECKPOINT_DIR);
-    let mpath = dir.join(CHECKPOINT_MANIFEST);
+    match read_checkpoint_head(sync_dir)? {
+        None => Ok(None),
+        Some(head) => materialize_checkpoint(sync_dir, head).map(Some),
+    }
+}
+
+/// The manifest phase of [`load_checkpoint`]: `Ok(None)` when no checkpoint is promoted.
+pub(crate) fn read_checkpoint_head(sync_dir: &Path) -> Result<Option<CheckpointHead>, String> {
+    let mut st = CheckpointHeadStats::default();
+    let mpath = sync_dir.join(CHECKPOINT_DIR).join(CHECKPOINT_MANIFEST);
+    let t = Instant::now();
     let bytes = match fs::read(&mpath) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", mpath.display())),
     };
+    st.present = true;
+    st.manifest_bytes = bytes.len() as u64;
+    st.manifest_read = t.elapsed();
+    let t = Instant::now();
     let m: CheckpointManifestV3 = serde_json::from_slice(&bytes)
         .map_err(|e| format!("CHECKPOINT_CORRUPT {}: {e}", mpath.display()))?;
+    st.manifest_parse = t.elapsed();
     if m.v != 3 {
         return Err(format!("unsupported checkpoint version {}", m.v));
     }
-    let pages_dir = dir.join(CHECKPOINT_PAGES);
+    Ok(Some(CheckpointHead { manifest: m }))
+}
+
+/// The page phase of [`load_checkpoint`]: read every page the head names, verify it against its
+/// content address, parse it, and validate the assembled state. Any failure is
+/// `CHECKPOINT_CORRUPT` (or a read error), exactly as [`load_checkpoint`] reports it.
+pub(crate) fn materialize_checkpoint(
+    sync_dir: &Path,
+    head: CheckpointHead,
+) -> Result<LoadedCheckpoint, String> {
+    let mut st = CheckpointPageStats::default();
+    let m = head.manifest;
+    let pages_dir = sync_dir.join(CHECKPOINT_DIR).join(CHECKPOINT_PAGES);
     let mut hashes = HashMap::new();
     let mut notebooks = Vec::with_capacity(m.notebooks.len());
     for n in m.notebooks {
         let mut pages = Vec::with_capacity(n.pages.len());
         for r in n.pages {
             let path = pages_dir.join(r.sha256.as_str());
+            let t0 = Instant::now();
             let b = fs::read(&path)
                 .map_err(|e| format!("CHECKPOINT_CORRUPT page {}: {e}", r.page_id))?;
-            if sha256_hex(&b) != r.sha256 {
+            let t1 = Instant::now();
+            st.read += t1 - t0;
+            st.pages += 1;
+            st.page_bytes += b.len() as u64;
+            let addressed = sha256_hex(&b) == r.sha256;
+            let t2 = Instant::now();
+            st.sha += t2 - t1;
+            if !addressed {
                 return Err(format!(
                     "CHECKPOINT_CORRUPT page {}: content does not match its address",
                     r.page_id
                 ));
             }
-            let p: SnapshotPage = serde_json::from_slice(&b)
-                .map_err(|e| format!("CHECKPOINT_CORRUPT page {}: {e}", r.page_id))?;
+            let p: Result<SnapshotPage, _> = serde_json::from_slice(&b);
+            st.parse += t2.elapsed();
+            let p = p.map_err(|e| format!("CHECKPOINT_CORRUPT page {}: {e}", r.page_id))?;
             if p.page_id != r.page_id {
                 return Err(format!(
                     "CHECKPOINT_CORRUPT: file for page {} holds page {}",
@@ -669,10 +818,11 @@ pub(crate) fn load_checkpoint(sync_dir: &Path) -> Result<Option<LoadedCheckpoint
         },
         history: m.history,
     };
-    state
-        .validate()
-        .map_err(|e| format!("CHECKPOINT_CORRUPT: invalid state: {e}"))?;
-    Ok(Some((state, m.through_server_seq, hashes)))
+    let t = Instant::now();
+    let valid = state.validate();
+    st.validate = t.elapsed();
+    valid.map_err(|e| format!("CHECKPOINT_CORRUPT: invalid state: {e}"))?;
+    Ok((state, m.through_server_seq, hashes))
 }
 
 /// Replay the confirmed log onto `state` (checkpoint through `through`): records ≤ `through`
@@ -689,7 +839,13 @@ pub(crate) fn replay_log(
 ) -> Result<(LogScan, u64, HashSet<PageId>), String> {
     let mut last = through;
     let mut touched = HashSet::new();
+    // Slice 19A totals (startup breakdown; reported even when the replay fails).
+    let (mut records, mut applied, mut payload_bytes) = (0u64, 0u64, 0u64);
+    let (mut decode_t, mut apply_t) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let t_scan = Instant::now();
     let scan = scan_log(&sync_dir.join(CONFIRMED_LOG_FILE), |seq, payload| {
+        records += 1;
+        payload_bytes += payload.len() as u64;
         if seq <= through {
             return Ok(());
         }
@@ -698,14 +854,29 @@ pub(crate) fn replay_log(
                 "CONFIRMED_LOG_GAP: checkpoint through {through} but next record is server_seq {seq}"
             ));
         }
-        let env = envelope(payload)?;
-        state
-            .apply_in_place(&env)
-            .map_err(|e| format!("reducer refused confirmed server_seq {seq}: {e}"))?;
+        let t0 = Instant::now();
+        let env = envelope(payload);
+        let t1 = Instant::now();
+        decode_t += t1 - t0;
+        let env = env?;
+        let r = state.apply_in_place(&env);
+        apply_t += t1.elapsed();
+        r.map_err(|e| format!("reducer refused confirmed server_seq {seq}: {e}"))?;
         touched.extend(touched_pages(&env.operation));
         last = seq;
+        applied += 1;
         Ok(())
-    })?;
+    });
+    {
+        use crate::sync_startup_diag as diag;
+        diag::time("replay_scan", t_scan.elapsed());
+        diag::time("replay_decode", decode_t);
+        diag::time("replay_apply", apply_t);
+        diag::count("replay_records", records);
+        diag::count("replay_applied", applied);
+        diag::count("replay_payload_bytes", payload_bytes);
+    }
+    let scan = scan?;
     Ok((scan, last, touched))
 }
 

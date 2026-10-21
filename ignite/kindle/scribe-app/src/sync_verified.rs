@@ -601,6 +601,15 @@ pub fn library_census(library_root: &Path) -> Result<(String, CensusStats), Stri
     Ok((sha256_hex(buf.as_bytes()).to_string(), stats))
 }
 
+/// [`library_census_sha256`], also reporting the walk's [`CensusStats`] to the startup
+/// breakdown (`stamp` = inside the stamp write, else the fast-path check).
+fn census_for_startup(library_root: &Path, stamp: bool) -> Result<String, String> {
+    let t0 = Instant::now();
+    let (h, stats) = library_census(library_root)?;
+    crate::sync_startup_diag::census(stamp, &stats, t0.elapsed());
+    Ok(h)
+}
+
 /// Canonical library census hash.
 pub fn library_census_sha256(library_root: &Path) -> Result<String, String> {
     library_census(library_root).map(|(h, _)| h)
@@ -957,7 +966,7 @@ fn evaluate_fast_path_inner(
     if gen != stamp.mutation_gen {
         return FastPathReason::GenMismatch;
     }
-    match library_census_sha256(library_root) {
+    match census_for_startup(library_root, false) {
         Ok(h) if h == stamp.census_sha256 => {}
         Ok(_) => return FastPathReason::CensusMismatch,
         Err(_) => return FastPathReason::CensusMismatch,
@@ -978,7 +987,7 @@ pub fn write_stamp_after_full_reconcile(
     acked_client_seq: u64,
 ) -> Result<(), String> {
     let mutation_gen = read_mutation_gen(library_root)?;
-    let census_sha256 = library_census_sha256(library_root)?;
+    let census_sha256 = census_for_startup(library_root, true)?;
     let stamp = LocalVerifiedV1 {
         v: STAMP_VERSION,
         library_id,

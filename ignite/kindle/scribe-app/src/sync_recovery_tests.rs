@@ -345,7 +345,7 @@ fn recovery_profile_inbound_remote_strokes() {
     assert!(s.fault().is_none());
     let (library_id, nb, page) = {
         let g = s.shared.lock().unwrap();
-        let n = &g.base.snapshot.notebooks[0];
+        let n = &g.base.as_ref().unwrap().snapshot.notebooks[0];
         (g.state.library_id, n.notebook_id, n.pages[0].clone())
     };
     let replica = ReplicaId::from_uuid(Uuid::now_v7()).unwrap();

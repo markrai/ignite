@@ -14,10 +14,10 @@ use super::tests::{env, stop, Env};
 use super::*;
 
 /// Stage `n` foreign AddStroke items after the cursor (as the coordinator would).
-fn stage_remote(s: &OutboundSync, replica: ReplicaId, next_client: &mut u64, n: usize) {
+pub(super) fn stage_remote(s: &OutboundSync, replica: ReplicaId, next_client: &mut u64, n: usize) {
     let mut g = s.shared.lock().unwrap();
     let (library_id, nb, page) = {
-        let nbk = &g.base.snapshot.notebooks[0];
+        let nbk = &g.base.as_ref().unwrap().snapshot.notebooks[0];
         (g.state.library_id, nbk.notebook_id, nbk.pages[0].page_id)
     };
     let mut seq = g
@@ -57,7 +57,7 @@ fn stage_remote(s: &OutboundSync, replica: ReplicaId, next_client: &mut u64, n: 
     }
 }
 
-fn apply_all_staged(s: &OutboundSync) {
+pub(super) fn apply_all_staged(s: &OutboundSync) {
     while s.inbound_ready() {
         s.apply_inbound().unwrap();
     }
@@ -119,7 +119,7 @@ fn assert_consistent(s: &OutboundSync, sync_dir: &Path) {
     let (durable, through) = read_confirmed_state(sync_dir, g.state.library_id).unwrap();
     assert_eq!(through, g.state.server_cursor, "durable confirmed position");
     assert!(
-        durable == g.base,
+        g.base.as_ref() == Some(&durable),
         "durable confirmed state == in-memory ServerBaseState"
     );
 }
@@ -413,8 +413,8 @@ fn a_legacy_base_state_is_converted_once_and_removed_only_after_promotion() {
         &BaseStateV2 {
             v: 2,
             through_server_seq: cursor,
-            snapshot: before.snapshot.clone(),
-            history: before.history.clone(),
+            snapshot: before.as_ref().unwrap().snapshot.clone(),
+            history: before.as_ref().unwrap().history.clone(),
         },
     )
     .unwrap();
@@ -604,4 +604,102 @@ fn checkpoints_keep_folders_and_memberships() {
         .unwrap();
     assert!(!manifest.contains("folder"), "{manifest}");
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------------ Slice 19B.2A: head / pages seam
+
+/// A rig whose promoted checkpoint holds real pages (genesis + remote work), stopped so its
+/// sync dir can be inspected and damaged freely.
+fn checkpointed_rig(label: &str) -> Rig {
+    let (mut rig, s) = Rig::new(label);
+    rig.remote(&s, 3);
+    assert!(s.checkpoint_now().unwrap(), "a checkpoint is promoted");
+    stop(s);
+    rig
+}
+
+fn page_files(sync_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<_> = fs::read_dir(sync_dir.join(CHECKPOINT_DIR).join(CHECKPOINT_PAGES))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn head_then_materialize_is_exactly_load_checkpoint() {
+    let rig = checkpointed_rig("head-equiv");
+    let sync = &rig.e.sync;
+    let (state, through, hashes) = load_checkpoint(sync).unwrap().unwrap();
+    let head = read_checkpoint_head(sync).unwrap().unwrap();
+    assert_eq!(head.through(), through);
+    let (state2, through2, hashes2) = materialize_checkpoint(sync, head).unwrap();
+    assert!(state2 == state, "same ServerBaseState");
+    assert_eq!(through2, through);
+    assert_eq!(hashes2, hashes);
+    assert_eq!(hashes.len(), page_files(sync).len());
+}
+
+#[test]
+fn no_checkpoint_has_no_head() {
+    let dir = std::env::temp_dir().join(format!("scribe-head-none-{}", Uuid::now_v7()));
+    fs::create_dir_all(&dir).unwrap();
+    assert!(read_checkpoint_head(&dir).unwrap().is_none());
+    assert!(load_checkpoint(&dir).unwrap().is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_valid_head_is_no_proof_of_page_contents() {
+    // Corrupt page bytes (address mismatch) and a missing page file both pass the manifest
+    // phase and fail only when the pages are materialized — with load_checkpoint's error.
+    for damage in ["flip", "remove"] {
+        let rig = checkpointed_rig(&format!("head-{damage}"));
+        let sync = &rig.e.sync;
+        let victim = page_files(sync).into_iter().next().unwrap();
+        match damage {
+            "flip" => {
+                let mut b = fs::read(&victim).unwrap();
+                let last = b.len() - 1;
+                b[last] ^= 0x01;
+                fs::write(&victim, b).unwrap();
+            }
+            _ => fs::remove_file(&victim).unwrap(),
+        }
+        let head = read_checkpoint_head(sync)
+            .unwrap()
+            .expect("manifest itself is intact");
+        let err = materialize_checkpoint(sync, head)
+            .err()
+            .expect("pages are refused");
+        assert!(err.contains("CHECKPOINT_CORRUPT page"), "{damage}: {err}");
+        assert_eq!(
+            load_checkpoint(sync).err().unwrap(),
+            err,
+            "{damage}: same error"
+        );
+        // Unchanged startup behaviour: open refuses the corrupt confirmed state.
+        let open_err = OutboundSync::open(&rig.e.lib, sync)
+            .err()
+            .expect("open refuses");
+        assert!(
+            open_err.contains("CHECKPOINT_CORRUPT page"),
+            "{damage}: {open_err}"
+        );
+    }
+}
+
+#[test]
+fn a_corrupt_manifest_fails_at_the_head() {
+    let rig = checkpointed_rig("head-manifest");
+    let sync = &rig.e.sync;
+    fs::write(
+        sync.join(CHECKPOINT_DIR).join(CHECKPOINT_MANIFEST),
+        b"{ not json",
+    )
+    .unwrap();
+    let err = read_checkpoint_head(sync).err().expect("refused");
+    assert!(err.starts_with("CHECKPOINT_CORRUPT"), "{err}");
+    assert_eq!(load_checkpoint(sync).err().unwrap(), err);
 }

@@ -72,3 +72,6 @@ dist/
 /ignite-review/
  Disposable Linux acceptance run artifacts (generated; may contain host-local paths)
 /deployment/linux/acceptance/evidence-*/
+
+# Local investigation / draft documents (never published)
+/docs/draft/

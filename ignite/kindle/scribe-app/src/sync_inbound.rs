@@ -160,6 +160,13 @@ fn lines(path: &Path) -> Result<Vec<Vec<u8>>, String> {
     Ok(out)
 }
 
+/// Slice 19A: record count and bytes (newlines excluded) of a startup load. Repeated loads of
+/// the same file report the first.
+fn note_lines(records: &'static str, bytes: &'static str, l: &[Vec<u8>]) {
+    crate::sync_startup_diag::count_once(records, l.len() as u64);
+    crate::sync_startup_diag::count_once(bytes, l.iter().map(|x| x.len() as u64).sum());
+}
+
 fn inbox_line(i: &InboxItem) -> Vec<u8> {
     let mut v = serde_json::to_vec(&InboxRecordV1 {
         v: 1,
@@ -208,7 +215,9 @@ pub(crate) fn load_inbox(
     cursor: u64,
 ) -> Result<Vec<InboxItem>, String> {
     let mut out: Vec<InboxItem> = Vec::new();
-    for l in lines(&dir.join(INBOX_FILE))? {
+    let records = lines(&dir.join(INBOX_FILE))?;
+    note_lines("inbox_records", "inbox_line_bytes", &records);
+    for l in records {
         let r: InboxRecordV1 =
             serde_json::from_slice(&l).map_err(|e| format!("corrupt inbox record: {e}"))?;
         if r.v != 1 {
@@ -274,7 +283,9 @@ pub(crate) fn load_accepted(
     let mut by_client: BTreeMap<u64, AcceptedOp> = BTreeMap::new();
     let mut client_of_op: HashMap<OperationId, u64> = HashMap::new();
     let mut client_of_server: HashMap<u64, u64> = HashMap::new();
-    for (line_no, l) in lines(&dir.join(HISTORY_FILE))?.into_iter().enumerate() {
+    let records = lines(&dir.join(HISTORY_FILE))?;
+    note_lines("accepted_records", "accepted_line_bytes", &records);
+    for (line_no, l) in records.into_iter().enumerate() {
         let at = |m: String| format!("ACCEPTED_HISTORY_CORRUPT (record {}): {m}", line_no + 1);
         let r: AcceptedRecordV1 =
             serde_json::from_slice(&l).map_err(|e| at(format!("unparsable: {e}")))?;
@@ -631,20 +642,14 @@ pub(crate) fn apply_staged(
 ) -> Result<Option<InboundApplied>, String> {
     // The ServerBaseState is advanced in place (never cloned). On `Err` it may be partially
     // advanced: every caller then faults sync, and a faulted state is never persisted — the
-    // durable checkpoint + confirmed log remain the truth for the next start.
-    let placeholder = LibraryState {
-        snapshot: SyncSnapshotV1 {
-            v: g.base.snapshot.v,
-            library_id: g.base.snapshot.library_id,
-            page_space: g.base.snapshot.page_space,
-            notebooks: Vec::new(),
-            folders: Vec::new(),
-        },
-        history: HistoryV1::empty(),
-    };
-    let mut base = std::mem::replace(&mut g.base, placeholder);
+    // durable checkpoint + confirmed log remain the truth for the next start. While it is out,
+    // `g.base` is `None` (never a placeholder).
+    let mut base = g
+        .base
+        .take()
+        .ok_or("inbound apply without a confirmed base")?;
     let r = apply_staged_on(g, &mut base, limit, target);
-    g.base = base;
+    g.base = Some(base);
     r
 }
 
@@ -940,6 +945,7 @@ impl OutboundSync {
     pub fn inbound_ready(&self) -> bool {
         let g = self.shared.lock().unwrap();
         g.fault.is_none()
+            && g.base.is_some()
             && g.inbox.iter().any(|i| i.server_seq > g.state.server_cursor)
             && !own_echoes_deferred(&g)
     }
@@ -949,6 +955,10 @@ impl OutboundSync {
     /// notebook is unaffected); `Ok(None)` = nothing to do.
     pub fn apply_inbound(&self) -> Result<Option<InboundApplied>, String> {
         if self.fault().is_some() {
+            return Ok(None);
+        }
+        // 19B.2B: never before the (deferred) confirmed base is published.
+        if !self.base_ready() {
             return Ok(None);
         }
         // Every local capture queued so far is durable in the outbox before we rebase on it.

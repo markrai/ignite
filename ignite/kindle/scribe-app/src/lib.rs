@@ -85,6 +85,7 @@ mod sync_recovery_stream;
 mod sync_recovery_supervise;
 mod sync_recovery_tail;
 mod sync_recovery_tunnel;
+mod sync_startup_diag;
 #[cfg(feature = "kindle_supervisor_harness")]
 pub use kindle_supervisor_harness::run as run_kindle_supervisor_harness;
 #[cfg(test)]
