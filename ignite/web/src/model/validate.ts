@@ -73,6 +73,24 @@ function int(v: unknown, where: string, min: number, max: number): number {
   return n;
 }
 
+// Text geometry is f32 in Rust (`SyncText`): operands are converted to f32 and the remaining
+// width is an f32 subtraction, whose correctly rounded result is `fround` of the exact
+// difference. Comparing in f64 instead refuses boxes Rust accepted (and Ignite authored).
+const f32 = Math.fround;
+
+/** Rust `SyncText::validate`: `width <= CANONICAL_PAGE_WIDTH - x`, evaluated in f32. */
+export function textWidthFits(x: number, width: number): boolean {
+  return f32(width) <= f32(CANONICAL_PAGE_WIDTH - f32(x));
+}
+
+/** The largest f32 below a positive f32 `v` (`v` itself when it is 0). */
+export function prevF32(v: number): number {
+  if (!(v > 0)) return v;
+  const b = new Float32Array([v]);
+  new Uint32Array(b.buffer)[0]! -= 1;
+  return b[0]!;
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-([457])[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA_RE = /^[0-9a-f]{64}$/;
 
@@ -134,11 +152,14 @@ function textObj(v: unknown, where: string): SyncText {
   const y = num(o.y, `${where}.y`);
   const width = num(o.width, `${where}.width`);
   const font_size = num(o.font_size, `${where}.font_size`);
-  if (!(x >= 0 && x < CANONICAL_PAGE_WIDTH) || !(y >= 0 && y < CANONICAL_PAGE_HEIGHT)) {
+  // Checked on the f32 values Rust validated (see `textWidthFits`).
+  const fx = f32(x);
+  const fy = f32(y);
+  if (!(fx >= 0 && fx < CANONICAL_PAGE_WIDTH) || !(fy >= 0 && fy < CANONICAL_PAGE_HEIGHT)) {
     fail(where, "text origin outside the canonical page");
   }
-  if (!(width > 0) || width > CANONICAL_PAGE_WIDTH - x) fail(where, "text width out of range");
-  if (!(font_size >= 1) || font_size > CANONICAL_PAGE_HEIGHT) fail(where, "invalid font_size");
+  if (!(f32(width) > 0) || !textWidthFits(x, width)) fail(where, "text width out of range");
+  if (!(f32(font_size) >= 1) || f32(font_size) > CANONICAL_PAGE_HEIGHT) fail(where, "invalid font_size");
   if (str(o.face, `${where}.face`) !== "default-sans-v1") fail(where, "unsupported text face");
   const content = str(o.content, `${where}.content`);
   if (content === "") fail(where, "empty text content");

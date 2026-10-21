@@ -2,13 +2,16 @@
 
 import { CANONICAL_PAGE_HEIGHT, CANONICAL_PAGE_WIDTH } from "../model/generated/protocolConstants";
 import type { SyncText } from "../model/types";
+import { prevF32, textWidthFits } from "../model/validate";
 
 export const DEFAULT_TEXT_FONT_SIZE = 340;
 export const DEFAULT_TEXT_WIDTH = 10_000;
 
 /** Clamp a moved origin so the object stays valid (mirrors `SyncText::validate`). */
 export function clampTextOrigin(x: number, y: number, width: number): { x: number; y: number } {
-  const cx = Math.fround(Math.min(Math.max(0, x), CANONICAL_PAGE_WIDTH - width));
+  let cx = Math.fround(Math.min(Math.max(0, x), CANONICAL_PAGE_WIDTH - width));
+  // fround(W - width) can round up past the f32 remaining width; step down to the edge f32.
+  while (cx > 0 && !textWidthFits(cx, width)) cx = prevF32(cx);
   const cy = Math.fround(Math.min(Math.max(0, y), CANONICAL_PAGE_HEIGHT - 1e-3));
   return { x: cx, y: cy };
 }
@@ -64,10 +67,14 @@ export function placeTextBox(x: number, y: number): { x: number; y: number; widt
   const W = CANONICAL_PAGE_WIDTH;
   // Page interaction rejects outside anchors before minting an id. Keep the
   // accepted canonical anchor instead of shifting near-edge blocks left.
-  const px = Math.fround(x);
-  const py = Math.fround(y);
+  // An anchor just inside an edge can round onto it as f32; keep it on the page.
+  let px = Math.fround(x);
+  if (px >= W) px = prevF32(W);
+  let py = Math.fround(y);
+  if (py >= CANONICAL_PAGE_HEIGHT) py = prevF32(CANONICAL_PAGE_HEIGHT);
+  // fround(W - px) is exactly Rust's f32 remaining width, so this width always fits.
   const width = Math.min(DEFAULT_TEXT_WIDTH, W - px);
-  return { x: Math.fround(px), y: Math.fround(py), width: Math.fround(width) };
+  return { x: px, y: py, width: Math.fround(width) };
 }
 
 export function newDraft(text_id: string, x: number, y: number, fontSize = DEFAULT_TEXT_FONT_SIZE): TextDraft {

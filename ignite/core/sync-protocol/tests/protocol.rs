@@ -665,3 +665,31 @@ fn streamed_snapshot_hash_equals_the_hash_of_the_canonical_bytes() {
         sync_protocol::sha256_hex(&bytes)
     );
 }
+
+/// Pins the f32 text-width semantics that ignite-web mirrors (`textWidthFits`; its protocol
+/// tests use these exact values). 15624 - 6500.0005f32 is exactly 9123.99951171875, halfway
+/// between two f32s; the f32 subtraction rounds it to 9124, so width 9124 fits.
+#[test]
+fn text_width_is_checked_in_f32_arithmetic() {
+    let x = 6500.0005_f32;
+    assert_eq!(f64::from(x), 6500.00048828125);
+    let fits = SyncText {
+        x,
+        width: 9124.0,
+        ..ok_text(1)
+    };
+    fits.validate().unwrap();
+
+    let json = String::from_utf8(sync_protocol::to_canonical_json(&fits).unwrap()).unwrap();
+    assert!(json.contains("\"x\":6500.0005,"), "{json}");
+    assert!(json.contains("\"width\":9124"), "{json}");
+    let parsed: SyncText = sync_protocol::from_json(json.as_bytes()).unwrap();
+    assert_eq!(parsed, fits);
+    parsed.validate().unwrap();
+
+    let over = SyncText {
+        width: f32::from_bits(9124.0_f32.to_bits() + 1),
+        ..fits.clone()
+    };
+    assert!(over.validate().is_err());
+}
