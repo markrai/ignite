@@ -1,0 +1,5 @@
+warning: in the working copy of '.github/workflows/ci.yml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'deployment/linux/docker/README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'deployment/linux/docker/docker-compose.yml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/self-hosting.md', LF will be replaced by CRLF the next time Git touches it

@@ -152,8 +152,8 @@ pass "preexisting volumes never adopted or removed by ownership cleanup"
 # --- 4) Compose is image-only (no build context dependency) ---
 grep -Eq '^[[:space:]]*build:' "$DIR/docker-compose.yml" \
   && fail "runtime compose must not contain build:" || true
-grep -q 'image: ignite-server:local' "$DIR/docker-compose.yml" \
-  || fail "compose missing image: ignite-server:local"
+grep -qF 'image: ${IGNITE_IMAGE:-ghcr.io/markrai/ignite-server:latest}' "$DIR/docker-compose.yml" \
+  || fail "compose missing the GHCR image"
 grep -q 'markrai/ignite' "$DIR/Dockerfile" || fail "OCI source label must be markrai/ignite"
 pass "compose is image-only; OCI source label corrected"
 

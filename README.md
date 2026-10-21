@@ -124,38 +124,66 @@ For configuration, backups, troubleshooting and advanced installation options, s
 
 ## Prefer Docker or Portainer?
 
-Ignite also supports Docker Compose on Linux with host networking.
+Ignite Server is also published as a container image, `ghcr.io/markrai/ignite-server`, for Docker Compose on Linux with host networking.
 
-**Current limitation:** A prebuilt container image is not yet published to GHCR or Docker Hub. Docker users currently build the image locally.
+**Requirements:** Linux x86_64 (amd64) with Docker Engine and the Docker Compose plugin. No Rust, Node.js or Git required.
 
-With Docker Engine, Docker Compose, Rust and Node.js installed:
+Run these commands on your Linux server:
 
 ```bash
-git clone https://github.com/markrai/ignite.git
-cd ignite
-git checkout v0.9.13
+mkdir -p ~/ignite-server && cd ~/ignite-server
+curl -fLO https://raw.githubusercontent.com/markrai/ignite/main/deployment/linux/docker/docker-compose.yml
 
-bash deployment/linux/build-bundle.sh
-bash deployment/linux/docker/build-image.sh
+docker compose pull
 
-cd deployment/linux/docker
+# First run only: prepare the server and print its one-time setup code
+docker compose run --rm ignite-server init --config /etc/scribe-server/config.toml
 
-bash ./init-once.sh
 docker compose up -d
 ```
 
-Save the one-time setup code printed by `init-once.sh`.
-
-Open:
+Save the `setup_code=` value printed by the `init` command, then open:
 
 `http://YOUR_SERVER_IP:8787/`
 
 Complete setup in the browser using that code.
 
+To update to the newest release later:
+
+```bash
+cd ~/ignite-server
+docker compose pull
+docker compose up -d
+```
+
+By default the stack tracks `latest`, which is always the newest stable release. To stay on
+one release instead, pin it persistently in a `.env` file in the same directory as
+`docker-compose.yml` (a one-off `IGNITE_IMAGE=… docker compose up -d` prefix would only apply
+to that single command):
+
+```bash
+cd ~/ignite-server
+printf '%s\n' \
+  'IGNITE_IMAGE=ghcr.io/markrai/ignite-server:v0.9.13' > .env
+```
+
+Subsequent `docker compose pull` and `docker compose up -d` commands in that directory keep
+using the pinned `v0.9.13` image until you edit `.env`. To track the newest stable release
+again, remove the pin (or set it to `ghcr.io/markrai/ignite-server:latest`). `.env` is a local
+operator file — do not commit it.
+
+**Portainer:** first run the one-time initialization from the server's shell:
+
+```bash
+docker run --rm -v ignite-server-state:/var/lib/scribe-server ghcr.io/markrai/ignite-server:latest init --config /etc/scribe-server/config.toml
+```
+
+Then create a stack (**Stacks → Add stack**) from the same [`docker-compose.yml`](deployment/linux/docker/docker-compose.yml) and deploy it.
+
 **Important Docker notes:**
 
-- Uses Linux host networking for Kindle discovery.
-- Persistent notebook data lives in a Docker named volume.
+- Uses Linux host networking for Kindle discovery. Port `8787` must be free on the host.
+- Persistent notebook data lives in the Docker named volume `ignite-server-state`.
 - Host firewall configuration is your responsibility.
 - Do not use `docker compose down -v` unless you intend to delete the persistent volume.
 

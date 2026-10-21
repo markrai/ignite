@@ -1,0 +1,82 @@
+# Publishes ghcr.io/markrai/ignite-server from an already published, CI-built GitHub Release.
+# The image is the release's own Linux asset packaged by the release tag's Dockerfile
+# (deployment/linux/docker/build-image.sh); Rust and ignite-web are never rebuilt here.
+#
+# Two entry points only:
+#   - ci.yml job `ghcr`, after `release` succeeds for a pushed stable v<X.Y.Z> tag;
+#   - a manual backfill from main for an existing stable release, confirmed by typing
+#     "publish v<X.Y.Z>". It never creates, moves or replaces a Git tag or GitHub Release.
+# v<X.Y.Z> image tags are never replaced; `latest` moves only to the newest stable release.
+# Inputs reach shell steps through env only, never through ${{ }} inside run scripts.
+name: GHCR image
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag to backfill (vX.Y.Z)
+        required: true
+        type: string
+      confirm:
+        description: Type "publish <tag>" to confirm, e.g. publish v0.9.13
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish ghcr.io/markrai/ignite-server
+    if: >-
+      github.repository == 'markrai/ignite' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: bash
+    concurrency:
+      group: ghcr-ignite-server
+      cancel-in-progress: false
+    env:
+      IGNITE_GHCR_TAG: ${{ inputs.tag }}
+      IGNITE_GHCR_CONFIRM: ${{ inputs.confirm }}
+      IGNITE_RELEASE_SRC: ${{ github.workspace }}/release
+      IGNITE_GHCR_WORK: ${{ github.workspace }}/ghcr-work
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      PUBLISH: tools/deployment/linux/docker/ghcr-publish.sh
+    steps:
+      - name: Check out the publishing tools (this workflow's commit)
+        uses: actions/checkout@v4
+        with:
+          path: tools
+          persist-credentials: false
+      - name: Guard trigger and release
+        run: bash "$PUBLISH" guard
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: release
+          persist-credentials: false
+      - name: Check release source
+        run: bash "$PUBLISH" source
+      - name: Download and verify the release asset
+        run: bash "$PUBLISH" fetch
+      - name: Log in to GHCR
+        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build, verify and push
+        run: bash "$PUBLISH" publish
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io

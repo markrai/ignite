@@ -22,7 +22,8 @@ fi
 if grep -Eq '^[[:space:]]*build:' "$f"; then
   fail "runtime compose must be image-only (no build:)"
 fi
-grep -q 'image: ignite-server:local' "$f" || fail "missing image: ignite-server:local"
+grep -qxF '    image: ${IGNITE_IMAGE:-ghcr.io/markrai/ignite-server:latest}' "$f" \
+  || fail "compose image must default to ghcr.io/markrai/ignite-server:latest"
 grep -q 'ignite-state:/var/lib/scribe-server' "$f" || fail "missing state volume mount"
 # Config bind is optional (image embeds default); must not require ./context
 if grep -q './context' "$f"; then

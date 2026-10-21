@@ -241,7 +241,7 @@ networking is **not** the supported default (mDNS / LAN discovery fit is poor; s
 | Item | Value |
 |------|--------|
 | Docs / scripts | [`deployment/linux/docker/`](../deployment/linux/docker/) |
-| Image tag (local) | `ignite-server:local` (build via `build-image.sh`; Compose is image-only) |
+| Image | `ghcr.io/markrai/ignite-server:latest` or `:v<version>` (local builds: `ignite-server:local`; Compose is image-only) |
 | Runtime PID 1 UID/GID | `19187:19187` after entrypoint drop (image USER is root for volume chown) |
 | Network | `network_mode: host` |
 | Default port | TCP `8787` |
@@ -249,23 +249,45 @@ networking is **not** the supported default (mDNS / LAN discovery fit is poor; s
 | Config | Embedded in the image; optional absolute-path override (Portainer) |
 | Validated arch | **linux/amd64** (ARM not claimed by this packaging path) |
 
-### Build and start
+### Install from GHCR
+
+Only Docker Engine and the Compose plugin are needed:
 
 ```bash
-bash deployment/linux/build-bundle.sh
-bash deployment/linux/docker/build-image.sh
-cd deployment/linux/docker
+mkdir -p ~/ignite-server && cd ~/ignite-server
+curl -fLO https://raw.githubusercontent.com/markrai/ignite/main/deployment/linux/docker/docker-compose.yml
+docker compose pull
 
 # First run only — explicit init (prints setup_code=… while unclaimed):
-bash ./init-once.sh
+docker compose run --rm ignite-server init --config /etc/scribe-server/config.toml
 
 docker compose up -d
 curl -fsS http://127.0.0.1:8787/control/v1/status
 ```
 
-Portainer: load the image on the Linux engine, paste the image-only stack (no `build:` /
-`context/`), use the embedded config or an **absolute** host bind for overrides, and run
-one-off `init` against the **same** named volume before claim.
+By default the stack tracks `latest`, the newest stable release. To stay on one release,
+pin it persistently in a `.env` file in the same directory as `docker-compose.yml` (a
+one-off `IGNITE_IMAGE=… docker compose up -d` prefix would only apply to that single
+command):
+
+```bash
+printf '%s\n' \
+  'IGNITE_IMAGE=ghcr.io/markrai/ignite-server:v0.9.13' > .env
+```
+
+Subsequent `docker compose pull` and `docker compose up -d` commands in that directory keep
+using the pinned `v0.9.13` image until you edit `.env`. Remove the pin (or set it to
+`ghcr.io/markrai/ignite-server:latest`) to track the newest stable release again. `.env` is
+a local operator file — do not commit it. The image is built by CI from the
+release's own Linux bundle, so it runs the same binary and web assets as the native install.
+
+Portainer: run the one-off `init` against the named volume `ignite-server-state` first
+(`docker run --rm -v ignite-server-state:/var/lib/scribe-server ghcr.io/markrai/ignite-server:latest init --config /etc/scribe-server/config.toml`),
+then paste the image-only stack (no `build:` / `context/`) and use the embedded config or an
+**absolute** host bind for overrides.
+
+Developers can build the image from source instead (`build-bundle.sh`, then
+`build-image.sh` → `ignite-server:local`) and run the stack with `IGNITE_IMAGE=ignite-server:local`.
 
 Open `http://<host>:8787/` and complete the claim in ignite-web. **Do not** put setup
 codes in Compose YAML, Portainer env vars, or shared logs. While unclaimed, every
@@ -282,8 +304,9 @@ override `listen` (and the healthcheck URL) together.
 
 ### Backup, restore, upgrades
 
-`ignite-update` is for the native systemd installation only; Compose deployments update by
-building and starting a newer image. Back up the Docker volume for `/var/lib/scribe-server`
+`ignite-update` is for the native systemd installation only; Compose deployments update with
+`docker compose pull && docker compose up -d` (same volume, no new claim; a version pinned
+in `.env` is retained by those commands until you edit it). Back up the Docker volume for `/var/lib/scribe-server`
 plus any host config override.
 Restore onto the same volume and start a current image. Do not run
 `docker compose down -v` unless you intend to destroy customer data. Disposable
@@ -295,7 +318,7 @@ Full operator notes: [`deployment/linux/docker/README.md`](../deployment/linux/d
 
 ## What this packaging does not include
 
-- Publishing images to Docker Hub / GHCR
+- Publishing images to Docker Hub, or images for ARM (GHCR publishes linux/amd64 only)
 - Automatic (unattended) updates; `ignite-update` runs only when an administrator runs it
 - Automatic container updaters
 - Reverse-proxy / automatic HTTPS configuration
@@ -343,3 +366,28 @@ Releases are published by CI, never from an ordinary push to `main`:
 
 The job refuses to touch a release that already exists; replacing published assets is a manual
 release-management decision.
+
+4. For a stable tag (no `-`), the `ghcr` job then runs
+   [`.github/workflows/ghcr.yml`](../.github/workflows/ghcr.yml) with the workflow's own
+   `GITHUB_TOKEN` (`contents: read`, `packages: write`; no PAT or repository secrets). It
+   downloads the just-published release asset, verifies its checksum (and GitHub's recorded
+   digest), bundle metadata and binary version, builds the image from it with the tag's own
+   `build-image.sh`, checks that the image's binary and web assets are byte-identical to the
+   asset, and pushes `ghcr.io/markrai/ignite-server:v<version>`. `latest` moves only if this is
+   the newest stable GitHub Release, and never to an older version than the one it holds.
+   An existing `v<version>` image is never replaced.
+
+**Backfilling a release published before GHCR existed** (for example v0.9.13): from `main`, run
+
+```bash
+gh workflow run ghcr.yml --ref main -f tag=v0.9.13 -f confirm="publish v0.9.13"
+```
+
+(or **Actions → GHCR image → Run workflow** with the same inputs). The run checks out that tag
+and its official release asset and builds from them. It refuses unless the tag is a stable
+`vX.Y.Z` whose GitHub Release is published, not a prerelease and was created by CI, and it
+never creates, moves or replaces the Git tag or the GitHub Release.
+
+**First GHCR publish only:** a new package is private. In the package settings on GitHub
+(**Packages → ignite-server → Package settings**), set its visibility to **Public** so that
+`docker compose pull` works without logging in.

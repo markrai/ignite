@@ -1,8 +1,13 @@
 # Ignite Server — Linux Docker Engine / Portainer stack (host networking).
 #
-# Image-only runtime stack (no build: context). Build with:
-#   bash deployment/linux/docker/build-image.sh
-# then load/tag the image on the target engine as ignite-server:local (or edit image:).
+# Image-only runtime stack (no build: context) using the published image
+# ghcr.io/markrai/ignite-server (linux/amd64). `latest` is the newest stable release.
+# Pin a release, or use a locally built image (build-image.sh → ignite-server:local), with:
+#   IGNITE_IMAGE=ghcr.io/markrai/ignite-server:v0.9.13 docker compose up -d
+#   IGNITE_IMAGE=ignite-server:local docker compose up -d
+# (Portainer: set IGNITE_IMAGE as a stack environment variable.)
+#
+# Upgrade: docker compose pull && docker compose up -d   (same volume; no new claim)
 #
 # Requirements:
 #   - Linux Docker Engine (not Docker Desktop Windows/macOS host networking)
@@ -24,7 +29,7 @@ name: ignite-server
 
 services:
   ignite-server:
-    image: ignite-server:local
+    image: ${IGNITE_IMAGE:-ghcr.io/markrai/ignite-server:latest}
     container_name: ignite-server
     network_mode: host
     restart: unless-stopped

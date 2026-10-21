@@ -5,7 +5,7 @@ Linux server or compatible NAS). Separate from the native systemd installer.
 
 | Item | Value |
 |------|--------|
-| Image (local tag) | `ignite-server:local` |
+| Image | `ghcr.io/markrai/ignite-server:latest` (or `:vX.Y.Z`); local builds `ignite-server:local` |
 | Runtime PID 1 UID/GID | `19187:19187` (after entrypoint drop) |
 | Image `Config.User` | root (entrypoint chown then `setpriv`) |
 | State | volume → `/var/lib/scribe-server` |
@@ -18,7 +18,39 @@ Linux server or compatible NAS). Separate from the native systemd installer.
 **Not supported as the default:** ordinary bridge networking + published ports.
 See [`../docker-network-feasibility.md`](../docker-network-feasibility.md).
 
-## Build the image
+## Published image (GHCR)
+
+Each stable release is published as `ghcr.io/markrai/ignite-server:v<version>`; `latest` is
+the newest stable release. The image is built by CI from that release's own tested Linux
+bundle (the GitHub Release asset) — the same binary and web assets `ignite-update` installs.
+Only Docker Engine and the Compose plugin are needed:
+
+```bash
+mkdir -p ~/ignite-server && cd ~/ignite-server
+curl -fLO https://raw.githubusercontent.com/markrai/ignite/main/deployment/linux/docker/docker-compose.yml
+docker compose pull
+docker compose run --rm ignite-server init --config /etc/scribe-server/config.toml   # first run only
+docker compose up -d
+curl -fsS http://127.0.0.1:8787/control/v1/status
+```
+
+The Compose image is `${IGNITE_IMAGE:-ghcr.io/markrai/ignite-server:latest}`, so with no
+pin it tracks `latest`, the newest stable release. To stay on one release, pin it
+persistently in a `.env` file in the same directory as `docker-compose.yml` (a one-off
+`IGNITE_IMAGE=… docker compose up -d` prefix would only apply to that single command):
+
+```bash
+printf '%s\n' \
+  'IGNITE_IMAGE=ghcr.io/markrai/ignite-server:v0.9.13' > .env
+```
+
+Subsequent `docker compose pull` and `docker compose up -d` commands in that directory keep
+using the pinned `v0.9.13` image until you edit `.env`. Remove the pin (or set it to
+`ghcr.io/markrai/ignite-server:latest`) to track the newest stable release again. `.env` is
+a local operator file — do not commit it (it is already git-ignored). In Portainer, the
+equivalent persistent pin is the `IGNITE_IMAGE` stack environment variable.
+
+## Build the image locally (developers)
 
 Runtime Compose is **image-only** (no `build:` / `context/`). Build separately:
 
@@ -30,15 +62,12 @@ bash deployment/linux/docker/build-image.sh
 
 Or: `IGNITE_DOCKER_BUILD_BUNDLE=1 bash deployment/linux/docker/build-image.sh`
 
-Images are **not** published to Docker Hub/GHCR by these scripts. For Portainer on
-another host, `docker save` / `docker load` (or your private distribution) the local tag.
-
-## Local Docker Compose
+Run the stack on the local build with `IGNITE_IMAGE=ignite-server:local`:
 
 ```bash
 cd deployment/linux/docker
-bash ./init-once.sh          # first run only; prints setup_code=… while unclaimed
-docker compose up -d
+IGNITE_IMAGE=ignite-server:local bash ./init-once.sh   # first run only; prints setup_code=…
+IGNITE_IMAGE=ignite-server:local docker compose up -d
 curl -fsS http://127.0.0.1:8787/control/v1/status
 ```
 
@@ -47,7 +76,8 @@ locally, uncomment the bind in `docker-compose.yml` pointing at `./config.toml`.
 
 ## Portainer (Linux Engine)
 
-1. Build/load `ignite-server:local` (or your chosen tag) on that engine.
+1. The stack pulls `ghcr.io/markrai/ignite-server:latest`; set the stack env var
+   `IGNITE_IMAGE` to pin a release (e.g. `ghcr.io/markrai/ignite-server:v0.9.13`).
 2. Create a stack from `docker-compose.yml` (paste or repo). Do **not** expect a
    generated `context/` directory — there is no Compose `build:`.
 3. Config:
@@ -60,8 +90,9 @@ locally, uncomment the bind in `docker-compose.yml` pointing at `./config.toml`.
 5. First-run init against the **same** named volume (`ignite-server-state`):
 
 ```bash
-docker compose run --rm ignite-server init --config /etc/scribe-server/config.toml
-# or Portainer one-off container with the same image + volume + command
+docker run --rm -v ignite-server-state:/var/lib/scribe-server \
+  ghcr.io/markrai/ignite-server:latest init --config /etc/scribe-server/config.toml
+# or, with the Compose file: docker compose run --rm ignite-server init --config /etc/scribe-server/config.toml
 ```
 
 Capture `setup_code=` from that command’s stdout only, then start the stack and claim
@@ -90,8 +121,10 @@ Back up the Docker volume for `/var/lib/scribe-server` (and any host config over
 Restore onto the same volume and start a current image. Do **not** use
 `docker compose down -v` unless you intend to destroy data.
 
-**Image upgrade:** replace the image tag and recreate the container with the **same**
-volume. Disposable acceptance proves restart/recreate with the **same** image digest;
+**Image upgrade:** `docker compose pull && docker compose up -d` (Portainer: re-pull and
+redeploy the stack) recreates the container on the newer image with the **same** volume;
+no new claim is needed. If you pinned a release in `.env` (see above), the pull keeps that
+pinned version until you edit `.env`; with no pin you track `latest`, which never moves to an older release. Disposable acceptance proves restart/recreate with the **same** image digest;
 a distinct software-version migration path is **not** claimed by that suite. The suite does
 pair a disposable client and round-trip a fixture blob, library, and operations through the
 product API, then re-verifies them after restart and after container recreate.

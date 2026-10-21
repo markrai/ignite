@@ -1,6 +1,6 @@
 # Ignite continuous integration — no secrets, no deploy, no device contact.
 # Only an explicitly pushed v<version> tag publishes a GitHub Release (job `release`), and only
-# after every other job has passed.
+# after every other job has passed; a stable tag's image then goes to GHCR (job `ghcr`).
 name: CI
 
 on:
@@ -248,6 +248,8 @@ jobs:
         run: bash deployment/linux/test-docker-network-probe.sh
       - name: Docker Compose/Dockerfile static checks
         run: bash deployment/linux/docker/test-compose-static.sh
+      - name: GHCR publishing guards and image references
+        run: bash deployment/linux/docker/test-ghcr-publish.sh
       - name: Docker accept evidence/ownership safety
         run: bash deployment/linux/docker/test-accept-safety.sh
 
@@ -306,3 +308,16 @@ jobs:
           gh release create "$tag" dist/release/* --verify-tag "${pre[@]}" \
             --title "Ignite ${tag#v}" \
             --notes "Ignite Server ${tag#v} for Linux x86_64. Update an installed server with: sudo ignite-update"
+
+  # Publishes the released image to GHCR once `release` (and so every CI job) has succeeded.
+  # Stable tags only; see .github/workflows/ghcr.yml for its guards and the manual backfill.
+  ghcr:
+    name: GHCR image (stable tags only)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr.yml
+    with:
+      tag: ${{ github.ref_name }}
