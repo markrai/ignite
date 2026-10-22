@@ -114,6 +114,9 @@ pub struct PersistedNotebookManifestV1 {
 
 pub struct NotebookOpen {
     pub manifest: PersistedNotebookManifestV1,
+    /// The page loaded: the replica-local selection ([`crate::nav_state`]) when still valid,
+    /// else `manifest.active_page_id`.
+    pub page_id: String,
     pub store: FsPageStore,
     pub loaded: LoadedPage,
     pub orphan_dirs: Vec<String>,
@@ -318,12 +321,14 @@ pub fn open_or_create_notebook(
         for o in &orphans {
             eprintln!("warning: orphan page directory ignored (not in manifest): {o}");
         }
-        let (store, mut loaded) = load_existing_page(data_dir, &manifest.active_page_id)?;
-        repair_background_chrome(data_dir, &manifest.active_page_id, &mut loaded)?;
+        let page_id = crate::nav_state::selected_page(data_dir, &manifest);
+        let (store, mut loaded) = load_existing_page(data_dir, &page_id)?;
+        repair_background_chrome(data_dir, &page_id, &mut loaded)?;
         resolve_existing_ink(ink_request, loaded.render_profile.ink_byte)?;
         validate_live_framebuffer(&loaded.header, fb_geo)?;
         return Ok(NotebookOpen {
             manifest,
+            page_id,
             store,
             loaded,
             orphan_dirs: orphans,
@@ -353,6 +358,7 @@ pub fn open_or_create_notebook(
         }
         return Ok(NotebookOpen {
             manifest,
+            page_id: DEFAULT_PAGE_ID.into(),
             store,
             loaded,
             orphan_dirs: orphans,
@@ -384,6 +390,7 @@ pub fn open_or_create_notebook(
     write_manifest_atomic(data_dir, &manifest)?;
     Ok(NotebookOpen {
         manifest,
+        page_id: DEFAULT_PAGE_ID.into(),
         store,
         loaded,
         orphan_dirs: Vec::new(),
@@ -482,7 +489,10 @@ pub fn create_page_files_from_template(
     )
 }
 
-/// Persist active page only (same page_ids / ordinal).
+/// Remember the page shown after plain navigation. Inside a library this is replica-local
+/// state ([`crate::nav_state`]): `notebook.meta` is not rewritten, so browsing is not a library
+/// mutation. A failed save only loses the reopen position and is logged, not returned. A
+/// notebook outside a library keeps the legacy canonical `active_page_id` write.
 pub fn persist_active_page(
     data_dir: &Path,
     manifest: &mut PersistedNotebookManifestV1,
@@ -494,8 +504,14 @@ pub fn persist_active_page(
         ));
     }
     let t0 = Instant::now();
-    manifest.active_page_id = active_page_id.to_string();
-    write_manifest_atomic(data_dir, manifest)?;
+    match crate::nav_state::remember(data_dir, manifest, active_page_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            manifest.active_page_id = active_page_id.to_string();
+            write_manifest_atomic(data_dir, manifest)?;
+        }
+        Err(e) => eprintln!("warning: nav_state_save_failed page={active_page_id} detail={e}"),
+    }
     Ok(t0.elapsed().as_micros() as u64)
 }
 

@@ -1,8 +1,9 @@
 //! Durable changed-page ledger, **record-only** (Slice 19B.3C).
 //!
 //! `<library>/.scribe-sync/page-ledger-v1.jsonl` records, before each canonical write, which
-//! local objects the current mutation generation may change. Nothing reads it yet: startup,
-//! reconciliation, capture, upload and checkpoint decisions are unchanged.
+//! local objects the current mutation generation may change. Only the diagnostic shadow check
+//! ([`crate::verified_baseline`], via [`read_provenance`]) reads it: startup, reconciliation,
+//! capture, upload and checkpoint decisions are unchanged.
 //!
 //! Format (one JSON object per `\n`-terminated line, append-only; never compacted, truncated,
 //! rotated or addressed by byte offset in v1):
@@ -441,4 +442,182 @@ pub fn parse_line(line: &str) -> Result<LedgerRecordV1, String> {
 
 pub fn ledger_path(root: &Path) -> std::path::PathBuf {
     root.join(SYNC_DIR).join(LEDGER_FILE)
+}
+
+// ---- Strict provenance reader (Slice 19B.3D; shadow validation only) ----
+
+/// Ledger size the reader accepts (larger → not trustworthy for shadow use).
+pub const READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Record count the reader accepts.
+pub const READ_MAX_RECORDS: usize = 50_000;
+
+/// Why the ledger cannot vouch for the generations `(baseline, current]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reject {
+    /// The verified baseline is ahead of the library's generation (rollback/restore).
+    BaselineAhead,
+    /// Generations advanced but there is no ledger.
+    Missing,
+    Unreadable,
+    TooLarge,
+    /// A malformed or unsupported line inside the provenance range.
+    Malformed,
+    /// The provenance range ends in an unterminated line.
+    TornTail,
+    /// Session generations not strictly increasing, or an old-generation record after a newer one.
+    Order,
+    /// A scope record not belonging to the session it follows.
+    ScopeOutsideSession,
+    /// A session record for a generation beyond the library's current one.
+    FutureGeneration,
+    /// A generation in range without a session record (unrecorded writer).
+    Gap,
+}
+
+impl Reject {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BaselineAhead => "baseline_ahead",
+            Self::Missing => "ledger_missing",
+            Self::Unreadable => "ledger_unreadable",
+            Self::TooLarge => "ledger_too_large",
+            Self::Malformed => "ledger_malformed",
+            Self::TornTail => "ledger_torn_tail",
+            Self::Order => "ledger_order",
+            Self::ScopeOutsideSession => "ledger_scope_outside_session",
+            Self::FutureGeneration => "ledger_future_generation",
+            Self::Gap => "ledger_generation_gap",
+        }
+    }
+}
+
+/// What the ledger claims for the generations `(baseline, current]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Provenance {
+    /// Session generations in range (exactly `baseline+1 ..= current`).
+    pub sessions: Vec<u64>,
+    /// Scope records in range, in file order.
+    pub scopes: Vec<LedgerScope>,
+    /// An `all` record is in range (whole-library coverage).
+    pub has_all: bool,
+    pub bytes: u64,
+    pub lines: usize,
+    /// Malformed lines strictly inside older generations (bracketed by valid records with
+    /// `g <= baseline`); they cannot belong to the range.
+    pub old_malformed: usize,
+}
+
+/// Read the ledger (never modifying it) and prove it accounts for every generation in
+/// `(baseline_gen, current_gen]`. Any doubt is a [`Reject`].
+pub fn read_provenance(
+    root: &Path,
+    baseline_gen: u64,
+    current_gen: u64,
+) -> Result<Provenance, Reject> {
+    if current_gen < baseline_gen {
+        return Err(Reject::BaselineAhead);
+    }
+    let path = ledger_path(root);
+    let raw = match fs::metadata(&path) {
+        Ok(m) if !m.is_file() => return Err(Reject::Unreadable),
+        Ok(m) if m.len() > READ_MAX_BYTES => return Err(Reject::TooLarge),
+        Ok(_) => fs::read(&path).map_err(|_| Reject::Unreadable)?,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return if current_gen == baseline_gen {
+                Ok(Provenance::default())
+            } else {
+                Err(Reject::Missing)
+            };
+        }
+        Err(_) => return Err(Reject::Unreadable),
+    };
+    if raw.len() as u64 > READ_MAX_BYTES {
+        return Err(Reject::TooLarge);
+    }
+    // Lines; an unterminated final segment is kept as a torn line.
+    let mut lines: Vec<&[u8]> = raw.split(|b| *b == b'\n').collect();
+    let torn_last = !raw.is_empty() && !raw.ends_with(b"\n");
+    if !torn_last {
+        lines.pop(); // empty segment after the final '\n' (or the empty file)
+    }
+    if lines.len() > READ_MAX_RECORDS {
+        return Err(Reject::TooLarge);
+    }
+    let parsed: Vec<Option<LedgerRecordV1>> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if torn_last && i + 1 == lines.len() {
+                return None;
+            }
+            std::str::from_utf8(l).ok().and_then(|s| parse_line(s).ok())
+        })
+        .collect();
+    // Records of generations <= baseline must all precede the range.
+    let last_old = parsed
+        .iter()
+        .rposition(|r| r.as_ref().is_some_and(|r| r.g <= baseline_gen));
+    let range_start = last_old.map_or(0, |i| i + 1);
+    let mut prov = Provenance {
+        bytes: raw.len() as u64,
+        lines: lines.len(),
+        ..Default::default()
+    };
+    // Valid session generations strictly increase across the whole file (no reuse).
+    let mut prev_session: Option<u64> = None;
+    for (i, r) in parsed.iter().enumerate() {
+        match r {
+            None if i < range_start => prov.old_malformed += 1,
+            None if torn_last && i + 1 == lines.len() => return Err(Reject::TornTail),
+            None => return Err(Reject::Malformed),
+            Some(r) if i < range_start && r.g > baseline_gen => return Err(Reject::Order),
+            Some(r) if r.k == "session" => {
+                if prev_session.is_some_and(|p| r.g <= p) {
+                    return Err(Reject::Order);
+                }
+                prev_session = Some(r.g);
+            }
+            Some(_) => {}
+        }
+    }
+    // The range: sessions in order, each scope inside its own session, no future generation.
+    let mut open: Option<u64> = None;
+    for r in parsed[range_start..].iter().flatten() {
+        if r.g > current_gen {
+            return Err(Reject::FutureGeneration);
+        }
+        if r.k == "session" {
+            open = Some(r.g);
+            prov.sessions.push(r.g);
+            continue;
+        }
+        if open != Some(r.g) {
+            return Err(Reject::ScopeOutsideSession);
+        }
+        let scope = match r.k.as_str() {
+            "page" => LedgerScope::Page {
+                nb: r.nb.clone().unwrap_or_default(),
+                page: r.page.clone().unwrap_or_default(),
+            },
+            "notebook" => LedgerScope::Notebook {
+                nb: r.nb.clone().unwrap_or_default(),
+            },
+            "structure" => LedgerScope::Structure,
+            _ => LedgerScope::All,
+        };
+        prov.has_all |= scope == LedgerScope::All;
+        prov.scopes.push(scope);
+    }
+    // Every generation in range is accounted for by exactly one session.
+    let expected = current_gen - baseline_gen;
+    if prov.sessions.len() as u64 != expected
+        || prov
+            .sessions
+            .iter()
+            .zip(baseline_gen + 1..)
+            .any(|(s, want)| *s != want)
+    {
+        return Err(Reject::Gap);
+    }
+    Ok(prov)
 }

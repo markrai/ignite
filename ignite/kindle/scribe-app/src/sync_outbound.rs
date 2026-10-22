@@ -3220,7 +3220,8 @@ fn reconcile(shared: &mut Shared, preverified: Option<ParsedJournal>) -> Result<
     ));
     // Only a successful full reconcile may establish a verified stamp.
     diag::enter("stamp");
-    if let Err(e) = crate::sync_verified::write_stamp_after_full_reconcile(
+    let admissions_before = crate::sync_verified::admission_count(&shared.library_root);
+    match crate::sync_verified::write_stamp_after_full_reconcile(
         &shared.library_root,
         &shared.dir,
         shared.state.library_id,
@@ -3228,9 +3229,20 @@ fn reconcile(shared: &mut Shared, preverified: Option<ParsedJournal>) -> Result<
         shared.state.server_cursor,
         shared.state.acked_client_seq,
     ) {
-        log(format!("verified_stamp_write_failed detail={e}"));
-    } else {
-        log("verified_stamp=written");
+        Err(e) => log(format!("verified_stamp_write_failed detail={e}")),
+        Ok(written) => {
+            log("verified_stamp=written");
+            // Slice 19B.3D (diagnostic only): shadow-check the page ledger against the previous
+            // baseline, then publish this capture as the new baseline. Never fails the reconcile.
+            for line in crate::verified_baseline::after_verified_reconcile(
+                &shared.library_root,
+                &shared.dir,
+                &written,
+                admissions_before,
+            ) {
+                log(line);
+            }
+        }
     }
     Ok(())
 }
@@ -4523,3 +4535,11 @@ mod deferred_base_tests;
 #[cfg(test)]
 #[path = "page_ledger_tests.rs"]
 mod page_ledger_tests;
+
+#[cfg(test)]
+#[path = "verified_baseline_tests.rs"]
+mod verified_baseline_tests;
+
+#[cfg(test)]
+#[path = "nav_state_tests.rs"]
+mod nav_state_tests;

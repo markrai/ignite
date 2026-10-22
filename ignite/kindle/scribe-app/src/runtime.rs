@@ -1008,7 +1008,7 @@ fn install_opened_notebook(
             active_notebook_id, opened.manifest.notebook_id
         ));
     }
-    let page_id = opened.manifest.active_page_id.clone();
+    let page_id = opened.page_id.clone();
     let chrome = chrome_for_page(&opened.manifest, &page_id)?;
     let label = chrome.label();
     let profile = opened.loaded.render_profile.clone();
@@ -2613,7 +2613,7 @@ fn reload_after_inbound(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(),
     let (new_dir, opened) = open_active_notebook(x.library, x.ink_request, &x.geo, &paper)?;
     let active = x.library.active_notebook_id().to_string();
     let title = x.library.title(&active)?.to_string();
-    let page_id = opened.manifest.active_page_id.clone();
+    let page_id = opened.page_id.clone();
     let profile = opened.loaded.render_profile.clone();
     ctrl.transport_mut().set_profile(profile.clone());
     ctrl.transport_mut().set_chrome_title(&title);

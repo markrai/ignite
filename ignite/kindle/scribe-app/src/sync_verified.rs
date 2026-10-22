@@ -305,6 +305,14 @@ pub struct InvalidateHooks {
     pub after_ledger_durable: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Page ledger: called with each diagnostic line just before it is written.
     pub on_ledger_diag: Option<DiagHook>,
+    /// Baseline (19B.3D): write only the first N bytes of the temp file, then fail.
+    pub torn_baseline_write: Option<usize>,
+    /// Baseline: fail the temp-file fsync.
+    pub fail_baseline_fsync: bool,
+    /// Baseline: stop before the publishing rename (temp file left behind).
+    pub fail_baseline_rename: bool,
+    /// Baseline: after the stamp is written, before the consistency check and publication.
+    pub before_baseline_publish: Option<Arc<dyn Fn() + Send + Sync>>,
     /// When a tracked [`MutationAdmit`] is dropped (guard-lifetime tests).
     pub on_admit_drop: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -632,14 +640,13 @@ fn walk_census(
     Ok(())
 }
 
-/// Canonical library census (path, size, and content fingerprint of metadata files).
-pub fn library_census(library_root: &Path) -> Result<(String, CensusStats), String> {
-    let t0 = Instant::now();
-    let mut files = BTreeMap::new();
-    let mut stats = CensusStats::default();
-    walk_census(library_root, library_root, &mut files, &mut stats)?;
+/// Per-file census: relative path → (length, content SHA-256, or `-` for size-only files).
+pub type CensusMap = BTreeMap<String, (u64, String)>;
+
+/// The census hash of a [`CensusMap`] (the value the v3 stamp records).
+pub fn census_map_sha256(files: &CensusMap) -> String {
     let mut buf = String::new();
-    for (rel, (len, fp)) in &files {
+    for (rel, (len, fp)) in files {
         buf.push_str(rel);
         buf.push('\t');
         buf.push_str(&len.to_string());
@@ -647,17 +654,37 @@ pub fn library_census(library_root: &Path) -> Result<(String, CensusStats), Stri
         buf.push_str(fp);
         buf.push('\n');
     }
+    sha256_hex(buf.as_bytes()).to_string()
+}
+
+/// Canonical library census as a per-file map (see [`library_census`]).
+pub fn library_census_map(library_root: &Path) -> Result<(CensusMap, CensusStats), String> {
+    let t0 = Instant::now();
+    let mut files = BTreeMap::new();
+    let mut stats = CensusStats::default();
+    walk_census(library_root, library_root, &mut files, &mut stats)?;
     stats.elapsed_ms = t0.elapsed().as_millis();
-    Ok((sha256_hex(buf.as_bytes()).to_string(), stats))
+    Ok((files, stats))
+}
+
+/// Canonical library census (path, size, and content fingerprint of metadata files).
+pub fn library_census(library_root: &Path) -> Result<(String, CensusStats), String> {
+    let (files, stats) = library_census_map(library_root)?;
+    Ok((census_map_sha256(&files), stats))
 }
 
 /// [`library_census_sha256`], also reporting the walk's [`CensusStats`] to the startup
 /// breakdown (`stamp` = inside the stamp write, else the fast-path check).
 fn census_for_startup(library_root: &Path, stamp: bool) -> Result<String, String> {
+    census_map_for_startup(library_root, stamp).map(|(_, h)| h)
+}
+
+fn census_map_for_startup(library_root: &Path, stamp: bool) -> Result<(CensusMap, String), String> {
     let t0 = Instant::now();
-    let (h, stats) = library_census(library_root)?;
+    let (files, stats) = library_census_map(library_root)?;
+    let h = census_map_sha256(&files);
     crate::sync_startup_diag::census(stamp, &stats, t0.elapsed());
-    Ok(h)
+    Ok((files, h))
 }
 
 /// Canonical library census hash.
@@ -883,6 +910,7 @@ pub fn note_library_mutation_scoped(
             return Err(e);
         }
     }
+    count_admission(&key);
     let ordinary = !permit;
     if ordinary {
         g.inflight_ordinary = g.inflight_ordinary.saturating_add(1);
@@ -1070,6 +1098,14 @@ fn evaluate_fast_path_inner(
     FastPathReason::Verified
 }
 
+/// What a successful [`write_stamp_after_full_reconcile`] recorded: the generation and the
+/// census it captured (19B.3D: the verified baseline is built from exactly this capture).
+#[derive(Debug)]
+pub struct StampWritten {
+    pub stamp: LocalVerifiedV1,
+    pub census: CensusMap,
+}
+
 /// Persist a stamp after a successful full reconcile (not after fast path).
 pub fn write_stamp_after_full_reconcile(
     library_root: &Path,
@@ -1078,9 +1114,9 @@ pub fn write_stamp_after_full_reconcile(
     replica_id: ReplicaId,
     server_cursor: u64,
     acked_client_seq: u64,
-) -> Result<(), String> {
+) -> Result<StampWritten, String> {
     let mutation_gen = read_mutation_gen(library_root)?;
-    let census_sha256 = census_for_startup(library_root, true)?;
+    let (census, census_sha256) = census_map_for_startup(library_root, true)?;
     let stamp = LocalVerifiedV1 {
         v: STAMP_VERSION,
         library_id,
@@ -1114,7 +1150,29 @@ pub fn write_stamp_after_full_reconcile(
     }
     fsync_dir(sync_dir, false)?;
     session_clear_invalidated(&session_key(library_root));
-    Ok(())
+    Ok(StampWritten { stamp, census })
+}
+
+/// Admissions per library root since process start (never reset by `clear_registry_for`).
+static ADMISSIONS: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+fn count_admission(key: &Path) {
+    let mut g = ADMISSIONS.lock().unwrap_or_else(|p| p.into_inner());
+    *g.get_or_insert_with(HashMap::new)
+        .entry(key.to_path_buf())
+        .or_default() += 1;
+}
+
+/// Number of tracked mutations admitted for `library_root` in this process. Equal values
+/// before and after a capture prove no mutation was admitted in between (19B.3D baseline).
+pub fn admission_count(library_root: &Path) -> u64 {
+    let key = session_key(library_root);
+    ADMISSIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key).copied())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
