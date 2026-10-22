@@ -1890,6 +1890,8 @@ pub fn load_existing_page(
             keep.len()
         );
         {
+            // Interrupted-append recovery is a canonical write (19B.3C: admitted + recorded).
+            let _admit = crate::sync_verified::note_mutation_from_page_dir(&dir)?;
             let f = OpenOptions::new()
                 .write(true)
                 .open(&j_p)
@@ -1914,6 +1916,7 @@ pub fn load_existing_page(
             keep.len()
         );
         {
+            let _admit = crate::sync_verified::note_mutation_from_page_dir(&dir)?;
             let f = OpenOptions::new()
                 .write(true)
                 .open(&e_p)
@@ -2428,9 +2431,14 @@ impl FsPageStore {
         if !self.writable {
             return Err("store not writable".into());
         }
-        if !strokes.is_empty() {
-            let _admit = crate::sync_verified::note_mutation_from_page_dir(&self.dir)?;
-        }
+        // Held until the journal fsync below (it used to drop at the end of the `if`).
+        let _admit = if strokes.is_empty() {
+            None
+        } else {
+            Some(crate::sync_verified::note_mutation_from_page_dir(
+                &self.dir,
+            )?)
+        };
         let mut buf = String::new();
         for s in strokes {
             if self.known_ids.contains(s.id.as_str()) {

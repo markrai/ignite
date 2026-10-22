@@ -29,6 +29,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sync_protocol::{sha256_hex, LibraryId, ReplicaId};
 
+pub use crate::page_ledger::LedgerScope;
 use crate::sync_local::SYNC_DIR;
 
 /// Stamp schema written under `--sync-dir`.
@@ -92,6 +93,8 @@ struct SessionState {
     inflight_ordinary: u32,
     /// Prepare is freezing a snapshot; ordinary and inbound writers wait.
     quiescing: bool,
+    /// Changed-page ledger state for the current generation (record-only, Slice 19B.3C).
+    ledger: crate::page_ledger::SessionLedger,
 }
 
 struct SessionCell {
@@ -138,6 +141,10 @@ impl Drop for MutationAdmit {
         let Some(cell) = self.cell.take() else {
             return;
         };
+        #[cfg(test)]
+        if let Some(f) = hooks().on_admit_drop {
+            f();
+        }
         if !self.ordinary {
             return;
         }
@@ -195,6 +202,7 @@ fn session_cell(key: &Path) -> Arc<SessionCell> {
                     inv: SessionInv::Open,
                     inflight_ordinary: 0,
                     quiescing: false,
+                    ledger: Default::default(),
                 }),
                 cv: Condvar::new(),
             })
@@ -223,6 +231,8 @@ fn session_clear_invalidated(key: &Path) {
     if let Some(cell) = cell {
         let mut g = cell.state.lock().unwrap_or_else(|p| p.into_inner());
         g.inv = SessionInv::Open;
+        // The next mutation bumps a new generation and starts a new ledger session.
+        g.ledger.reset();
     }
 }
 
@@ -264,6 +274,9 @@ fn registry() -> std::sync::MutexGuard<'static, Option<HashMap<PathBuf, PathBuf>
     g
 }
 
+/// Test observer for page-ledger diagnostic lines.
+pub type DiagHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Deterministic failure injection for durability-ordering tests (thread-local).
 #[derive(Clone, Default)]
 pub struct InvalidateHooks {
@@ -280,6 +293,20 @@ pub struct InvalidateHooks {
     pub before_session_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     /// After ordinary admission (inflight incremented, session lock released), before return.
     pub after_ordinary_admit: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Page ledger (19B.3C): fail creating the ledger file.
+    pub fail_ledger_create: bool,
+    /// Page ledger: write only the first N bytes of the append, then fail (torn record).
+    pub torn_ledger_append: Option<usize>,
+    /// Page ledger: fail the record fsync (bytes written).
+    pub fail_ledger_fsync: bool,
+    /// Page ledger: fail the directory fsync after creating the file.
+    pub fail_ledger_dir_sync: bool,
+    /// Page ledger: after a record set is durable, before the admit returns.
+    pub after_ledger_durable: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Page ledger: called with each diagnostic line just before it is written.
+    pub on_ledger_diag: Option<DiagHook>,
+    /// When a tracked [`MutationAdmit`] is dropped (guard-lifetime tests).
+    pub on_admit_drop: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(test)]
@@ -300,6 +327,26 @@ fn hooks() -> InvalidateHooks {
     }
     #[cfg(not(test))]
     InvalidateHooks::default()
+}
+
+#[cfg(test)]
+pub(crate) fn test_hooks() -> InvalidateHooks {
+    hooks()
+}
+
+/// (mutex poisoned, ordinary writes in flight) of a library's session cell, if any.
+#[cfg(test)]
+pub(crate) fn session_health_for_test(library_root: &Path) -> Option<(bool, u32)> {
+    let cell = session_table()
+        .as_ref()
+        .and_then(|t| t.cells.get(&session_key(library_root)).cloned())?;
+    let poisoned = cell.state.is_poisoned();
+    let inflight = cell
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .inflight_ordinary;
+    Some((poisoned, inflight))
 }
 
 /// Clears injected hooks on drop (including panic unwind).
@@ -377,6 +424,9 @@ pub fn register_paths(library_root: &Path, sync_dir: &Path) {
 
 /// Drop one library's registration (sync teardown for that open).
 pub fn clear_registry_for(library_root: &Path) {
+    if crate::page_ledger::PAGE_LEDGER_ENABLED {
+        crate::page_ledger::emit(Some(crate::page_ledger::stats_line()));
+    }
     let key = session_key(library_root);
     if let Some(m) = registry().as_mut() {
         m.remove(&key);
@@ -765,7 +815,20 @@ pub fn hold_authoring_for_maintenance(library_root: &Path) -> Result<Maintenance
 ///
 /// On error the content mutation must not proceed. In-memory session state is not the next
 /// process's proof: generation / stamp / census on disk are.
+///
+/// Records [`LedgerScope::All`] in the page ledger; narrower callers use
+/// [`note_library_mutation_scoped`] or the `note_mutation_from_*` helpers.
 pub fn note_library_mutation(library_root: &Path) -> Result<MutationAdmit, String> {
+    note_library_mutation_scoped(library_root, &LedgerScope::All)
+}
+
+/// [`note_library_mutation`], also recording `scope` durably in the page ledger before the
+/// admit is returned (record-only; see [`crate::page_ledger`]). A ledger failure refuses the
+/// mutation exactly like a generation-bump failure.
+pub fn note_library_mutation_scoped(
+    library_root: &Path,
+    scope: &LedgerScope,
+) -> Result<MutationAdmit, String> {
     if library_root.as_os_str().is_empty() {
         return Err("REFUSE SYNC STAMP: empty library root".into());
     }
@@ -795,11 +858,29 @@ pub fn note_library_mutation(library_root: &Path) -> Result<MutationAdmit, Strin
             }
         }
         match invalidate_durable(library_root, &key) {
-            Ok(()) => g.inv = SessionInv::DurablyInvalidated,
+            Ok(gen) => {
+                g.inv = SessionInv::DurablyInvalidated;
+                g.ledger.begin(gen);
+            }
             Err(e) => {
-                eprintln!("sync_verified_invalidate_failed detail={e}");
+                drop(g);
+                crate::page_ledger::emit(Some(format!(
+                    "sync_verified_invalidate_failed detail={e}"
+                )));
                 return Err(e);
             }
+        }
+    }
+    // After the bump, before the content write; under the session lock. Diagnostics are
+    // emitted only after the lock is released.
+    let mut ledger_diag = None;
+    if crate::page_ledger::PAGE_LEDGER_ENABLED {
+        let r = g.ledger.record(library_root, scope);
+        ledger_diag = g.ledger.take_diag();
+        if let Err(e) = r {
+            drop(g);
+            crate::page_ledger::emit(ledger_diag);
+            return Err(e);
         }
     }
     let ordinary = !permit;
@@ -814,13 +895,17 @@ pub fn note_library_mutation(library_root: &Path) -> Result<MutationAdmit, Strin
             f();
         }
     }
-    Ok(MutationAdmit {
+    // Built before emitting, so an unwinding emit still releases the in-flight count.
+    let admit = MutationAdmit {
         cell: Some(cell),
         ordinary,
-    })
+    };
+    crate::page_ledger::emit(ledger_diag);
+    Ok(admit)
 }
 
-fn invalidate_durable(library_root: &Path, key: &Path) -> Result<(), String> {
+/// Durable generation bump + stamp clear; returns the generation now on disk.
+fn invalidate_durable(library_root: &Path, key: &Path) -> Result<u64, String> {
     let cur = read_mutation_gen(library_root)?;
     let next = cur.saturating_add(1).max(1);
     write_mutation_gen(library_root, next)?;
@@ -831,13 +916,16 @@ fn invalidate_durable(library_root: &Path, key: &Path) -> Result<(), String> {
     if let Some(sync_dir) = sync_dir {
         clear_stamp_file(&sync_dir)?;
     }
-    Ok(())
+    Ok(next)
 }
 
 /// Convenience: note mutation when the library root can be inferred from a page dir.
+/// Records the page scope (wider if the path is not `notebooks/<nb>/<page>`).
 pub fn note_mutation_from_page_dir(page_dir: &Path) -> Result<MutationAdmit, String> {
     match library_root_from_page_dir(page_dir) {
-        Some(root) => note_library_mutation(&root),
+        Some(root) => {
+            note_library_mutation_scoped(&root, &crate::page_ledger::scope_for_dir(&root, page_dir))
+        }
         None if path_looks_like_library_tree(page_dir) => Err(format!(
             "REFUSE SYNC STAMP: cannot resolve library root from {}",
             page_dir.display()
@@ -846,9 +934,13 @@ pub fn note_mutation_from_page_dir(page_dir: &Path) -> Result<MutationAdmit, Str
     }
 }
 
+/// Records the notebook scope (wider if the path is not `notebooks/<nb>`).
 pub fn note_mutation_from_notebook_dir(notebook_dir: &Path) -> Result<MutationAdmit, String> {
     match library_root_from_notebook_dir(notebook_dir) {
-        Some(root) => note_library_mutation(&root),
+        Some(root) => note_library_mutation_scoped(
+            &root,
+            &crate::page_ledger::scope_for_dir(&root, notebook_dir),
+        ),
         None if path_looks_like_library_tree(notebook_dir) => Err(format!(
             "REFUSE SYNC STAMP: cannot resolve library root from {}",
             notebook_dir.display()
@@ -857,9 +949,10 @@ pub fn note_mutation_from_notebook_dir(notebook_dir: &Path) -> Result<MutationAd
     }
 }
 
+/// Records the library-structure scope.
 pub fn note_mutation_from_folders_dir(folders_dir: &Path) -> Result<MutationAdmit, String> {
     match library_root_from_folders_dir(folders_dir) {
-        Some(root) => note_library_mutation(&root),
+        Some(root) => note_library_mutation_scoped(&root, &LedgerScope::Structure),
         None if path_looks_like_library_tree(folders_dir) => Err(format!(
             "REFUSE SYNC STAMP: cannot resolve library root from {}",
             folders_dir.display()

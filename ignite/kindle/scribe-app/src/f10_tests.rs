@@ -895,4 +895,71 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
     }
+    /// Slice 19B.3C: resuming an interrupted migration (record already on disk, so no record
+    /// write precedes the remaining moves) admits the moves as `all` before the first one.
+    #[test]
+    fn resumed_legacy_migration_records_all_before_moving() {
+        use crate::page_ledger::{ledger_path, parse_line};
+        use crate::sync_verified::{
+            clear_registry_for, install_invalidate_hooks, read_mutation_gen, InvalidateHooks,
+        };
+        use std::sync::{Arc, Mutex};
+        let root = tmp("migration-ledger-resume");
+        make_representative_f9_legacy(&root);
+        open_or_create_library_with_hooks(
+            &root,
+            InkRequest::Default,
+            &geo(),
+            &bg(),
+            &MigrationHooks {
+                fail_after_moves: Some(1),
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+        // Legacy objects still waiting in the root.
+        let waiting: Vec<PathBuf> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy();
+                n == "notebook.meta" || n.starts_with("page-")
+            })
+            .collect();
+        assert!(!waiting.is_empty());
+        clear_registry_for(&root); // the next process resumes
+        let g0 = read_mutation_gen(&root).unwrap();
+        let seen: Arc<Mutex<Option<bool>>> = Arc::default();
+        {
+            let (seen, waiting) = (seen.clone(), waiting.clone());
+            let _h = install_invalidate_hooks(InvalidateHooks {
+                after_ledger_durable: Some(Arc::new(move || {
+                    let mut s = seen.lock().unwrap();
+                    if s.is_none() {
+                        *s = Some(waiting.iter().all(|p| p.exists()));
+                    }
+                })),
+                ..Default::default()
+            });
+            let opened = open_or_create_library(&root, InkRequest::Default, &geo(), &bg()).unwrap();
+            drop(opened.notebook.store);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(true),
+            "recorded before the first move"
+        );
+        let raw = fs::read_to_string(ledger_path(&root)).unwrap();
+        let recs: Vec<_> = raw.lines().map(|l| parse_line(l).unwrap()).collect();
+        let g = g0 + 1;
+        let s = recs
+            .iter()
+            .position(|r| r.g == g && r.k == "session")
+            .unwrap();
+        assert_eq!(recs[s + 1].k, "all", "{raw}");
+        clear_registry_for(&root);
+        let _ = fs::remove_dir_all(root);
+    }
 }

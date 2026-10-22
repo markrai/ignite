@@ -666,6 +666,9 @@ pub fn delete_page_durable(
         ));
     }
 
+    // Held through the quarantine move, which runs after the manifest write's own admit ends.
+    let _admit = crate::sync_verified::note_mutation_from_notebook_dir(data_dir)
+        .map_err(|e| format!("REFUSE PAGE DELETE: {e}"))?;
     let trash = trash_root(data_dir);
     fs::create_dir_all(&trash).map_err(|e| format!("REFUSE PAGE DELETE: create trash: {e}"))?;
     let trash_name = unique_trash_entry_name(page_id);
@@ -744,6 +747,7 @@ pub fn quarantine_page_dir(data_dir: &Path, page_id: &str) -> Result<(), String>
     if !src.exists() {
         return Ok(());
     }
+    let _admit = crate::sync_verified::note_mutation_from_page_dir(&src)?;
     let trash = trash_root(data_dir);
     fs::create_dir_all(&trash).map_err(|e| format!("create trash: {e}"))?;
     let dst = trash.join(unique_trash_entry_name(page_id));

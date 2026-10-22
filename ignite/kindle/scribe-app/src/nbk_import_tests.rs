@@ -1138,3 +1138,70 @@ fn fixture_manifest_load_from_path_missing_file_fails() {
     let err = NbkImportFixtures::load_from_path(&missing).unwrap_err();
     assert!(err.contains("failed to read"), "{err}");
 }
+
+// ------------------------------------------------------------------------------ page ledger
+
+/// Slice 19B.3C: an import is a bulk change admitted (and recorded as `all`) before any write;
+/// a ledger failure refuses the import before the library changes.
+#[test]
+fn an_import_records_the_whole_library_in_the_page_ledger_before_writing() {
+    use crate::page_ledger::{ledger_path, parse_line};
+    use crate::sync_verified::{
+        clear_registry_for, install_invalidate_hooks, read_mutation_gen, InvalidateHooks,
+    };
+    let mut s = Scribe::new();
+    let root = s.lib.root().to_path_buf();
+    let src = SourceNotebook {
+        origin_id: "0b1c2d3e-4f50-4a61-8b72-93a4b5c6d7e8".into(),
+        title: "Empty".into(),
+        dir: tmp("ledger-empty-source"),
+    };
+    let g = geo();
+    let mut receipts = Ledger::open(&root).unwrap();
+    let before = s.lib.manifest().notebook_ids.clone();
+
+    // A ledger failure: refused before anything is imported.
+    clear_registry_for(&root);
+    {
+        let _h = install_invalidate_hooks(InvalidateHooks {
+            fail_ledger_fsync: true,
+            ..Default::default()
+        });
+        let mut target = ImportTarget {
+            library: &mut s.lib,
+            profile: &s.profile,
+            geo: &g,
+            paper: &s.paper,
+            cancel: &NO_CANCEL,
+        };
+        let out = import_one(&mut target, &mut receipts, &src, &NoSync);
+        assert!(
+            matches!(out, ImportOutcome::Failed(ref e) if e.contains("PAGE LEDGER")),
+            "{out:?}"
+        );
+    }
+    assert_eq!(s.lib.manifest().notebook_ids, before);
+
+    // Admitted: `all` is durable in the current generation whatever the source turns out to be.
+    clear_registry_for(&root);
+    let mut target = ImportTarget {
+        library: &mut s.lib,
+        profile: &s.profile,
+        geo: &g,
+        paper: &s.paper,
+        cancel: &NO_CANCEL,
+    };
+    let _ = import_one(&mut target, &mut receipts, &src, &NoSync);
+    let gen = read_mutation_gen(&root).unwrap();
+    let raw = fs::read_to_string(ledger_path(&root)).unwrap();
+    let recs: Vec<_> = raw.lines().filter_map(|l| parse_line(l).ok()).collect();
+    let session = recs
+        .iter()
+        .position(|r| r.g == gen && r.k == "session")
+        .expect("session record");
+    assert!(
+        recs[session..].iter().any(|r| r.g == gen && r.k == "all"),
+        "{raw}"
+    );
+    clear_registry_for(&root);
+}

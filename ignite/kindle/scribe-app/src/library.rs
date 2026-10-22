@@ -322,9 +322,15 @@ fn write_json_atomic<T: Serialize>(
     // Do not treat an unresolved notebook path as the library root — that would bump the
     // wrong generation file and leave the real stamp trusted.
     let _admit = match crate::sync_verified::library_root_from_tree(dir) {
-        Some(root) => crate::sync_verified::note_library_mutation(&root)?,
+        Some(root) => crate::sync_verified::note_library_mutation_scoped(
+            &root,
+            &crate::page_ledger::scope_for_dir(&root, dir),
+        )?,
         None if final_name == LIBRARY_MANIFEST_FILE || final_name == MIGRATION_RECORD_FILE => {
-            crate::sync_verified::note_library_mutation(dir)?
+            crate::sync_verified::note_library_mutation_scoped(
+                dir,
+                &crate::sync_verified::LedgerScope::Structure,
+            )?
         }
         None if crate::sync_verified::path_looks_like_library_tree(dir) => {
             return Err(format!(
@@ -777,6 +783,9 @@ fn migrate_legacy_root(root: &Path, hooks: &MigrationHooks) -> Result<(), String
         record
     };
 
+    // The moves below also run when resuming from an existing record (no write above), so
+    // admit them explicitly: a bulk layout change, recorded as `all` (19B.3C).
+    let _admit = crate::sync_verified::note_library_mutation(root)?;
     let notebooks = root.join(NOTEBOOKS_DIR);
     let stage = notebooks.join(MIGRATION_STAGE_NAME);
     let target = notebooks.join(&record.notebook_id);
@@ -1177,6 +1186,9 @@ pub fn delete_notebook_durable(
     let planned = plan_delete_notebook(&library.manifest, notebook_id)?;
     let src = library.notebook_dir(notebook_id);
     validate_notebook_directory(&src, notebook_id)?;
+    // Held through the quarantine move, which runs after the manifest write's own admit ends.
+    let _admit = crate::sync_verified::note_mutation_from_notebook_dir(&src)
+        .map_err(|e| format!("REFUSE NOTEBOOK DELETE: {e}"))?;
     let trash = library.root.join(NOTEBOOK_TRASH_DIR);
     fs::create_dir_all(&trash).map_err(|e| format!("REFUSE NOTEBOOK DELETE: create trash: {e}"))?;
     let trash_entry_name = unique_trash_entry_name(notebook_id);
@@ -1259,6 +1271,7 @@ pub fn quarantine_notebook_dir(
     if !src.exists() {
         return Ok(());
     }
+    let _admit = crate::sync_verified::note_mutation_from_notebook_dir(&src)?;
     let trash = library.root.join(NOTEBOOK_TRASH_DIR);
     fs::create_dir_all(&trash).map_err(|e| format!("create trash: {e}"))?;
     fs::rename(&src, trash.join(unique_trash_entry_name(notebook_id)))

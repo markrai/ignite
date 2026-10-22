@@ -4519,3 +4519,7 @@ mod startup_diag_tests;
 #[cfg(test)]
 #[path = "sync_deferred_base_tests.rs"]
 mod deferred_base_tests;
+
+#[cfg(test)]
+#[path = "page_ledger_tests.rs"]
+mod page_ledger_tests;
