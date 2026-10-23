@@ -1,4 +1,4 @@
-![logo](logo.jpg)
+![logo](github.jpg)
 
 **Ignite** is an open-source **Kindle Scribe notebook replacement**: local
 handwriting, durable notebooks on-device, a one-file installer for prepared
