@@ -1,8 +1,15 @@
 # Ignite public release packaging
 
 This document is the maintainer procedure for a complete GitHub Release
-(Kindle installer + Linux server). It does **not** replace hardware
-qualification.
+(Kindle installer + Linux server). Every GitHub Release is a normal release
+for the Ignite community of users and testers; there is no separate
+prerelease or testing channel.
+
+Required before publication: successful CI, verified release artifacts and
+SHA-256 checksums, correct version/provenance, and explicit maintainer
+approval. Physical Kindle hardware testing is **not** required before
+publication: hardware results establish specific device/firmware
+compatibility claims, not permission to publish.
 
 ## Artifacts (per version `X.Y.Z`)
 
@@ -37,8 +44,10 @@ Publication is [`.github/workflows/release-promote.yml`](../.github/workflows/re
 1. Freeze the release-candidate commit (docs and authentic screenshots already on it).
 2. Download the CI artifacts from that commit’s successful run; record
    `{commit_sha, workflow_run_id, kindle_sha256, linux_sha256}`.
-3. Hardware-accept the **exact** Kindle installer bytes (and exercise sync against
-   the **same** Linux artifact if sync is advertised).
+3. Optionally exercise the **exact** Kindle installer bytes on hardware (and sync
+   against the **same** Linux artifact if sync is advertised) to inform
+   device/firmware compatibility claims. Hardware results are not a
+   publication gate.
 4. From `main`, dispatch **Promote release** with those recorded values and
    confirm `publish vX.Y.Z from run <id>`.
 5. The workflow refuses missing, expired, mismatched, failed, or unconfirmed
@@ -53,7 +62,7 @@ artifacts and create the Release: job-level `contents: write` and `actions: read
 (`GITHUB_TOKEN` only). GHCR keeps `contents: read` + `packages: write` as today.
 Do not add a PAT.
 
-### Qualification record (fill before dispatch)
+### Promotion record (fill before dispatch)
 
 ```text
 commit_sha=
@@ -65,7 +74,7 @@ linux_sha256=
 ```
 
 CI logs print `kindle_sha256=` and `linux_sha256=` after each successful artifact
-job. Retention is 30 days — qualify and promote before the artifacts expire.
+job. Retention is 30 days — verify and promote before the artifacts expire.
 
 ## Kindle packaging (CI and local)
 
@@ -93,15 +102,19 @@ Rust ARMv7hf uses that same digest-pinned `rust:1-bullseye` image and
 (`scribe-app/restore_from_server`). `ink-probe` is not packaged.
 `kindle-supervisor-harness` must never be staged.
 
-## CI vs hardware
+## Automated validation vs hardware-verified compatibility
 
-**Automated (CI):** workspace tests, recovery isolation, armv7 check, installer
-pytest, shared packager tests, version sync, Linux bundle tests, Docker static
-and GHCR mocks, promote-publish failure-path tests, full Kindle Scriptlet build.
+**Automated validation (required before publication):** workspace tests, recovery
+isolation, armv7 check, installer pytest, shared packager tests, version sync,
+Linux bundle tests, Docker static and GHCR mocks, promote-publish
+failure-path tests, full Kindle Scriptlet build.
 
-**Hardware (required before promote-publish, not CI):**
+**Hardware-verified compatibility (not required before publication):** hardware
+results establish specific device/firmware compatibility claims, not permission
+to publish. When hardware is available, the table below lists exercises that
+inform such claims:
 
-| Check | Requirement |
+| Check | Exercise |
 |-------|-------------|
 | Fresh install | Clean install of the **CI** Scriptlet on a prepared Scribe |
 | Upgrade | Upgrade from an existing Ignite install |
@@ -115,6 +128,10 @@ Device class: **Verified** matrix only (Scribe 1st gen, firmware **5.18.6**)
 unless new evidence is gathered. Do not claim unverified firmware. See
 [`docs/compatibility.md`](compatibility.md).
 
+Back up notebooks before installing or upgrading. Users and testers are
+encouraged to report installation/runtime results, including Kindle model
+and firmware.
+
 ## Maintainer sequence (vX.Y.Z)
 
 1. Finish packaging, promote-publish, docs, Kindle-first README, and authentic
@@ -123,12 +140,12 @@ unless new evidence is gathered. Do not claim unverified firmware. See
    `ignite/web/package.json`, and `package-lock.json` together; CI version-sync
    must pass.
 3. From that commit’s CI run, download both artifacts; record identity.
-4. Complete the hardware table on those exact bytes; capture screenshots if not
-   already on the commit (if you add files, that is a new commit → new CI run →
-   re-qualify).
+4. Optionally exercise the hardware table on those exact bytes to inform
+   compatibility claims; capture screenshots if not already on the commit
+   (if you add files, that is a new commit → new CI run → re-verify).
 5. Dispatch **Promote release** from `main` with recorded identity. That
    confirmation is the publication approval.
-6. Confirm the Release assets’ SHA-256s equal the recorded qualification
+6. Confirm the Release assets’ SHA-256s equal the recorded
    digests (promotion correctness, not a substitute for pre-publish checks).
 7. GHCR: `docker pull ghcr.io/markrai/ignite-server:v0.9.13` (example version). First-time package
    visibility may still need a manual Public toggle.
@@ -142,5 +159,5 @@ unless new evidence is gathered. Do not claim unverified firmware. See
 - Uploading the support ZIP as a Release asset
 - Replacing assets on an existing GitHub Release
 - Tag-push rebuild as the source of published bytes
-- Publishing before hardware sign-off on the CI Scriptlet
+- Claiming hardware-verified compatibility without hardware evidence
 - Generated / AI screenshots in the README
