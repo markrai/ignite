@@ -16,6 +16,11 @@ name = "kindle-supervisor-harness"
 path = "src/bin/kindle_supervisor_harness.rs"
 required-features = ["kindle_supervisor_harness"]
 
+# Slice 19B.3B: disposable small-durable-write benchmark (not packaged; see the bench's docs).
+[[bin]]
+name = "durable-write-bench"
+path = "src/bin/durable_write_bench.rs"
+
 [features]
 # Narrow, non-production gate: exposes DisposableStreamPermit construction and the
 # isolated harness binary. Ordinary scribe-app / Scriptlet builds must omit this.

@@ -78,15 +78,22 @@ fn write_atomic(
     bytes: &[u8],
     hooks: &SyncWriteHooks,
 ) -> Result<(), String> {
-    if name == IDENTITY_FILE {
+    // Held until this function returns, so admission (generation, ledger record, maintenance
+    // in-flight accounting) covers the whole write. It used to drop at the end of the `if`.
+    let _admit = if name == IDENTITY_FILE {
         let root = dir.parent().ok_or_else(|| {
             format!(
                 "REFUSE SYNC STAMP: identity dir {} has no parent",
                 dir.display()
             )
         })?;
-        let _admit = crate::sync_verified::note_library_mutation(root)?;
-    }
+        Some(crate::sync_verified::note_library_mutation_scoped(
+            root,
+            &crate::sync_verified::LedgerScope::Structure,
+        )?)
+    } else {
+        None
+    };
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = dir.join(format!("{name}.tmp"));
     if hooks.fail_write {
@@ -276,7 +283,10 @@ fn persist_planned_identity_inner(
     plan: &Reconciled,
     hooks: &SyncWriteHooks,
 ) -> Result<(), String> {
-    let _admit = crate::sync_verified::note_library_mutation(library_root)?;
+    let _admit = crate::sync_verified::note_library_mutation_scoped(
+        library_root,
+        &crate::sync_verified::LedgerScope::Structure,
+    )?;
     let _txn = ExclusiveLock::acquire(&library_root.join(SYNC_DIR), IDENTITY_LOCK_FILE)?;
     if read_identity(library_root)?.as_ref() != planned_from {
         return Err(
@@ -651,12 +661,12 @@ fn build_snapshot_inner(
                     ))
                 }
             };
-            pages.push(page_snapshot(
-                &nb_dir,
-                page_local,
-                page_id,
-                persist_background_identity,
-            )?);
+            // Slice 19B.3B: per-page cost (startup breakdown; no page identity is recorded).
+            let t_page = std::time::Instant::now();
+            crate::sync_startup_diag::page_begin();
+            let page = page_snapshot(&nb_dir, page_local, page_id, persist_background_identity);
+            crate::sync_startup_diag::page_end(t_page.elapsed());
+            pages.push(page?);
         }
         if skip_unbound && pages.is_empty() {
             continue;

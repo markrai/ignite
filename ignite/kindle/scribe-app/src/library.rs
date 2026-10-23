@@ -146,7 +146,11 @@ pub struct MigrationHooks {
 #[derive(Clone, Debug)]
 pub struct LibraryRepository {
     root: PathBuf,
+    /// `library.meta`, except `active_notebook_id`, which is the replica-local selection
+    /// ([`crate::nav_state::selected_notebook`]). Every canonical write persists it as is.
     manifest: PersistedLibraryManifestV1,
+    /// `active_notebook_id` as it is in `library.meta` on disk (the selection's `base`).
+    disk_active_notebook_id: String,
     summaries: BTreeMap<String, NotebookHomeSummary>,
     orphan_dirs: Vec<String>,
 }
@@ -322,9 +326,15 @@ fn write_json_atomic<T: Serialize>(
     // Do not treat an unresolved notebook path as the library root — that would bump the
     // wrong generation file and leave the real stamp trusted.
     let _admit = match crate::sync_verified::library_root_from_tree(dir) {
-        Some(root) => crate::sync_verified::note_library_mutation(&root)?,
+        Some(root) => crate::sync_verified::note_library_mutation_scoped(
+            &root,
+            &crate::page_ledger::scope_for_dir(&root, dir),
+        )?,
         None if final_name == LIBRARY_MANIFEST_FILE || final_name == MIGRATION_RECORD_FILE => {
-            crate::sync_verified::note_library_mutation(dir)?
+            crate::sync_verified::note_library_mutation_scoped(
+                dir,
+                &crate::sync_verified::LedgerScope::Structure,
+            )?
         }
         None if crate::sync_verified::path_looks_like_library_tree(dir) => {
             return Err(format!(
@@ -551,7 +561,9 @@ fn load_repository(root: &Path) -> Result<LibraryRepository, String> {
     // Launch-critical: `library.meta`, each listed notebook directory, `notebook.info` titles,
     // and structural `notebook.meta` (page *count* for Home). Per-page `page_exists` is an
     // open-time / sync-time gate — a missing page must not block Home.
-    let manifest = read_library_manifest(root)?;
+    let mut manifest = read_library_manifest(root)?;
+    let disk_active_notebook_id = manifest.active_notebook_id.clone();
+    manifest.active_notebook_id = crate::nav_state::selected_notebook(root, &manifest);
     let mut summaries = BTreeMap::new();
     for id in &manifest.notebook_ids {
         let dir = root.join(NOTEBOOKS_DIR).join(id);
@@ -587,6 +599,7 @@ fn load_repository(root: &Path) -> Result<LibraryRepository, String> {
     Ok(LibraryRepository {
         root: root.to_path_buf(),
         manifest,
+        disk_active_notebook_id,
         summaries,
         orphan_dirs,
     })
@@ -777,6 +790,9 @@ fn migrate_legacy_root(root: &Path, hooks: &MigrationHooks) -> Result<(), String
         record
     };
 
+    // The moves below also run when resuming from an existing record (no write above), so
+    // admit them explicitly: a bulk layout change, recorded as `all` (19B.3C).
+    let _admit = crate::sync_verified::note_library_mutation(root)?;
     let notebooks = root.join(NOTEBOOKS_DIR);
     let stage = notebooks.join(MIGRATION_STAGE_NAME);
     let target = notebooks.join(&record.notebook_id);
@@ -1030,6 +1046,7 @@ pub fn create_notebook_durable(
         ));
     }
     let manifest_persist_us = t0.elapsed().as_micros() as u64;
+    library.disk_active_notebook_id = planned.active_notebook_id.clone();
     library.manifest = planned;
     library.summaries.insert(
         id.clone(),
@@ -1070,14 +1087,23 @@ pub fn switch_notebook_durable(
             manifest_persist_us: 0,
         });
     }
-    let mut planned = library.manifest.clone();
-    planned.active_notebook_id = target_id.to_string();
-    validate_library_manifest(&planned)?;
+    // 19B.3D.2: the selection is replica-local state, not a library mutation; `library.meta`
+    // is not rewritten. A failed save only loses the reopen choice and is logged.
     let t0 = Instant::now();
-    write_library_manifest_atomic(&library.root, &planned, &hooks.manifest)
-        .map_err(|e| format!("REFUSE NOTEBOOK SWITCH: library manifest persist failed: {e}"))?;
+    let saved = if hooks.manifest.fail_write {
+        Err("injected: selection write failed".to_string())
+    } else {
+        crate::nav_state::remember_notebook(
+            &library.root,
+            &library.disk_active_notebook_id,
+            target_id,
+        )
+    };
+    if let Err(e) = saved {
+        eprintln!("warning: nav_state_save_failed notebook={target_id} detail={e}");
+    }
     let manifest_persist_us = t0.elapsed().as_micros() as u64;
-    library.manifest = planned;
+    library.manifest.active_notebook_id = target_id.to_string();
     Ok(SwitchNotebookCommit {
         from_notebook_id: from,
         target_notebook_id: target_id.to_string(),
@@ -1177,6 +1203,9 @@ pub fn delete_notebook_durable(
     let planned = plan_delete_notebook(&library.manifest, notebook_id)?;
     let src = library.notebook_dir(notebook_id);
     validate_notebook_directory(&src, notebook_id)?;
+    // Held through the quarantine move, which runs after the manifest write's own admit ends.
+    let _admit = crate::sync_verified::note_mutation_from_notebook_dir(&src)
+        .map_err(|e| format!("REFUSE NOTEBOOK DELETE: {e}"))?;
     let trash = library.root.join(NOTEBOOK_TRASH_DIR);
     fs::create_dir_all(&trash).map_err(|e| format!("REFUSE NOTEBOOK DELETE: create trash: {e}"))?;
     let trash_entry_name = unique_trash_entry_name(notebook_id);
@@ -1195,6 +1224,7 @@ pub fn delete_notebook_durable(
         )
     })?;
     let manifest_persist_us = t0.elapsed().as_micros() as u64;
+    library.disk_active_notebook_id = planned.active_notebook_id.clone();
     library.manifest = planned;
     library.summaries.remove(notebook_id);
 
@@ -1259,6 +1289,7 @@ pub fn quarantine_notebook_dir(
     if !src.exists() {
         return Ok(());
     }
+    let _admit = crate::sync_verified::note_mutation_from_notebook_dir(&src)?;
     let trash = library.root.join(NOTEBOOK_TRASH_DIR);
     fs::create_dir_all(&trash).map_err(|e| format!("create trash: {e}"))?;
     fs::rename(&src, trash.join(unique_trash_entry_name(notebook_id)))
@@ -1317,6 +1348,7 @@ pub fn create_notebook_at_durable(
         &planned,
         &LibraryManifestWriteHooks::default(),
     )?;
+    library.disk_active_notebook_id = planned.active_notebook_id.clone();
     library.manifest = planned;
     library.summaries.insert(
         notebook_id.to_string(),
@@ -1352,8 +1384,18 @@ pub fn reorder_notebooks_durable(
         &planned,
         &LibraryManifestWriteHooks::default(),
     )?;
+    library.disk_active_notebook_id = planned.active_notebook_id.clone();
     library.manifest = planned;
     Ok(())
+}
+
+/// What an older build's notebook switch does: rewrite `library.meta` (admitted mutation).
+#[cfg(test)]
+pub(crate) fn write_library_manifest_for_test(
+    root: &Path,
+    manifest: &PersistedLibraryManifestV1,
+) -> Result<(), String> {
+    write_library_manifest_atomic(root, manifest, &LibraryManifestWriteHooks::default())
 }
 
 #[cfg(test)]

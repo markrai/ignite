@@ -37,6 +37,50 @@ pub fn is_before(at: Instant, origin: Instant) -> bool {
     at < origin
 }
 
+/// `(VmRSS, VmHWM)` in kB from `/proc/<pid>/status` text; `None` for a missing or malformed
+/// field.
+pub fn parse_mem_status(status: &str) -> (Option<u64>, Option<u64>) {
+    let field = |key: &str| {
+        status.lines().find_map(|l| {
+            l.strip_prefix(key)?
+                .trim()
+                .strip_suffix("kB")?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// This process's `(VmRSS, VmHWM)` in kB. `VmHWM` is the process-lifetime peak resident set,
+/// not the memory of any one phase. `(None, None)` off Linux or when `/proc` is unreadable.
+pub fn mem_status_kb() -> (Option<u64>, Option<u64>) {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string("/proc/self/status") {
+            Ok(s) => parse_mem_status(&s),
+            Err(_) => (None, None),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None)
+    }
+}
+
+/// Print `launch_mem tag=... ms=N rss_kb=... hwm_kb=...` (`na` when unavailable).
+pub fn mem_sample(tag: &str) {
+    let (rss, hwm) = mem_status_kb();
+    let kb = |v: Option<u64>| v.map_or_else(|| "na".to_string(), |x| x.to_string());
+    println!(
+        "launch_mem tag={tag} ms={} rss_kb={} hwm_kb={}",
+        elapsed_ms(),
+        kb(rss),
+        kb(hwm)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +99,28 @@ mod tests {
         let dur = saturating_ms_since(pump_up, session_start)
             .saturating_sub(saturating_ms_since(pump_down, session_start));
         assert_eq!(dur, 0, "saturated Down and Up yield dur_ms=0");
+    }
+
+    #[test]
+    fn mem_status_parses_rss_and_hwm_and_tolerates_garbage() {
+        let ok = "Name:	scribe-app
+VmHWM:	  51234 kB
+VmRSS:	   40960 kB
+";
+        assert_eq!(parse_mem_status(ok), (Some(40960), Some(51234)));
+        assert_eq!(parse_mem_status(""), (None, None));
+        assert_eq!(
+            parse_mem_status(
+                "VmRSS: lots
+VmHWM:	12 MB
+"
+            ),
+            (None, None)
+        );
+        assert_eq!(parse_mem_status("VmRSS:	7 kB"), (Some(7), None));
+        // Whatever the platform offers, sampling never panics.
+        let _ = mem_status_kb();
+        mem_sample("test");
     }
 
     #[test]

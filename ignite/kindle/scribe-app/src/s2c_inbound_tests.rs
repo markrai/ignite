@@ -1377,6 +1377,78 @@ fn crash_after_cursor_before_inbox_cleanup() {
     crash_and_recover("after_cursor_write", stroke_ops);
 }
 
+/// Slice 19B.1: geometry supplied to `open_with_device` is installed before startup
+/// reconciliation, so completing an interrupted inbound apply (a remote blank `CreatePage`,
+/// whose background is built from the device geometry) uses it, with no first-page probe.
+#[test]
+fn interrupted_apply_recovers_with_supplied_geometry() {
+    use crate::sync_startup_diag::{field, take_last_line};
+    let point = "after_bind_page";
+    let srv = server();
+    let (k, s) = kindle(&srv);
+    let lib = s.state().library_id;
+    let (nb, p0) = first_page(&srv, lib);
+    converge(&s, &srv);
+    s.set_crash_point(Some(point));
+    let mut b = Remote::new(lib);
+    let o = page_ops(&mut b, nb, &p0);
+    b.submit(&srv, o);
+    let t0 = Instant::now();
+    while s.fault().is_none() {
+        if s.inbound_ready() {
+            let _ = s.apply_inbound();
+        }
+        s.kick();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "crash point never hit"
+        );
+    }
+    assert!(s.fault().unwrap().contains(point), "{:?}", s.fault());
+    drop(s); // process death mid-apply: the apply marker stays behind
+    assert!(
+        inbound::read_marker(&k.sync).unwrap().is_some(),
+        "marker left for recovery"
+    );
+
+    let g = geo();
+    let panel = DeviceGeometry {
+        width: g.xres,
+        height: g.yres,
+        line_length: g.line_length,
+    };
+    let s = OutboundSync::open_with_device(&k.lib, &k.sync, Some(panel)).unwrap();
+    let line = take_last_line().unwrap();
+    assert_eq!(
+        field(&line, "path"),
+        Some("recovery_marker_fallback"),
+        "{line}"
+    );
+    assert_eq!(field(&line, "device_geom_probe"), Some("0"), "{line}");
+    assert!(s.fault().is_none(), "{:?}", s.fault());
+    assert_eq!(s.shared.lock().unwrap().device, Some(panel));
+    assert!(
+        inbound::read_marker(&k.sync).unwrap().is_none(),
+        "recovery completed"
+    );
+    converge(&s, &srv);
+    assert_match(&k, &s, &srv);
+    // Every page, including the recovered one, carries the supplied panel geometry.
+    let nb_dir = k.lib.join("notebooks").join("notebook-1");
+    let pages = &page_locals(&k.lib)["notebook-1"];
+    assert_eq!(pages.len(), 2, "the remote page was materialized");
+    for p in pages {
+        let (store, _) = load_existing_page(&nb_dir, p).unwrap();
+        let h = store.header();
+        assert_eq!(
+            (h.panel_width, h.panel_height, h.line_length),
+            (panel.width, panel.height, panel.line_length),
+            "page {p}"
+        );
+    }
+}
+
 // ------------------------------------------------------------------ no-echo audit
 
 #[test]

@@ -1008,7 +1008,7 @@ fn install_opened_notebook(
             active_notebook_id, opened.manifest.notebook_id
         ));
     }
-    let page_id = opened.manifest.active_page_id.clone();
+    let page_id = opened.page_id.clone();
     let chrome = chrome_for_page(&opened.manifest, &page_id)?;
     let label = chrome.label();
     let profile = opened.loaded.render_profile.clone();
@@ -2613,7 +2613,7 @@ fn reload_after_inbound(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(),
     let (new_dir, opened) = open_active_notebook(x.library, x.ink_request, &x.geo, &paper)?;
     let active = x.library.active_notebook_id().to_string();
     let title = x.library.title(&active)?.to_string();
-    let page_id = opened.manifest.active_page_id.clone();
+    let page_id = opened.page_id.clone();
     let profile = opened.loaded.render_profile.clone();
     ctrl.transport_mut().set_profile(profile.clone());
     ctrl.transport_mut().set_chrome_title(&title);
@@ -3767,15 +3767,26 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     // problems never block the notebook: a refusal just leaves sync off.
     crate::launch_clock::mark("sync_reconcile_begin");
     if let Some(sync_dir) = &cfg.sync_dir {
-        match crate::sync_outbound::OutboundSync::open(&cfg.data_dir, sync_dir) {
+        // The framebuffer geometry is known here: supplying it skips the first-page probe and is
+        // also what startup recovery of an interrupted inbound apply materializes with.
+        let device = crate::sync_outbound::DeviceGeometry {
+            width: g.xres,
+            height: g.yres,
+            line_length: g.line_length,
+        };
+        // Slice 19B.2B: on a proven verified-fast-path start the confirmed base loads in the
+        // background; `open_with` still returns only once local capture is safe, and the
+        // global is installed before Home becomes interactive either way.
+        let opts = crate::sync_outbound::SyncOpenOptions {
+            device: Some(device),
+            defer_confirmed_base: crate::sync_outbound::DEFER_CONFIRMED_BASE,
+            ..Default::default()
+        };
+        match crate::sync_outbound::OutboundSync::open_with(&cfg.data_dir, sync_dir, opts) {
             Ok(s) => {
-                s.set_device(crate::sync_outbound::DeviceGeometry {
-                    width: g.xres,
-                    height: g.yres,
-                    line_length: g.line_length,
-                });
                 println!("sync_enabled=true sync_dir={}", sync_dir.display());
                 crate::sync_outbound::install_global(s);
+                crate::launch_clock::mark("sync_capture_ready");
             }
             Err(e) => println!("sync_enabled=false reason={e:?}"),
         }
@@ -3912,6 +3923,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         |at: Instant| at.saturating_duration_since(session_start).as_millis() as u64;
     println!("ready: waiting for Pen Down / Eraser Down (Ctrl+C to exit) ...");
     crate::launch_clock::mark("ui_ready");
+    crate::launch_clock::mem_sample("ui_ready");
     if let Some((pump, _)) = touch.as_ref() {
         crate::launch_diag::live().emit_ui_ready_fifo(
             pump.backlog(),

@@ -679,13 +679,17 @@ mod tests {
         let (before, h0) = snapshot_bytes_and_hash(&build_snapshot(&root, &id).unwrap()).unwrap();
         let meta0 = fs::read(root.join("library.meta")).unwrap();
 
-        // Active notebook (library.meta) and active page (notebook.meta) change durably…
+        // Active notebook and active page are replica-local (19B.3D.1/2): library.meta and
+        // notebook.meta are not rewritten…
         let mut lib = repo(&root);
         switch_notebook_durable(&mut lib, "notebook-1", &SwitchNotebookHooks::default()).unwrap();
         let nb1 = lib.notebook_dir("notebook-1");
+        let nb_meta0 = fs::read(nb1.join("notebook.meta")).unwrap();
         let mut m1 = manifest(&nb1);
         persist_active_page(&nb1, &mut m1, "page-2").unwrap();
-        assert_ne!(fs::read(root.join("library.meta")).unwrap(), meta0);
+        assert_eq!(fs::read(root.join("library.meta")).unwrap(), meta0);
+        assert_eq!(fs::read(nb1.join("notebook.meta")).unwrap(), nb_meta0);
+        assert_eq!(repo(&root).active_notebook_id(), "notebook-1");
 
         // …but the shared semantic snapshot is byte-identical, and no identity is allocated.
         let r = ensure_sync_identity(&root).unwrap();

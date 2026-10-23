@@ -47,11 +47,13 @@ pub mod link_picker;
 mod link_tests;
 pub mod modal;
 pub mod nav;
+pub mod nav_state;
 pub mod nbk_import;
 pub mod notebook;
 pub mod open_page;
 pub mod orch;
 pub mod page_label;
+pub mod page_ledger;
 pub mod page_thumb;
 pub mod prefs;
 pub mod pressure;
@@ -85,6 +87,7 @@ mod sync_recovery_stream;
 mod sync_recovery_supervise;
 mod sync_recovery_tail;
 mod sync_recovery_tunnel;
+mod sync_startup_diag;
 #[cfg(feature = "kindle_supervisor_harness")]
 pub use kindle_supervisor_harness::run as run_kindle_supervisor_harness;
 #[cfg(test)]
@@ -99,3 +102,4 @@ pub mod text_paint;
 pub mod tools_ui;
 pub mod touch;
 pub mod ui_gfx;
+pub mod verified_baseline;
