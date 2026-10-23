@@ -6,8 +6,9 @@ replacement with optional self-hosted sync.
 ## Development environment
 
 - **Rust**: stable toolchain (`rustup`), matching `Cargo.toml` edition 2021
-- **Docker** (optional): for Kindle ARMv7hf cross builds (`rust:1-bullseye` +
-  `gcc-arm-linux-gnueabihf`)
+- **Docker** (optional): for Kindle ARMv7hf cross builds and the pinned
+  Dropbear client (`rust:1-bullseye` + `gcc-arm-linux-gnueabihf`; see
+  `tools/pinned-docker-images.txt`)
 - **Python 3** + **pytest**: Kindle installer / Scriptlet unit tests
 - **Git**: clone this repository; no private services required for default tests
 
@@ -26,8 +27,8 @@ Host unit tests do **not** need a Kindle, jailbreak, or production credentials.
 | `ignite/assets/` | Fonts and third-party notices |
 | `deployment/kindle/` | Installer scripts, SFX builder, pytest suite |
 | `deployment/linux/` | Ignite Server portable Linux bundle + staging tests |
-| `scripts/kindle/` | Release packaging (`package-release.ps1`) |
-| `tools/` | Cross-build, Dropbear client build, launcher helpers |
+| `scripts/kindle/` | Thin packaging wrappers (`package-release.sh` / `.ps1`) |
+| `tools/` | Cross-build, Dropbear client, launcher, promote-publish |
 | `docs/` | Architecture, troubleshooting, compatibility, self-hosting |
 
 ## Build and test (host)
@@ -48,22 +49,23 @@ cd tools/kindle_launcher && pytest -q
 
 ## Kindle ARMv7hf binaries
 
+Official Kindle packaging (Linux / CI; digest-pinned Docker images, no SkipBuild):
+
 ```bash
-docker run --rm -v "$(pwd):/src" -w /src rust:1-bullseye \
-  bash /src/tools/docker_build_armv7hf.sh
+bash scripts/kindle/package-release.sh
 ```
 
-Outputs land under `target/armv7-unknown-linux-gnueabihf/release/`
-(`scribe-app`, `scribe-lifecycle`, `ink-probe`).
-
-Customer Scriptlet packaging (Windows packaging host + Docker):
+Windows:
 
 ```powershell
 .\scripts\kindle\package-release.ps1
 ```
 
-Requires a verified Dropbear client under `target/dropbear-kindle/`
-(see `tools/dropbear/`).
+`-SkipBuild` is not provenance-safe and must not be used for official artifacts.
+Staging is shared in `deployment/kindle/package_release.py`. Dropbear ELF digest
+and size must match `tools/dropbear/PINNED.txt`. Public GitHub Releases are
+promoted from a hardware-tested CI run (exact bytes, no tag-push rebuild); see
+`docs/release-packaging.md`.
 
 ## Coding and testing expectations
 

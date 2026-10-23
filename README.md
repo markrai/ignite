@@ -1,240 +1,99 @@
 ![logo](logo.jpg)
 
-an open-source **Kindle Scribe notebook replacement**: local handwriting, durable notebooks on-device,   
-optional self-hosted sync, and a single-file installer for prepared Kindles.
+**Ignite** is an open-source **Kindle Scribe notebook replacement**: local
+handwriting, durable notebooks on-device, a one-file installer for prepared
+Kindles, and **optional** self-hosted sync.
+
+> Ignite requires a Kindle that is **already prepared** for third-party apps
+> (jailbreak / community tooling, SH Integration, root helper). It does **not**
+> jailbreak a stock Kindle and does **not** claim support for every Kindle
+> generation. For jailbreaking, follow the community guide at
+> [kindlemodding.org/jailbreaking](https://kindlemodding.org/jailbreaking/).
 
 ## Table of Contents
 
-- [Self-host Ignite](#self-host-ignite)
-  - [Quick Start: Linux Server](#quick-start-linux-server)
-    - [1. Download and install](#1-download-and-install)
-    - [2. Open Ignite Web](#2-open-ignite-web)
-    - [3. Verify the server](#3-verify-the-server)
-    - [4. Keep Ignite updated](#4-keep-ignite-updated)
-  - [Prefer Docker or Portainer?](#prefer-docker-or-portainer)
-  - [Connect your Kindle Scribe](#connect-your-kindle-scribe)
-  - [Security and network access](#security-and-network-access)
 - [Features](#features)
+- [Install on Kindle](#install-on-kindle)
+- [Device compatibility](#device-compatibility)
+- [Optional self-hosted sync](#optional-self-hosted-sync)
 - [Status](#status)
 - [Repository layout](#repository-layout)
-- [Self-hosted Ignite Server](#self-hosted-ignite-server)
-- [Supported device expectations](#supported-device-expectations)
-- [Kindle installation (overview)](#kindle-installation-overview)
 - [Build from source](#build-from-source)
-  - [Host tools](#host-tools)
-  - [Rust workspace (no Kindle required)](#rust-workspace-no-kindle-required)
-  - [Kindle ARMv7hf binaries](#kindle-armv7hf-binaries)
-  - [Customer Scriptlet (packaging host)](#customer-scriptlet-packaging-host)
 - [Development setup](#development-setup)
 - [Architecture](#architecture)
 - [Experimental recovery](#experimental-recovery)
 - [Known limitations](#known-limitations)
 - [Contributing](#contributing)
 - [Third-party notices](#third-party-notices)
-- [License](#license)  
-
-
-> Ignite requires a Kindle that is **already prepared** for third-party apps  
-> (jailbreak / community tooling, SH Integration, root helper). It does **not**  
-> jailbreak a stock Kindle and does **not** claim support for every Kindle  
-> generation. For jailbreaking, follow the community guide at  
-> [kindlemodding.org/jailbreaking](https://kindlemodding.org/jailbreaking/).
-
-# Self-host Ignite
-
-Ignite is an open-source Kindle Scribe notebook replacement with an optional self-hosted server and Web companion.
-
-Your notebooks can live on the Kindle itself, while **Ignite Server** lets you sync notebooks between your Kindle and a browser on your local network.
-
-## Quick Start: Linux Server
-
-**Requirements:** Linux x86_64, systemd, `curl`, `tar`, `sha256sum`, and sudo access. No Rust, Node.js, Git or Docker required.
-
-### 1. Download and install
-
-Run these commands on your Linux server:
-
-```bash
-mkdir -p ~/ignite-install && cd ~/ignite-install
-
-VERSION=0.9.13
-ASSET="ignite-server-${VERSION}-linux-x86_64.tar.gz"
-URL="https://github.com/markrai/ignite/releases/download/v${VERSION}"
-
-curl -fLO "$URL/$ASSET"
-curl -fLO "$URL/$ASSET.sha256"
-
-sha256sum -c "$ASSET.sha256"
-
-tar -xzf "$ASSET"
-cd "ignite-server-${VERSION}-linux-x86_64"
-
-sudo ./install.sh
-```
-
-The installer creates the `scribe-server` systemd service, configures the necessary directories and LAN firewall rules where supported, and starts Ignite Server.
-
-It also provides a one-time setup code for claiming your new server.
-
-### 2. Open Ignite Web
-
-Open the address printed by the installer, typically:
-
-`http://your-hostname.local/`
-
-If `.local` name resolution isn't available on your network, use your server's LAN IP address instead.
-
-Ignite normally uses port 80, or port 8787 if port 80 was already occupied during initial installation.
-
-Enter the setup code printed during installation to complete the initial setup.
-
-**That's it. Ignite Server and its browser interface are running.**
-
-### 3. Verify the server
-
-```bash
-sudo systemctl status scribe-server
-```
-
-For a default port-80 installation:
-
-```bash
-curl -fsS http://127.0.0.1/control/v1/status
-```
-
-The status response should show the installed version and server identity.
-
-### 4. Keep Ignite updated
-
-Future updates require just one command:
-
-```bash
-sudo ignite-update
-```
-
-The updater checks official GitHub Releases, verifies the downloaded bundle, creates a recovery backup, and installs the newer version.
-
-To check without installing:
-
-```bash
-sudo ignite-update --check
-```
-
-For configuration, backups, troubleshooting and advanced installation options, see [Self-hosting documentation](docs/self-hosting.md).
-
-## Prefer Docker or Portainer?
-
-Ignite Server is also published as a container image, `ghcr.io/markrai/ignite-server`, for Docker Compose on Linux with host networking.
-
-**Requirements:** Linux x86_64 (amd64) with Docker Engine and the Docker Compose plugin. No Rust, Node.js or Git required.
-
-Run these commands on your Linux server:
-
-```bash
-mkdir -p ~/ignite-server && cd ~/ignite-server
-curl -fLO https://raw.githubusercontent.com/markrai/ignite/main/deployment/linux/docker/docker-compose.yml
-
-docker compose pull
-
-# First run only: prepare the server and print its one-time setup code
-docker compose run --rm ignite-server init --config /etc/scribe-server/config.toml
-
-docker compose up -d
-```
-
-Save the `setup_code=` value printed by the `init` command, then open:
-
-`http://YOUR_SERVER_IP:8787/`
-
-Complete setup in the browser using that code.
-
-To update to the newest release later:
-
-```bash
-cd ~/ignite-server
-docker compose pull
-docker compose up -d
-```
-
-By default the stack tracks `latest`, which is always the newest stable release. To stay on
-one release instead, pin it persistently in a `.env` file in the same directory as
-`docker-compose.yml` (a one-off `IGNITE_IMAGE=… docker compose up -d` prefix would only apply
-to that single command):
-
-```bash
-cd ~/ignite-server
-printf '%s\n' \
-  'IGNITE_IMAGE=ghcr.io/markrai/ignite-server:v0.9.13' > .env
-```
-
-Subsequent `docker compose pull` and `docker compose up -d` commands in that directory keep
-using the pinned `v0.9.13` image until you edit `.env`. To track the newest stable release
-again, remove the pin (or set it to `ghcr.io/markrai/ignite-server:latest`). `.env` is a local
-operator file — do not commit it.
-
-**Portainer:** first run the one-time initialization from the server's shell:
-
-```bash
-docker run --rm -v ignite-server-state:/var/lib/scribe-server ghcr.io/markrai/ignite-server:latest init --config /etc/scribe-server/config.toml
-```
-
-Then create a stack (**Stacks → Add stack**) from the same [`docker-compose.yml`](deployment/linux/docker/docker-compose.yml) and deploy it.
-
-**Important Docker notes:**
-
-- Uses Linux host networking for Kindle discovery. Port `8787` must be free on the host.
-- Persistent notebook data lives in the Docker named volume `ignite-server-state`.
-- Host firewall configuration is your responsibility.
-- Do not use `docker compose down -v` unless you intend to delete the persistent volume.
-
-See [Docker and Portainer setup](deployment/linux/docker/README.md) for configuration, backups and upgrades.
-
-## Connect your Kindle Scribe
-
-Ignite Server is optional. The Kindle application stores notebooks locally and can operate without self-hosted sync.
-
-To use the Kindle application:
-
-1. You need a compatible Kindle Scribe prepared for third-party applications.
-2. Install the Ignite Kindle application through its Scriptlet installer.
-3. Connect the Kindle and your Ignite Server to the same trusted LAN.
-4. Complete the application's server pairing process.
-
-The server and Kindle application are separate installations.
-
-**A stock, non-jailbroken Kindle cannot run Ignite.** See the [compatibility guide](docs/compatibility.md) and [Kindle installation instructions](deployment/kindle/README.txt).
-
-The v0.9.13 GitHub Release currently contains the **Linux server**, not the Kindle installer. Kindle beta distribution is handled separately.
-
-## Security and network access
-
-Ignite Server currently uses plain HTTP and is designed for **trusted local networks**.
-
-Do not expose its HTTP port directly to the public Internet.
-
-For additional deployment options, recovery procedures and network configuration, see [Self-hosting documentation](docs/self-hosting.md).
+- [License](#license)
 
 ## Features
 
 - Multi-stroke notebook editing on Kindle Scribe
 - On-device library, tools, and durable page storage
-- Optional LAN sync with a self-hosted server
-- One-file customer installer (`Install Ignite v*.sh`)
-- Diagnose / backup / uninstall helpers
-- This is a work in progress, and new features are being readily implemented.
+- One-file customer installer (`Install Ignite vX.Y.Z.sh`) plus Diagnose / Backup / Uninstall helpers
+- Optional LAN sync with a self-hosted **Ignite Server** and browser companion
+- This is a work in progress; new features are still being added
+
+Authentic application screenshots (library, handwriting, optional sync) are
+captured on hardware during release qualification and will live under
+[`docs/images/`](docs/images/) — not generated substitutes.
+
+## Install on Kindle
+
+1. Prepare a compatible Kindle Scribe using the
+   [Kindle Modding jailbreak guide](https://kindlemodding.org/jailbreaking/)
+   (SH Integration and a root helper are required).
+2. From [GitHub Releases](https://github.com/markrai/ignite/releases) download
+   `Install Ignite vX.Y.Z.sh` and `Install Ignite vX.Y.Z.sha256`.
+3. Verify the checksum (`sha256sum -c "Install Ignite vX.Y.Z.sha256"`).
+4. Copy **only** the installer into the Kindle **Documents** folder over USB.
+5. Eject the Kindle, then open **Install Ignite** on the device.
+6. Open **Ignite** from the Library.
+
+A stock, non-jailbroken Kindle cannot run Ignite. Full customer steps:
+[`deployment/kindle/README.txt`](deployment/kindle/README.txt). Problems:
+[`docs/troubleshooting.md`](docs/troubleshooting.md).
+
+Application registration identity is `com.markrai.ignite` (from 0.9.11).
+Upgrading from 0.9.10 migrates the older `com.markrai.scribe` handler;
+notebooks stay at `/mnt/us/scribe-data`.
+
+## Device compatibility
+
+See [`docs/compatibility.md`](docs/compatibility.md). Do not treat unverified
+firmware as supported.
+
+- **Verified:** Kindle Scribe (1st generation), firmware **5.18.6**, 32-bit ARM
+- **Tester / in progress:** 2024 Scribe polarity path (firmware **5.19.6**)
+
+## Optional self-hosted sync
+
+Ignite stores notebooks on the Kindle without a server. Ignite Server is
+optional: it syncs notebooks between a prepared Kindle and a browser on a
+**trusted LAN** (plain HTTP — do not expose the port to the public Internet).
+
+- Native Linux install and updates: [`docs/self-hosting.md`](docs/self-hosting.md)
+- Docker / Portainer (`ghcr.io/markrai/ignite-server`): [`deployment/linux/docker/README.md`](deployment/linux/docker/README.md)
+
+The Kindle installer and the Linux/Docker server are separate artifacts on the
+same GitHub Release.
 
 ## Status
 
 | Area | Status |
 |------|--------|
 | Kindle app + installer | Active development / beta |
-| Self-hosted sync server | **Ignite Server** — portable Linux bundle (see [self-hosting](docs/self-hosting.md)) |
-| Web companion | **ignite-web** in `ignite/web/` (browser replica + sync) |
+| Self-hosted sync server | **Ignite Server** — portable Linux bundle and GHCR image |
+| Web companion | **ignite-web** in `ignite/web/` |
 | Experimental recovery | **Disabled** in product builds (see below) |
 
 Version: see [`ignite/VERSION`](ignite/VERSION).
 
 **Project board:** Follow current and planned work on the [public Ignite Kanban board](https://scrumboy.com/ignite).
+
+Releases are **promoted** from a hardware-tested CI artifact (exact bytes, no
+rebuild). See [`docs/release-packaging.md`](docs/release-packaging.md).
 
 ## Repository layout
 
@@ -253,60 +112,19 @@ C:\dev\project\ignite\          (outer workspace / this repository root)
     web\                        ignite-web (browser replica + PWA)
     assets\                     Fonts + third-party notices
   scribe\                       Optional local native-Scribe work (not Ignite product)
-  deployment\kindle\            Installer, SFX, pytest
+  deployment\kindle\            Installer, SFX, pytest, shared packager
   deployment\linux\             Ignite Server portable Linux bundle + acceptance tests
-  scripts\kindle\               Release packaging
-  tools\                        Cross-build, Dropbear client, launcher
+  scripts\kindle\               Thin packaging wrappers
+  tools\                        Cross-build, Dropbear client, launcher, promote-publish
   docs\                         Architecture, troubleshooting, compatibility, self-hosting
 ```
-
-## Self-hosted Ignite Server
-
-Install Ignite Server (with ignite-web) from the Linux bundle on
-[GitHub Releases](https://github.com/markrai/ignite/releases), then keep it current with:
-
-```bash
-sudo ignite-update
-```
-
-Updates come from the official published releases; the updater verifies the download and takes
-a recovery backup before installing. Installation, updating and building a bundle from source
-are described in [`docs/self-hosting.md`](docs/self-hosting.md). Trusted LAN / plain HTTP only.
-Optional Linux Docker Compose / Portainer packaging (host networking) lives under
-[`deployment/linux/docker/`](deployment/linux/docker/).
-
-## Supported device expectations
-
-See [`docs/compatibility.md`](docs/compatibility.md).
-
-- **Verified:** Kindle Scribe (1st generation), firmware **5.18.6**, 32-bit ARM
-- **In progress / tester:** 2024 Scribe polarity path (firmware **5.19.6**)
-
-## Kindle installation (overview)
-
-1. Prepare the Kindle for third-party apps using the
-
-   [Kindle Modding jailbreak guide](https://kindlemodding.org/jailbreaking/).
-2. Obtain `Install Ignite vVERSION.sh` (release artifact) and its `.sha256`.
-3. Verify the checksum.
-4. Copy the Scriptlet into the Kindle **Documents** folder over USB.
-5. Open **Install Ignite** on the device.
-6. Launch **Ignite** from the Library.
-
-Application registration identity is `**com.markrai.ignite**` (from 0.9.11).
-Upgrading from 0.9.10 migrates the older `com.markrai.scribe` handler automatically;
-notebooks stay at `/mnt/us/scribe-data` and sync service discovery remains
-`_scribe._tcp`.
-
-Full steps: [`deployment/kindle/README.txt`](deployment/kindle/README.txt).  
-Problems: [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Build from source
 
 ### Host tools
 
 - Recent stable Rust (`rustup`)
-- Optional: Docker (Kindle ARMv7hf + Dropbear builds)
+- Optional: Docker (Kindle ARMv7hf + Dropbear builds; images are digest-pinned)
 - Python 3 + pytest (installer tests)
 
 ### Rust workspace (no Kindle required)
@@ -316,19 +134,17 @@ cargo test --workspace --locked
 cargo test -p scribe-app --lib --locked
 ```
 
-### Kindle ARMv7hf binaries
+### Kindle ARMv7hf binaries and customer installer
+
+Official packaging always rebuilds (no `-SkipBuild`):
 
 ```bash
-docker run --rm -v "$(pwd):/src" -w /src rust:1-bullseye \
-  bash /src/tools/docker_build_armv7hf.sh
+bash scripts/kindle/package-release.sh
 ```
 
-### Customer Scriptlet (packaging host)
-
-```powershell
-# After Dropbear client build under target/dropbear-kindle/
-.\scripts\kindle\package-release.ps1
-```
+Windows developers can use `.\scripts\kindle\package-release.ps1` (Docker Desktop).
+Staging lives in [`deployment/kindle/package_release.py`](deployment/kindle/package_release.py).
+`ink-probe` is built as a check artifact and is **not** shipped in the customer Scriptlet.
 
 Details: [`docs/release-packaging.md`](docs/release-packaging.md),
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -362,10 +178,10 @@ prerequisite for using Ignite as a notebook.
 - Sync servers are plain HTTP for LAN/self-host use—do not expose casually
 - Review 79 (performance investigation) remains open
 - ignite-web Playwright E2E coverage has been run on Chromium; Firefox and
-WebKit/Safari E2E suites have not yet been executed in this migration, so
-compatibility on those browsers remains unverified
+  WebKit/Safari E2E suites have not yet been executed in this migration, so
+  compatibility on those browsers remains unverified
 - Ignite Server portable Linux packaging is validated with disposable staging
-tests; optional Compose/Portainer image under `deployment/linux/docker/`
+  tests; optional Compose/Portainer image under `deployment/linux/docker/`
 
 ## Contributing
 

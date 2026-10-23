@@ -64,6 +64,7 @@ signatures/digests, and cross-compile.
 | Upstream license | Dropbear’s LICENSE (MIT-style / permissive; see tarball `LICENSE`) |
 | Copyright | Matt Johnston and contributors (see upstream) |
 | Redistribution | Allowed under Dropbear’s upstream terms; **do not claim Dropbear is AGPL** |
+| Compile image | Digest-pinned `rust:1-bullseye` (same pin as Kindle ARMv7hf Rust). Debian bookworm in `PINNED.txt` `signing_key_sources` is GPG-key provenance only. |
 | Packaged ELF digest (Kindle) | SHA-256 `d20b510a58b59ff5bf482bb5fcc66768d4c4c51705855b9f5c9e47ffaaf3d1e9` |
 
 The customer Scriptlet may include the verified client under a recovery path.

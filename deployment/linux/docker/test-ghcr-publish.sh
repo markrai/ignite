@@ -39,26 +39,15 @@ order="$(grep -nE 'PUBLISH" (guard|source|fetch|publish)|ref: refs/tags/|docker 
   || fail "ghcr.yml step order (guard before checkout, verify before login/push): $order"
 pass "ghcr.yml: call/dispatch only, GITHUB_TOKEN with contents:read + packages:write, guarded order"
 
-# --- 2) ci.yml: ghcr only after release, stable tag pushes only --------------------------------
-ghcr_job="$(block "$CI" '^  ghcr:$')"
-for want in \
-  "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')" \
-  '    needs: release' \
-  '    uses: ./.github/workflows/ghcr.yml' \
-  '      tag: ${{ github.ref_name }}'; do
-  grep -qxF -- "$want" <<<"$ghcr_job" || fail "ci.yml ghcr job missing: $want"
-done
-[ "$(grep -A2 -x '    permissions:' <<<"$ghcr_job" | tr -d ' ' | tr '\n' ' ')" = "permissions: contents:read packages:write " ] \
-  || fail "ci.yml ghcr job permissions"
-[ "$(grep -c 'packages: write' "$CI")" = 1 ] || fail "only the ghcr job may get packages: write"
-grep -qx "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" <<<"$(block "$CI" '^  release:$')" \
-  || fail "release job must stay tag-push only"
-needs="$(block "$CI" '^  release:$' | sed -n 's/^      - \([a-z0-9-]*\)$/\1/p' | sort)"
-for job in $(block "$CI" '^jobs:$' | sed -n 's/^  \([a-z0-9-]*\):$/\1/p'); do
-  case "$job" in release | ghcr) continue ;; esac
-  grep -qx "$job" <<<"$needs" || fail "release (and so ghcr) does not wait for CI job $job"
-done
-pass "ci.yml: ghcr needs release, which needs every CI job; stable tag pushes only"
+# --- 2) ci.yml builds artifacts; publication is promote-publish, then GHCR ------
+PROMOTE_WF="$ROOT/.github/workflows/release-promote.yml"
+grep -qE '^  ghcr:' "$CI" && fail "ci.yml must not call GHCR (promotion owns GHCR)"
+grep -q 'gh release create' "$CI" && fail "ci.yml must not create GitHub Releases"
+[ "$(grep -c 'packages: write' "$CI")" = 0 ] || fail "ci.yml must not grant packages: write"
+grep -qE '^  kindle-package:' "$CI" || fail "ci.yml missing kindle-package"
+grep -q 'uses: ./.github/workflows/ghcr.yml' "$PROMOTE_WF" || fail "release-promote.yml must call ghcr.yml"
+grep -q 'needs: promote' "$PROMOTE_WF" || fail "GHCR must run after promote"
+pass "ci.yml: artifacts only; GHCR follows promote-publish"
 
 # --- 3) image references agree everywhere ------------------------------------------------------
 IMAGE="$(sed -n 's/^IMAGE=//p' "$PUB")"
@@ -79,8 +68,8 @@ done
 grep -qi 'not yet published' "$ROOT/README.md" && fail "README still says the image is unpublished"
 grep -q 'ignite-server:local' "$ROOT/README.md" && fail "README quick start must not need a local build"
 url="https://raw.githubusercontent.com/$REPO/main/deployment/linux/docker/docker-compose.yml"
-grep -qF "$url" "$ROOT/README.md" && grep -qF "$url" "$DIR/README.md" || fail "docs must fetch compose from $url"
-grep -q 'docker compose pull' "$ROOT/README.md" || fail "README must show docker compose pull"
+grep -qF "$url" "$ROOT/docs/self-hosting.md" && grep -qF "$url" "$DIR/README.md" || fail "docs must fetch compose from $url"
+grep -q 'docker compose pull' "$ROOT/docs/self-hosting.md" || fail "self-hosting.md must show docker compose pull"
 pass "image references: $IMAGE everywhere, compose default :latest, docs copy-pasteable"
 
 # --- 4) ghcr-publish.sh behaviour against mocks -------------------------------------------------

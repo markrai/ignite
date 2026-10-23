@@ -354,28 +354,31 @@ Windows/WSL details, cleanup guarantees, and result fields.
 
 ## Publishing a release (maintainers)
 
-Releases are published by CI, never from an ordinary push to `main`:
+Releases are **promoted** from a hardware-tested CI run. Tag-push CI does **not**
+rebuild and publish. Full procedure: [`docs/release-packaging.md`](release-packaging.md).
 
-1. Set the release version in `ignite/VERSION`, the Rust workspace and `ignite/web`
-   (`npm version <v> --no-git-tag-version`), and merge it to `main`.
-2. Push an annotated tag `v<version>` for that commit.
-3. The CI workflow runs every job; only if all pass does the `release` job check that the tag,
-   `ignite/VERSION`, the binary and the bundle metadata agree, and publish
-   `ignite-server-<version>-linux-x86_64.tar.gz` plus `.sha256` as a new GitHub Release
-   (`-` in the tag marks a prerelease, which `ignite-update` ignores).
-
-The job refuses to touch a release that already exists; replacing published assets is a manual
-release-management decision.
-
-4. For a stable tag (no `-`), the `ghcr` job then runs
+1. Set the release version in `ignite/VERSION`, the Rust workspace (`Cargo.toml` /
+   `Cargo.lock`) and `ignite/web` (`package.json` / `package-lock.json`), and merge
+   to `main`. `tools/ci/check_version_sync.py` must pass.
+2. From that commit’s successful **CI** workflow run on `main` (not a PR or
+   another workflow), download `ignite-kindle-release` and
+   `ignite-server-linux-release`. Record `{commit, run_id, sha256}`.
+3. Hardware-accept the exact Kindle installer (and sync against the same Linux
+   artifact). Do not tag-and-hope.
+4. From `main`, run **Actions → Promote release** with those values and confirm
+   `publish v<version> from run <id>`. The workflow publishes those four files
+   without rebuilding and refuses to replace an existing Release (`-` in the tag
+   marks a prerelease, which `ignite-update` ignores).
+5. For a stable tag (no `-`), promote then runs
    [`.github/workflows/ghcr.yml`](../.github/workflows/ghcr.yml) with the workflow's own
    `GITHUB_TOKEN` (`contents: read`, `packages: write`; no PAT or repository secrets). It
-   downloads the just-published release asset, verifies its checksum (and GitHub's recorded
+   downloads the just-published **Linux** release asset, verifies its checksum (and GitHub's recorded
    digest), bundle metadata and binary version, builds the image from it with the tag's own
    `build-image.sh`, checks that the image's binary and web assets are byte-identical to the
    asset, and pushes `ghcr.io/markrai/ignite-server:v<version>`. `latest` moves only if this is
    the newest stable GitHub Release, and never to an older version than the one it holds.
-   An existing `v<version>` image is never replaced.
+   An existing `v<version>` image is never replaced. The promote job also uses
+   `actions: read` solely to download the qualifying CI artifacts.
 
 **Backfilling a release published before GHCR existed** (for example v0.9.13): from `main`, run
 

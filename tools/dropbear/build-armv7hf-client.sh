@@ -1,5 +1,7 @@
 #!/bin/sh
-# Cross-compile a client-only Dropbear MULTI binary for Kindle (ARMv7hf, glibc 2.31 toolchain → runs on glibc 2.35).
+# Cross-compile a client-only Dropbear MULTI binary for Kindle (ARMv7hf).
+# Requires the Debian bullseye armhf-cross toolchain (glibc 2.31 headers;
+# PINNED.txt max_glibc=GLIBC_2.28). Bookworm gcc-12 emits GLIBC_2.34.
 # Expects verify-source.sh to have populated $WORKDIR with a verified tarball.
 set -eu
 
