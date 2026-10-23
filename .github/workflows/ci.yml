@@ -312,6 +312,8 @@ jobs:
       - name: Kindle package-release.ps1 wrapper (SkipBuild)
         shell: pwsh
         run: pwsh -NoProfile -File scripts/kindle/test-package-release.ps1
+      - name: Kindle package-release.sh host-owned target/
+        run: bash scripts/kindle/test-package-release.sh
       - name: Docker networking probe safety
         run: bash deployment/linux/test-docker-network-probe.sh
       - name: Docker Compose/Dockerfile static checks
