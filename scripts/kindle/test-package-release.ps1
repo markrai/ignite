@@ -50,7 +50,7 @@ function Write-Utf8NoBom([string]$Path, [string]$Text) {
 function New-LogShim([string]$Name, [string]$LogPath, [string]$ExtraBash) {
   $unix = Join-Path $fakeBin $Name
   $body = @"
-#!/usr/bin/env bash
+#!/bin/sh
 echo "`$0 `$*" >> "$($LogPath.Replace('\', '/'))"
 $ExtraBash
 "@
