@@ -3,7 +3,7 @@
 # (deployment/linux/docker/build-image.sh); Rust and ignite-web are never rebuilt here.
 #
 # Two entry points only:
-#   - ci.yml job `ghcr`, after `release` succeeds for a pushed stable v<X.Y.Z> tag;
+#   - release-promote.yml job `ghcr`, after promote-publish creates a stable GitHub Release;
 #   - a manual backfill from main for an existing stable release, confirmed by typing
 #     "publish v<X.Y.Z>". It never creates, moves or replaces a Git tag or GitHub Release.
 # v<X.Y.Z> image tags are never replaced; `latest` moves only to the newest stable release.
@@ -17,6 +17,11 @@ on:
         description: Release tag (vX.Y.Z)
         required: true
         type: string
+      confirm:
+        description: Type "publish <tag>" when not invoked from a tag push
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       tag:
@@ -36,6 +41,7 @@ jobs:
     if: >-
       github.repository == 'markrai/ignite' &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_call' ||
        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     permissions:

@@ -70,9 +70,12 @@ for compatibility. See [`self-hosting.md`](self-hosting.md).
 ## Packaging and installation
 
 1. Cross-compile ARMv7hf binaries (`tools/docker_build_armv7hf.sh`).
-2. Optionally build a pinned Dropbear client (`tools/dropbear/`).
+2. Build the pinned Dropbear client (`tools/dropbear/docker_build.sh` in the
+   same digest-pinned `rust:1-bullseye` image as the Rust ARM build;
+   `PINNED.txt` enforced).
 3. Stage payload + build self-extracting Scriptlet
-   (`scripts/kindle/package-release.ps1` → `Install Ignite vVERSION.sh`).
+   (`deployment/kindle/package_release.py` via `scripts/kindle/package-release.sh` →
+   `Install Ignite vVERSION.sh`).
 4. Customer copies the single Scriptlet into Kindle **Documents** and opens it.
 
 Installer logic and tests: `deployment/kindle/`.

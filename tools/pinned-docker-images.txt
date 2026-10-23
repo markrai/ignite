@@ -1,0 +1,11 @@
+# Digest-pinned images for official Kindle packaging. Do not replace a digest
+# to silence a Dropbear or ARM build mismatch — investigate first.
+# Format: name=reference@sha256:<64 hex>
+#
+# Dropbear uses the same rust:1-bullseye digest as the Kindle ARMv7hf Rust
+# build (gcc-10 / glibc 2.31 armhf-cross). A bookworm toolchain emits
+# __libc_start_main@GLIBC_2.34 and will not match tools/dropbear/PINNED.txt.
+# "Debian bookworm" in PINNED.txt signing_key_sources is GPG-key provenance
+# only — it is not the compilation image.
+rust_armv7hf=rust:1-bullseye@sha256:4730e387a220a08a365c77da3096544dde214f9d796c16284d4be45438cad4a9
+dropbear_armv7hf=rust:1-bullseye@sha256:4730e387a220a08a365c77da3096544dde214f9d796c16284d4be45438cad4a9

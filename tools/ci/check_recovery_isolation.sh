@@ -63,10 +63,16 @@ if "$RG" -n 'kindle_supervisor_harness' tools/docker_build_armv7hf.sh >/dev/null
   fail "docker_build_armv7hf.sh must not reference kindle_supervisor_harness"
 fi
 
-# 4) package-release must not stage the harness binary.
-if "$RG" -n 'kindle-supervisor-harness|kindle_supervisor_harness' scripts/kindle/package-release.ps1 >/dev/null; then
-  fail "package-release.ps1 must not package the supervisor harness"
-fi
+# 4) package-release (Python core + wrappers) must not stage the harness binary.
+for packager in \
+  deployment/kindle/package_release.py \
+  scripts/kindle/package-release.sh \
+  scripts/kindle/package-release.ps1
+do
+  if "$RG" -n 'kindle-supervisor-harness|kindle_supervisor_harness' "$packager" >/dev/null; then
+    fail "$packager must not package the supervisor harness"
+  fi
+done
 
 # 5) Ordinary main must not wire recovery submit or the harness.
 if "$RG" -n 'submit_recovery|SupervisedRecoveryStream|kindle_supervisor_harness|run_kindle_supervisor_harness' \

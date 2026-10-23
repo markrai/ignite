@@ -1,0 +1,81 @@
+# Promote previously built CI artifacts to a GitHub Release without rebuilding.
+# Hardware qualification must have recorded the CI run id, commit, and SHA-256s.
+# Inputs reach shell steps through env only, never through ${{ }} inside run scripts.
+name: Promote release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (vX.Y.Z)
+        required: true
+        type: string
+      run_id:
+        description: Successful CI workflow run id that produced the tested artifacts
+        required: true
+        type: string
+      commit:
+        description: 40-character SHA of that run (must match the run head_sha)
+        required: true
+        type: string
+      kindle_sha256:
+        description: SHA-256 of the hardware-tested Install Ignite vX.Y.Z.sh
+        required: true
+        type: string
+      linux_sha256:
+        description: SHA-256 of the tested ignite-server-*-linux-x86_64.tar.gz
+        required: true
+        type: string
+      confirm:
+        description: Type "publish <tag> from run <run_id>"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  promote:
+    name: Promote tested CI artifacts
+    if: github.repository == 'markrai/ignite' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: ignite-release-promote
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      IGNITE_PROMOTE_TAG: ${{ inputs.tag }}
+      IGNITE_PROMOTE_RUN_ID: ${{ inputs.run_id }}
+      IGNITE_PROMOTE_COMMIT: ${{ inputs.commit }}
+      IGNITE_PROMOTE_KINDLE_SHA256: ${{ inputs.kindle_sha256 }}
+      IGNITE_PROMOTE_LINUX_SHA256: ${{ inputs.linux_sha256 }}
+      IGNITE_PROMOTE_CONFIRM: ${{ inputs.confirm }}
+      IGNITE_PROMOTE_WORK: ${{ github.workspace }}/promote-work
+      GH_TOKEN: ${{ github.token }}
+      PROMOTE: tools/release/promote-release.sh
+    steps:
+      - name: Check out promotion tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Guard, resolve, fetch, verify, publish
+        run: bash "$PROMOTE" all
+
+  ghcr:
+    name: GHCR image (stable tags only)
+    needs: promote
+    if: github.repository == 'markrai/ignite' && github.ref == 'refs/heads/main' && !contains(inputs.tag, '-')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr.yml
+    with:
+      tag: ${{ inputs.tag }}
+      confirm: publish ${{ inputs.tag }}

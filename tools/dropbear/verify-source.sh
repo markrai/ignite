@@ -6,7 +6,9 @@ set -eu
 
 # Fingerprint taken from Debian bookworm and Ubuntu universe packaging of
 # debian/upstream/signing-key.asc (identical). Not taken from the upstream
-# tarball directory.
+# tarball directory. Bookworm here is only the distro that publishes that
+# key file — Dropbear is compiled in the pinned rust:1-bullseye image, not
+# in bookworm.
 PINNED_FPR="F7347EF2EE2E07A267628CA944931494F29C6773"
 PINNED_SHA256="86b036c433a69d89ce51ebae335d65c47738ccf90d13e5eb0fea832e556da502"
 VERSION="2024.85"
