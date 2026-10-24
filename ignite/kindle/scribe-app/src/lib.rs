@@ -59,6 +59,7 @@ pub mod prefs;
 pub mod pressure;
 pub mod pressure_curve;
 pub mod profile;
+pub mod release_manifest;
 pub mod render;
 #[cfg(unix)]
 pub mod runtime;

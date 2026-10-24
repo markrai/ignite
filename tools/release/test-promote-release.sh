@@ -7,6 +7,8 @@ ROOT="$(cd "$DIR/../.." && pwd)"
 PUB="$DIR/promote-release.sh"
 WF="$ROOT/.github/workflows/release-promote.yml"
 CI="$ROOT/.github/workflows/ci.yml"
+PYTHON_COMMAND="${PYTHON:-python3}"
+PYTHON_REAL="$(command -v "$PYTHON_COMMAND")"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -27,6 +29,17 @@ grep -Eq 'run: *[|>]' "$WF" && fail "promote run steps must be single-line"
 [ -z "$(grep -E 'run:' "$WF" | grep '\${{')" ] || fail "promote run steps must not interpolate \${{ }}"
 grep -q 'uses: ./.github/workflows/ghcr.yml' "$WF" || fail "stable promote must call ghcr.yml"
 grep -q 'cancel-in-progress: false' "$WF" || fail "promote publishes must not be cancelled mid-flight"
+block "$WF" 'kindle_signature:' | grep -q 'required: true' \
+  || fail "offline Kindle signature must be a required dispatch input"
+grep -q 'IGNITE_PROMOTE_KINDLE_SIGNATURE:.*inputs.kindle_signature' "$WF" \
+  || fail "signature input must reach promotion through the environment"
+grep -qi 'hardware' "$WF" && fail "hardware testing must not be described as a publication gate"
+grep -q 'name: Promote authenticated CI artifacts' "$WF" \
+  || fail "promotion job must describe authenticated CI artifacts"
+grep -q 'IGNITE_PROMOTE_TEST_' "$WF" && fail "test trust-root overrides must not be exposed by the workflow"
+grep -q 'IGNITE_PROMOTE_TEST_' "$PUB" && fail "promotion must not contain a test trust-root override"
+block "$WF" '^  ghcr:' | grep -q 'kindle_signature' \
+  && fail "GHCR job must remain independent of Kindle signing metadata"
 pass "release-promote.yml: dispatch from main, narrow permissions, GHCR after promote"
 
 # ci.yml must not auto-publish on tag push (no second Kindle/Linux rebuild as Release source)
@@ -37,6 +50,8 @@ grep -qE '^  ghcr:' "$CI" && fail "ci.yml must not call GHCR (promotion owns GHC
 grep -qE '^  kindle-package:' "$CI" || fail "ci.yml missing kindle-package job"
 grep -q 'name: ignite-kindle-release' "$CI" || fail "ci.yml must upload ignite-kindle-release"
 grep -q 'retention-days: 30' "$CI" || fail "release artifacts must be retained for hardware qualification"
+grep -q 'python3 tools/release/test_kindle_release_sign.py' "$CI" \
+  || fail "CI must run the offline signing helper tests"
 pass "ci.yml: builds artifacts, does not publish Releases or GHCR"
 
 T="$(mktemp -d)"
@@ -51,6 +66,21 @@ KINDLE_SHA="$(printf 'b%.0s' {1..64})"
 LINUX_SHA="$(printf 'c%.0s' {1..64})"
 MOCK="$T/bin"
 mkdir -p "$MOCK"
+
+# One disposable key per harness run. Only its public half reaches the promotion
+# verifier; the real repository pin remains UNPROVISIONED.
+TEST_PRIVATE_KEY="$T/disposable-private.pem"
+TEST_PUBLIC_DER="$T/disposable-public.der"
+TEST_PUBLIC_PIN="$T/disposable-public.hex"
+openssl genpkey -algorithm ED25519 -out "$TEST_PRIVATE_KEY" 2>/dev/null
+openssl pkey -in "$TEST_PRIVATE_KEY" -pubout -outform DER -out "$TEST_PUBLIC_DER" 2>/dev/null
+{ tail -c 32 "$TEST_PUBLIC_DER" | od -An -v -tx1 | tr -d ' \n'; printf '\n'; } >"$TEST_PUBLIC_PIN"
+TEST_REPOSITORY="$T/repository"
+PUB_RUN="$TEST_REPOSITORY/tools/release/promote-release.sh"
+mkdir -p "$TEST_REPOSITORY/tools/release"
+cp "$PUB" "$PUB_RUN"
+cp "$ROOT/tools/release/kindle_release_sign.py" "$TEST_REPOSITORY/tools/release/"
+cp "$TEST_PUBLIC_PIN" "$TEST_REPOSITORY/tools/release/kindle-release-public-key.hex"
 
 cat >"$MOCK/gh" <<'SH'
 #!/usr/bin/env bash
@@ -120,9 +150,11 @@ case " $* " in
   *validate_stage.py*)
     [ "${MOCK_VALIDATE:-ok}" = ok ] || { echo "validate failed" >&2; exit 1; }
     exit 0 ;;
+  *kindle_release_sign.py*" version "*" --tag v0.9.13 "*)
+    printf '0.9.13\n'
+    exit 0 ;;
 esac
-if [ -x /usr/bin/python3 ]; then exec /usr/bin/python3 "$@"; fi
-exec python3 "$@"
+exec "$PYTHON_REAL" "$@"
 SH
 chmod +x "$MOCK"/*
 
@@ -138,7 +170,7 @@ make_linux() {
 }
 
 reset() {
-  rm -rf "$T/work" "$T/arts" "$T/publish.log" "$T/release-exists" "$T/tag.tsv" \
+  rm -rf "$T/work" "$T/arts" "$T/signing" "$T/publish.log" "$T/release-exists" "$T/tag.tsv" \
     "$T/tag.http" "$T/tag.network" "$T/tag.after.tsv" "$T/tag.no-create" \
     "$T/tagobj" "$T/tagobj.err" "$T/compare.err" "$T/version.err" "$T/reg-status" \
     "$T/workflow.err"
@@ -153,12 +185,20 @@ reset() {
   make_linux
   KINDLE_SHA="$(sha256sum "$T/arts/ignite-kindle-release/Install Ignite v$V.sh" | awk '{print $1}')"
   LINUX_SHA="$(sha256sum "$T/arts/ignite-server-linux-release/ignite-server-$V-linux-x86_64.tar.gz" | awk '{print $1}')"
+  sign_output="$("$PYTHON_REAL" "$ROOT/tools/release/kindle_release_sign.py" sign \
+    --installer "$T/arts/ignite-kindle-release/Install Ignite v$V.sh" \
+    --tag "$TAG" --expected-sha256 "$KINDLE_SHA" \
+    --private-key "$TEST_PRIVATE_KEY" --public-key "$TEST_PUBLIC_PIN" \
+    --output-dir "$T/signing")" || fail "could not create disposable promotion signature"
+  KINDLE_SIGNATURE="$(printf '%s\n' "$sign_output" | sed -n 's/^signature_hex=//p')"
+  [[ "$KINDLE_SIGNATURE" =~ ^[0-9a-f]{128}$ ]] || fail "disposable signature is malformed"
 }
 
 run() {
   local name="$1" cmd="$2"; shift 2
   local BASE=(
     PATH="$MOCK:$PATH"
+    PYTHON_REAL="$PYTHON_REAL"
     MOCK_STATE="$T"
     MOCK_VALIDATE="${MOCK_VALIDATE:-ok}"
     GITHUB_REPOSITORY=markrai/ignite
@@ -170,11 +210,12 @@ run() {
     IGNITE_PROMOTE_COMMIT="$COMMIT"
     IGNITE_PROMOTE_CONFIRM="publish $TAG from run $RUN"
     IGNITE_PROMOTE_KINDLE_SHA256="$KINDLE_SHA"
+    IGNITE_PROMOTE_KINDLE_SIGNATURE="$KINDLE_SIGNATURE"
     IGNITE_PROMOTE_LINUX_SHA256="$LINUX_SHA"
     IGNITE_PROMOTE_WORK="$T/work"
   )
   set +e
-  env "${BASE[@]}" "$@" bash "$PUB" "$cmd" >"$T/$name.out" 2>"$T/$name.err"
+  env "${BASE[@]}" "$@" bash "$PUB_RUN" "$cmd" >"$T/$name.out" 2>"$T/$name.err"
   RC=$?
   set -e
 }
@@ -190,6 +231,9 @@ run g-pr guard GITHUB_EVENT_NAME=pull_request; refused g-pr "never publishes"
 run g-branch guard GITHUB_REF=refs/heads/feature; refused g-branch "runs only from main"
 run g-fork guard GITHUB_REPOSITORY=someone/ignite; refused g-fork "publishing runs only in markrai/ignite"
 run g-confirm guard IGNITE_PROMOTE_CONFIRM="publish $TAG"; refused g-confirm "needs confirm"
+run g-no-signature guard IGNITE_PROMOTE_KINDLE_SIGNATURE=; refused g-no-signature "signature missing or malformed"
+run g-bad-signature guard IGNITE_PROMOTE_KINDLE_SIGNATURE=abcd; refused g-bad-signature "signature missing or malformed"
+run g-bad-tag guard IGNITE_PROMOTE_TAG=v01.2.3; refused g-bad-tag "not a canonical release tag"
 pass "guard: dispatch from main with exact confirm only"
 
 reset
@@ -248,7 +292,29 @@ pass "fetch: downloads both artifacts once"
 
 reset
 run f-ok fetch; ok f-ok
+source_before="$(sha256sum \
+  "$T/work/kindle/Install Ignite v$V.sh" \
+  "$T/work/kindle/Install Ignite v$V.sha256" \
+  "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz" \
+  "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz.sha256")"
 run v-ok verify; ok v-ok
+source_after="$(sha256sum \
+  "$T/work/kindle/Install Ignite v$V.sh" \
+  "$T/work/kindle/Install Ignite v$V.sha256" \
+  "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz" \
+  "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz.sha256")"
+[ "$source_before" = "$source_after" ] || fail "verification changed an original CI artifact"
+[ "$(find "$T/work/dist" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6 ] \
+  || fail "verification must stage exactly six release assets"
+for asset in \
+  "Install Ignite v$V.sh" \
+  "Install Ignite v$V.sha256" \
+  "ignite-kindle-v$V.manifest" \
+  "ignite-kindle-v$V.manifest.sig" \
+  "ignite-server-$V-linux-x86_64.tar.gz" \
+  "ignite-server-$V-linux-x86_64.tar.gz.sha256"; do
+  [ -f "$T/work/dist/$asset" ] || fail "staged release is missing $asset"
+done
 echo extra >"$T/work/kindle/stray.txt"
 run v-extra verify; refused v-extra "Kindle artifact file set mismatch"
 reset; run f-ok fetch; ok f-ok
@@ -259,14 +325,63 @@ reset; run f-ok fetch; ok f-ok
 # half-missing linux checksum
 rm -f "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz.sha256"
 run v-half verify; refused v-half "Linux artifact file set mismatch"
-pass "verify: exact four files and recorded SHA-256s"
+reset; run f-ok fetch; ok f-ok
+printf 'UNPROVISIONED\n' >"$TEST_REPOSITORY/tools/release/kindle-release-public-key.hex"
+run v-unprovisioned verify; \
+  refused v-unprovisioned "official release public key is not provisioned"
+cp "$TEST_PUBLIC_PIN" "$TEST_REPOSITORY/tools/release/kindle-release-public-key.hex"
+reset; run f-ok fetch; ok f-ok
+case "${KINDLE_SIGNATURE: -1}" in
+  0) BAD_SIGNATURE="${KINDLE_SIGNATURE:0:127}1" ;;
+  *) BAD_SIGNATURE="${KINDLE_SIGNATURE:0:127}0" ;;
+esac
+run v-bad-auth verify IGNITE_PROMOTE_KINDLE_SIGNATURE="$BAD_SIGNATURE"; \
+  refused v-bad-auth "signature verification failed"
+pass "verify: original four CI files are unchanged; only valid authenticated metadata makes six assets"
 
 reset
 run f-ok fetch; ok f-ok
 run v-ok verify; ok v-ok
+run p-ineligible-repo publish GITHUB_REPOSITORY=someone/ignite; \
+  refused p-ineligible-repo "publishing runs only in markrai/ignite"
+run p-ineligible-branch publish GITHUB_REF=refs/heads/feature; \
+  refused p-ineligible-branch "runs only from main"
+run p-ineligible-confirm publish IGNITE_PROMOTE_CONFIRM="publish $TAG"; \
+  refused p-ineligible-confirm "needs confirm"
+printf 'failure\tcompleted\t%s\tpush\tmain\t.github/workflows/ci.yml\t161335\n' "$COMMIT" >"$T/run.tsv"
+run p-ineligible-ci publish; refused p-ineligible-ci "did not succeed"
+[ ! -f "$T/publish.log" ] \
+  || fail "direct publish reached gh release create with invalid eligibility"
+pass "direct publish: repository, branch, confirmation, and CI-run eligibility are mandatory"
+
+reset
+run p-no-fetch publish
+[ "$RC" != 0 ] || fail "direct publish without verified inputs must fail"
+[ ! -f "$T/publish.log" ] || fail "direct publish bypass reached gh release create"
+run f-ok fetch; ok f-ok
+case "${KINDLE_SIGNATURE: -1}" in
+  0) BAD_SIGNATURE="${KINDLE_SIGNATURE:0:127}1" ;;
+  *) BAD_SIGNATURE="${KINDLE_SIGNATURE:0:127}0" ;;
+esac
+run p-bad-auth publish IGNITE_PROMOTE_KINDLE_SIGNATURE="$BAD_SIGNATURE"; \
+  refused p-bad-auth "signature verification failed"
+[ ! -f "$T/publish.log" ] || fail "invalid authentication reached gh release create"
+pass "publish subcommand re-verifies and fails before any GitHub publication call"
+
+reset
+run f-ok fetch; ok f-ok
 run p-ok publish; ok p-ok
 grep -q "create $TAG" "$T/publish.log" || { cat "$T/publish.log" >&2; fail "publish did not create the release"; }
 grep -q -- "--target $COMMIT" "$T/publish.log" || fail "publish must target the recorded commit"
+for asset in \
+  "Install Ignite v$V.sh" \
+  "Install Ignite v$V.sha256" \
+  "ignite-kindle-v$V.manifest" \
+  "ignite-kindle-v$V.manifest.sig" \
+  "ignite-server-$V-linux-x86_64.tar.gz" \
+  "ignite-server-$V-linux-x86_64.tar.gz.sha256"; do
+  grep -qF "$asset" "$T/publish.log" || fail "published release is missing $asset"
+done
 [ -f "$T/tag.tsv" ] || fail "publish must record the created tag"
 touch "$T/release-exists"
 run p-exists publish; refused p-exists "already exists; its assets are not replaced"
@@ -274,7 +389,6 @@ pass "publish: creates release at recorded commit; never replaces"
 
 reset
 run f-ok fetch; ok f-ok
-run v-ok verify; ok v-ok
 printf 'commit\t%s\n' "$COMMIT" >"$T/tag.tsv"
 run p-tag-ok publish; ok p-tag-ok
 printf 'commit\t%s\n' "$(printf 'e%.0s' {1..40})" >"$T/tag.tsv"
@@ -302,10 +416,16 @@ grep -q "release create" "$T/publish.log" || fail "all did not publish"
 pass "all: guard → resolve → fetch → verify → publish"
 
 grep -qF "$SECRET" "$T/argv.log" && fail "the workflow token reached a command line"
-pass "the workflow token never appears in argv"
+while IFS= read -r private_line; do
+  [ -n "$private_line" ] || continue
+  if grep -qF -- "$private_line" "$T/argv.log" "$T"/*.out "$T"/*.err; then
+    fail "private-key contents reached a command line or promotion log"
+  fi
+done <"$TEST_PRIVATE_KEY"
+pass "workflow token and private-key contents never appear in mocked GitHub argv"
 
-python3 "$ROOT/tools/ci/check_version_sync.py" || fail "version sync on this tree"
-python3 "$ROOT/tools/ci/test_check_version_sync.py" || fail "version mismatch fixture"
+"$PYTHON_REAL" "$ROOT/tools/ci/check_version_sync.py" || fail "version sync on this tree"
+"$PYTHON_REAL" "$ROOT/tools/ci/test_check_version_sync.py" || fail "version mismatch fixture"
 pass "version files agree; mismatch fixture fails closed"
 
 grep -vE '^\s*#' "$ROOT/scripts/kindle/package-release.sh" | grep -q SkipBuild \

@@ -5,13 +5,14 @@
 #   promote-release.sh guard     repository / event / confirm
 #   promote-release.sh resolve   designated CI workflow on main, version match
 #   promote-release.sh fetch     download Kindle + Linux artifacts from that run
-#   promote-release.sh verify    exact four files, checksums, recorded SHA-256s
-#   promote-release.sh publish   create the GitHub Release from those bytes
+#   promote-release.sh verify    four CI files + authenticated Kindle metadata
+#   promote-release.sh publish   re-verify, then create a six-asset GitHub Release
 #   promote-release.sh all       guard → resolve → fetch → verify → publish
 #
 # Environment (tokens never on argv): IGNITE_PROMOTE_TAG, IGNITE_PROMOTE_RUN_ID,
 # IGNITE_PROMOTE_COMMIT, IGNITE_PROMOTE_CONFIRM, IGNITE_PROMOTE_KINDLE_SHA256,
-# IGNITE_PROMOTE_LINUX_SHA256, IGNITE_PROMOTE_WORK, GH_TOKEN, GITHUB_REPOSITORY,
+# IGNITE_PROMOTE_LINUX_SHA256, IGNITE_PROMOTE_KINDLE_SIGNATURE,
+# IGNITE_PROMOTE_WORK, GH_TOKEN, GITHUB_REPOSITORY,
 # GITHUB_EVENT_NAME, GITHUB_REF.
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
@@ -21,6 +22,9 @@ ARCH=x86_64
 CI_WORKFLOW=.github/workflows/ci.yml
 CI_WORKFLOW_FILE=ci.yml
 MAIN_BRANCH=main
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SIGN_TOOL="$ROOT/tools/release/kindle_release_sign.py"
+PUBLIC_KEY_FILE="$ROOT/tools/release/kindle-release-public-key.hex"
 
 die() { echo "promote-release.sh: $*" >&2; exit 1; }
 
@@ -30,15 +34,16 @@ COMMIT="${IGNITE_PROMOTE_COMMIT:-}"
 CONFIRM="${IGNITE_PROMOTE_CONFIRM:-}"
 KINDLE_SHA="${IGNITE_PROMOTE_KINDLE_SHA256:-}"
 LINUX_SHA="${IGNITE_PROMOTE_LINUX_SHA256:-}"
+KINDLE_SIGNATURE="${IGNITE_PROMOTE_KINDLE_SIGNATURE:-}"
 WORK="${IGNITE_PROMOTE_WORK:-}"
 
-[[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]] \
-  || die "not a release tag: ${TAG:-none}"
-VERSION="${TAG#v}"
+VERSION="$(python3 "$SIGN_TOOL" version --tag "$TAG")" \
+  || die "not a canonical release tag: ${TAG:-none}"
 [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]] || die "run id must be a positive integer"
 [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "commit must be a 40-character lowercase SHA-1"
 [[ "$KINDLE_SHA" =~ ^[0-9a-f]{64}$ ]] || die "kindle sha256 missing or malformed"
 [[ "$LINUX_SHA" =~ ^[0-9a-f]{64}$ ]] || die "linux sha256 missing or malformed"
+[[ "$KINDLE_SIGNATURE" =~ ^[0-9a-f]{128}$ ]] || die "kindle signature missing or malformed"
 [ -n "$WORK" ] || die "IGNITE_PROMOTE_WORK is required"
 
 SFX="Install Ignite v$VERSION.sh"
@@ -46,6 +51,9 @@ SFX_SUM="Install Ignite v$VERSION.sha256"
 LINUX="ignite-server-$VERSION-linux-$ARCH.tar.gz"
 LINUX_SUM="$LINUX.sha256"
 DIST="$WORK/dist"
+MANIFEST="ignite-kindle-v$VERSION.manifest"
+MANIFEST_SIG="$MANIFEST.sig"
+AUTH_DIR="$WORK/authenticated-metadata"
 
 guard() {
   [ "${GITHUB_REPOSITORY:-}" = "$REPO" ] || die "publishing runs only in $REPO (got ${GITHUB_REPOSITORY:-none})"
@@ -124,7 +132,7 @@ _list_files() {
 }
 
 verify() {
-  local kfiles lfiles have_k have_l
+  local kfiles lfiles have_k have_l source_hashes
   kfiles="$(_list_files "$WORK/kindle")"
   lfiles="$(_list_files "$WORK/linux")"
   [ "$kfiles" = "$(printf '%s\n' "$SFX" "$SFX_SUM")" ] \
@@ -141,8 +149,11 @@ verify() {
     || die "Kindle installer sha256 $have_k != recorded $KINDLE_SHA (refusing to publish untested bytes)"
   [ "$have_l" = "$LINUX_SHA" ] \
     || die "Linux bundle sha256 $have_l != recorded $LINUX_SHA (refusing to publish untested bytes)"
+  source_hashes="$(sha256sum \
+    "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" \
+    "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM")"
 
-  python3 "$(cd "$(dirname "$0")/../.." && pwd)/deployment/kindle/validate_stage.py" \
+  python3 "$ROOT/deployment/kindle/validate_stage.py" \
     --sfx "$WORK/kindle/$SFX" --version "$VERSION" \
     || die "Kindle installer failed validate_stage.py"
 
@@ -155,12 +166,32 @@ verify() {
     || die "bundle binary is not $VERSION"
   rm -rf "${WORK:?}/${LINUX%.tar.gz}"
 
+  rm -rf "$AUTH_DIR"
+  python3 "$SIGN_TOOL" verify \
+    --installer "$WORK/kindle/$SFX" \
+    --tag "$TAG" \
+    --expected-sha256 "$KINDLE_SHA" \
+    --signature-hex "$KINDLE_SIGNATURE" \
+    --public-key "$PUBLIC_KEY_FILE" \
+    --output-dir "$AUTH_DIR" \
+    || die "Kindle release metadata signature verification failed"
+
+  [ "$source_hashes" = "$(sha256sum \
+    "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" \
+    "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM")" ] \
+    || die "source CI artifacts changed during verification"
+
   rm -rf "$DIST"
   mkdir -p "$DIST"
-  cp -a "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM" "$DIST/"
-  [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(printf '%s\n' "$SFX" "$SFX_SUM" "$LINUX" "$LINUX_SUM")" ] \
-    || die "staging dist does not contain exactly the four primary assets"
-  echo "verify: four assets match recorded SHA-256s"
+  cp -a \
+    "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" \
+    "$AUTH_DIR/$MANIFEST" "$AUTH_DIR/$MANIFEST_SIG" \
+    "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM" \
+    "$DIST/"
+  [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(printf '%s\n' \
+      "$SFX" "$SFX_SUM" "$MANIFEST" "$MANIFEST_SIG" "$LINUX" "$LINUX_SUM")" ] \
+    || die "staging dist does not contain exactly the six release assets"
+  echo "verify: four CI assets unchanged; authenticated metadata staged"
 }
 
 # Sets GH_HTTP_CODE / GH_HTTP_BODY from `gh api`. Returns 0 on HTTP 200, 1 on
@@ -222,7 +253,7 @@ _require_tag_commit() {
   die "$1"
 }
 
-publish() {
+_publish_verified() {
   if _gh_http --jq .tag_name "repos/$REPO/releases/tags/$TAG"; then
     die "release $TAG already exists; its assets are not replaced"
   fi
@@ -237,6 +268,7 @@ publish() {
 Ignite $VERSION
 
 **Kindle application (primary):** \`$SFX\` and \`$SFX_SUM\`.
+Authenticated updater metadata: \`$MANIFEST\` and \`$MANIFEST_SIG\`.
 Copy the installer into the Kindle Documents folder over USB. See [deployment/kindle/README.txt](https://github.com/markrai/ignite/blob/main/deployment/kindle/README.txt).
 
 **Optional Ignite Server (Linux x86_64):** \`$LINUX\` and \`$LINUX_SUM\`.
@@ -251,12 +283,20 @@ EOF
   echo "published: $TAG from run $RUN_ID commit $COMMIT"
 }
 
+publish() {
+  # Direct publication must prove the same authorization and CI-run eligibility as `all`.
+  guard
+  resolve
+  verify
+  _publish_verified
+}
+
 all() {
   guard
   resolve
   fetch
   verify
-  publish
+  _publish_verified
 }
 
 case "${1:-}" in

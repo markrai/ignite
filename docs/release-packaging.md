@@ -13,7 +13,7 @@ compatibility claims, not permission to publish.
 
 ## Artifacts (per version `X.Y.Z`)
 
-Primary GitHub Release assets (exactly these four):
+CI constructs exactly these four files (two artifact uploads):
 
 | Artifact | Builder |
 |----------|---------|
@@ -22,8 +22,25 @@ Primary GitHub Release assets (exactly these four):
 | `ignite-server-X.Y.Z-linux-x86_64.tar.gz` | CI `ignite-server-linux` |
 | `ignite-server-X.Y.Z-linux-x86_64.tar.gz.sha256` | Same |
 
+After offline authorization and authenticated promotion, a GitHub Release contains those exact
+four files unchanged plus two promotion-created metadata files:
+
+| Additional Release asset | Producer |
+|--------------------------|----------|
+| `ignite-kindle-vX.Y.Z.manifest` | Promotion, deterministically reconstructed from the CI installer |
+| `ignite-kindle-vX.Y.Z.manifest.sig` | Promotion, from the verified offline Ed25519 signature input |
+
+Thus CI artifact payloads contain four files and an authenticated GitHub Release contains six.
+Neither metadata file is a new build artifact, and promotion never modifies the original four.
+
 GitHub also attaches source archives. The developer/support ZIP may be produced
 locally; it is **not** a Release asset.
+
+Authenticated Kindle update metadata and the offline procedure are specified in
+[`kindle-release-manifest.md`](kindle-release-manifest.md). The code path is implemented, but the
+production public-key pin is still `UNPROVISIONED`; **Promote release is intentionally blocked**
+until the maintainer installs the genuine public key. Existing releases therefore still have the
+original four assets. No checksum sidecar is an independent publisher signature.
 
 Version authority: `ignite/VERSION`, kept in sync with the Cargo workspace,
 `Cargo.lock`, `ignite/web/package.json`, and `package-lock.json`
@@ -48,11 +65,15 @@ Publication is [`.github/workflows/release-promote.yml`](../.github/workflows/re
    against the **same** Linux artifact if sync is advertised) to inform
    device/firmware compatibility claims. Hardware results are not a
    publication gate.
-4. From `main`, dispatch **Promote release** with those recorded values and
+4. Using the offline private key, run `tools/release/kindle_release_sign.py sign` on the exact CI
+   Kindle installer and recorded hash. The helper authenticates its own output against the shared
+   public pin. Copy only its non-secret `signature_hex` output.
+5. From `main`, dispatch **Promote release** with the recorded values, the signature hex, and
    confirm `publish vX.Y.Z from run <id>`.
-5. The workflow refuses missing, expired, mismatched, failed, or unconfirmed
-   artifacts; never replaces an existing Release; never rebuilds.
-6. Stable tags then run GHCR against the **published** Linux tarball (existing
+6. The workflow refuses missing, expired, mismatched, failed, unauthenticated, or unconfirmed
+   artifacts; never replaces an existing Release; never rebuilds. It publishes six assets in one
+   operation only after reconstructing and authenticating the manifest.
+7. Stable tags then run GHCR against the **published** Linux tarball (existing
    GHCR guards). `ghcr-publish.sh` still downloads only the Linux pair.
 
 **Never** publish first and compare checksums afterward to discover a mismatch.
@@ -70,6 +91,7 @@ workflow_run_id=
 kindle_artifact=ignite-kindle-release
 linux_artifact=ignite-server-linux-release
 kindle_sha256=
+kindle_signature=<copy the 128-character lowercase hex from the offline helper>
 linux_sha256=
 ```
 
@@ -143,14 +165,17 @@ and firmware.
 4. Optionally exercise the hardware table on those exact bytes to inform
    compatibility claims; capture screenshots if not already on the commit
    (if you add files, that is a new commit → new CI run → re-verify).
-5. Dispatch **Promote release** from `main` with recorded identity. That
-   confirmation is the publication approval.
-6. Confirm the Release assets’ SHA-256s equal the recorded
+5. Follow the offline signing steps in
+   [`kindle-release-manifest.md`](kindle-release-manifest.md) using the exact downloaded Kindle
+   installer, tag, recorded hash, offline private key, and provisioned repository public pin.
+6. Dispatch **Promote release** from `main` with recorded identity and the helper's public
+   `signature_hex`. The offline signature plus explicit confirmation is the publication approval.
+7. Confirm all six Release assets are present and the original four assets’ SHA-256s equal the recorded
    digests (promotion correctness, not a substitute for pre-publish checks).
-7. GHCR: `docker pull ghcr.io/markrai/ignite-server:v0.9.13` (example version). First-time package
+8. GHCR: `docker pull ghcr.io/markrai/ignite-server:v0.9.13` (example version). First-time package
    visibility may still need a manual Public toggle.
-8. Update the compatibility matrix with the published Scriptlet hash.
-9. Do **not** replace Release assets. Fix forward with a new version.
+9. Update the compatibility matrix with the published Scriptlet hash.
+10. Do **not** replace Release assets. Fix forward with a new version.
 
 ## Forbidden
 
@@ -159,5 +184,7 @@ and firmware.
 - Uploading the support ZIP as a Release asset
 - Replacing assets on an existing GitHub Release
 - Tag-push rebuild as the source of published bytes
+- Signing or promoting while the production public-key pin is `UNPROVISIONED`
+- Sending the production private key or passphrase to GitHub Actions
 - Claiming hardware-verified compatibility without hardware evidence
 - Generated / AI screenshots in the README

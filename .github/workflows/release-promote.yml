@@ -1,5 +1,5 @@
 # Promote previously built CI artifacts to a GitHub Release without rebuilding.
-# Hardware qualification must have recorded the CI run id, commit, and SHA-256s.
+# Publication requires successful CI, recorded artifact identity, and authenticated promotion.
 # Inputs reach shell steps through env only, never through ${{ }} inside run scripts.
 name: Promote release
 
@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       run_id:
-        description: Successful CI workflow run id that produced the tested artifacts
+        description: Successful CI workflow run id that produced the release artifacts
         required: true
         type: string
       commit:
@@ -19,11 +19,15 @@ on:
         required: true
         type: string
       kindle_sha256:
-        description: SHA-256 of the hardware-tested Install Ignite vX.Y.Z.sh
+        description: SHA-256 of the verified CI-produced Install Ignite vX.Y.Z.sh
+        required: true
+        type: string
+      kindle_signature:
+        description: 128-character Ed25519 signature hex from the offline signing helper
         required: true
         type: string
       linux_sha256:
-        description: SHA-256 of the tested ignite-server-*-linux-x86_64.tar.gz
+        description: SHA-256 of the verified CI-produced ignite-server-*-linux-x86_64.tar.gz
         required: true
         type: string
       confirm:
@@ -35,7 +39,7 @@ permissions: {}
 
 jobs:
   promote:
-    name: Promote tested CI artifacts
+    name: Promote authenticated CI artifacts
     if: github.repository == 'markrai/ignite' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -52,6 +56,7 @@ jobs:
       IGNITE_PROMOTE_RUN_ID: ${{ inputs.run_id }}
       IGNITE_PROMOTE_COMMIT: ${{ inputs.commit }}
       IGNITE_PROMOTE_KINDLE_SHA256: ${{ inputs.kindle_sha256 }}
+      IGNITE_PROMOTE_KINDLE_SIGNATURE: ${{ inputs.kindle_signature }}
       IGNITE_PROMOTE_LINUX_SHA256: ${{ inputs.linux_sha256 }}
       IGNITE_PROMOTE_CONFIRM: ${{ inputs.confirm }}
       IGNITE_PROMOTE_WORK: ${{ github.workspace }}/promote-work

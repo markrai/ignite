@@ -320,6 +320,8 @@ jobs:
         run: bash deployment/linux/docker/test-compose-static.sh
       - name: GHCR publishing guards and image references
         run: bash deployment/linux/docker/test-ghcr-publish.sh
+      - name: Offline Kindle release signing helper
+        run: python3 tools/release/test_kindle_release_sign.py
       - name: Promote-publish guards
         run: bash tools/release/test-promote-release.sh
       - name: Version file synchronization
