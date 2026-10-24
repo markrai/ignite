@@ -3544,7 +3544,11 @@ fn execute_ui_command(
 
 /// Live framebuffer session. The process singleton must already be held; this
 /// function mmaps `/dev/fb0` and opens input.
-pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
+pub fn run_page_session(
+    cfg: RuntimeConfig,
+    stop: Arc<AtomicBool>,
+    launch_health: &mut crate::launch_health::Reporter,
+) -> i32 {
     crate::launch_clock::mark("runtime_entry");
     println!(
         "# SCRIBE APP GATE F11: V1 usable notebook UX (Home, modals, keyboard, chrome) + F0–F10"
@@ -3943,6 +3947,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut sync_capture_max_us = 0u64;
     let mut inbound_apply_count = 0u64;
     let mut inbound_apply_max_us = 0u64;
+    let mut initial_iteration_gate = crate::launch_health::InitialIterationGate::default();
     let code = loop {
         crate::launch_diag::live().maybe_emit_stats();
         if stop.load(Ordering::SeqCst) {
@@ -3951,6 +3956,13 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             shutdown_safe = safe;
             stylus_mode_disarm_failed = disarm_fail;
             break c;
+        }
+
+        // Reaching the loop a second time proves that one complete iteration returned normally
+        // (including a handled `continue`). Home was constructed and GC16-rendered above. An
+        // initialization error, loop error, or immediate stop breaks before this acknowledgment.
+        if initial_iteration_gate.entering_iteration() {
+            launch_health.acknowledge_ready();
         }
 
         // F11.1: Kindle screensaver/suspend. The process and UiState survive, but the panel

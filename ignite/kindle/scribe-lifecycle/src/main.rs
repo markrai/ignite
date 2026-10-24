@@ -12,6 +12,7 @@
 //!
 //! Probe mode never opens framebuffer, HWTCON, stylus, or notebook data.
 
+mod launch_health;
 mod protocol;
 
 #[cfg(unix)]
@@ -19,6 +20,9 @@ mod lipc;
 
 #[cfg(unix)]
 mod unix_main {
+    use crate::launch_health::{
+        clear_handshake_environment, LaunchState, ObserverEvent, PreparedLaunchHealth,
+    };
     use crate::lipc::{ChildSupervisor, LIPCcode, LifecycleState, LipcHandle, LipcLib, LIPC_OK};
     use crate::protocol::{
         ack_value, relay_line_for_powerd_event, request_id_from_payload, result_property,
@@ -43,6 +47,7 @@ mod unix_main {
     const DEFAULT_CHILD: &str = "/mnt/us/scribe-app/bin/scribe-app";
     const DEFAULT_CHILD_LOG: &str = "/mnt/us/scribe-app/logs/scribe-app.child.log";
     const CHILD_SHUTDOWN_BUDGET: Duration = Duration::from_secs(45);
+    const LAUNCH_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 
     static STATE: OnceLock<LifecycleState> = OnceLock::new();
     static LIB: OnceLock<LipcLib> = OnceLock::new();
@@ -199,6 +204,43 @@ mod unix_main {
         LIPC_OK
     }
 
+    fn log_health_event(attempt: &str, pid: u32, event: ObserverEvent) {
+        match event {
+            ObserverEvent::Ready => state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=ready"
+            )),
+            ObserverEvent::IncorrectIdentifier { received } => state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=started ack=rejected reason=incorrect_identifier received={received}"
+            )),
+            ObserverEvent::MalformedAcknowledgment => state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=started ack=rejected reason=malformed"
+            )),
+            ObserverEvent::TimedOut => state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=timeout compatibility=missing_ack_or_legacy_child"
+            )),
+            ObserverEvent::Interrupted { error } => state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=interrupted reason=ipc_read_error detail={error:?}"
+            )),
+        }
+    }
+
+    fn log_health_child_exit(attempt: &str, pid: u32, before: LaunchState, after: LaunchState) {
+        if after == LaunchState::PrematureExit {
+            state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=premature_exit"
+            ));
+        } else if after == LaunchState::NormalExit {
+            state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=normal_exit_before_ready classification=non_failure"
+            ));
+        } else {
+            state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state={} event=child_exit observation=complete",
+                before.as_str()
+            ));
+        }
+    }
+
     fn signal_term(pid: u32) -> std::io::Result<()> {
         let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
         if rc == 0 {
@@ -217,11 +259,26 @@ mod unix_main {
             state().log(&format!("child_stop skipped reason={reason} no_supervisor"));
             return true;
         };
-        let Some(child) = sup.child.as_mut() else {
+        let Some(pid) = sup.child.as_ref().map(std::process::Child::id) else {
             state().log(&format!("child_stop skipped reason={reason} no_child"));
             return true;
         };
-        let pid = child.id();
+        if let Some(health) = sup.health.as_mut() {
+            let before = health.state();
+            let attempt = health.attempt().to_owned();
+            let after = health.intentional_stop();
+            state().log(&format!(
+                "launch_health attempt={attempt} pid={pid} state=intentional_stop reason={reason} readiness_before={}",
+                before.as_str()
+            ));
+            debug_assert!(matches!(
+                after,
+                LaunchState::IntentionalStop
+                    | LaunchState::Ready
+                    | LaunchState::TimedOut
+                    | LaunchState::Interrupted
+            ));
+        }
         // Close the relay pipe first; the child's reader thread sees EOF.
         sup.events = None;
         state().log(&format!(
@@ -231,6 +288,7 @@ mod unix_main {
         if let Err(e) = signal_term(pid) {
             state().log(&format!("child_sigterm_failed pid={pid} err={e}"));
         }
+        let child = sup.child.as_mut().expect("child checked above");
         let deadline = Instant::now() + CHILD_SHUTDOWN_BUDGET;
         loop {
             match child.try_wait() {
@@ -239,6 +297,7 @@ mod unix_main {
                         "child_exited pid={pid} status={status} reason={reason}"
                     ));
                     sup.child = None;
+                    sup.health = None;
                     return true;
                 }
                 Ok(None) => {
@@ -269,12 +328,21 @@ mod unix_main {
             return;
         };
         if let Some(existing) = sup.child.as_mut() {
+            let existing_pid = existing.id();
             match existing.try_wait() {
                 Ok(Some(status)) => {
+                    if let Some(health) = sup.health.as_mut() {
+                        let before = health.state();
+                        let attempt = health.attempt().to_owned();
+                        let after = health.child_exited(status.success());
+                        log_health_child_exit(&attempt, existing_pid, before, after);
+                    }
                     state().log(&format!(
                         "previous_child_exited status={status}; clearing before relaunch"
                     ));
                     sup.child = None;
+                    sup.events = None;
+                    sup.health = None;
                 }
                 Ok(None) => {
                     state().log(&format!(
@@ -284,10 +352,30 @@ mod unix_main {
                     return;
                 }
                 Err(e) => {
+                    if let Some(health) = sup.health.as_mut() {
+                        let attempt = health.attempt().to_owned();
+                        let after = health.interrupted();
+                        state().log(&format!(
+                            "launch_health attempt={attempt} pid={existing_pid} state={} reason=child_poll_failed",
+                            after.as_str()
+                        ));
+                    }
                     state().log(&format!("go_child_poll_failed err={e}"));
                     return;
                 }
             }
+        }
+        if sup.child.is_none() {
+            if let Some(health) = sup.health.as_mut() {
+                let attempt = health.attempt().to_owned();
+                let after = health.interrupted();
+                state().log(&format!(
+                    "launch_health attempt={attempt} state={} reason=orphaned_observation",
+                    after.as_str()
+                ));
+            }
+            sup.health = None;
+            sup.events = None;
         }
         state().log(&format!(
             "child_start bin={} args={:?} payload={payload:?}",
@@ -312,26 +400,58 @@ mod unix_main {
             }
             Err(_) => (Stdio::null(), Stdio::null()),
         };
-        match Command::new(&sup.child_bin)
+        let mut pending_health = match PreparedLaunchHealth::new() {
+            Ok(health) => Some(health),
+            Err(e) => {
+                state().log(&format!(
+                    "launch_health attempt={} state=interrupted reason=ipc_setup_failed detail={:?}",
+                    e.attempt, e.error
+                ));
+                None
+            }
+        };
+        let mut command = Command::new(&sup.child_bin);
+        clear_handshake_environment(&mut command);
+        command
             .args(&sup.child_args)
             .arg(CHILD_DISPLAY_EVENTS_FLAG)
             .stdin(Stdio::piped())
             .stdout(stdout)
-            .stderr(stderr)
-            .spawn()
-        {
-            Ok(child) => {
+            .stderr(stderr);
+        if let Some(health) = pending_health.as_ref() {
+            health.configure_command(&mut command);
+        }
+        match command.spawn() {
+            Ok(mut child) => {
+                let pid = child.id();
                 state().log(&format!(
                     "child_started pid={} child_log={child_log_path}",
-                    child.id()
+                    pid
                 ));
-                let watch_pid = child.id();
-                std::thread::spawn(move || watch_child(watch_pid));
-                let mut child = child;
+                let observer = pending_health
+                    .take()
+                    .map(|health| health.spawned(Instant::now(), LAUNCH_HEALTH_TIMEOUT));
+                if let Some(health) = observer.as_ref() {
+                    state().log(&format!(
+                        "launch_health attempt={} pid={pid} state=started timeout_s={} protocol=unix_datagram_v1",
+                        health.attempt(),
+                        LAUNCH_HEALTH_TIMEOUT.as_secs()
+                    ));
+                }
                 sup.events = child.stdin.take();
                 sup.child = Some(child);
+                sup.health = observer;
+                std::thread::spawn(move || watch_child(pid));
             }
             Err(e) => {
+                if let Some(health) = pending_health.take() {
+                    let observation = health.spawn_failed();
+                    state().log(&format!(
+                        "launch_health attempt={} state={} reason=child_spawn_failed",
+                        observation.attempt(),
+                        observation.state().as_str()
+                    ));
+                }
                 state().log(&format!("child_start_failed err={e}"));
             }
         }
@@ -353,21 +473,46 @@ mod unix_main {
                 let Some(sup) = guard.as_mut() else {
                     return;
                 };
-                let Some(child) = sup.child.as_mut().filter(|c| c.id() == pid) else {
+                if sup.child.as_ref().map(std::process::Child::id) != Some(pid) {
                     return; // stopped deliberately (or replaced)
-                };
-                match child.try_wait() {
-                    Ok(None) => continue,
+                }
+                if let Some(health) = sup.health.as_mut() {
+                    let attempt = health.attempt().to_owned();
+                    for event in health.poll(Instant::now()) {
+                        log_health_event(&attempt, pid, event);
+                    }
+                }
+                let wait = sup.child.as_mut().expect("child checked above").try_wait();
+                match wait {
+                    Ok(None) => None,
                     Ok(Some(status)) => {
+                        if let Some(health) = sup.health.as_mut() {
+                            let before = health.state();
+                            let attempt = health.attempt().to_owned();
+                            let after = health.child_exited(status.success());
+                            log_health_child_exit(&attempt, pid, before, after);
+                        }
                         sup.child = None;
                         sup.events = None;
-                        status
+                        sup.health = None;
+                        Some(status)
                     }
                     Err(e) => {
+                        if let Some(health) = sup.health.as_mut() {
+                            let attempt = health.attempt().to_owned();
+                            let after = health.interrupted();
+                            state().log(&format!(
+                                "launch_health attempt={attempt} pid={pid} state={} reason=child_wait_failed",
+                                after.as_str()
+                            ));
+                        }
                         state().log(&format!("child_watch_failed pid={pid} err={e}"));
                         return;
                     }
                 }
+            };
+            let Some(status) = status else {
+                continue;
             };
             state().log(&format!(
                 "child_exited_unexpectedly pid={pid} status={status} reason={} action=handoff_kindle_home",
@@ -519,6 +664,7 @@ mod unix_main {
             child_args: args.child_args.clone(),
             child: None,
             events: None,
+            health: None,
         });
 
         let st = LifecycleState {

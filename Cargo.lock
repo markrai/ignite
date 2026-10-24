@@ -938,6 +938,7 @@ dependencies = [
  "ed25519-dalek",
  "fontdue",
  "kindle-platform",
+ "libc",
  "mdns-sd",
  "nbk-reader",
  "notebook-core",
@@ -959,6 +960,7 @@ version = "0.9.14"
 dependencies = [
  "libc",
  "libloading",
+ "uuid",
 ]
 
 [[package]]

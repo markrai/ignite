@@ -1,1 +1,2 @@
 tools/release/kindle-release-public-key.hex text eol=lf
+ignite/kindle/scribe-lifecycle/src/lipc.rs text eol=lf diff

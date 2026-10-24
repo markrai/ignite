@@ -36,8 +36,12 @@ fn main() -> ExitCode {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
+        use scribe_app::launch_health::Reporter;
         use scribe_app::singleton::{process_exit_code, run_with_singleton, DEFAULT_LOCK_PATH};
 
+        // Claim the lifecycle-only descriptor before initialization can launch subprocesses.
+        // A singleton loser or startup failure drops it without reporting readiness.
+        let mut launch_health = Reporter::from_environment();
         // Kernel flock before any framebuffer / input / library / sync work.
         // A second invocation leaves the live instance alone (never SIGTERM, never paint).
         match run_with_singleton(Path::new(DEFAULT_LOCK_PATH), || {
@@ -59,7 +63,7 @@ fn main() -> ExitCode {
                         return 1;
                     }
                 };
-                let code = runtime::run_page_session(cfg, Arc::clone(&stop));
+                let code = runtime::run_page_session(cfg, Arc::clone(&stop), &mut launch_health);
                 // S2B: bounded stop of background sync after the pen session is released (never
                 // delays the input/panel shutdown; the durable outbox survives for the next
                 // launch). D1: stop the server link first (closes discovery + the firewall

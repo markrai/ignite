@@ -52,6 +52,9 @@ fontdue = { version = "0.9", default-features = false }
 ed25519-dalek = { version = "2.2", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Host-side integration tests (never linked into the Kindle binary).
 scribe-sync-server = { workspace = true }

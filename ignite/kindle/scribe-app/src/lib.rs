@@ -41,6 +41,7 @@ mod kindle_supervisor_harness;
 pub mod lasso;
 pub mod launch_clock;
 pub mod launch_diag;
+pub mod launch_health;
 pub mod library;
 pub mod link_paint;
 pub mod link_picker;
