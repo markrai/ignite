@@ -29,6 +29,12 @@ SU_BIN="${IGNITE_SU:-/var/local/kmc/bin/su}"
 TOOLS_LIB="$APP_ROOT/tools/ignite-release/lib"
 JOURNAL=$APP_ROOT/run/ignite-activate.journal
 COMMITTED=$APP_ROOT/run/ignite-activate.committed
+UPDATE_DIR=$APP_ROOT/state/update
+PENDING_HEALTH=$UPDATE_DIR/pending-health.v1
+LKG_INVENTORY_NAME=ignite-lkg-inventory.v1
+LKG_INVENTORY=$PREV_DIR/$LKG_INVENTORY_NAME
+LKG_HANDLER_NAME=appreg-handler.sql
+LKG_HANDLER=$PREV_DIR/$LKG_HANDLER_NAME
 
 LIB_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=register-helpers.sh
@@ -106,6 +112,354 @@ publish_crash() {
   fi
 }
 
+sha256_file() {
+  sha_output=$(sha256sum "$1" 2>/dev/null) || return 1
+  sha_value=${sha_output%%[!0123456789abcdef]*}
+  sha_rest=${sha_output#"$sha_value"}
+  [ "${#sha_value}" -eq 64 ] \
+    && printf '%s\n' "$sha_value" | LC_ALL=C grep -Eq '^[0-9a-f]{64}$' \
+    || return 1
+  case "$sha_rest" in ' '*) ;; *) return 1 ;; esac
+  printf '%s\n' "$sha_value"
+}
+
+file_bytes() {
+  bytes_output=$(wc -c < "$1" 2>/dev/null) || return 1
+  bytes_value=$(printf '%s' "$bytes_output" \
+    | LC_ALL=C sed 's/^[[:space:]]*//; s/[[:space:]]*$//') || return 1
+  case "$bytes_value" in
+    0|[1-9]|[1-9][0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$bytes_value" in *[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$bytes_value"
+}
+
+valid_numeric_identifier() {
+  identifier=$1
+  case "$identifier" in
+    ''|*[!0-9]*) return 1 ;;
+    0) return 0 ;;
+    0*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Keep this grammar byte-for-byte aligned with kindle_release_sign.py and the
+# Rust release-manifest verifier: SemVer core plus an optional prerelease only.
+valid_release_version() {
+  version=$1
+  [ -n "$version" ] && [ "${#version}" -le 64 ] || return 1
+  core=${version%%-*}
+  if [ "$core" = "$version" ]; then
+    prerelease=
+  else
+    prerelease=${version#*-}
+    [ -n "$prerelease" ] || return 1
+  fi
+  printf '%s\n' "$core" | LC_ALL=C grep -Eq \
+    '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || return 1
+  [ -z "$prerelease" ] && return 0
+  printf '%s\n' "$prerelease" | LC_ALL=C grep -Eq \
+    '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$' || return 1
+  old_ifs=$IFS
+  IFS=.
+  set -- $prerelease
+  IFS=$old_ifs
+  for identifier in "$@"; do
+    case "$identifier" in
+      *[!0-9]*) ;;
+      *) valid_numeric_identifier "$identifier" || return 1 ;;
+    esac
+  done
+  return 0
+}
+
+refuse_symlink() {
+  path=$1
+  label=$2
+  if [ -L "$path" ]; then
+    log "install_integrity: $label is a symlink ($path)"
+    return 1
+  fi
+  return 0
+}
+
+ensure_update_dir() {
+  refuse_symlink "$APP_ROOT/state" "state directory" || return 1
+  refuse_symlink "$UPDATE_DIR" "update state directory" || return 1
+  if [ -e "$APP_ROOT/state" ] && [ ! -d "$APP_ROOT/state" ]; then
+    log "install_integrity: state path is not a directory"
+    return 1
+  fi
+  if [ -e "$UPDATE_DIR" ] && [ ! -d "$UPDATE_DIR" ]; then
+    log "install_integrity: update state path is not a directory"
+    return 1
+  fi
+  mkdir -p "$UPDATE_DIR" || return 1
+  chmod 0700 "$UPDATE_DIR" 2>/dev/null || true
+  return 0
+}
+
+snapshot_name_allowed() {
+  case "$1" in
+    scribe-app|scribe-lifecycle|scribe-lifecycle-host.sh|Scribe.sh|scribe-icon.png|\
+    OFL.txt|DESCRIPTION.en_us.html|upstream_info.md|source-sans-3-OFL.txt|\
+    install-runtime.sh|uninstall-runtime.sh|backup-runtime.sh|register-helpers.sh|\
+    install-recovery.sh|Uninstall\ Ignite.sh|Backup\ Ignite\ Data.sh|Diagnose\ Ignite.sh|\
+    "$LKG_HANDLER_NAME"|"$LKG_INVENTORY_NAME")
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_snapshot_tree() {
+  root=$1
+  refuse_symlink "$root" "retained release directory" || return 1
+  [ -d "$root" ] || {
+    log "lkg_invalid: retained release directory missing"
+    return 1
+  }
+  for path in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      continue
+    fi
+    name=${path##*/}
+    snapshot_name_allowed "$name" || {
+      log "lkg_invalid: unexpected retained path $name"
+      return 1
+    }
+    refuse_symlink "$path" "retained path $name" || return 1
+    [ -f "$path" ] || {
+      log "lkg_invalid: retained path is not a regular file: $name"
+      return 1
+    }
+  done
+  for required in scribe-app scribe-lifecycle scribe-lifecycle-host.sh; do
+    [ -f "$root/$required" ] && [ ! -L "$root/$required" ] || {
+      log "lkg_invalid: required retained file missing: $required"
+      return 1
+    }
+  done
+  return 0
+}
+
+lkg_inventory_entry() {
+  root=$1
+  name=$2
+  path=$root/$name
+  refuse_symlink "$path" "retained inventory entry $name" || return 1
+  if [ -f "$path" ]; then
+    bytes=$(file_bytes "$path") || return 1
+    digest=$(sha256_file "$path") || return 1
+    printf 'entry=%s|file|%s|%s\n' "$name" "$bytes" "$digest"
+  elif [ -e "$path" ]; then
+    log "lkg_invalid: inventory entry is not a regular file: $name"
+    return 1
+  else
+    printf 'entry=%s|absent|0|-\n' "$name"
+  fi
+}
+
+# Canonical bytes: LF-only fixed header and fixed entry order. Paths are a closed set.
+write_lkg_inventory() {
+  root=$1
+  out=$2
+  validate_snapshot_tree "$root" || return 1
+  {
+    printf '%s\n' 'IGNITE_LKG_INVENTORY_V1'
+    printf '%s\n' 'schema=1'
+    printf '%s\n' 'kind=ignite-application-release'
+    printf '%s\n' 'entry_count=18'
+  } >"$out" || return 1
+  for name in \
+    scribe-app scribe-lifecycle scribe-lifecycle-host.sh Scribe.sh scribe-icon.png \
+    OFL.txt DESCRIPTION.en_us.html upstream_info.md source-sans-3-OFL.txt \
+    install-runtime.sh uninstall-runtime.sh backup-runtime.sh register-helpers.sh \
+    install-recovery.sh "Uninstall Ignite.sh" "Backup Ignite Data.sh" \
+    "Diagnose Ignite.sh" "$LKG_HANDLER_NAME"
+  do
+    lkg_inventory_entry "$root" "$name" >>"$out" || return 1
+  done
+  return 0
+}
+
+validate_lkg_inventory() {
+  expected_bytes=$1
+  expected_sha=$2
+  ensure_update_dir || return 1
+  validate_snapshot_tree "$PREV_DIR" || return 1
+  refuse_symlink "$LKG_INVENTORY" "retained inventory" || return 1
+  [ -f "$LKG_INVENTORY" ] || {
+    log "lkg_invalid: inventory missing"
+    return 1
+  }
+  inv_bytes=$(file_bytes "$LKG_INVENTORY") || return 1
+  [ "$inv_bytes" -gt 0 ] && [ "$inv_bytes" -le 32768 ] || {
+    log "lkg_invalid: inventory size out of bounds ($inv_bytes)"
+    return 1
+  }
+  [ "$inv_bytes" = "$expected_bytes" ] || {
+    log "lkg_invalid: inventory byte count mismatch (have $inv_bytes want $expected_bytes)"
+    return 1
+  }
+  inv_sha=$(sha256_file "$LKG_INVENTORY") || return 1
+  [ "$inv_sha" = "$expected_sha" ] || {
+    log "lkg_invalid: inventory digest mismatch (have $inv_sha want $expected_sha)"
+    return 1
+  }
+  verify_tmp=$UPDATE_DIR/.lkg-verify.$$.tmp
+  refuse_symlink "$verify_tmp" "inventory verification temporary" || return 1
+  rm -f "$verify_tmp"
+  if ! write_lkg_inventory "$PREV_DIR" "$verify_tmp"; then
+    rm -f "$verify_tmp"
+    return 1
+  fi
+  verify_sha=$(sha256_file "$verify_tmp") || {
+    rm -f "$verify_tmp"
+    return 1
+  }
+  rm -f "$verify_tmp"
+  [ "$verify_sha" = "$inv_sha" ] || {
+    log "lkg_invalid: retained files do not match canonical inventory"
+    return 1
+  }
+  return 0
+}
+
+pending_invalid() {
+  log "pending_health_invalid: $*"
+  return 1
+}
+
+pending_canonical_matches() {
+  canonical_tmp=$UPDATE_DIR/.pending-verify.$$.tmp
+  refuse_symlink "$canonical_tmp" "pending-health verification temporary" || return 1
+  rm -f "$canonical_tmp"
+  if ! {
+    printf '%s\n' 'IGNITE_PENDING_HEALTH_V1'
+    printf '%s\n' 'schema=1'
+    printf '%s\n' 'status=pending-health'
+    printf 'candidate_version=%s\n' "$PH_CANDIDATE_VERSION"
+    printf 'candidate_txn=%s\n' "$PH_CANDIDATE_TXN"
+    printf 'candidate_app_bytes=%s\n' "$PH_APP_BYTES"
+    printf 'candidate_app_sha256=%s\n' "$PH_APP_SHA"
+    printf 'candidate_lifecycle_bytes=%s\n' "$PH_LIFE_BYTES"
+    printf 'candidate_lifecycle_sha256=%s\n' "$PH_LIFE_SHA"
+    printf '%s\n' 'retained_version=unknown'
+    printf 'retained_release_identity=sha256:%s\n' "$PH_LKG_ID"
+    printf 'lkg_inventory_bytes=%s\n' "$PH_INV_BYTES"
+    printf 'lkg_inventory_sha256=%s\n' "$PH_INV_SHA"
+    printf '%s\n' 'data_compatibility=unknown'
+  } >"$canonical_tmp"; then
+    rm -f "$canonical_tmp"
+    return 1
+  fi
+  if ! cmp -s "$canonical_tmp" "$PENDING_HEALTH"; then
+    rm -f "$canonical_tmp"
+    pending_invalid "record bytes are not the exact canonical 14-line encoding"
+    return 1
+  fi
+  rm -f "$canonical_tmp"
+  return 0
+}
+
+validate_pending_health() {
+  ensure_update_dir || return 1
+  refuse_symlink "$PENDING_HEALTH" "pending-health record" || return 1
+  [ -f "$PENDING_HEALTH" ] || return 1
+  pending_bytes=$(file_bytes "$PENDING_HEALTH") || return 1
+  [ "$pending_bytes" -gt 0 ] && [ "$pending_bytes" -le 4096 ] \
+    || pending_invalid "record size out of bounds ($pending_bytes)" || return 1
+
+  ph_1=$(sed -n '1p' "$PENDING_HEALTH")
+  ph_2=$(sed -n '2p' "$PENDING_HEALTH")
+  ph_3=$(sed -n '3p' "$PENDING_HEALTH")
+  ph_4=$(sed -n '4p' "$PENDING_HEALTH")
+  ph_5=$(sed -n '5p' "$PENDING_HEALTH")
+  ph_6=$(sed -n '6p' "$PENDING_HEALTH")
+  ph_7=$(sed -n '7p' "$PENDING_HEALTH")
+  ph_8=$(sed -n '8p' "$PENDING_HEALTH")
+  ph_9=$(sed -n '9p' "$PENDING_HEALTH")
+  ph_10=$(sed -n '10p' "$PENDING_HEALTH")
+  ph_11=$(sed -n '11p' "$PENDING_HEALTH")
+  ph_12=$(sed -n '12p' "$PENDING_HEALTH")
+  ph_13=$(sed -n '13p' "$PENDING_HEALTH")
+  ph_14=$(sed -n '14p' "$PENDING_HEALTH")
+  [ "$ph_1" = "IGNITE_PENDING_HEALTH_V1" ] || pending_invalid "unsupported header" || return 1
+  [ "$ph_2" = "schema=1" ] || pending_invalid "unsupported schema" || return 1
+  [ "$ph_3" = "status=pending-health" ] || pending_invalid "unsupported status" || return 1
+  case "$ph_4" in candidate_version=*) PH_CANDIDATE_VERSION=${ph_4#candidate_version=} ;; *) pending_invalid "candidate_version missing"; return 1 ;; esac
+  case "$ph_5" in candidate_txn=*) PH_CANDIDATE_TXN=${ph_5#candidate_txn=} ;; *) pending_invalid "candidate_txn missing"; return 1 ;; esac
+  case "$ph_6" in candidate_app_bytes=*) PH_APP_BYTES=${ph_6#candidate_app_bytes=} ;; *) pending_invalid "candidate_app_bytes missing"; return 1 ;; esac
+  case "$ph_7" in candidate_app_sha256=*) PH_APP_SHA=${ph_7#candidate_app_sha256=} ;; *) pending_invalid "candidate_app_sha256 missing"; return 1 ;; esac
+  case "$ph_8" in candidate_lifecycle_bytes=*) PH_LIFE_BYTES=${ph_8#candidate_lifecycle_bytes=} ;; *) pending_invalid "candidate_lifecycle_bytes missing"; return 1 ;; esac
+  case "$ph_9" in candidate_lifecycle_sha256=*) PH_LIFE_SHA=${ph_9#candidate_lifecycle_sha256=} ;; *) pending_invalid "candidate_lifecycle_sha256 missing"; return 1 ;; esac
+  [ "$ph_10" = "retained_version=unknown" ] || pending_invalid "retained_version must remain explicit unknown" || return 1
+  case "$ph_11" in retained_release_identity=sha256:*) PH_LKG_ID=${ph_11#retained_release_identity=sha256:} ;; *) pending_invalid "retained release identity missing"; return 1 ;; esac
+  case "$ph_12" in lkg_inventory_bytes=*) PH_INV_BYTES=${ph_12#lkg_inventory_bytes=} ;; *) pending_invalid "lkg_inventory_bytes missing"; return 1 ;; esac
+  case "$ph_13" in lkg_inventory_sha256=*) PH_INV_SHA=${ph_13#lkg_inventory_sha256=} ;; *) pending_invalid "lkg_inventory_sha256 missing"; return 1 ;; esac
+  [ "$ph_14" = "data_compatibility=unknown" ] || pending_invalid "data compatibility must remain unknown" || return 1
+
+  valid_release_version "$PH_CANDIDATE_VERSION" \
+    || pending_invalid "candidate version malformed or noncanonical" || return 1
+  printf '%s\n' "$PH_CANDIDATE_TXN" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-[0-9]+$' \
+    || pending_invalid "candidate transaction malformed" || return 1
+  for value in "$PH_APP_BYTES" "$PH_LIFE_BYTES" "$PH_INV_BYTES"; do
+    printf '%s\n' "$value" | grep -Eq '^(0|[1-9][0-9]*)$' \
+      || pending_invalid "non-canonical byte count" || return 1
+  done
+  for digest in "$PH_APP_SHA" "$PH_LIFE_SHA" "$PH_LKG_ID" "$PH_INV_SHA"; do
+    printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$' \
+      || pending_invalid "malformed SHA-256 digest" || return 1
+  done
+  [ "$PH_LKG_ID" = "$PH_INV_SHA" ] \
+    || pending_invalid "retained release identity does not match inventory identity" || return 1
+  pending_canonical_matches || return 1
+
+  for live in "$STABLE_APP" "$STABLE_LIFE"; do
+    refuse_symlink "$live" "installed candidate file" || return 1
+    [ -f "$live" ] || pending_invalid "installed candidate file missing: $live" || return 1
+  done
+  live_app_bytes=$(file_bytes "$STABLE_APP") \
+    || pending_invalid "cannot measure installed candidate application" || return 1
+  live_app_sha=$(sha256_file "$STABLE_APP") \
+    || pending_invalid "cannot hash installed candidate application" || return 1
+  [ "$live_app_bytes" = "$PH_APP_BYTES" ] \
+    && [ "$live_app_sha" = "$PH_APP_SHA" ] \
+    || pending_invalid "installed candidate application does not match record" || return 1
+  live_life_bytes=$(file_bytes "$STABLE_LIFE") \
+    || pending_invalid "cannot measure installed candidate lifecycle" || return 1
+  live_life_sha=$(sha256_file "$STABLE_LIFE") \
+    || pending_invalid "cannot hash installed candidate lifecycle" || return 1
+  [ "$live_life_bytes" = "$PH_LIFE_BYTES" ] \
+    && [ "$live_life_sha" = "$PH_LIFE_SHA" ] \
+    || pending_invalid "installed candidate lifecycle does not match record" || return 1
+  validate_lkg_inventory "$PH_INV_BYTES" "$PH_INV_SHA" || return 1
+  return 0
+}
+
+guard_pending_health() {
+  ensure_update_dir || die "pending health state path is unsafe"
+  if [ -e "$PENDING_HEALTH" ] || [ -L "$PENDING_HEALTH" ]; then
+    validate_pending_health \
+      || die "pending health state is malformed, damaged, or inconsistent; retained recovery evidence was not changed"
+    die "update blocked: candidate $PH_CANDIDATE_VERSION transaction $PH_CANDIDATE_TXN is still pending health qualification; retained last-known-good was preserved"
+  fi
+  if [ -e "$LKG_INVENTORY" ] || [ -L "$LKG_INVENTORY" ] \
+    || [ -e "$LKG_HANDLER" ] || [ -L "$LKG_HANDLER" ]; then
+    die "pending health state is missing but retained qualification metadata remains; refusing ambiguous installation without deleting evidence"
+  fi
+  for orphan in "$UPDATE_DIR"/.pending-health.*.tmp \
+    "$UPDATE_DIR"/.pending-verify.*.tmp "$UPDATE_DIR"/.lkg-verify.*.tmp; do
+    if [ -e "$orphan" ] || [ -L "$orphan" ]; then
+      die "pending health state has an orphaned temporary file; refusing ambiguous installation without deleting evidence"
+    fi
+  done
+  return 0
+}
+
 load_handler_snap_from_journal() {
   if [ ! -f "$JOURNAL" ]; then
     return 0
@@ -135,11 +489,102 @@ journal_had_previous() {
   fi
 }
 
+cleanup_lkg_temporaries() {
+  refuse_symlink "$PREV_DIR" "previous-release directory" || return 1
+  refuse_symlink "$UPDATE_DIR" "update state directory" || return 1
+  rm -f "$PREV_DIR/.ignite-lkg-inventory."*.tmp \
+    "$PREV_DIR/.appreg-handler."*.tmp \
+    "$PREV_DIR/.lkg-complete."*.tmp \
+    "$UPDATE_DIR/.pending-health."*.tmp \
+    "$UPDATE_DIR/.pending-verify."*.tmp \
+    "$UPDATE_DIR/.lkg-verify."*.tmp 2>/dev/null || true
+  return 0
+}
+
 cleanup_committed_leftovers() {
+  cleanup_lkg_temporaries || return 1
   rm -f "$JOURNAL" "$JOURNAL.tmp" 2>/dev/null || true
   rm -rf "$PREV_STAGING" || true
   rm -rf "$PREV_OLD" || true
   rm -f "$COMMITTED" "$COMMITTED.tmp" 2>/dev/null || true
+  return 0
+}
+
+v2_commit_marker_canonical_matches() {
+  expected_marker=$1
+  marker_bytes=$(file_bytes "$COMMITTED") || {
+    log "install_recover: cannot measure activation commit marker"
+    return 1
+  }
+  [ "$marker_bytes" -gt 0 ] && [ "$marker_bytes" -le 256 ] || {
+    log "install_recover: activation commit marker size is out of bounds"
+    return 1
+  }
+  marker_tmp=$APP_ROOT/run/.commit-verify.$$.tmp
+  refuse_symlink "$marker_tmp" "activation commit verification temporary" || return 1
+  rm -f "$marker_tmp"
+  if ! printf '%s\n' "$expected_marker" >"$marker_tmp"; then
+    rm -f "$marker_tmp"
+    return 1
+  fi
+  if ! cmp -s "$marker_tmp" "$COMMITTED"; then
+    rm -f "$marker_tmp"
+    log "install_recover: v2 activation commit marker is not canonically encoded"
+    return 1
+  fi
+  rm -f "$marker_tmp"
+  return 0
+}
+
+validate_committed_transaction() {
+  refuse_symlink "$COMMITTED" "activation commit marker" || return 1
+  [ -f "$COMMITTED" ] || return 1
+  marker=$(sed -n '1p' "$COMMITTED")
+  case "$marker" in
+    committed\ txn=*)
+      # Legacy v1 marker: preserve the existing authoritative cleanup behavior.
+      return 0
+      ;;
+    ignite-activate-commit-v2\ txn=*\ pending_health=0)
+      commit_txn=${marker#ignite-activate-commit-v2 txn=}
+      commit_txn=${commit_txn% pending_health=0}
+      commit_pending=0
+      ;;
+    ignite-activate-commit-v2\ txn=*\ pending_health=1)
+      commit_txn=${marker#ignite-activate-commit-v2 txn=}
+      commit_txn=${commit_txn% pending_health=1}
+      commit_pending=1
+      ;;
+    *)
+      log "install_recover: malformed or unsupported activation commit marker"
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$commit_txn" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-[0-9]+$' || {
+    log "install_recover: malformed transaction id in commit marker"
+    return 1
+  }
+  v2_commit_marker_canonical_matches \
+    "ignite-activate-commit-v2 txn=$commit_txn pending_health=$commit_pending" || return 1
+  if [ "$commit_pending" = "0" ]; then
+    if [ -e "$PENDING_HEALTH" ] || [ -L "$PENDING_HEALTH" ]; then
+      log "install_recover: committed first install has contradictory pending-health state"
+      return 1
+    fi
+  else
+    validate_pending_health || return 1
+    [ "$PH_CANDIDATE_TXN" = "$commit_txn" ] || {
+      log "install_recover: committed transaction does not match pending-health transaction"
+      return 1
+    }
+  fi
+  if [ -f "$JOURNAL" ]; then
+    journal_txn=$(grep '^# txn=' "$JOURNAL" 2>/dev/null | tail -n 1 | sed 's/^# txn=//') || true
+    [ "$journal_txn" = "$commit_txn" ] || {
+      log "install_recover: journal and commit marker transaction ids differ"
+      return 1
+    }
+  fi
   return 0
 }
 
@@ -153,6 +598,7 @@ restore_pending_transaction() {
   had=$(journal_had_previous)
   load_handler_snap_from_journal
   rm -rf "$PREV_STAGING" || true
+  cleanup_lkg_temporaries || return 1
   if [ "$had" = "0" ]; then
     log "install_recover: pending first-install; discarding incomplete runtime"
     rm -rf "$PREV_DIR" "$PREV_OLD" || true
@@ -164,13 +610,19 @@ restore_pending_transaction() {
     fi
   fi
   rollback_runtime || return 1
+  # Candidate metadata belongs to the rolled-back transaction. Remove it only
+  # after A and its Ignite handler have been restored successfully.
+  rm -f "$PENDING_HEALTH" "$LKG_INVENTORY" "$LKG_HANDLER"
+  sync
   rm -f "$JOURNAL"
+  sync
   return 0
 }
 
 recover_install_transaction() {
   if [ -f "$COMMITTED" ]; then
     log "install_recover: committed transaction leftover cleanup (keep installed runtime)"
+    validate_committed_transaction || return 1
     cleanup_committed_leftovers
     return 0
   fi
@@ -180,6 +632,7 @@ recover_install_transaction() {
     return 0
   fi
   rm -rf "$PREV_STAGING" || true
+  cleanup_lkg_temporaries || return 1
   if [ ! -f "$PREV_DIR/scribe-app" ] && [ -f "$PREV_OLD/scribe-app" ]; then
     log "install_recover: restoring recovery base from .prev (no pending journal)"
     rm -rf "$PREV_DIR"
@@ -191,28 +644,42 @@ recover_install_transaction() {
 snapshot_copy_optional() {
   src=$1
   dest=$2
+  refuse_symlink "$src" "snapshot source" || return 1
   if [ ! -f "$src" ]; then
     return 0
   fi
   cp -f "$src" "$dest" || return 1
 }
 
+snapshot_copy_required() {
+  src=$1
+  dest=$2
+  refuse_symlink "$src" "snapshot source" || return 1
+  [ -f "$src" ] || return 1
+  cp -f "$src" "$dest" || return 1
+}
+
 # Fill staging from live files, then publish as previous-release.
 # Does NOT delete .prev: that remains the old recovery base until durable commit.
 snapshot_previous_release() {
+  refuse_symlink "$PREV_DIR" "previous-release" || return 1
+  refuse_symlink "$PREV_OLD" "previous-release.prev" || return 1
+  refuse_symlink "$PREV_STAGING" "previous-release.staging" || return 1
   rm -rf "$PREV_STAGING"
   mkdir -p "$PREV_STAGING" || return 1
-  cp -f "$STABLE_APP" "$PREV_STAGING/scribe-app" || return 1
-  cp -f "$STABLE_LIFE" "$PREV_STAGING/scribe-lifecycle" || return 1
-  cp -f "$STABLE_HOST" "$PREV_STAGING/scribe-lifecycle-host.sh" || return 1
+  snapshot_copy_required "$STABLE_APP" "$PREV_STAGING/scribe-app" || return 1
+  snapshot_copy_required "$STABLE_LIFE" "$PREV_STAGING/scribe-lifecycle" || return 1
+  snapshot_copy_required "$STABLE_HOST" "$PREV_STAGING/scribe-lifecycle-host.sh" || return 1
   snapshot_copy_optional "$SCRIPTLET" "$PREV_STAGING/Scribe.sh" || return 1
   snapshot_copy_optional "$APP_ROOT/assets/scribe-icon.png" "$PREV_STAGING/scribe-icon.png" || return 1
   snapshot_copy_optional "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt" "$PREV_STAGING/OFL.txt" || return 1
   snapshot_copy_optional "$APP_ROOT/assets/licenses/noto-emoji/DESCRIPTION.en_us.html" \
     "$PREV_STAGING/DESCRIPTION.en_us.html" || return 1
+  snapshot_copy_optional "$APP_ROOT/assets/licenses/noto-emoji/upstream_info.md" \
+    "$PREV_STAGING/upstream_info.md" || return 1
   snapshot_copy_optional "$APP_ROOT/assets/licenses/source-sans-3/OFL.txt" \
     "$PREV_STAGING/source-sans-3-OFL.txt" || return 1
-  for helper in install-runtime.sh uninstall-runtime.sh backup-runtime.sh register-helpers.sh; do
+  for helper in install-runtime.sh uninstall-runtime.sh backup-runtime.sh register-helpers.sh install-recovery.sh; do
     snapshot_copy_optional "$TOOLS_LIB/$helper" "$PREV_STAGING/$helper" || return 1
   done
   snapshot_copy_optional "$DOCS/Uninstall Ignite.sh" "$PREV_STAGING/Uninstall Ignite.sh" || return 1
@@ -236,9 +703,164 @@ snapshot_previous_release() {
   return 0
 }
 
+verify_or_complete_snapshot_entry() {
+  name=$1
+  live=$2
+  retained=$PREV_DIR/$name
+  refuse_symlink "$live" "live release file $name" || return 1
+  refuse_symlink "$retained" "retained release file $name" || return 1
+  if [ -e "$live" ] && [ ! -f "$live" ]; then
+    log "lkg_invalid: live release path is not a regular file: $name"
+    return 1
+  fi
+  if [ -e "$retained" ] && [ ! -f "$retained" ]; then
+    log "lkg_invalid: retained release path is not a regular file: $name"
+    return 1
+  fi
+  if [ -f "$retained" ]; then
+    [ -f "$live" ] || {
+      log "lkg_invalid: retained file has no matching live release file: $name"
+      return 1
+    }
+    retained_bytes=$(file_bytes "$retained") || return 1
+    live_bytes=$(file_bytes "$live") || return 1
+    retained_sha=$(sha256_file "$retained") || return 1
+    live_sha=$(sha256_file "$live") || return 1
+    [ "$retained_bytes" = "$live_bytes" ] && [ "$retained_sha" = "$live_sha" ] || {
+      log "lkg_invalid: existing retained file does not match live release A: $name"
+      return 1
+    }
+    return 0
+  fi
+  [ -f "$live" ] || return 0
+
+  complete_tmp=$PREV_DIR/.lkg-complete.$$.tmp
+  refuse_symlink "$complete_tmp" "retained completion temporary" || return 1
+  rm -f "$complete_tmp"
+  cp -f "$live" "$complete_tmp" || return 1
+  sync
+  mv -f "$complete_tmp" "$retained" || return 1
+  sync
+  log "install_snapshot: completed legacy retained entry $name"
+  return 0
+}
+
+# A legacy successful install already has previous-release=A, so the ordinary
+# snapshot path intentionally does not replace it. Verify that it is the same A
+# as the live release and atomically fill any release-owned entries that older
+# snapshot code did not retain.
+prepare_existing_snapshot() {
+  validate_snapshot_tree "$PREV_DIR" || return 1
+  verify_or_complete_snapshot_entry scribe-app "$STABLE_APP" || return 1
+  verify_or_complete_snapshot_entry scribe-lifecycle "$STABLE_LIFE" || return 1
+  verify_or_complete_snapshot_entry scribe-lifecycle-host.sh "$STABLE_HOST" || return 1
+  verify_or_complete_snapshot_entry Scribe.sh "$SCRIPTLET" || return 1
+  verify_or_complete_snapshot_entry scribe-icon.png "$APP_ROOT/assets/scribe-icon.png" || return 1
+  verify_or_complete_snapshot_entry OFL.txt "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt" || return 1
+  verify_or_complete_snapshot_entry DESCRIPTION.en_us.html \
+    "$APP_ROOT/assets/licenses/noto-emoji/DESCRIPTION.en_us.html" || return 1
+  verify_or_complete_snapshot_entry upstream_info.md \
+    "$APP_ROOT/assets/licenses/noto-emoji/upstream_info.md" || return 1
+  verify_or_complete_snapshot_entry source-sans-3-OFL.txt \
+    "$APP_ROOT/assets/licenses/source-sans-3/OFL.txt" || return 1
+  verify_or_complete_snapshot_entry install-runtime.sh "$TOOLS_LIB/install-runtime.sh" || return 1
+  verify_or_complete_snapshot_entry uninstall-runtime.sh "$TOOLS_LIB/uninstall-runtime.sh" || return 1
+  verify_or_complete_snapshot_entry backup-runtime.sh "$TOOLS_LIB/backup-runtime.sh" || return 1
+  verify_or_complete_snapshot_entry register-helpers.sh "$TOOLS_LIB/register-helpers.sh" || return 1
+  verify_or_complete_snapshot_entry install-recovery.sh "$TOOLS_LIB/install-recovery.sh" || return 1
+  verify_or_complete_snapshot_entry "Uninstall Ignite.sh" "$DOCS/Uninstall Ignite.sh" || return 1
+  verify_or_complete_snapshot_entry "Backup Ignite Data.sh" "$DOCS/Backup Ignite Data.sh" || return 1
+  verify_or_complete_snapshot_entry "Diagnose Ignite.sh" "$DOCS/Diagnose Ignite.sh" || return 1
+  return 0
+}
+
+retain_lkg_handler_snapshot() {
+  [ "${HAD_PREVIOUS:-0}" = "1" ] || return 0
+  validate_snapshot_tree "$PREV_DIR" || return 1
+  refuse_symlink "$LKG_HANDLER" "retained handler snapshot" || return 1
+  handler_tmp=$PREV_DIR/.appreg-handler.${ACTIVATE_TXN}.tmp
+  refuse_symlink "$handler_tmp" "retained handler temporary" || return 1
+  rm -f "$handler_tmp"
+  if [ "${IGNITE_SKIP_REGISTER:-}" = "1" ]; then
+    rm -f "$LKG_HANDLER"
+    return 0
+  fi
+  [ -n "${IGNITE_HANDLER_SNAP:-}" ] \
+    && [ -f "$IGNITE_HANDLER_SNAP" ] \
+    && [ ! -L "$IGNITE_HANDLER_SNAP" ] || {
+      log "lkg_invalid: pre-upgrade Ignite handler snapshot is unavailable"
+      return 1
+    }
+  cp -f "$IGNITE_HANDLER_SNAP" "$handler_tmp" || return 1
+  chmod 0600 "$handler_tmp" 2>/dev/null || true
+  sync
+  mv -f "$handler_tmp" "$LKG_HANDLER" || return 1
+  sync
+  return 0
+}
+
+publish_lkg_inventory() {
+  [ "${HAD_PREVIOUS:-0}" = "1" ] || return 0
+  inventory_tmp=$PREV_DIR/.ignite-lkg-inventory.${ACTIVATE_TXN}.tmp
+  refuse_symlink "$inventory_tmp" "retained inventory temporary" || return 1
+  rm -f "$inventory_tmp"
+  write_lkg_inventory "$PREV_DIR" "$inventory_tmp" || return 1
+  chmod 0600 "$inventory_tmp" 2>/dev/null || true
+  sync
+  publish_crash before-lkg-inventory-publish
+  mv -f "$inventory_tmp" "$LKG_INVENTORY" || return 1
+  sync
+  publish_crash after-lkg-inventory-publish
+  LKG_INVENTORY_BYTES=$(file_bytes "$LKG_INVENTORY") || return 1
+  LKG_INVENTORY_SHA=$(sha256_file "$LKG_INVENTORY") || return 1
+  validate_lkg_inventory "$LKG_INVENTORY_BYTES" "$LKG_INVENTORY_SHA" || return 1
+  return 0
+}
+
+publish_pending_health() {
+  [ "${HAD_PREVIOUS:-0}" = "1" ] || return 0
+  ensure_update_dir || return 1
+  if [ -e "$PENDING_HEALTH" ] || [ -L "$PENDING_HEALTH" ]; then
+    log "pending_health_invalid: refusing to overwrite existing pending-health record"
+    return 1
+  fi
+  pending_tmp=$UPDATE_DIR/.pending-health.${ACTIVATE_TXN}.tmp
+  refuse_symlink "$pending_tmp" "pending-health temporary" || return 1
+  rm -f "$pending_tmp"
+  candidate_app_bytes=$(file_bytes "$STABLE_APP") || return 1
+  candidate_app_sha=$(sha256_file "$STABLE_APP") || return 1
+  candidate_life_bytes=$(file_bytes "$STABLE_LIFE") || return 1
+  candidate_life_sha=$(sha256_file "$STABLE_LIFE") || return 1
+  {
+    printf '%s\n' 'IGNITE_PENDING_HEALTH_V1'
+    printf '%s\n' 'schema=1'
+    printf '%s\n' 'status=pending-health'
+    printf 'candidate_version=%s\n' "$CANDIDATE_VERSION"
+    printf 'candidate_txn=%s\n' "$ACTIVATE_TXN"
+    printf 'candidate_app_bytes=%s\n' "$candidate_app_bytes"
+    printf 'candidate_app_sha256=%s\n' "$candidate_app_sha"
+    printf 'candidate_lifecycle_bytes=%s\n' "$candidate_life_bytes"
+    printf 'candidate_lifecycle_sha256=%s\n' "$candidate_life_sha"
+    printf '%s\n' 'retained_version=unknown'
+    printf 'retained_release_identity=sha256:%s\n' "$LKG_INVENTORY_SHA"
+    printf 'lkg_inventory_bytes=%s\n' "$LKG_INVENTORY_BYTES"
+    printf 'lkg_inventory_sha256=%s\n' "$LKG_INVENTORY_SHA"
+    printf '%s\n' 'data_compatibility=unknown'
+  } >"$pending_tmp" || return 1
+  chmod 0600 "$pending_tmp" 2>/dev/null || true
+  sync
+  publish_crash before-pending-health-publish
+  mv -f "$pending_tmp" "$PENDING_HEALTH" || return 1
+  sync
+  publish_crash after-pending-health-publish
+  validate_pending_health || return 1
+  return 0
+}
+
 commit_install_transaction() {
   mkdir -p "$APP_ROOT/run" || return 1
-  printf 'committed txn=%s\n' "${ACTIVATE_TXN:-unknown}" >"$COMMITTED.tmp" || return 1
+  printf 'ignite-activate-commit-v2 txn=%s pending_health=%s\n' \
+    "${ACTIVATE_TXN:-unknown}" "${HAD_PREVIOUS:-0}" >"$COMMITTED.tmp" || return 1
   sync
   mv -f "$COMMITTED.tmp" "$COMMITTED" || return 1
   sync
@@ -262,9 +884,11 @@ rollback_runtime() {
     restore_cp_optional "$PREV_DIR/OFL.txt" "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt" ofl || return 1
     restore_cp_optional "$PREV_DIR/DESCRIPTION.en_us.html" \
       "$APP_ROOT/assets/licenses/noto-emoji/DESCRIPTION.en_us.html" description || return 1
+    restore_cp_optional "$PREV_DIR/upstream_info.md" \
+      "$APP_ROOT/assets/licenses/noto-emoji/upstream_info.md" upstream-info || return 1
     restore_cp_optional "$PREV_DIR/source-sans-3-OFL.txt" \
       "$APP_ROOT/assets/licenses/source-sans-3/OFL.txt" source-sans-ofl || return 1
-    for helper in install-runtime.sh uninstall-runtime.sh backup-runtime.sh register-helpers.sh; do
+    for helper in install-runtime.sh uninstall-runtime.sh backup-runtime.sh register-helpers.sh install-recovery.sh; do
       restore_cp_optional "$PREV_DIR/$helper" "$TOOLS_LIB/$helper" "helper-$helper" || return 1
     done
     restore_cp_optional "$PREV_DIR/Uninstall Ignite.sh" "$DOCS/Uninstall Ignite.sh" uninstall-docs || return 1
@@ -339,6 +963,15 @@ activate_mv_optional() {
 [ -f "$PACKAGE_ROOT/recovery/bin/dropbearmulti" ] || die "missing recovery/bin/dropbearmulti"
 [ -f "$PACKAGE_ROOT/recovery/manifest/elf.sha256" ] || die "missing recovery/manifest/elf.sha256"
 [ -f "$PACKAGE_ROOT/lib/install-recovery.sh" ] || die "missing lib/install-recovery.sh"
+command -v sha256sum >/dev/null 2>&1 || die "unsupported: sha256sum is required for retained-release integrity"
+
+PACKAGE_NAME=${PACKAGE_ROOT##*/}
+case "$PACKAGE_NAME" in
+  Ignite-Kindle-*) CANDIDATE_VERSION=${PACKAGE_NAME#Ignite-Kindle-} ;;
+  *) die "package directory name is malformed: $PACKAGE_NAME" ;;
+esac
+valid_release_version "$CANDIDATE_VERSION" \
+  || die "package version is malformed or noncanonical: $CANDIDATE_VERSION"
 
 # Full-feature host policy (ignore comment lines): sync capability required; optional to use.
 _host_active=$(grep -v '^[[:space:]]*#' "$PACKAGE_ROOT/host/scribe-lifecycle-host.sh" || true)
@@ -431,11 +1064,18 @@ mkdir -p "$APP_ROOT/bin" \
 
 recover_install_transaction || die "interrupted: could not finish recovery from a previous incomplete Install Ignite. Notebooks were not deleted. Copy Ignite-Diagnose from Documents over USB."
 
+# A committed candidate awaiting qualification owns the retained A snapshot.
+# No installer invocation is authorized to replace either one in this slice.
+guard_pending_health
+
 cleanup_staged_new
 
 # Snapshot last successful live files only if previous-release is empty.
 if [ ! -f "$PREV_DIR/scribe-app" ] && [ -f "$STABLE_APP" ]; then
   snapshot_previous_release || die "could not snapshot current release for rollback"
+fi
+if [ -f "$PREV_DIR/scribe-app" ] && [ -f "$STABLE_APP" ]; then
+  prepare_existing_snapshot || die "existing previous-release does not exactly match live release A"
 fi
 
 # --- stage *.new (release-owned files only) ---
@@ -498,11 +1138,12 @@ else
   HAD_PREVIOUS=0
 fi
 {
-  echo "# ignite-activate v1"
+  echo "# ignite-activate v2"
   echo "# txn=$ACTIVATE_TXN"
   echo "# package=$PACKAGE_ROOT"
   echo "# phase=pending"
   echo "# had_previous=$HAD_PREVIOUS"
+  echo "# pending_health_required=$HAD_PREVIOUS"
 } >"$JOURNAL"
 
 activate_mv scribe-app "$STABLE_APP.new" "$STABLE_APP"
@@ -543,6 +1184,11 @@ if [ "${IGNITE_SKIP_REGISTER:-}" != "1" ]; then
   fi
 fi
 
+# The retained application registration is scoped to Ignite only. It is copied
+# into A before its canonical inventory is published; notebook/sync/device state
+# is never part of this snapshot.
+retain_lkg_handler_snapshot || fail_and_rollback "could not retain previous Ignite handler state"
+
 # --- post-install verification ---
 verify_fail() { fail_and_rollback "post-install verification failed: $*"; }
 if [ "${IGNITE_FORCE_VERIFY_FAIL:-}" = "1" ]; then
@@ -580,8 +1226,20 @@ else
   fi
 fi
 
-# Publish new recovery base B; keep A in .prev until durable commit.
-snapshot_previous_release || fail_and_rollback "previous-release snapshot failed"
+# Static application verification has succeeded, but B is not yet transactionally
+# committed and is not health-qualified. Any interruption before the commit marker
+# remains an ordinary installer rollback to A.
+publish_crash after-static-verification
+
+if ! ignite_install_recovery "$PACKAGE_ROOT"; then
+  fail_and_rollback "recovery component failed before application commit; retained application was restored"
+fi
+
+# For upgrades, keep A in previous-release and publish its exact inventory plus
+# B's pending-health record before the durable commit marker. First installs have
+# no A and therefore publish neither LKG nor pending-health state.
+publish_lkg_inventory || fail_and_rollback "last-known-good inventory publication failed"
+publish_pending_health || fail_and_rollback "pending-health publication failed"
 publish_crash before-commit
 commit_install_transaction || fail_and_rollback "durable commit marker failed"
 publish_crash after-commit
@@ -590,10 +1248,6 @@ rm -f "$JOURNAL"
 publish_crash before-prev-cleanup
 rm -rf "$PREV_OLD"
 rm -f "$COMMITTED" "$COMMITTED.tmp"
-
-if ! ignite_install_recovery "$PACKAGE_ROOT"; then
-  die "recovery component failed after application files were installed. Notebooks were not deleted. Recovery executable was not published. Copy Ignite-Diagnose from Documents."
-fi
 
 log "install_ok profile=full-feature package=$PACKAGE_ROOT recovery=installed spawned=no"
 log "notebook data path untouched: $DATA_DIR"
