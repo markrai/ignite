@@ -30,7 +30,10 @@ pub const EXPECTED_GRAYSCALE: u32 = 2;
 /// Linux `fb.h` grayscale flag / Lab126 `GRAYSCALE_8BIT`. Same 8-bit packed layout.
 pub const ACCEPTED_GRAYSCALE_LINUX_GRAY: u32 = 1;
 pub const EXPECTED_NONSTD: u32 = 1;
+/// Rotation from the proven 5.18.6 snapshot. A 5.19.6 diagnostic reports 1
+/// with the same portrait geometry; screen orientation still needs hardware confirmation.
 pub const EXPECTED_ROTATE: u32 = 3;
+pub const ACCEPTED_ROTATE_CW: u32 = 1;
 
 /// Probe-reported hardware black/white observation (`ink-probe` Gate B).
 /// Compositor polarity lives in `fb_polarity` (`LOGICAL_BLACK` / `LOGICAL_WHITE`).
@@ -91,7 +94,12 @@ pub fn check_preconditions(
         ));
     }
     check_u32("nonstd", var.nonstd, EXPECTED_NONSTD, &mut mismatches);
-    check_u32("rotate", var.rotate, EXPECTED_ROTATE, &mut mismatches);
+    if var.rotate != EXPECTED_ROTATE && var.rotate != ACCEPTED_ROTATE_CW {
+        mismatches.push(format!(
+            "rotate: got {}, expected {} (or {} observed in the 5.19.6 diagnostic)",
+            var.rotate, EXPECTED_ROTATE, ACCEPTED_ROTATE_CW
+        ));
+    }
 
     if mismatches.is_empty() {
         Ok(())

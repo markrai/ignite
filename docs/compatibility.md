@@ -20,6 +20,7 @@ Evidence classes:
 |--------|----------|--------|---------|----------------|-------|-------|
 | Scribe (1st gen / 2022) | 5.18.6 | **0.9.11** | Fresh install/migrate + idempotent reinstall on device | `grayscale=2`, identity polarity | **Verified** | Namespace `com.markrai.ignite`; Scriptlet SHA-256 `7c71b74887ffa546febacb9ff361f8c2cfd2719f8b4dd1d4083d963fd1f0e1e0` |
 | Scribe (2024) | 5.19.6 | 0.9.11 candidate | Intended | `grayscale=1`, complement polarity | **Tester** / in progress | Polarity fix from 0.9.10; confirm identity migration + polarity on device |
+| Scribe (1st gen / 2022) | 5.19.6 | 0.9.14 diagnostic | Install succeeds; launch stopped at Gate B | `grayscale=1`, `rotate=1` reported with portrait geometry | **Reported** | Gate now allows this observed rotation value; screen orientation / ink remain unconfirmed |
 | Other Kindle models | — | — | — | — | **Untested** | Not a goal of current packages |
 | Stock (no jailbreak) | any | — | Will refuse | — | **Verified** refusal | Missing root helper / preparation |
 
