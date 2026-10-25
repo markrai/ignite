@@ -33,6 +33,7 @@ pub const EXPECTED_NONSTD: u32 = 1;
 /// Rotation from the proven 5.18.6 snapshot. A 5.19.6 diagnostic reports 1
 /// with the same portrait geometry; screen orientation still needs hardware confirmation.
 pub const EXPECTED_ROTATE: u32 = 3;
+/// Alternate 5.19.6 diagnostic value; runtime reverses both touch and stylus axes for it.
 pub const ACCEPTED_ROTATE_CW: u32 = 1;
 
 /// Probe-reported hardware black/white observation (`ink-probe` Gate B).

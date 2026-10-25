@@ -13,4 +13,4 @@ Capture them during hardware qualification of a release candidate (see
 | `sync.jpg` | Optional: pairing / sync with Ignite Server (only if that feature is advertised) |
 
 Commit the files next to this note and embed them in the root `README.md`.
-Do not add placeholder or AI-generated images.
+Do not add placeholder, mocked, or reconstructed images.
