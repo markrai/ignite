@@ -3658,11 +3658,16 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         match LinuxEvdevTouch::open_observer(path) {
             Ok(t) => {
                 let axes = t.axes();
-                match TouchMapping::new((axes.x.min, axes.x.max), (axes.y.min, axes.y.max), &g) {
+                match TouchMapping::for_rotation(
+                    (axes.x.min, axes.x.max),
+                    (axes.y.min, axes.y.max),
+                    &g,
+                    fb.var.rotate,
+                ) {
                     Ok(mapping) => {
                         println!(
-                            "touch=observer path={path} grab=never x={}..{} y={}..{} slot_max={}",
-                            axes.x.min, axes.x.max, axes.y.min, axes.y.max, axes.slot_max
+                            "touch=observer path={path} grab=never rotate={} x={}..{} y={}..{} slot_max={}",
+                            fb.var.rotate, axes.x.min, axes.x.max, axes.y.min, axes.y.max, axes.slot_max
                         );
                         touch = Some((TouchPump::start(t), mapping));
                     }
