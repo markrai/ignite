@@ -206,6 +206,8 @@ pub struct ChildSupervisor {
     pub events: Option<std::process::ChildStdin>,
     /// Observation-only readiness for the currently associated child process.
     pub health: Option<crate::launch_health::LaunchHealthObserver>,
+    /// Nonblocking sender for best-effort, candidate-bound durable evidence.
+    pub evidence: Option<crate::candidate_health::EvidenceObserver>,
 }
 
 impl LifecycleState {

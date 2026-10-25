@@ -960,6 +960,7 @@ version = "0.9.14"
 dependencies = [
  "libc",
  "libloading",
+ "sha2",
  "uuid",
 ]
 

@@ -237,6 +237,10 @@ mod unix {
             );
         }
 
+        pub fn attempt(&self) -> &str {
+            self.observation.attempt()
+        }
+
         pub fn spawned(mut self, now: Instant, timeout: Duration) -> LaunchHealthObserver {
             let _ = self.observation.child_spawned();
             drop(self.child_sender);
@@ -361,6 +365,7 @@ mod unix {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::os::fd::FromRawFd;
         use std::process::{Child, ExitStatus, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
         use std::thread;
 
@@ -369,6 +374,25 @@ mod unix {
         const FIXTURE_MARKER: &str = "launch-health-fixture-ran";
         const FIRST: &str = "00112233445566778899aabbccddeeff";
         const CHILD_DEADLINE: Duration = Duration::from_secs(5);
+        static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn record_stop_request(_signal: libc::c_int) {
+            STOP_REQUESTED.store(true, Ordering::SeqCst);
+        }
+
+        fn install_stop_handler() {
+            STOP_REQUESTED.store(false, Ordering::SeqCst);
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = record_stop_request as *const () as usize;
+            action.sa_flags = 0;
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+                assert_eq!(
+                    libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()),
+                    0
+                );
+            }
+        }
 
         #[test]
         #[ignore = "subprocess fixture; invoked by launch-health integration tests"]
@@ -394,6 +418,21 @@ mod unix {
                 "missing" | "noop" => {}
                 "crash" => std::process::exit(17),
                 "legacy" => {
+                    println!("{FIXTURE_MARKER}");
+                    std::io::stdout().flush().expect("flush fixture marker");
+                    thread::park_timeout(CHILD_DEADLINE);
+                    return;
+                }
+                "stop-clean" => {
+                    install_stop_handler();
+                    println!("{FIXTURE_MARKER}");
+                    std::io::stdout().flush().expect("flush fixture marker");
+                    while !STOP_REQUESTED.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    return;
+                }
+                "stop-abnormal" => {
                     println!("{FIXTURE_MARKER}");
                     std::io::stdout().flush().expect("flush fixture marker");
                     thread::park_timeout(CHILD_DEADLINE);

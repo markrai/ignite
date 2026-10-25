@@ -1281,6 +1281,30 @@ def test_pending_health_blocks_reinstall_and_stacked_upgrade(tmp_path: Path) -> 
     retained_a = (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes()
     pending = _pending_path(kindle).read_bytes()
     inventory = _inventory_path(kindle).read_bytes()
+    pending_fields = _read_record(_pending_path(kindle))
+    evidence_path = kindle / "scribe-app" / "state" / "update" / "launch-health-evidence.v1"
+    evidence = (
+        "IGNITE_LAUNCH_HEALTH_EVIDENCE_V1\n"
+        "schema=1\n"
+        f"candidate_version={pending_fields['candidate_version']}\n"
+        f"candidate_txn={pending_fields['candidate_txn']}\n"
+        f"pending_sha256={hashlib.sha256(pending).hexdigest()}\n"
+        f"candidate_app_bytes={pending_fields['candidate_app_bytes']}\n"
+        f"candidate_app_sha256={pending_fields['candidate_app_sha256']}\n"
+        f"candidate_lifecycle_bytes={pending_fields['candidate_lifecycle_bytes']}\n"
+        f"candidate_lifecycle_sha256={pending_fields['candidate_lifecycle_sha256']}\n"
+        "launch_uuid=00112233445566778899aabbccddeeff\n"
+        "outcome=ready_running\n"
+        "ready=true\n"
+        "readiness=ready\n"
+        "process=running\n"
+        "observation_complete=false\n"
+        "ready_elapsed_ms=250\n"
+        "post_ready_observed_ms=60000\n"
+        "qualification=unqualified\n"
+        "data_compatibility=unknown\n"
+    ).encode("ascii")
+    evidence_path.write_bytes(evidence)
 
     for attempted in (payload_b, payload_c):
         refused = _run_install(attempted, kindle)
@@ -1290,6 +1314,7 @@ def test_pending_health_blocks_reinstall_and_stacked_upgrade(tmp_path: Path) -> 
         assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == retained_a
         assert _pending_path(kindle).read_bytes() == pending
         assert _inventory_path(kindle).read_bytes() == inventory
+        assert evidence_path.read_bytes() == evidence
 
 
 def test_pending_health_record_damage_fails_closed(tmp_path: Path) -> None:

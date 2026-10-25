@@ -16,10 +16,16 @@ mod launch_health;
 mod protocol;
 
 #[cfg(unix)]
+mod candidate_health;
+
+#[cfg(unix)]
 mod lipc;
 
 #[cfg(unix)]
 mod unix_main {
+    use crate::candidate_health::{
+        EvidenceObserver, EvidenceReport, InitialEvidence, LaunchAttempt, DEFAULT_UPDATE_DIR,
+    };
     use crate::launch_health::{
         clear_handshake_environment, LaunchState, ObserverEvent, PreparedLaunchHealth,
     };
@@ -48,6 +54,7 @@ mod unix_main {
     const DEFAULT_CHILD_LOG: &str = "/mnt/us/scribe-app/logs/scribe-app.child.log";
     const CHILD_SHUTDOWN_BUDGET: Duration = Duration::from_secs(45);
     const LAUNCH_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
+    const READY_RUNNING_CHECKPOINT: Duration = Duration::from_secs(60);
 
     static STATE: OnceLock<LifecycleState> = OnceLock::new();
     static LIB: OnceLock<LipcLib> = OnceLock::new();
@@ -204,23 +211,74 @@ mod unix_main {
         LIPC_OK
     }
 
-    fn log_health_event(attempt: &str, pid: u32, event: ObserverEvent) {
-        match event {
-            ObserverEvent::Ready => state().log(&format!(
-                "launch_health attempt={attempt} pid={pid} state=ready"
+    fn report_evidence(report: EvidenceReport) {
+        match report.result {
+            Ok(()) => state().log(&format!(
+                "launch_health_evidence attempt={} outcome={} status=published qualification=unqualified",
+                report.launch_uuid, report.outcome
             )),
+            Err(error) => state().log(&format!(
+                "launch_health_evidence attempt={} outcome={} status=unavailable detail={error:?}",
+                report.launch_uuid, report.outcome
+            )),
+        }
+    }
+
+    fn start_evidence_worker(
+        child_bin: &str,
+        attempt: LaunchAttempt,
+        started_at: Instant,
+        initial: InitialEvidence,
+    ) -> Option<EvidenceObserver> {
+        EvidenceObserver::start(
+            std::path::PathBuf::from(DEFAULT_UPDATE_DIR),
+            std::path::PathBuf::from(child_bin),
+            attempt,
+            started_at,
+            initial,
+            report_evidence,
+        )
+        .ok()
+    }
+
+    fn log_health_event(
+        attempt: &str,
+        pid: u32,
+        event: ObserverEvent,
+        evidence: &mut Option<EvidenceObserver>,
+        now: Instant,
+    ) {
+        match event {
+            ObserverEvent::Ready => {
+                state().log(&format!(
+                    "launch_health attempt={attempt} pid={pid} state=ready"
+                ));
+                if let Some(evidence) = evidence.as_mut() {
+                    evidence.record_ready(now);
+                }
+            }
             ObserverEvent::IncorrectIdentifier { received } => state().log(&format!(
                 "launch_health attempt={attempt} pid={pid} state=started ack=rejected reason=incorrect_identifier received={received}"
             )),
             ObserverEvent::MalformedAcknowledgment => state().log(&format!(
                 "launch_health attempt={attempt} pid={pid} state=started ack=rejected reason=malformed"
             )),
-            ObserverEvent::TimedOut => state().log(&format!(
-                "launch_health attempt={attempt} pid={pid} state=timeout compatibility=missing_ack_or_legacy_child"
-            )),
-            ObserverEvent::Interrupted { error } => state().log(&format!(
-                "launch_health attempt={attempt} pid={pid} state=interrupted reason=ipc_read_error detail={error:?}"
-            )),
+            ObserverEvent::TimedOut => {
+                state().log(&format!(
+                    "launch_health attempt={attempt} pid={pid} state=timeout compatibility=missing_ack_or_legacy_child"
+                ));
+                if let Some(evidence) = evidence.as_mut() {
+                    evidence.record_timeout(now);
+                }
+            }
+            ObserverEvent::Interrupted { error } => {
+                state().log(&format!(
+                    "launch_health attempt={attempt} pid={pid} state=interrupted reason=ipc_read_error detail={error:?}"
+                ));
+                if let Some(evidence) = evidence.as_mut() {
+                    evidence.record_interrupted(now);
+                }
+            }
         }
     }
 
@@ -293,11 +351,21 @@ mod unix_main {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let successful = status.success();
+                    let outcome = if successful {
+                        "intentional_stop"
+                    } else {
+                        "intentional_stop_failed"
+                    };
                     state().log(&format!(
-                        "child_exited pid={pid} status={status} reason={reason}"
+                        "child_exited pid={pid} status={status} reason={reason} requested_stop_outcome={outcome}"
                     ));
+                    if let Some(evidence) = sup.evidence.as_mut() {
+                        evidence.record_intentional_stop(successful, Instant::now());
+                    }
                     sup.child = None;
                     sup.health = None;
+                    sup.evidence = None;
                     return true;
                 }
                 Ok(None) => {
@@ -306,12 +374,18 @@ mod unix_main {
                             "child_shutdown_timeout pid={pid} budget_s={} FAIL",
                             CHILD_SHUTDOWN_BUDGET.as_secs()
                         ));
+                        if let Some(evidence) = sup.evidence.as_mut() {
+                            evidence.record_interrupted(Instant::now());
+                        }
                         return false;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
                     state().log(&format!("child_wait_failed pid={pid} err={e}"));
+                    if let Some(evidence) = sup.evidence.as_mut() {
+                        evidence.record_interrupted(Instant::now());
+                    }
                     return false;
                 }
             }
@@ -337,12 +411,16 @@ mod unix_main {
                         let after = health.child_exited(status.success());
                         log_health_child_exit(&attempt, existing_pid, before, after);
                     }
+                    if let Some(evidence) = sup.evidence.as_mut() {
+                        evidence.record_exit(status.success(), Instant::now());
+                    }
                     state().log(&format!(
                         "previous_child_exited status={status}; clearing before relaunch"
                     ));
                     sup.child = None;
                     sup.events = None;
                     sup.health = None;
+                    sup.evidence = None;
                 }
                 Ok(None) => {
                     state().log(&format!(
@@ -360,6 +438,9 @@ mod unix_main {
                             after.as_str()
                         ));
                     }
+                    if let Some(evidence) = sup.evidence.as_mut() {
+                        evidence.record_interrupted(Instant::now());
+                    }
                     state().log(&format!("go_child_poll_failed err={e}"));
                     return;
                 }
@@ -375,6 +456,10 @@ mod unix_main {
                 ));
             }
             sup.health = None;
+            if let Some(evidence) = sup.evidence.as_mut() {
+                evidence.record_interrupted(Instant::now());
+            }
+            sup.evidence = None;
             sup.events = None;
         }
         state().log(&format!(
@@ -400,14 +485,17 @@ mod unix_main {
             }
             Err(_) => (Stdio::null(), Stdio::null()),
         };
-        let mut pending_health = match PreparedLaunchHealth::new() {
-            Ok(health) => Some(health),
+        let (mut pending_health, launch_attempt) = match PreparedLaunchHealth::new() {
+            Ok(health) => {
+                let attempt = health.attempt().to_owned();
+                (Some(health), attempt)
+            }
             Err(e) => {
                 state().log(&format!(
                     "launch_health attempt={} state=interrupted reason=ipc_setup_failed detail={:?}",
                     e.attempt, e.error
                 ));
-                None
+                (None, e.attempt)
             }
         };
         let mut command = Command::new(&sup.child_bin);
@@ -421,16 +509,20 @@ mod unix_main {
         if let Some(health) = pending_health.as_ref() {
             health.configure_command(&mut command);
         }
+        // Capture ordering without filesystem access. The worker uses this pre-spawn token to keep
+        // a delayed older worker from displacing a newer cross-process owner.
+        let evidence_attempt = LaunchAttempt::capture(&launch_attempt).ok();
         match command.spawn() {
             Ok(mut child) => {
                 let pid = child.id();
+                let started_at = Instant::now();
                 state().log(&format!(
                     "child_started pid={} child_log={child_log_path}",
                     pid
                 ));
                 let observer = pending_health
                     .take()
-                    .map(|health| health.spawned(Instant::now(), LAUNCH_HEALTH_TIMEOUT));
+                    .map(|health| health.spawned(started_at, LAUNCH_HEALTH_TIMEOUT));
                 if let Some(health) = observer.as_ref() {
                     state().log(&format!(
                         "launch_health attempt={} pid={pid} state=started timeout_s={} protocol=unix_datagram_v1",
@@ -438,9 +530,24 @@ mod unix_main {
                         LAUNCH_HEALTH_TIMEOUT.as_secs()
                     ));
                 }
+                // All evidence filesystem work occurs on a detached worker. This handoff performs
+                // only allocation and thread creation on the launch path.
+                let evidence = evidence_attempt.and_then(|attempt| {
+                    start_evidence_worker(
+                        &sup.child_bin,
+                        attempt,
+                        started_at,
+                        if observer.is_some() {
+                            InitialEvidence::Spawned
+                        } else {
+                            InitialEvidence::Unavailable
+                        },
+                    )
+                });
                 sup.events = child.stdin.take();
                 sup.child = Some(child);
                 sup.health = observer;
+                sup.evidence = evidence;
                 std::thread::spawn(move || watch_child(pid));
             }
             Err(e) => {
@@ -451,6 +558,14 @@ mod unix_main {
                         observation.attempt(),
                         observation.state().as_str()
                     ));
+                }
+                if let Some(attempt) = evidence_attempt {
+                    let _ = start_evidence_worker(
+                        &sup.child_bin,
+                        attempt,
+                        Instant::now(),
+                        InitialEvidence::SpawnFailed,
+                    );
                 }
                 state().log(&format!("child_start_failed err={e}"));
             }
@@ -476,15 +591,22 @@ mod unix_main {
                 if sup.child.as_ref().map(std::process::Child::id) != Some(pid) {
                     return; // stopped deliberately (or replaced)
                 }
+                let now = Instant::now();
                 if let Some(health) = sup.health.as_mut() {
                     let attempt = health.attempt().to_owned();
-                    for event in health.poll(Instant::now()) {
-                        log_health_event(&attempt, pid, event);
+                    let events = health.poll(now);
+                    for event in events {
+                        log_health_event(&attempt, pid, event, &mut sup.evidence, now);
                     }
                 }
                 let wait = sup.child.as_mut().expect("child checked above").try_wait();
                 match wait {
-                    Ok(None) => None,
+                    Ok(None) => {
+                        if let Some(evidence) = sup.evidence.as_mut() {
+                            evidence.maybe_record_running(now, READY_RUNNING_CHECKPOINT);
+                        }
+                        None
+                    }
                     Ok(Some(status)) => {
                         if let Some(health) = sup.health.as_mut() {
                             let before = health.state();
@@ -492,9 +614,13 @@ mod unix_main {
                             let after = health.child_exited(status.success());
                             log_health_child_exit(&attempt, pid, before, after);
                         }
+                        if let Some(evidence) = sup.evidence.as_mut() {
+                            evidence.record_exit(status.success(), now);
+                        }
                         sup.child = None;
                         sup.events = None;
                         sup.health = None;
+                        sup.evidence = None;
                         Some(status)
                     }
                     Err(e) => {
@@ -505,6 +631,9 @@ mod unix_main {
                                 "launch_health attempt={attempt} pid={pid} state={} reason=child_wait_failed",
                                 after.as_str()
                             ));
+                        }
+                        if let Some(evidence) = sup.evidence.as_mut() {
+                            evidence.record_interrupted(now);
                         }
                         state().log(&format!("child_watch_failed pid={pid} err={e}"));
                         return;
@@ -665,6 +794,7 @@ mod unix_main {
             child: None,
             events: None,
             health: None,
+            evidence: None,
         });
 
         let st = LifecycleState {
