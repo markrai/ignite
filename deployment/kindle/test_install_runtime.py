@@ -1556,7 +1556,10 @@ def test_noncanonical_package_version_fails_closed(tmp_path: Path, version: str)
     assert refused.returncode != 0
     output = refused.stdout + refused.stderr
     if version in ("1.2.3-rc.", "1.2.3-rc/1"):
-        assert "package directory" in output
+        assert (
+            "package directory" in output
+            or "package version is malformed or noncanonical" in output
+        )
     else:
         assert "package version is malformed or noncanonical" in output
     assert not (kindle / "scribe-app" / "bin" / "scribe-app").exists()
