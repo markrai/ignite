@@ -30,8 +30,8 @@ use kindle_platform::{
     PREFERRED_STYLUS_PATH,
 };
 use notebook_core::{
-    portrait_wacom_calibration, DeviceCalibration, DevicePoint, DisplayPoint, PagePoint, Point,
-    Stroke, ERASER_HIT_RADIUS_CANONICAL,
+    portrait_wacom_calibration, DeviceCalibration, DevicePoint, DisplayPoint, Orientation,
+    PagePoint, Point, Stroke, ERASER_HIT_RADIUS_CANONICAL,
 };
 
 use crate::app_ui::{DownRoute, NotebookUiContext, PenRouter, Redraw, UiCommand, UiState};
@@ -3612,6 +3612,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         }
     };
     let g = fb.geometry;
+    let fb_rotate = fb.var.rotate;
     crate::launch_clock::mark("framebuffer_ready");
 
     crate::launch_clock::mark("loading_paint_submit");
@@ -3658,11 +3659,16 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         match LinuxEvdevTouch::open_observer(path) {
             Ok(t) => {
                 let axes = t.axes();
-                match TouchMapping::new((axes.x.min, axes.x.max), (axes.y.min, axes.y.max), &g) {
+                match TouchMapping::for_rotation(
+                    (axes.x.min, axes.x.max),
+                    (axes.y.min, axes.y.max),
+                    &g,
+                    fb_rotate,
+                ) {
                     Ok(mapping) => {
                         println!(
-                            "touch=observer path={path} grab=never x={}..{} y={}..{} slot_max={}",
-                            axes.x.min, axes.x.max, axes.y.min, axes.y.max, axes.slot_max
+                            "touch=observer path={path} grab=never rotate={} x={}..{} y={}..{} slot_max={}",
+                            fb_rotate, axes.x.min, axes.x.max, axes.y.min, axes.y.max, axes.slot_max
                         );
                         touch = Some((TouchPump::start(t), mapping));
                     }
@@ -3905,7 +3911,11 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         RuntimeStore::Unbound,
     );
 
-    let cal = portrait_wacom_calibration();
+    let mut cal = portrait_wacom_calibration();
+    if fb_rotate == 1 {
+        // Pen and finger axes are both reversed on the reported 5.19.6 Scribe orientation.
+        cal.orientation = Orientation::Portrait180;
+    }
     let mut nav = NavGestureState::Idle;
     let mut eraser = EraserGestureState::Idle;
     let mut router = PenRouter::default();

@@ -46,10 +46,36 @@ pub struct TouchMapping {
     y: (i32, i32),
     panel_w: u32,
     panel_h: u32,
+    reverse_axes: bool,
 }
 
 impl TouchMapping {
     pub fn new(x: (i32, i32), y: (i32, i32), geo: &FbGeometry) -> Result<Self, String> {
+        Self::with_axis_reversal(x, y, geo, false)
+    }
+
+    /// Build a mapping for the framebuffer's reported rotation. The Scribe reports 3 on the
+    /// established orientation and 1 on the 5.19.6 orientation; those differ by 180 degrees.
+    pub fn for_rotation(
+        x: (i32, i32),
+        y: (i32, i32),
+        geo: &FbGeometry,
+        rotate: u32,
+    ) -> Result<Self, String> {
+        let reverse_axes = match rotate {
+            3 => false,
+            1 => true,
+            other => return Err(format!("REFUSE TOUCH: unsupported framebuffer rotate={other}")),
+        };
+        Self::with_axis_reversal(x, y, geo, reverse_axes)
+    }
+
+    fn with_axis_reversal(
+        x: (i32, i32),
+        y: (i32, i32),
+        geo: &FbGeometry,
+        reverse_axes: bool,
+    ) -> Result<Self, String> {
         if x.1 <= x.0 || y.1 <= y.0 || geo.xres == 0 || geo.yres == 0 {
             return Err(format!(
                 "REFUSE TOUCH: degenerate mapping x={x:?} y={y:?} panel={}x{}",
@@ -61,6 +87,7 @@ impl TouchMapping {
             y,
             panel_w: geo.xres,
             panel_h: geo.yres,
+            reverse_axes,
         })
     }
 
@@ -74,9 +101,15 @@ impl TouchMapping {
 
     /// `None` for a coordinate outside the device-reported range (malformed report).
     pub fn map(&self, x: i32, y: i32) -> Option<UiPoint> {
+        let mut x = Self::axis(x, self.x, self.panel_w)?;
+        let mut y = Self::axis(y, self.y, self.panel_h)?;
+        if self.reverse_axes {
+            x = self.panel_w - 1 - x;
+            y = self.panel_h - 1 - y;
+        }
         Some(UiPoint {
-            x: Self::axis(x, self.x, self.panel_w)?,
-            y: Self::axis(y, self.y, self.panel_h)?,
+            x,
+            y,
         })
     }
 }
