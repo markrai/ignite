@@ -160,4 +160,4 @@ and firmware.
 - Replacing assets on an existing GitHub Release
 - Tag-push rebuild as the source of published bytes
 - Claiming hardware-verified compatibility without hardware evidence
-- Generated screenshots in the README
+- Generated / AI screenshots in the README
