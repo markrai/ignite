@@ -102,6 +102,11 @@ explicit policy blocker. There is intentionally no zero/eligible result while
 
 ## Slice 3D-B2 authorization contract
 
+The B2a feasibility review found that the current installer and lifecycle locks cannot establish the
+required exclusive decision boundary without broader coordination changes. No authorization command
+has been added. See
+[`kindle-promotion-authorization-gate-feasibility.md`](kindle-promotion-authorization-gate-feasibility.md).
+
 1. Promotion should initially require an explicit user/maintainer action after an inspectable report.
    That authorization must bind the pending transaction, pending digest, retained inventory identity,
    and evidence launch UUID, and must include a separately resolved data-compatibility decision.

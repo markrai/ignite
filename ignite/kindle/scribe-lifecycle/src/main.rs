@@ -22,6 +22,9 @@ mod candidate_health;
 mod lipc;
 
 #[cfg(unix)]
+mod updater_lock;
+
+#[cfg(unix)]
 mod unix_main {
     use crate::candidate_health::{
         assess_default_promotion, EvidenceObserver, EvidenceReport, InitialEvidence, LaunchAttempt,
@@ -904,6 +907,15 @@ mod unix_main {
 
 #[cfg(unix)]
 fn main() {
+    if let Some(result) = updater_lock::run_requested_command() {
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("updater_lock_failed: {error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
     unix_main::run();
 }
 

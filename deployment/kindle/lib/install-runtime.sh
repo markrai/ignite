@@ -15,6 +15,45 @@ APP_ROOT="${IGNITE_APP_ROOT:-/mnt/us/scribe-app}"
 DATA_DIR="${IGNITE_DATA_DIR:-/mnt/us/scribe-data}"
 DOCS="${IGNITE_DOCS:-/mnt/us/documents}"
 US_ROOT="${IGNITE_US_ROOT:-/mnt/us}"
+
+# Serialize every installed-state mutation, including interrupted-install recovery. The Rust
+# helper execs this script with its kernel lock descriptor inherited, so holder death releases the
+# lock but a surviving descendant cannot continue after an unlocked wrapper disappears.
+UPDATER_LOCK_HELPER="${IGNITE_UPDATER_LOCK_HELPER:-$PACKAGE_ROOT/bin/scribe-lifecycle}"
+if [ "${IGNITE_UPDATER_LOCK_HELD:-}" != "1" ]; then
+  if [ ! -f "$UPDATER_LOCK_HELPER" ] || [ ! -x "$UPDATER_LOCK_HELPER" ]; then
+    echo "install_failed: coordination: updater transaction lock helper is unavailable" >&2
+    exit 1
+  fi
+  exec "$UPDATER_LOCK_HELPER" --with-updater-transaction-lock -- \
+    /bin/sh "$0" "$PACKAGE_ROOT"
+fi
+case "${IGNITE_UPDATER_LOCK_FD:-}" in
+  ''|*[!0-9]*)
+    echo "install_failed: coordination: updater transaction lock handoff is invalid" >&2
+    exit 1
+    ;;
+esac
+if "$UPDATER_LOCK_HELPER" --verify-updater-transaction-lock "$IGNITE_UPDATER_LOCK_FD"; then
+  :
+else
+  lock_status=$?
+  echo "install_failed: coordination: inherited descriptor does not hold the updater transaction lock" >&2
+  exit "$lock_status"
+fi
+
+# The self-extractor historically made Diagnose available immediately after extraction. Keep that
+# best-effort behavior, but perform the installed-file write only after acquiring the transaction
+# lock so a concurrent upgrade cannot contaminate the retained A snapshot.
+if [ "${IGNITE_INSTALL_DIAGNOSE_EARLY:-}" = "1" ]; then
+  mkdir -p "$DOCS" 2>/dev/null || true
+  if [ -f "$PACKAGE_ROOT/Diagnose-Ignite.sh" ]; then
+    cp -f "$PACKAGE_ROOT/Diagnose-Ignite.sh" "$DOCS/Diagnose Ignite.sh" || true
+    chmod 0755 "$DOCS/Diagnose Ignite.sh" 2>/dev/null || true
+    sed -i 's/\r$//' "$DOCS/Diagnose Ignite.sh" 2>/dev/null || true
+  fi
+fi
+
 STABLE_APP=$APP_ROOT/bin/scribe-app
 STABLE_LIFE=$APP_ROOT/bin/scribe-lifecycle
 STABLE_HOST=$APP_ROOT/bin/scribe-lifecycle-host.sh

@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,28 @@ OPTIONAL_ACTIVATION_BOUNDARIES = ["description"]
 ALL_ACTIVATION_BOUNDARIES = REQUIRED_ACTIVATION_BOUNDARIES + OPTIONAL_ACTIVATION_BOUNDARIES
 
 
+def _write_passthrough_lock_helper(kindle: Path) -> Path:
+    """Host-only stand-in; kernel lock behavior has separate Unix regression coverage."""
+    helper = kindle / ".test-bin" / "updater-lock-helper.sh"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_text(
+        "#!/bin/sh\n"
+        'if test "$1" = "--verify-updater-transaction-lock"; then exit 0; fi\n'
+        'test "$1" = "--with-updater-transaction-lock" || exit 64\n'
+        "shift\n"
+        'test "$1" = "--" || exit 64\n'
+        "shift\n"
+        "IGNITE_UPDATER_LOCK_HELD=1\n"
+        "IGNITE_UPDATER_LOCK_FD=0\n"
+        "export IGNITE_UPDATER_LOCK_HELD IGNITE_UPDATER_LOCK_FD\n"
+        'exec "$@"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    helper.chmod(helper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return helper
+
+
 def _env_for(kindle: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     sh = _require_sh()
     env = _posix_env(sh)
@@ -62,6 +85,9 @@ def _env_for(kindle: Path, extra: dict[str, str] | None = None) -> dict[str, str
             "IGNITE_RECOVERY_ALLOW_NONROOT": "1",
             "IGNITE_RECOVERY_SKIP_CHOWN": "1",
             "IGNITE_RECOVERY_ROOT": _to_posix_path(kindle / "var" / "local" / "ignite-recovery"),
+            "IGNITE_UPDATER_LOCK_HELPER": _to_posix_path(
+                _write_passthrough_lock_helper(kindle)
+            ),
         }
     )
     if extra:
@@ -69,15 +95,99 @@ def _env_for(kindle: Path, extra: dict[str, str] | None = None) -> dict[str, str
     return env
 
 
-def _run_install(payload: Path, kindle: Path, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run_install(
+    payload: Path,
+    kindle: Path,
+    extra: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     sh = _require_sh()
     script = _HERE / "lib" / "install-runtime.sh"
-    return subprocess.run(
+    options: dict[str, object] = {}
+    if pass_fds:
+        options["pass_fds"] = pass_fds
+    return subprocess.run(  # type: ignore[arg-type]
         [sh, _to_posix_path(script), _to_posix_path(payload)],
         capture_output=True,
         text=True,
         env=_env_for(kindle, extra),
+        **options,
     )
+
+
+@pytest.fixture(scope="session")
+def compiled_rust_lock_helper(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("compiled updater-lock integration requires Linux")
+    cargo = shutil.which("cargo")
+    assert cargo is not None, "Linux updater-lock integration requires cargo"
+    target_dir = tmp_path_factory.mktemp("rust-updater-lock-target")
+    built = subprocess.run(
+        [cargo, "build", "-p", "scribe-lifecycle", "--target-dir", str(target_dir)],
+        cwd=_HERE.parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert built.returncode == 0, built.stdout + built.stderr
+    helper = target_dir / "debug" / "scribe-lifecycle"
+    assert helper.is_file()
+    return helper
+
+
+def _start_rust_lock_holder(helper: Path, lock_path: Path, ready: Path) -> subprocess.Popen[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+            "IGNITE_TEST_LOCK_READY": str(ready),
+        }
+    )
+    code = (
+        "import os,time; "
+        "open(os.environ['IGNITE_TEST_LOCK_READY'],'w',encoding='ascii').write('ready\\n'); "
+        "time.sleep(60)"
+    )
+    return subprocess.Popen(
+        [
+            str(helper),
+            "--with-updater-transaction-lock",
+            "--",
+            sys.executable,
+            "-c",
+            code,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=env,
+    )
+
+
+def _run_uninstall_runtime(
+    kindle: Path,
+    extra: dict[str, str],
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    sh = _require_sh()
+    options: dict[str, object] = {}
+    if pass_fds:
+        options["pass_fds"] = pass_fds
+    return subprocess.run(  # type: ignore[arg-type]
+        [sh, _to_posix_path(_HERE / "lib" / "uninstall-runtime.sh")],
+        capture_output=True,
+        text=True,
+        env=_env_for(kindle, extra),
+        **options,
+    )
+
+
+def _wait_for_file(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        assert process.poll() is None, "lock holder exited before readiness"
+        assert time.monotonic() < deadline, "lock holder readiness timed out"
+        time.sleep(0.01)
 
 
 def _pending_path(kindle: Path) -> Path:
@@ -1657,3 +1767,177 @@ def test_arm32le_elf_stub_is_accepted(tmp_path: Path) -> None:
     (kindle / "documents").mkdir(parents=True)
     result = _run_install(payload, kindle, {"IGNITE_SKIP_ELF_CHECK": "0"})
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_missing_transaction_lock_helper_refuses_before_mutation(tmp_path: Path) -> None:
+    payload = make_payload(tmp_path / "src")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+
+    refused = _run_install(
+        payload,
+        kindle,
+        {"IGNITE_UPDATER_LOCK_HELPER": _to_posix_path(tmp_path / "missing-helper")},
+    )
+
+    assert refused.returncode != 0
+    assert "coordination: updater transaction lock helper is unavailable" in refused.stderr
+    assert not (kindle / "scribe-app").exists()
+
+
+def test_transaction_lock_precedes_install_recovery_and_uninstall_mutation() -> None:
+    install = (_HERE / "lib" / "install-runtime.sh").read_text(encoding="utf-8")
+    uninstall = (_HERE / "lib" / "uninstall-runtime.sh").read_text(encoding="utf-8")
+
+    install_lock = install.index("--with-updater-transaction-lock")
+    install_verify = install.index("--verify-updater-transaction-lock")
+    assert install_lock < install.index("recover_install_transaction")
+    assert install_verify < install.index("recover_install_transaction")
+    assert install_lock < install.index('mkdir -p "$APP_ROOT/bin"')
+    assert install_lock < install.index("guard_pending_health")
+
+    uninstall_lock = uninstall.index("--with-updater-transaction-lock")
+    uninstall_verify = uninstall.index("--verify-updater-transaction-lock")
+    assert uninstall_lock < uninstall.index("# Refuse while running")
+    assert uninstall_verify < uninstall.index("# Refuse while running")
+    assert uninstall_lock < uninstall.index('rm -f "$APP_ROOT/bin/scribe-app"')
+    assert uninstall_lock < uninstall.index("ignite_recovery_uninstall")
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux flock semantics"
+)
+def test_compiled_rust_handoff_rejects_forgery_and_releases_after_holder_death(
+    tmp_path: Path, compiled_rust_lock_helper: Path
+) -> None:
+    payload = make_payload(tmp_path / "src")
+    packaged_helper = payload / "bin" / "scribe-lifecycle"
+    shutil.copyfile(compiled_rust_lock_helper, packaged_helper)
+    packaged_helper.chmod(
+        packaged_helper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    lock_path = tmp_path / "updater.lock"
+    rust_env = {
+        "IGNITE_UPDATER_LOCK_HELPER": str(packaged_helper),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+    }
+
+    installed = _run_install(payload, kindle, rust_env)
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    live = kindle / "scribe-app" / "bin" / "scribe-app"
+    installed_helper = kindle / "scribe-app" / "bin" / "scribe-lifecycle"
+    uninstall_env = {
+        "IGNITE_UPDATER_LOCK_HELPER": str(installed_helper),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+    }
+    live_before = live.read_bytes()
+    stale = kindle / "scribe-app" / "bin" / "scribe-app.new"
+    stale.write_bytes(b"recovery-must-not-run")
+
+    forged_fd = os.open(lock_path, os.O_RDWR)
+    ready = tmp_path / "holder.ready"
+    holder = _start_rust_lock_holder(
+        compiled_rust_lock_helper,
+        lock_path,
+        ready,
+    )
+    try:
+        _wait_for_file(ready, holder)
+        forged_install_env = {
+            **rust_env,
+            "IGNITE_UPDATER_LOCK_HELD": "1",
+            "IGNITE_UPDATER_LOCK_FD": str(forged_fd),
+        }
+        forged_install = _run_install(
+            payload,
+            kindle,
+            forged_install_env,
+            pass_fds=(forged_fd,),
+        )
+        assert forged_install.returncode == 75
+        assert "already in progress" in forged_install.stderr
+        assert stale.read_bytes() == b"recovery-must-not-run"
+        assert live.read_bytes() == live_before
+
+        forged_uninstall_env = {
+            **uninstall_env,
+            "IGNITE_UPDATER_LOCK_HELD": "1",
+            "IGNITE_UPDATER_LOCK_FD": str(forged_fd),
+        }
+        forged_uninstall = _run_uninstall_runtime(
+            kindle,
+            forged_uninstall_env,
+            pass_fds=(forged_fd,),
+        )
+        assert forged_uninstall.returncode == 75
+        assert "already in progress" in forged_uninstall.stderr
+        assert stale.read_bytes() == b"recovery-must-not-run"
+        assert live.read_bytes() == live_before
+    finally:
+        os.close(forged_fd)
+        holder.kill()
+        holder.wait(timeout=5)
+
+    recovered = _run_install(
+        payload,
+        kindle,
+        rust_env,
+    )
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not stale.exists()
+
+    uninstalled = _run_uninstall_runtime(kindle, uninstall_env)
+    assert uninstalled.returncode == 0, uninstalled.stdout + uninstalled.stderr
+    assert not live.exists()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux flock semantics"
+)
+def test_compiled_rust_lock_contention_preserves_pending_b_and_retained_a(
+    tmp_path: Path, compiled_rust_lock_helper: Path
+) -> None:
+    payload_b, kindle = _install_pending_candidate(tmp_path)
+    app = kindle / "scribe-app"
+    protected_roots = [
+        app / "bin",
+        app / "previous-release",
+        app / "state" / "update",
+        app / "run",
+    ]
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(path.relative_to(app)): path.read_bytes()
+            for root in protected_roots
+            if root.exists()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    lock_path = tmp_path / "updater.lock"
+    rust_env = {
+        "IGNITE_UPDATER_LOCK_HELPER": str(compiled_rust_lock_helper),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+    }
+    ready = tmp_path / "holder.ready"
+    holder = _start_rust_lock_holder(
+        compiled_rust_lock_helper,
+        lock_path,
+        ready,
+    )
+    try:
+        _wait_for_file(ready, holder)
+        install = _run_install(payload_b, kindle, rust_env)
+        assert install.returncode == 75
+        assert "already in progress" in install.stderr
+        uninstall = _run_uninstall_runtime(kindle, rust_env)
+        assert uninstall.returncode == 75
+        assert "already in progress" in uninstall.stderr
+        assert snapshot() == before
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)

@@ -402,27 +402,29 @@ def validate_sfx(sfx_path: Path, version: str) -> list[str]:
         )
     if "@@IGNITE_" in text:
         errors.append("SFX still contains an unstamped placeholder")
+    if "ignite-extract-${IGNITE_PACKAGE_VERSION}-$$" not in text:
+        errors.append("SFX extraction stage must be process-unique before lock acquisition")
     if "IGNITE_ARCHIVE_OFFSET=0000000000" in text:
         errors.append("SFX OFFSET was not stamped")
     if "$((IGNITE_ARCHIVE_OFFSET" in text or "$((IGNITE_ARCHIVE_BYTES" in text:
         errors.append("SFX must not use zero-padded OFFSET/BYTES in $((...)) (BusyBox octal)")
     extract_at = text.find('tar -xzf "$ARCHIVE"')
-    diagnose_at = text.find('cp -f "$PACKAGE_ROOT/Diagnose-Ignite.sh"')
+    diagnose_at = text.find("IGNITE_INSTALL_DIAGNOSE_EARLY=1")
     runtime_at = text.find('sh "$PACKAGE_ROOT/lib/install-runtime.sh"')
     if extract_at < 0:
         errors.append("SFX missing payload extract")
     if diagnose_at < 0:
-        errors.append("SFX missing Diagnose Ignite copy")
+        errors.append("SFX missing locked Diagnose Ignite publication request")
     elif extract_at >= 0 and diagnose_at < extract_at:
-        errors.append("Diagnose Ignite must be copied only after successful payload extract")
+        errors.append("Diagnose Ignite must be published only after successful payload extract")
     if runtime_at < 0:
         errors.append("SFX missing install-runtime invocation")
     elif diagnose_at >= 0 and runtime_at < diagnose_at:
-        errors.append("Diagnose Ignite copy must happen before install-runtime")
+        errors.append("Diagnose Ignite publication request must happen before install-runtime")
     if "write_usb_fail_report" not in text or 'Ignite-Diagnose.txt' not in text:
         errors.append("SFX must write USB Ignite-Diagnose.txt on install failure")
-    if "Diagnose Ignite is installed only after the payload extracts successfully." not in text:
-        errors.append("SFX must state Diagnose Ignite is post-extract only")
+    if "install-runtime publishes Diagnose after it has acquired" not in text:
+        errors.append("SFX must state Diagnose Ignite publication is transaction-locked")
     for pattern, label in CONTAMINATION_PATTERNS:
         if pattern.search(text):
             errors.append(f"SFX prefix: contamination ({label})")

@@ -178,6 +178,7 @@ def test_prefix_does_not_claim_success_in_conditional_group(tmp_path: Path) -> N
     payload = make_payload(tmp_path / "src")
     prefix, _archive, _meta = split_sfx(build_sfx(payload, FIXTURE_VERSION, default_template()))
     text = prefix.decode("utf-8")
+    assert "ignite-extract-${IGNITE_PACKAGE_VERSION}-$$" in text
     assert '} >>"$LOG" 2>&1 && STATUS=0 || STATUS=$?' not in text
     assert "SUCCESS. Open Ignite from the Library." in text
     success_at = text.index("SUCCESS. Open Ignite from the Library.")
@@ -186,10 +187,10 @@ def test_prefix_does_not_claim_success_in_conditional_group(tmp_path: Path) -> N
     rm_at = text.index("removed installer from Library")
     assert runtime_at < rm_at
     extract_at = text.index('tar -xzf "$ARCHIVE"')
-    diagnose_at = text.index('cp -f "$PACKAGE_ROOT/Diagnose-Ignite.sh"')
+    diagnose_at = text.index("IGNITE_INSTALL_DIAGNOSE_EARLY=1")
     assert extract_at < diagnose_at < runtime_at
     assert "write_usb_fail_report" in text
-    assert "Diagnose Ignite is installed only after the payload extracts successfully." in text
+    assert "install-runtime publishes Diagnose after it has acquired" in text
 
 
 def test_set_e_subshell_does_not_print_success_after_false(tmp_path: Path) -> None:

@@ -24,6 +24,32 @@ SCRIPTLET=$DOCS/Scribe.sh
 # Stamped at packaging (Install Ignite v<version>.sh).
 IGNITE_PACKAGE_VERSION='@@IGNITE_PACKAGE_VERSION@@'
 
+# Uninstall shares the same nonblocking kernel transaction lock as install and recovery. The
+# installed lifecycle binary is safe to unlink after it execs this shell: the inherited descriptor,
+# not the binary pathname, owns the lock for the complete operation.
+UPDATER_LOCK_HELPER="${IGNITE_UPDATER_LOCK_HELPER:-$APP_ROOT/bin/scribe-lifecycle}"
+if [ "${IGNITE_UPDATER_LOCK_HELD:-}" != "1" ]; then
+  if [ ! -f "$UPDATER_LOCK_HELPER" ] || [ ! -x "$UPDATER_LOCK_HELPER" ]; then
+    echo "uninstall_failed: coordination: updater transaction lock helper is unavailable" >&2
+    exit 1
+  fi
+  exec "$UPDATER_LOCK_HELPER" --with-updater-transaction-lock -- \
+    /bin/sh "$0" "$@"
+fi
+case "${IGNITE_UPDATER_LOCK_FD:-}" in
+  ''|*[!0-9]*)
+    echo "uninstall_failed: coordination: updater transaction lock handoff is invalid" >&2
+    exit 1
+    ;;
+esac
+if "$UPDATER_LOCK_HELPER" --verify-updater-transaction-lock "$IGNITE_UPDATER_LOCK_FD"; then
+  :
+else
+  lock_status=$?
+  echo "uninstall_failed: coordination: inherited descriptor does not hold the updater transaction lock" >&2
+  exit "$lock_status"
+fi
+
 LIB_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=register-helpers.sh
 . "$LIB_DIR/register-helpers.sh"
