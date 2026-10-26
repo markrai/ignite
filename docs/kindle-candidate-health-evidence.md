@@ -81,20 +81,42 @@ Every state says `qualification=unqualified`. Readiness does not establish noteb
 correctness, ongoing stability, data compatibility, or rollback safety. Missing, damaged, stale,
 contradictory, or unwritable evidence cannot authorize a future action.
 
-## Slice 3D-B authorization contract
+## Slice 3D-B1 read-only assessment
+
+Run the lifecycle binary manually as root with no other arguments:
+
+```sh
+/mnt/us/scribe-app/bin/scribe-lifecycle --assess-promotion
+```
+
+The command never loads LIPC and has no write, repair, promotion, rollback, or deletion operation. It
+opens the existing evidence lock read-only, holds a shared lock, and performs two complete validation
+passes over canonical pending state, both live B executables, the closed 18-entry retained A inventory,
+current ownership, and evidence. A change or invalid second pass is reported as a concurrent-change
+failure. The report ends with `promotion_authorized=false` in every case.
+
+`BLOCKED` (exit 1) means evidence is insufficient, state is damaged, or the assessment raced a state
+change. `REVIEW_REQUIRED` (exit 3) means all runtime checks passed, but compatibility remains an
+explicit policy blocker. There is intentionally no zero/eligible result while
+`data_compatibility=unknown`.
+
+## Slice 3D-B2 authorization contract
 
 1. Promotion should initially require an explicit user/maintainer action after an inspectable report.
+   That authorization must bind the pending transaction, pending digest, retained inventory identity,
+   and evidence launch UUID, and must include a separately resolved data-compatibility decision.
 2. Minimal runtime evidence should be a matching, complete `intentional_stop` with `ready=true`, an
    `readiness=ready`, and at least the chosen monotonic post-ready duration (currently 60 seconds).
-   3D-B must revalidate pending state, B's binaries, and A's inventory. An active `ready_running` record
+   3D-B2 must revalidate pending state, B's binaries, and A's inventory. An active `ready_running` record
    is insufficient because the process may exit immediately afterward. `intentional_stop_failed`
    must never satisfy this contract.
 3. Repeated successful launches may add confidence and appear in the report, but cannot silently
    promote B. Any future history must be separately bounded.
 4. An unrequested post-ready exit invalidates runtime qualification until a later explicitly reviewed
    successful observation. It does not trigger rollback by itself.
-5. Promotion needs its own journal: verify A and B, write a prepared marker, durably update pending
-   state, commit, and recover deterministically. Interruption must leave verified A or live B intact.
+5. Promotion needs its own journal and an exclusive decision boundary: revalidate the authorized
+   snapshot, write a prepared marker, durably update pending state, commit, and recover
+   deterministically. Interruption must leave verified A or live B intact.
 6. A can be retired only after committed transaction recovery and explicit promotion authorization.
 7. Data compatibility needs a separate format/capability contract and user-visible validation. Until
    then, `data_compatibility=unknown` prevents claims that executable rollback is data-safe.

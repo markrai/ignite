@@ -24,7 +24,8 @@ mod lipc;
 #[cfg(unix)]
 mod unix_main {
     use crate::candidate_health::{
-        EvidenceObserver, EvidenceReport, InitialEvidence, LaunchAttempt, DEFAULT_UPDATE_DIR,
+        assess_default_promotion, EvidenceObserver, EvidenceReport, InitialEvidence, LaunchAttempt,
+        DEFAULT_UPDATE_DIR,
     };
     use crate::launch_health::{
         clear_handshake_environment, LaunchState, ObserverEvent, PreparedLaunchHealth,
@@ -76,6 +77,8 @@ mod unix_main {
             "scribe-lifecycle — Kindle appmgrd lifecycle host / probe\n\n\
              Probe (no FB/stylus/data):\n\
                scribe-lifecycle --probe\n\n\
+             Read-only pending-release assessment (never authorizes promotion):\n\
+               scribe-lifecycle --assess-promotion\n\n\
              Production host:\n\
                scribe-lifecycle --host [--service com.markrai.ignite] \\\n\
                  [--log HOST_LOG] [--child-log CHILD_LOG] \\\n\
@@ -784,6 +787,20 @@ mod unix_main {
     }
 
     pub fn run() {
+        let process_args: Vec<String> = std::env::args().skip(1).collect();
+        if process_args
+            .iter()
+            .any(|argument| argument == "--assess-promotion")
+        {
+            if process_args != ["--assess-promotion"] {
+                eprintln!("error: --assess-promotion does not accept other arguments");
+                usage();
+            }
+            let report = assess_default_promotion();
+            print!("{report}");
+            std::process::exit(report.exit_code());
+        }
+
         let args = parse_args();
         ensure_log_parent(&args.log_path);
         let _ = CHILD_LOG.set(args.child_log.clone());

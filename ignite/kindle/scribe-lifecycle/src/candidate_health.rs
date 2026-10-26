@@ -4,6 +4,10 @@
 //! the canonical `pending-health.v1` record matches both live executables, then publishes one
 //! bounded observation record. Every encoded state remains explicitly unqualified.
 
+mod assessment;
+
+pub use assessment::assess_default_promotion;
+
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
