@@ -27,6 +27,9 @@ mod launch_gate;
 #[cfg(unix)]
 mod updater_lock;
 
+#[cfg(all(test, unix))]
+mod lock_test_support;
+
 #[cfg(unix)]
 mod unix_main {
     use crate::candidate_health::{

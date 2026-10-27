@@ -725,6 +725,7 @@ pub fn run_requested_command() -> Option<Result<(), BoundaryError>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_test_support::{descriptor_holders, RELEASE_VISIBILITY_DEADLINE};
     use std::sync::mpsc;
 
     struct TestPaths {
@@ -762,6 +763,19 @@ mod tests {
         }
     }
 
+    /// Acquire a lock this test has just released. See `lock_test_support` for why release is only
+    /// eventually visible under the parallel harness; a lock that stays held still fails.
+    fn acquire_after_release(path: &Path, mode: LockMode, label: &'static str) -> KernelLock {
+        KernelLock::acquire(path, mode, RELEASE_VISIBILITY_DEADLINE, label).unwrap_or_else(|error| {
+            panic!(
+                "{label} still unavailable {RELEASE_VISIBILITY_DEADLINE:?} after release ({error}); \
+                 descriptor holders of {}: {:?}",
+                path.display(),
+                descriptor_holders(path)
+            )
+        })
+    }
+
     fn report(uuid: &str, ok: bool) -> EvidenceReport {
         EvidenceReport {
             launch_uuid: uuid.to_owned(),
@@ -791,6 +805,9 @@ mod tests {
             Err(BoundaryError::Contended(_))
         ));
         drop(decision);
+        // Admission itself never waits. Once a shared probe succeeds, every copy of the
+        // exclusive decision description is closed, so admission must then succeed at once.
+        let _released = acquire_after_release(&tree.paths.gate, LockMode::Shared, "test gate");
         host.admit_launch().unwrap();
     }
 
@@ -801,13 +818,7 @@ mod tests {
         let admission = host.admit_launch().unwrap();
         let worker = host.evidence_worker_activity().unwrap();
         drop(admission);
-        let gate = KernelLock::acquire(
-            &tree.paths.gate,
-            LockMode::Exclusive,
-            Duration::ZERO,
-            "test gate",
-        )
-        .unwrap();
+        let gate = acquire_after_release(&tree.paths.gate, LockMode::Exclusive, "test gate");
         assert!(matches!(
             KernelLock::acquire(
                 &tree.paths.worker,
@@ -818,13 +829,7 @@ mod tests {
             Err(BoundaryError::Contended(_))
         ));
         drop(worker);
-        KernelLock::acquire(
-            &tree.paths.worker,
-            LockMode::Exclusive,
-            Duration::ZERO,
-            "test workers",
-        )
-        .unwrap();
+        acquire_after_release(&tree.paths.worker, LockMode::Exclusive, "test workers");
         drop(gate);
     }
 
@@ -900,13 +905,7 @@ mod tests {
         ));
         child.kill().unwrap();
         child.wait().unwrap();
-        KernelLock::acquire(
-            &tree.paths.child,
-            LockMode::Exclusive,
-            Duration::ZERO,
-            "test child",
-        )
-        .unwrap();
+        acquire_after_release(&tree.paths.child, LockMode::Exclusive, "test child");
     }
 
     #[test]

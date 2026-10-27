@@ -244,6 +244,7 @@ fn exec_with_lock(path: &Path, command: &[OsString]) -> Result<(), LockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_test_support::{descriptor_holders, RELEASE_VISIBILITY_DEADLINE};
     use std::os::unix::fs::symlink;
     use std::process::{Child, Stdio};
     use std::thread;
@@ -285,7 +286,27 @@ mod tests {
         let first = acquire_at(&path.0).expect("first lock");
         assert!(matches!(acquire_at(&path.0), Err(LockError::Contended)));
         drop(first);
-        acquire_at(&path.0).expect("lock after release");
+        acquire_after_release(&path.0);
+    }
+
+    /// Acquire a lock this test has just released. See `lock_test_support` for why release is only
+    /// eventually visible under the parallel harness; a lock that stays held still fails.
+    fn acquire_after_release(path: &Path) -> File {
+        let deadline = Instant::now() + RELEASE_VISIBILITY_DEADLINE;
+        loop {
+            match acquire_at(path) {
+                Err(LockError::Contended) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(LockError::Contended) => panic!(
+                    "lock still contended {RELEASE_VISIBILITY_DEADLINE:?} after release; \
+                     descriptor holders of {}: {:?}",
+                    path.display(),
+                    descriptor_holders(path)
+                ),
+                result => return result.expect("lock after release"),
+            }
+        }
     }
 
     #[test]
