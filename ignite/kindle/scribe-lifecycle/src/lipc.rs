@@ -6,7 +6,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub type LIPCcode = c_int;
 pub const LIPC_OK: LIPCcode = 0;
@@ -195,6 +195,13 @@ pub struct LifecycleState {
     pub pause_seen: AtomicBool,
     pub go_seen: AtomicBool,
     pub load_seen: AtomicBool,
+    /// Present only when the host established all cross-process coordination primitives. If setup
+    /// fails, ordinary launches remain available but every future decision boundary refuses.
+    pub launch_coordination: Option<Arc<crate::launch_gate::HostLaunchCoordination>>,
+    /// Lifetime shared gate held when full coordination setup failed. This prevents a stale or
+    /// different host lease from authorizing a decision while this host can still launch.
+    pub degraded_decision_blocker: Option<crate::launch_gate::LaunchAdmission>,
+    pub launch_coordination_failed: bool,
     pub child: Mutex<Option<ChildSupervisor>>,
 }
 
@@ -208,6 +215,9 @@ pub struct ChildSupervisor {
     pub health: Option<crate::launch_health::LaunchHealthObserver>,
     /// Nonblocking sender for best-effort, candidate-bound durable evidence.
     pub evidence: Option<crate::candidate_health::EvidenceObserver>,
+    /// Kernel activity token retained by both host and child. An orphan child therefore remains
+    /// visible to a future exclusive decision after lifecycle-host death.
+    pub running_activity: Option<crate::launch_gate::RunningChildActivity>,
 }
 
 impl LifecycleState {

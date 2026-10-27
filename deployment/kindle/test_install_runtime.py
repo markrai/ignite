@@ -1941,3 +1941,78 @@ def test_compiled_rust_lock_contention_preserves_pending_b_and_retained_a(
     finally:
         holder.kill()
         holder.wait(timeout=5)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux flock semantics"
+)
+def test_promotion_decision_boundary_excludes_actual_installer(
+    tmp_path: Path, compiled_rust_lock_helper: Path
+) -> None:
+    payload = make_payload(tmp_path / "src")
+    kindle = tmp_path / "kindle"
+    update = kindle / "scribe-app" / "state" / "update"
+    update.mkdir(parents=True)
+    (update / ".launch-health-evidence.v1.lock").touch()
+    coordination_env = {
+        "IGNITE_TEST_LAUNCH_GATE_PATH": str(tmp_path / "launch-gate.lock"),
+        "IGNITE_TEST_LAUNCH_HOST_PATH": str(tmp_path / "host.lock"),
+        "IGNITE_TEST_LAUNCH_CHILD_PATH": str(tmp_path / "child.lock"),
+        "IGNITE_TEST_EVIDENCE_WORKER_PATH": str(tmp_path / "worker.lock"),
+        "IGNITE_TEST_LAUNCH_CONTROL_PATH": str(tmp_path / "control.sock"),
+        "IGNITE_TEST_UPDATE_DIR": str(update),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(tmp_path / "updater.lock"),
+        "IGNITE_TEST_DECISION_TIMEOUT_MS": "500",
+    }
+    process_env = os.environ.copy()
+    process_env.update(coordination_env)
+    host_ready = tmp_path / "host.ready"
+    host = subprocess.Popen(
+        [
+            str(compiled_rust_lock_helper),
+            "--test-launch-coordination-host",
+            "ready",
+            str(host_ready),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=process_env,
+    )
+    decision_ready = tmp_path / "decision.ready"
+    decision: subprocess.Popen[str] | None = None
+    try:
+        _wait_for_file(host_ready, host)
+        decision = subprocess.Popen(
+            [
+                str(compiled_rust_lock_helper),
+                "--test-hold-promotion-decision-boundary",
+                str(decision_ready),
+                "60000",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=process_env,
+        )
+        _wait_for_file(decision_ready, decision)
+
+        refused = _run_install(
+            payload,
+            kindle,
+            {
+                **coordination_env,
+                "IGNITE_UPDATER_LOCK_HELPER": str(compiled_rust_lock_helper),
+            },
+        )
+        assert refused.returncode == 75
+        assert "already in progress" in refused.stderr
+        assert not (kindle / "scribe-app" / "bin").exists()
+    finally:
+        if decision is not None:
+            decision.kill()
+            decision.wait(timeout=5)
+        host.kill()
+        host.wait(timeout=5)

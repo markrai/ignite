@@ -22,6 +22,9 @@ mod candidate_health;
 mod lipc;
 
 #[cfg(unix)]
+mod launch_gate;
+
+#[cfg(unix)]
 mod updater_lock;
 
 #[cfg(unix)]
@@ -29,6 +32,9 @@ mod unix_main {
     use crate::candidate_health::{
         assess_default_promotion, EvidenceObserver, EvidenceReport, InitialEvidence, LaunchAttempt,
         DEFAULT_UPDATE_DIR,
+    };
+    use crate::launch_gate::{
+        block_decisions_after_setup_failure, EvidenceWorkerActivity, HostLaunchCoordination,
     };
     use crate::launch_health::{
         clear_handshake_environment, LaunchState, ObserverEvent, PreparedLaunchHealth,
@@ -45,7 +51,7 @@ mod unix_main {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     const APPMGRD: &str = "com.lab126.appmgrd";
@@ -59,6 +65,8 @@ mod unix_main {
     const CHILD_SHUTDOWN_BUDGET: Duration = Duration::from_secs(45);
     const LAUNCH_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
     const READY_RUNNING_CHECKPOINT: Duration = Duration::from_secs(60);
+    #[cfg(debug_assertions)]
+    pub const TEST_PRODUCTION_GO_ARGUMENT: &str = "--test-production-go-dispatch";
 
     static STATE: OnceLock<LifecycleState> = OnceLock::new();
     static LIB: OnceLock<LipcLib> = OnceLock::new();
@@ -82,6 +90,8 @@ mod unix_main {
                scribe-lifecycle --probe\n\n\
              Read-only pending-release assessment (never authorizes promotion):\n\
                scribe-lifecycle --assess-promotion\n\n\
+             Exclusive decision boundary (coordination only; no authorization):\n\
+               scribe-lifecycle --check-promotion-decision-boundary\n\n\
              Production host:\n\
                scribe-lifecycle --host [--service com.markrai.ignite] \\\n\
                  [--log HOST_LOG] [--child-log CHILD_LOG] \\\n\
@@ -218,6 +228,9 @@ mod unix_main {
     }
 
     fn report_evidence(report: EvidenceReport) {
+        if let Some(coordination) = state().launch_coordination.as_ref() {
+            coordination.evidence_report(&report);
+        }
         match report.result {
             Ok(()) => state().log(&format!(
                 "launch_health_evidence attempt={} outcome={} status=published qualification=unqualified",
@@ -235,16 +248,30 @@ mod unix_main {
         attempt: LaunchAttempt,
         started_at: Instant,
         initial: InitialEvidence,
-    ) -> Option<EvidenceObserver> {
-        EvidenceObserver::start(
-            std::path::PathBuf::from(DEFAULT_UPDATE_DIR),
-            std::path::PathBuf::from(child_bin),
-            attempt,
-            started_at,
-            initial,
-            report_evidence,
-        )
-        .ok()
+        activity: Option<EvidenceWorkerActivity>,
+    ) -> std::io::Result<EvidenceObserver> {
+        let update_dir = std::path::PathBuf::from(DEFAULT_UPDATE_DIR);
+        let app = std::path::PathBuf::from(child_bin);
+        if let Some(activity) = activity {
+            EvidenceObserver::start_tracked(
+                update_dir,
+                app,
+                attempt,
+                started_at,
+                initial,
+                activity,
+                report_evidence,
+            )
+        } else {
+            EvidenceObserver::start(
+                update_dir,
+                app,
+                attempt,
+                started_at,
+                initial,
+                report_evidence,
+            )
+        }
     }
 
     fn log_health_event(
@@ -372,6 +399,7 @@ mod unix_main {
                     sup.child = None;
                     sup.health = None;
                     sup.evidence = None;
+                    sup.running_activity = None;
                     return true;
                 }
                 Ok(None) => {
@@ -398,14 +426,37 @@ mod unix_main {
         }
     }
 
-    fn start_child_if_configured(payload: &str) {
+    fn start_child_if_configured(payload: &str) -> bool {
+        let coordination = state().launch_coordination.clone();
+        if coordination.is_none()
+            && state().launch_coordination_failed
+            && state().degraded_decision_blocker.is_none()
+        {
+            state().log("go_refused reason=launch_coordination_unavailable");
+            return false;
+        }
+        // Shared admission is atomic with respect to the future exclusive decision gate. It is a
+        // nonblocking kernel operation; a held decision refuses this launch before child spawn.
+        let _admission = if let Some(coordination) = coordination.as_ref() {
+            match coordination.admit_launch() {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    state().log(&format!(
+                        "go_refused reason=promotion_decision_boundary detail={error}"
+                    ));
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         let mut guard = match state().child.lock() {
             Ok(g) => g,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let Some(sup) = guard.as_mut() else {
             state().log(&format!("go_probe_only payload={payload:?}"));
-            return;
+            return true;
         };
         if let Some(existing) = sup.child.as_mut() {
             let existing_pid = existing.id();
@@ -427,13 +478,14 @@ mod unix_main {
                     sup.events = None;
                     sup.health = None;
                     sup.evidence = None;
+                    sup.running_activity = None;
                 }
                 Ok(None) => {
                     state().log(&format!(
                         "go_skipped_already_running pid={} payload={payload:?}",
                         existing.id()
                     ));
-                    return;
+                    return true;
                 }
                 Err(e) => {
                     if let Some(health) = sup.health.as_mut() {
@@ -448,7 +500,7 @@ mod unix_main {
                         evidence.record_interrupted(Instant::now());
                     }
                     state().log(&format!("go_child_poll_failed err={e}"));
-                    return;
+                    return true;
                 }
             }
         }
@@ -466,6 +518,7 @@ mod unix_main {
                 evidence.record_interrupted(Instant::now());
             }
             sup.evidence = None;
+            sup.running_activity = None;
             sup.events = None;
         }
         state().log(&format!(
@@ -518,6 +571,43 @@ mod unix_main {
         // Capture ordering without filesystem access. The worker uses this pre-spawn token to keep
         // a delayed older worker from displacing a newer cross-process owner.
         let evidence_attempt = LaunchAttempt::capture(&launch_attempt).ok();
+        let mut running_activity = if let Some(coordination) = coordination.as_ref() {
+            coordination.begin_launch(&launch_attempt);
+            match coordination.running_child_activity() {
+                Ok(activity) => Some(activity),
+                Err(error) => {
+                    coordination.mark_worker_unavailable(&launch_attempt);
+                    state().log(&format!(
+                        "child_start_refused reason=running_child_coordination detail={error}"
+                    ));
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let mut worker_activity = if evidence_attempt.is_some() {
+            coordination.as_ref().and_then(|coordination| {
+                match coordination.evidence_worker_activity() {
+                    Ok(activity) => Some(activity),
+                    Err(error) => {
+                        coordination.mark_worker_unavailable(&launch_attempt);
+                        state().log(&format!(
+                            "launch_health attempt={launch_attempt} state=interrupted reason=worker_coordination_failed detail={error}"
+                        ));
+                        None
+                    }
+                }
+            })
+        } else {
+            if let Some(coordination) = coordination.as_ref() {
+                coordination.mark_worker_unavailable(&launch_attempt);
+            }
+            None
+        };
+        if let Some(activity) = running_activity.as_ref() {
+            activity.configure_command(&mut command);
+        }
         match command.spawn() {
             Ok(mut child) => {
                 let pid = child.id();
@@ -539,7 +629,7 @@ mod unix_main {
                 // All evidence filesystem work occurs on a detached worker. This handoff performs
                 // only allocation and thread creation on the launch path.
                 let evidence = evidence_attempt.and_then(|attempt| {
-                    start_evidence_worker(
+                    match start_evidence_worker(
                         &sup.child_bin,
                         attempt,
                         started_at,
@@ -548,12 +638,25 @@ mod unix_main {
                         } else {
                             InitialEvidence::Unavailable
                         },
-                    )
+                        worker_activity.take(),
+                    ) {
+                        Ok(observer) => Some(observer),
+                        Err(error) => {
+                            if let Some(coordination) = coordination.as_ref() {
+                                coordination.mark_worker_unavailable(&launch_attempt);
+                            }
+                            state().log(&format!(
+                                "launch_health attempt={launch_attempt} state=interrupted reason=worker_spawn_failed detail={error}"
+                            ));
+                            None
+                        }
+                    }
                 });
                 sup.events = child.stdin.take();
                 sup.child = Some(child);
                 sup.health = observer;
                 sup.evidence = evidence;
+                sup.running_activity = running_activity.take();
                 std::thread::spawn(move || watch_child(pid));
             }
             Err(e) => {
@@ -566,16 +669,25 @@ mod unix_main {
                     ));
                 }
                 if let Some(attempt) = evidence_attempt {
-                    let _ = start_evidence_worker(
+                    if let Err(error) = start_evidence_worker(
                         &sup.child_bin,
                         attempt,
                         Instant::now(),
                         InitialEvidence::SpawnFailed,
-                    );
+                        worker_activity.take(),
+                    ) {
+                        if let Some(coordination) = coordination.as_ref() {
+                            coordination.mark_worker_unavailable(&launch_attempt);
+                        }
+                        state().log(&format!(
+                            "launch_health attempt={launch_attempt} state=interrupted reason=worker_spawn_failed detail={error}"
+                        ));
+                    }
                 }
                 state().log(&format!("child_start_failed err={e}"));
             }
         }
+        true
     }
 
     /// Watch one child. Deliberate stops (pause/unload) reap it inside `stop_child_sigterm`
@@ -627,6 +739,7 @@ mod unix_main {
                         sup.events = None;
                         sup.health = None;
                         sup.evidence = None;
+                        sup.running_activity = None;
                         Some(status)
                     }
                     Err(e) => {
@@ -696,8 +809,111 @@ mod unix_main {
         let payload = payload_from_value(value);
         state().go_seen.store(true, Ordering::SeqCst);
         state().log(&format!("lifecycle_event prop={prop} payload={payload:?}"));
-        start_child_if_configured(&payload);
-        acknowledge(lipc, prop, &payload)
+        dispatch_go(&payload, || acknowledge(lipc, prop, &payload))
+    }
+
+    /// Shared by the production LIPC callback and the Linux subprocess fixture. The fixture thus
+    /// exercises the same launch-admission and acknowledgment decision used by appmgrd.
+    fn dispatch_go<F>(payload: &str, acknowledge_launch: F) -> LIPCcode
+    where
+        F: FnOnce() -> LIPCcode,
+    {
+        if start_child_if_configured(payload) {
+            acknowledge_launch()
+        } else {
+            // A successful goresult would falsely tell appmgrd that a child was admitted. Returning
+            // a nonzero callback result leaves the request failed while the decision gate is held.
+            state().log("lifecycle_ack_skipped prop=go reason=launch_not_admitted");
+            1
+        }
+    }
+
+    /// Debug-only Linux integration fixture for the production `go` dispatch. It does not load
+    /// LIPC, but it uses the production callback body, lifecycle state, supervisor, and spawn path.
+    #[cfg(debug_assertions)]
+    pub fn run_test_production_go_dispatch() -> ! {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        if args.len() != 7 || args[0] != std::ffi::OsStr::new(TEST_PRODUCTION_GO_ARGUMENT) {
+            eprintln!(
+                "usage: scribe-lifecycle {TEST_PRODUCTION_GO_ARGUMENT} HOST_READY TRIGGER CHILD_MARKER ACK_MARKER RESULT LOG"
+            );
+            std::process::exit(2);
+        }
+        let host_ready = PathBuf::from(&args[1]);
+        let trigger = PathBuf::from(&args[2]);
+        let child_marker = PathBuf::from(&args[3]);
+        let ack_marker = PathBuf::from(&args[4]);
+        let result_path = PathBuf::from(&args[5]);
+        let log_path = PathBuf::from(&args[6]);
+
+        let coordination = match HostLaunchCoordination::start() {
+            Ok(coordination) => Arc::new(coordination),
+            Err(error) => {
+                eprintln!("production_go_fixture_coordination_failed: {error}");
+                std::process::exit(error.exit_code());
+            }
+        };
+        let completed_launch = "00112233445566778899aabbccddeeff";
+        coordination.begin_launch(completed_launch);
+        coordination.evidence_report(&EvidenceReport {
+            launch_uuid: completed_launch.to_owned(),
+            outcome: "fixture_complete",
+            result: Ok(()),
+            terminal: true,
+        });
+
+        let child = ChildSupervisor {
+            child_bin: "/bin/sh".to_owned(),
+            child_args: vec![
+                "-c".to_owned(),
+                "printf 'spawned\\n' > \"$1\"".to_owned(),
+                "sh".to_owned(),
+                child_marker.to_string_lossy().into_owned(),
+            ],
+            child: None,
+            events: None,
+            health: None,
+            evidence: None,
+            running_activity: None,
+        };
+        let _ = CHILD_LOG.set(log_path.to_string_lossy().into_owned());
+        let _ = STATE.set(LifecycleState {
+            service_name: "test.production.go".to_owned(),
+            log_path: log_path.to_string_lossy().into_owned(),
+            done: AtomicBool::new(false),
+            unload_seen: AtomicBool::new(false),
+            pause_seen: AtomicBool::new(false),
+            go_seen: AtomicBool::new(false),
+            load_seen: AtomicBool::new(false),
+            launch_coordination: Some(coordination),
+            degraded_decision_blocker: None,
+            launch_coordination_failed: false,
+            child: Mutex::new(Some(child)),
+        });
+        if let Err(error) = std::fs::write(&host_ready, b"ready\n") {
+            eprintln!("production_go_fixture_ready_failed: {error}");
+            std::process::exit(1);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !trigger.exists() {
+            if Instant::now() >= deadline {
+                eprintln!("production_go_fixture_trigger_timed_out");
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = dispatch_go("fixture:", || {
+            if std::fs::write(&ack_marker, b"acknowledged\n").is_ok() {
+                LIPC_OK
+            } else {
+                1
+            }
+        });
+        if let Err(error) = std::fs::write(&result_path, format!("{result}\n")) {
+            eprintln!("production_go_fixture_result_failed: {error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
     }
 
     unsafe extern "C" fn on_pause(
@@ -808,6 +1024,24 @@ mod unix_main {
         ensure_log_parent(&args.log_path);
         let _ = CHILD_LOG.set(args.child_log.clone());
 
+        let (launch_coordination, degraded_decision_blocker, coordination_error) = if args.probe {
+            (None, None, None)
+        } else {
+            match HostLaunchCoordination::start() {
+                Ok(coordination) => (Some(Arc::new(coordination)), None, None),
+                Err(error) => {
+                    let blocker = block_decisions_after_setup_failure();
+                    let detail = match &blocker {
+                        Ok(_) => error.to_string(),
+                        Err(blocker_error) => {
+                            format!("{error}; degraded blocker failed: {blocker_error}")
+                        }
+                    };
+                    (None, blocker.ok(), Some(detail))
+                }
+            }
+        };
+
         let child = args.child_bin.as_ref().map(|bin| ChildSupervisor {
             child_bin: bin.clone(),
             child_args: args.child_args.clone(),
@@ -815,6 +1049,7 @@ mod unix_main {
             events: None,
             health: None,
             evidence: None,
+            running_activity: None,
         });
 
         let st = LifecycleState {
@@ -825,9 +1060,20 @@ mod unix_main {
             pause_seen: AtomicBool::new(false),
             go_seen: AtomicBool::new(false),
             load_seen: AtomicBool::new(false),
+            launch_coordination,
+            launch_coordination_failed: coordination_error.is_some(),
+            degraded_decision_blocker,
             child: Mutex::new(child),
         };
         let _ = STATE.set(st);
+
+        if let Some(error) = coordination_error {
+            state().log(&format!(
+                "launch_coordination status=unavailable decisions=refused detail={error}"
+            ));
+        } else if state().launch_coordination.is_some() {
+            state().log("launch_coordination status=ready decisions=possible_after_quiescence");
+        }
 
         state().log(&format!(
             "lifecycle_start service={} probe={} lipc_so={} pid={}",
@@ -907,6 +1153,21 @@ mod unix_main {
 
 #[cfg(unix)]
 fn main() {
+    #[cfg(debug_assertions)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(unix_main::TEST_PRODUCTION_GO_ARGUMENT))
+    {
+        unix_main::run_test_production_go_dispatch();
+    }
+    if let Some(result) = launch_gate::run_requested_command() {
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("promotion_decision_boundary_failed: {error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
     if let Some(result) = updater_lock::run_requested_command() {
         match result {
             Ok(()) => std::process::exit(0),

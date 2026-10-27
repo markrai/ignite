@@ -1,7 +1,7 @@
 # Kindle promotion authorization gate feasibility (Slice 3D-B2a)
 
-**Status: blocked; the installer-side lock prerequisite is complete, but the lifecycle launch gate,
-worker quiescence, and trusted compatibility evidence remain absent. No authorization interface was
+**Status: coordination prerequisites complete through Slice 3D-B2a.2; trusted compatibility
+evidence remains absent, so authorization is still blocked. No authorization interface was
 implemented.**
 
 Slice 3D-B1 is a read-only observation. Its `REVIEW_REQUIRED` result is not an authorization and
@@ -20,18 +20,21 @@ transaction lock before installed-state mutation, including `recover_install_tra
 installer/recovery/uninstall race identified here, but does not by itself exclude a lifecycle child
 spawn or drain an already queued evidence worker.
 
-The pending-health guard remains a policy check rather than a mutex. Future assessors must take the
+The pending-health guard remains a policy check rather than a mutex. Future assessors must use the
+manual/internal decision boundary in
+[`kindle-lifecycle-decision-boundary.md`](kindle-lifecycle-decision-boundary.md), which takes the
 updater lock in the documented global order; the B1 shared evidence lock alone still cannot exclude
 installer-owned changes.
 
-### Lifecycle and evidence
+### Lifecycle and evidence (updated by Slice 3D-B2a.2)
 
-The evidence lock serializes publication of `launch-health-owner.v1` and
-`launch-health-evidence.v1`. It does not serialize child launch. The lifecycle host deliberately
-captures a monotonic launch-order token and calls `command.spawn()` before handing ownership work to
-an asynchronous evidence worker.
+The lifecycle host now admits `go` under a shared cross-process launch gate and acquires child and
+worker activity tokens before spawning. A decision takes the launch gate exclusively, excludes a
+running or orphaned child, drains worker tokens with a bounded deadline, confirms a completed worker
+from the current live host generation, and then takes the evidence lock. The updater transaction
+lock is acquired between the launch gate and worker/evidence boundaries.
 
-A stale-authorization interleaving is therefore possible:
+A stale-authorization interleaving was previously possible:
 
 1. Durable owner/evidence describe a completed, successful launch L1.
 2. A separate preflight process takes the evidence lock exclusively.
@@ -40,11 +43,15 @@ A stale-authorization interleaving is therefore possible:
 5. Preflight validates L1 and releases the lock.
 6. The delayed L2 worker claims ownership and replaces the evidence.
 
-The `scribe-app` singleton at `/tmp/scribe-app.lock` prevents two application bodies from running
-simultaneously, but it does not prevent lifecycle from spawning L2 or its evidence worker from later
-superseding L1. The lifecycle supervisor mutex is process-local and cannot be acquired by a separate
-manual preflight invocation. Evidence workers are detached and expose no cross-process quiescence
-barrier.
+This interleaving is now closed: L2 must hold shared launch admission until its worker token is
+queued, so an exclusive decision cannot enter between spawn and handoff. A queued worker retains its
+token while blocked on the evidence lock. Host death cannot hide a live child because the child
+inherits its activity token, and a restarted host refuses decisions until a launch in that new host
+generation has completed its terminal evidence publication.
+
+The `scribe-app` singleton remains independent and is not used as promotion evidence. The new gate,
+activity tokens, and host-generation endpoint provide the cross-process boundary; the process-local
+supervisor mutex alone is still not treated as authority.
 
 ### Data compatibility
 
@@ -74,19 +81,18 @@ A safe implementation needs all of the following cooperating changes:
 1. A fixed, no-symlink updater transaction lock honored by every installer, recovery, uninstall, and
    future promotion path **before any mutation or cleanup**. **Completed for current install,
    recovery, and uninstall paths in Slice 3D-B2a.1; future promotion must join it.**
-2. A lifecycle-owned launch gate in the long-running host. While a decision is active, `go` must not
-   spawn a child. The gate must be established through the host's supervisor serialization rather
-   than inferred from `/proc`.
-3. A bounded evidence-worker quiescence operation. The host must be able to prove that no earlier or
-   later ownership worker is queued before the authorization snapshot is taken.
-4. An explicit global lock order covering the launch gate, evidence lock, and updater transaction
-   lock, with contention and interrupted-owner behavior defined and tested.
+2. **Completed in Slice 3D-B2a.2.** A lifecycle-owned launch gate prevents child spawn and worker
+   queueing while a decision is active.
+3. **Completed in Slice 3D-B2a.2.** Per-worker activity tokens, running-child exclusion, and the
+   current host-generation endpoint provide bounded quiescence without relying on `/proc` scans.
+4. **Completed in Slice 3D-B2a.2.** The global order is launch gate, updater transaction lock,
+   child/worker quiescence, then evidence lock; contention and process death fail closed.
 5. Revalidation of the complete B1 snapshot after all boundaries are held and immediately before any
    authorization result is returned or a B2b transaction is prepared.
 
-These are behavioral changes to installer/lifecycle coordination and are outside B2a's stated
-boundaries. A double-read, process scan, lock-file existence check, or exclusive evidence lock alone
-is not an acceptable substitute.
+The coordination changes in items 1–4 are now implemented without authorization or promotion
+behavior. B2a must still perform item 5 inside the held boundary. A double-read, process scan,
+lock-file existence check, or exclusive evidence lock alone is not an acceptable substitute.
 
 ## Proposed authorization binding after the boundary exists
 

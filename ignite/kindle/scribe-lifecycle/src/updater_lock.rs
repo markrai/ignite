@@ -122,6 +122,17 @@ fn acquire_at(path: &Path) -> Result<File, LockError> {
     Ok(file)
 }
 
+/// Held by a future promotion decision after it has acquired the lifecycle launch gate.
+/// Keeping the file alive keeps the kernel lock alive; no pathname or environment marker is
+/// treated as authority.
+pub(crate) struct UpdaterTransactionGuard {
+    _lock: File,
+}
+
+pub(crate) fn acquire_for_decision() -> Result<UpdaterTransactionGuard, LockError> {
+    acquire_at(&configured_lock_path()).map(|lock| UpdaterTransactionGuard { _lock: lock })
+}
+
 fn verify_inherited_fd_at(fd: RawFd, path: &Path) -> Result<(), LockError> {
     let descriptor_path = PathBuf::from(format!("/proc/self/fd/{fd}"));
     let descriptor_metadata = std::fs::metadata(&descriptor_path)

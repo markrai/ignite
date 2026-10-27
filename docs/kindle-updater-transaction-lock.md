@@ -44,7 +44,11 @@ global order and release them in reverse:
 
 1. lifecycle launch gate (prevents a new child/evidence worker from being queued);
 2. updater transaction lock (excludes install, recovery, uninstall, and future promotion mutation);
-3. evidence lock (after bounded evidence-worker quiescence).
+3. running-child exclusion and bounded evidence-worker quiescence;
+4. evidence lock for the stable decision snapshot.
 
-Install and uninstall acquire only item 2. Evidence publication acquires only item 3. No code in this
-slice acquires the future launch gate or combines the updater and evidence locks.
+Install and uninstall acquire only item 2. Launch admission takes item 1 shared and prepares item 3
+as shared activity tokens; evidence publication takes item 4 while retaining its worker token. No
+code in this slice changes installer ordering. Slice 3D-B2a.2 implements the lifecycle and decision
+side of this order; see
+[`kindle-lifecycle-decision-boundary.md`](kindle-lifecycle-decision-boundary.md).

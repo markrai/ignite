@@ -13,7 +13,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -788,6 +788,9 @@ pub struct EvidenceReport {
     pub launch_uuid: String,
     pub outcome: &'static str,
     pub result: Result<(), EvidenceError>,
+    /// True only when this report is the worker's final report. A failed publication is final
+    /// because evidence workers deliberately stop after the first persistence error.
+    pub terminal: bool,
 }
 
 enum EvidenceCommand {
@@ -807,6 +810,11 @@ pub struct EvidenceObserver {
     available: bool,
 }
 
+struct WorkerResources {
+    lifecycle: Option<PathBuf>,
+    activity: Option<crate::launch_gate::EvidenceWorkerActivity>,
+}
+
 impl EvidenceObserver {
     pub fn start<F>(
         update_dir: PathBuf,
@@ -820,7 +828,42 @@ impl EvidenceObserver {
         F: Fn(EvidenceReport) + Send + 'static,
     {
         Self::start_inner(
-            update_dir, app, None, attempt, started_at, initial, reporter,
+            update_dir,
+            app,
+            WorkerResources {
+                lifecycle: None,
+                activity: None,
+            },
+            attempt,
+            started_at,
+            initial,
+            reporter,
+        )
+    }
+
+    pub fn start_tracked<F>(
+        update_dir: PathBuf,
+        app: PathBuf,
+        attempt: LaunchAttempt,
+        started_at: Instant,
+        initial: InitialEvidence,
+        activity: crate::launch_gate::EvidenceWorkerActivity,
+        reporter: F,
+    ) -> io::Result<Self>
+    where
+        F: Fn(EvidenceReport) + Send + 'static,
+    {
+        Self::start_inner(
+            update_dir,
+            app,
+            WorkerResources {
+                lifecycle: None,
+                activity: Some(activity),
+            },
+            attempt,
+            started_at,
+            initial,
+            reporter,
         )
     }
 
@@ -840,7 +883,10 @@ impl EvidenceObserver {
         Self::start_inner(
             update_dir,
             app,
-            Some(lifecycle),
+            WorkerResources {
+                lifecycle: Some(lifecycle),
+                activity: None,
+            },
             attempt,
             started_at,
             initial,
@@ -851,7 +897,7 @@ impl EvidenceObserver {
     fn start_inner<F>(
         update_dir: PathBuf,
         app: PathBuf,
-        lifecycle: Option<PathBuf>,
+        resources: WorkerResources,
         attempt: LaunchAttempt,
         started_at: Instant,
         initial: InitialEvidence,
@@ -865,6 +911,9 @@ impl EvidenceObserver {
         thread::Builder::new()
             .name("ignite-health-evidence".to_owned())
             .spawn(move || {
+                // This token was acquired by the lifecycle host before child spawn. Holding it
+                // through the complete worker closes the spawn-to-thread-start quiescence gap.
+                let _activity = resources.activity;
                 let ownership = match LaunchOwnership::claim(&update_dir, attempt) {
                     Ok(ownership) => ownership,
                     Err(error) => {
@@ -872,17 +921,19 @@ impl EvidenceObserver {
                             launch_uuid: worker_uuid,
                             outcome: "ownership",
                             result: Err(error),
+                            terminal: true,
                         });
                         return;
                     }
                 };
-                let lifecycle = match lifecycle.map_or_else(std::env::current_exe, Ok) {
+                let lifecycle = match resources.lifecycle.map_or_else(std::env::current_exe, Ok) {
                     Ok(lifecycle) => lifecycle,
                     Err(error) => {
                         reporter(EvidenceReport {
                             launch_uuid: worker_uuid,
                             outcome: "setup",
                             result: Err(error.into()),
+                            terminal: true,
                         });
                         return;
                     }
@@ -895,6 +946,7 @@ impl EvidenceObserver {
                                 launch_uuid: worker_uuid,
                                 outcome: "setup",
                                 result: Err(error),
+                                terminal: true,
                             });
                             return;
                         }
@@ -909,6 +961,7 @@ impl EvidenceObserver {
                     launch_uuid: worker_uuid.clone(),
                     outcome: initial.outcome(),
                     result: initial_result,
+                    terminal: !initial_ok || matches!(initial, InitialEvidence::SpawnFailed),
                 });
                 if !initial_ok || matches!(initial, InitialEvidence::SpawnFailed) {
                     return;
@@ -948,11 +1001,20 @@ impl EvidenceObserver {
                         launch_uuid: worker_uuid.clone(),
                         outcome,
                         result,
+                        terminal: !publication_ok || terminal,
                     });
                     if !publication_ok || terminal {
                         return;
                     }
                 }
+                reporter(EvidenceReport {
+                    launch_uuid: worker_uuid,
+                    outcome: "abandoned",
+                    result: Err(invalid(
+                        "evidence command channel closed before a terminal observation",
+                    )),
+                    terminal: true,
+                });
             })?;
         Ok(Self {
             sender,
@@ -1237,6 +1299,70 @@ fn acquire_publication_lock(update_dir: &Path) -> Result<PublicationLock, Eviden
         .map_err(|error| invalid(format!("cannot open health evidence lock: {error}")))?;
     lock.set_permissions(fs::Permissions::from_mode(0o600))?;
     PublicationLock::acquire(lock)
+}
+
+/// Exclusive evidence boundary used only after the lifecycle launch gate, updater transaction
+/// lock, and evidence-worker quiescence have all been established. Unlike publication, assessment
+/// must not create a missing lock file because that would manufacture coordination state.
+pub(crate) struct DecisionEvidenceLock {
+    _lock: File,
+}
+
+pub(crate) fn acquire_decision_evidence_lock(
+    update_dir: &Path,
+    timeout: Duration,
+) -> Result<DecisionEvidenceLock, EvidenceError> {
+    ensure_safe_update_dir(update_dir)?;
+    let lock_path = update_dir.join(EVIDENCE_LOCK_NAME);
+    refuse_symlink(&lock_path, "health evidence lock")?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .map_err(|error| {
+            invalid(format!(
+                "cannot open existing health evidence lock: {error}"
+            ))
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(invalid(
+            "health evidence lock is not a singly linked regular file",
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(invalid(
+            "health evidence lock is not owned by the effective user",
+        ));
+    }
+    let path_metadata = fs::symlink_metadata(&lock_path)?;
+    if path_metadata.file_type().is_symlink()
+        || path_metadata.dev() != metadata.dev()
+        || path_metadata.ino() != metadata.ino()
+    {
+        return Err(invalid("health evidence lock changed while it was opened"));
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(DecisionEvidenceLock { _lock: file });
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ) {
+            return Err(error.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(
+                "health evidence lock remained busy through the decision deadline",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct PublicationLock(File);
@@ -1947,15 +2073,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(wait_for_report(&report_receiver, "spawned").result.is_ok());
+        let spawned = wait_for_report(&report_receiver, "spawned");
+        assert!(spawned.result.is_ok());
+        assert!(!spawned.terminal);
         observer.record_ready(start + Duration::from_millis(100));
-        assert!(wait_for_report(&report_receiver, "ready").result.is_ok());
+        let ready = wait_for_report(&report_receiver, "ready");
+        assert!(ready.result.is_ok());
+        assert!(!ready.terminal);
 
         let _newer = tree.ownership(SECOND_LAUNCH);
         observer.maybe_record_running(start + Duration::from_secs(61), Duration::from_secs(60));
-        assert!(wait_for_report(&report_receiver, "ready_running")
-            .result
-            .is_err());
+        let failed_checkpoint = wait_for_report(&report_receiver, "ready_running");
+        assert!(failed_checkpoint.result.is_err());
+        assert!(failed_checkpoint.terminal);
 
         fs::remove_file(&tree.app).unwrap();
         observer.maybe_record_running(start + Duration::from_secs(120), Duration::from_secs(60));
