@@ -1,8 +1,8 @@
 # Kindle promotion authorization gate feasibility (Slice 3D-B2a)
 
 **Status: coordination and boundary-aware B1 revalidation are complete through Slice 3D-B2a.3;
-trusted compatibility evidence remains absent, so authorization is still blocked. No authorization
-interface was implemented.**
+trusted compatibility evidence and pre-first-launch admission remain absent, so authorization is
+still blocked. No authorization interface was implemented.**
 
 Slice 3D-B1 is a read-only observation. Its `REVIEW_REQUIRED` result is not an authorization and
 cannot be upgraded into one by a later caller. The original feasibility review found no primitive
@@ -59,8 +59,10 @@ Both current canonical records require `data_compatibility=unknown`. No trusted 
 capability declaration, or device-local validation result exists. Unknown must remain a hard blocker;
 a command-line assertion, `--force`, confirmation prompt, or unsigned sidecar would not resolve it.
 
-Actual compatibility evidence needs a separately specified, strictly validated contract. At minimum
-it must:
+The source-grounded contract is now specified in
+[`kindle-data-compatibility-contract.md`](kindle-data-compatibility-contract.md), but none of its
+capability, data-writer exclusion, probe, provenance, or stable-state evidence is implemented.
+At minimum the eventual evidence must:
 
 - identify the compatibility-policy/schema version;
 - bind the exact pending transaction and pending-record digest;
@@ -73,6 +75,38 @@ it must:
 
 Maintainer-authenticated release capabilities may be one input, but they cannot replace device-local
 checks when B may already have written data. The evidence format and checker are separate future work.
+
+### Pre-first-launch correction (Slice 3D-B2a.4.0)
+
+Post-launch promotion assessment is not the first compatibility decision. Current `scribe-app`
+startup can complete adoption recovery, migrate a library, reconcile sync state, and repair import
+or page state before or after Home readiness. If B performs a write A cannot read, later
+`promotion_authorized=false` preserves A's files but does not make executable rollback safe.
+
+The corrected design in
+[`kindle-data-compatibility-contract.md`](kindle-data-compatibility-contract.md) therefore requires a
+positive bidirectional result before B is selected for normal execution. The authoritative operation
+is a future pre-activation candidate-admission transaction: launch gate first, updater lock second,
+then child/worker and data-writer exclusion, exact A/B probes and stable roots, durable binding,
+activation, pending publication, and commit under one boundary. Lifecycle admission and a
+kernel-backed lifecycle-to-application capability enforce the result after reboot and prevent direct
+or mixed-tree B execution. A flag, environment variable, process scan, or unsigned marker alone is
+not sufficient.
+
+The existing installer cannot provide that boundary: it takes the updater lock without the launch
+gate, performs a racy `/proc` scan, and selects B before publishing pending state. B2a.3 also cannot
+be reused unchanged because it requires health evidence from a B launch. The required pre-launch
+coordinator, data-writer boundary, authenticated capabilities/provenance, no-write probes, stable
+root, durable admission binding, and child handoff remain future implementation slices. Until they
+exist, `data_compatibility=unknown` blocks both safe first-launch approval and promotion
+authorization; this document's authorization binding remains a post-launch contract only.
+
+Read-only firmware-5.18.6 inspection on 2026-10-27 confirmed that `/mnt/us` exposes mode `0777`
+through `fuse.fsp`, so it cannot permission-isolate authoritative admission state. Writable ext3
+`/var/local/root` is not writable by the framework user and is the current candidate parent for a
+future root-owned record. The same inspection confirmed appmgrd's 60-second `go` deadline and
+exclusive lock contention/release on existing `/tmp` and `/mnt/us` files. No Slice code was deployed,
+no admission state was created, and reboot/power-loss durability remains untested.
 
 ## Boundary required before B2a can continue
 
@@ -111,6 +145,8 @@ candidate_app_bytes=<canonical decimal>
 candidate_app_sha256=<64 lowercase hex>
 candidate_lifecycle_bytes=<canonical decimal>
 candidate_lifecycle_sha256=<64 lowercase hex>
+candidate_host_bytes=<canonical decimal>
+candidate_host_sha256=<64 lowercase hex>
 retained_inventory_bytes=<canonical decimal>
 retained_inventory_sha256=<64 lowercase hex>
 launch_owner_uuid=<32 lowercase hex>
@@ -118,12 +154,15 @@ launch_owner_sha256=<64 lowercase hex>
 health_evidence_sha256=<64 lowercase hex>
 data_compatibility=compatible
 data_compatibility_evidence_sha256=<64 lowercase hex>
+prelaunch_admission_sha256=<64 lowercase hex>
 ```
 
 After exclusive revalidation, a non-mutating preflight could compare a manually supplied challenge
-digest with the digest of those exact bytes. Any changed transaction, executable, inventory, owner,
-evidence, or compatibility result would produce a different challenge and fail closed. Merely
-invoking the command or repeating a B1 report would not be sufficient.
+digest with the digest of those exact bytes. For candidates installed under the corrected protocol,
+the binding must also identify the transaction-specific pre-first-launch compatibility/admission
+result. Any changed transaction, executable, inventory, owner, evidence, or compatibility result
+would produce a different challenge and fail closed. Merely invoking the command or repeating a B1
+report would not be sufficient.
 
 No challenge should be emitted as authorizable while compatibility is unknown. No authorization
 record or persistence format is introduced in this feasibility slice.
@@ -139,8 +178,10 @@ from a prior B1 or B2a.3 report.
 
 ## B2b transaction prerequisites
 
-B2b must not begin until compatibility evidence and explicit authorization are added on top of this
-boundary. Its crash-safe transaction must:
+B2b must not begin until compatibility evidence, the pre-first-launch gate for supported candidate
+installs, and explicit authorization are added on top of this boundary. A candidate installed by an
+older path must be classified from its current data and cannot be presumed to have passed that gate.
+Its crash-safe transaction must:
 
 1. acquire the lifecycle launch gate and updater transaction lock in the defined order;
 2. drain evidence workers and take the evidence lock exclusively;
