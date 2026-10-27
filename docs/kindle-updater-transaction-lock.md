@@ -50,5 +50,5 @@ global order and release them in reverse:
 Install and uninstall acquire only item 2. Launch admission takes item 1 shared and prepares item 3
 as shared activity tokens; evidence publication takes item 4 while retaining its worker token. No
 code in this slice changes installer ordering. Slice 3D-B2a.2 implements the lifecycle and decision
-side of this order; see
+side of this order, and Slice 3D-B2a.3 runs B1 assessment while retaining every guard; see
 [`kindle-lifecycle-decision-boundary.md`](kindle-lifecycle-decision-boundary.md).

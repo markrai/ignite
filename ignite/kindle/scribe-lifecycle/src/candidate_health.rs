@@ -7,6 +7,7 @@
 mod assessment;
 
 pub use assessment::assess_default_promotion;
+pub(crate) use assessment::assess_promotion_under_boundary;
 
 use sha2::{Digest, Sha256};
 use std::fmt;

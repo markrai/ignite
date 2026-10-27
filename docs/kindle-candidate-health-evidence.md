@@ -102,10 +102,11 @@ explicit policy blocker. There is intentionally no zero/eligible result while
 
 ## Slice 3D-B2 authorization contract
 
-The B2a feasibility review identified installer and lifecycle coordination prerequisites. B2a.1 and
-B2a.2 now provide the updater transaction lock, lifecycle launch gate, child/worker quiescence, and
-exclusive evidence boundary. No authorization command has been added because trusted positive data
-compatibility evidence and authorization-time B1 revalidation remain absent. See
+The B2a feasibility review identified installer and lifecycle coordination prerequisites. B2a.1,
+B2a.2, and B2a.3 now provide the updater transaction lock, lifecycle launch gate, child/worker
+quiescence, exclusive evidence boundary, and complete B1 revalidation inside that boundary. No
+authorization command has been added because trusted positive data-compatibility evidence remains
+absent. See
 [`kindle-promotion-authorization-gate-feasibility.md`](kindle-promotion-authorization-gate-feasibility.md).
 
 1. Promotion should initially require an explicit user/maintainer action after an inspectable report.

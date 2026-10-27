@@ -6,7 +6,8 @@
 //! lock, drains worker activity, and finally takes the evidence lock. No release state is changed.
 
 use crate::candidate_health::{
-    acquire_decision_evidence_lock, DecisionEvidenceLock, EvidenceReport, DEFAULT_UPDATE_DIR,
+    acquire_decision_evidence_lock, assess_promotion_under_boundary, DecisionEvidenceLock,
+    EvidenceReport, DEFAULT_UPDATE_DIR,
 };
 use crate::updater_lock::{self, UpdaterTransactionGuard};
 use std::ffi::OsStr;
@@ -26,6 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DECISION_CHECK_ARGUMENT: &str = "--check-promotion-decision-boundary";
+pub const BOUNDARY_ASSESS_ARGUMENT: &str = "--assess-promotion-with-boundary";
 const DEFAULT_GATE_PATH: &str = "/tmp/ignite-lifecycle-launch-gate.lock";
 const DEFAULT_HOST_PATH: &str = "/tmp/ignite-lifecycle-host.lock";
 const DEFAULT_CHILD_PATH: &str = "/tmp/ignite-lifecycle-child.lock";
@@ -49,6 +51,10 @@ const TEST_CONTROL_ENV: &str = "IGNITE_TEST_LAUNCH_CONTROL_PATH";
 const TEST_UPDATE_ENV: &str = "IGNITE_TEST_UPDATE_DIR";
 #[cfg(debug_assertions)]
 const TEST_TIMEOUT_ENV: &str = "IGNITE_TEST_DECISION_TIMEOUT_MS";
+#[cfg(debug_assertions)]
+const TEST_ASSESS_READY_ENV: &str = "IGNITE_TEST_BOUNDARY_ASSESSMENT_READY";
+#[cfg(debug_assertions)]
+const TEST_ASSESS_CONTINUE_ENV: &str = "IGNITE_TEST_BOUNDARY_ASSESSMENT_CONTINUE";
 
 #[derive(Clone, Debug)]
 struct CoordinationPaths {
@@ -127,7 +133,10 @@ impl BoundaryError {
 impl fmt::Display for BoundaryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage => write!(f, "usage: scribe-lifecycle {DECISION_CHECK_ARGUMENT}"),
+            Self::Usage => write!(
+                f,
+                "usage: scribe-lifecycle {DECISION_CHECK_ARGUMENT}|{BOUNDARY_ASSESS_ARGUMENT}"
+            ),
             Self::Contended(boundary) => write!(f, "{boundary} is busy"),
             Self::Unavailable(detail) => write!(f, "decision boundary unavailable: {detail}"),
             Self::Unsafe(detail) => write!(f, "unsafe decision coordination path: {detail}"),
@@ -463,13 +472,22 @@ fn serve_control(listener: UnixListener, latest: Arc<Mutex<LatestWorker>>) {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostGeneration {
+    launch_uuid: String,
+    control_device: u64,
+    control_inode: u64,
+}
+
 struct DecisionBoundary {
-    _gate: KernelLock,
-    _updater: UpdaterTransactionGuard,
-    _child: KernelLock,
-    _workers: KernelLock,
+    // Field order intentionally releases locks in reverse acquisition order.
     _evidence: DecisionEvidenceLock,
-    latest_launch_uuid: String,
+    _workers: KernelLock,
+    _child: KernelLock,
+    _updater: UpdaterTransactionGuard,
+    _gate: KernelLock,
+    paths: CoordinationPaths,
+    host_generation: HostGeneration,
 }
 
 impl DecisionBoundary {
@@ -489,7 +507,6 @@ impl DecisionBoundary {
                 BoundaryError::Unavailable(error.to_string())
             }
         })?;
-        require_live_host(&paths.host)?;
         let child = KernelLock::acquire(
             &paths.child,
             LockMode::Exclusive,
@@ -502,18 +519,38 @@ impl DecisionBoundary {
             timeout,
             "evidence worker quiescence",
         )?;
-        let latest_launch_uuid = query_host(&paths.control)?;
+        require_live_host(&paths.host)?;
+        let host_generation = query_host(&paths.control)?;
         let evidence = acquire_decision_evidence_lock(&paths.update_dir, timeout)
             .map_err(|error| BoundaryError::Unavailable(error.to_string()))?;
         Ok(Self {
-            _gate: gate,
-            _updater: updater,
-            _child: child,
-            _workers: workers,
             _evidence: evidence,
-            latest_launch_uuid,
+            _workers: workers,
+            _child: child,
+            _updater: updater,
+            _gate: gate,
+            paths,
+            host_generation,
         })
     }
+
+    fn confirm_host_generation(&self) -> Result<(), BoundaryError> {
+        confirm_host_generation(&self.paths, &self.host_generation)
+    }
+}
+
+fn confirm_host_generation(
+    paths: &CoordinationPaths,
+    expected: &HostGeneration,
+) -> Result<(), BoundaryError> {
+    require_live_host(&paths.host)?;
+    let current = query_host(&paths.control)?;
+    if &current != expected {
+        return Err(BoundaryError::Unavailable(
+            "lifecycle host generation changed during assessment".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_live_host(path: &Path) -> Result<(), BoundaryError> {
@@ -531,7 +568,7 @@ fn require_live_host(path: &Path) -> Result<(), BoundaryError> {
     }
 }
 
-fn query_host(path: &Path) -> Result<String, BoundaryError> {
+fn query_host(path: &Path) -> Result<HostGeneration, BoundaryError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| io_error("inspect lifecycle control socket", error))?;
     if !metadata.file_type().is_socket()
@@ -574,7 +611,23 @@ fn query_host(path: &Path) -> Result<String, BoundaryError> {
             "lifecycle host returned a malformed launch UUID".to_owned(),
         ));
     }
-    Ok(uuid.to_owned())
+    let current_metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error("reinspect lifecycle control socket", error))?;
+    if !current_metadata.file_type().is_socket()
+        || current_metadata.nlink() != 1
+        || current_metadata.uid() != unsafe { libc::geteuid() }
+        || current_metadata.dev() != metadata.dev()
+        || current_metadata.ino() != metadata.ino()
+    {
+        return Err(BoundaryError::Unavailable(
+            "lifecycle control endpoint changed during generation query".to_owned(),
+        ));
+    }
+    Ok(HostGeneration {
+        launch_uuid: uuid.to_owned(),
+        control_device: metadata.dev(),
+        control_inode: metadata.ino(),
+    })
 }
 
 fn check_decision_boundary() -> Result<(), BoundaryError> {
@@ -584,8 +637,63 @@ fn check_decision_boundary() -> Result<(), BoundaryError> {
     let boundary = DecisionBoundary::acquire()?;
     println!(
         "IGNITE_PROMOTION_DECISION_BOUNDARY_V1\nstatus=ready\nlaunch_uuid={}\nauthorization=not_granted",
-        boundary.latest_launch_uuid
+        boundary.host_generation.launch_uuid
     );
+    Ok(())
+}
+
+fn assess_promotion_with_boundary() -> Result<i32, BoundaryError> {
+    if std::env::args_os().count() != 2 {
+        return Err(BoundaryError::Usage);
+    }
+    let boundary = DecisionBoundary::acquire()?;
+    pause_boundary_assessment_for_test()?;
+    let launch_uuid = boundary.host_generation.launch_uuid.clone();
+    let report = assess_promotion_under_boundary(
+        &boundary._evidence,
+        &boundary.paths.update_dir,
+        &launch_uuid,
+    );
+    let confirmation = boundary
+        .confirm_host_generation()
+        .map_err(|error| error.to_string());
+    let report = report.record_boundary_confirmation(&launch_uuid, confirmation);
+    print!("{report}");
+    io::stdout()
+        .flush()
+        .map_err(|error| io_error("flush assessment report", error))?;
+    Ok(report.exit_code())
+}
+
+#[cfg(debug_assertions)]
+fn pause_boundary_assessment_for_test() -> Result<(), BoundaryError> {
+    let Some(ready) = std::env::var_os(TEST_ASSESS_READY_ENV) else {
+        return Ok(());
+    };
+    let Some(continue_path) = std::env::var_os(TEST_ASSESS_CONTINUE_ENV) else {
+        return Err(BoundaryError::Unavailable(format!(
+            "{TEST_ASSESS_CONTINUE_ENV} is required with {TEST_ASSESS_READY_ENV}"
+        )));
+    };
+    fs::write(PathBuf::from(ready), b"ready\n")
+        .map_err(|error| io_error("write assessment fixture readiness", error))?;
+    let continue_path = PathBuf::from(continue_path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if continue_path.is_file() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(BoundaryError::Unavailable(
+                "assessment fixture continuation timed out".to_owned(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn pause_boundary_assessment_for_test() -> Result<(), BoundaryError> {
     Ok(())
 }
 
@@ -701,22 +809,25 @@ fn run_test_admission_fixture() -> Result<(), BoundaryError> {
     Ok(())
 }
 
-pub fn run_requested_command() -> Option<Result<(), BoundaryError>> {
+pub fn run_requested_command() -> Option<Result<i32, BoundaryError>> {
     match std::env::args_os().nth(1).as_deref() {
         Some(argument) if argument == OsStr::new(DECISION_CHECK_ARGUMENT) => {
-            Some(check_decision_boundary())
+            Some(check_decision_boundary().map(|()| 0))
+        }
+        Some(argument) if argument == OsStr::new(BOUNDARY_ASSESS_ARGUMENT) => {
+            Some(assess_promotion_with_boundary())
         }
         #[cfg(debug_assertions)]
         Some(argument) if argument == OsStr::new(TEST_HOST_ARGUMENT) => {
-            Some(run_test_host_fixture())
+            Some(run_test_host_fixture().map(|()| 0))
         }
         #[cfg(debug_assertions)]
         Some(argument) if argument == OsStr::new(TEST_ADMISSION_ARGUMENT) => {
-            Some(run_test_admission_fixture())
+            Some(run_test_admission_fixture().map(|()| 0))
         }
         #[cfg(debug_assertions)]
         Some(argument) if argument == OsStr::new(TEST_HOLD_DECISION_ARGUMENT) => {
-            Some(run_test_decision_holder())
+            Some(run_test_decision_holder().map(|()| 0))
         }
         _ => None,
     }
@@ -947,6 +1058,25 @@ mod tests {
             .unwrap()
             .response()
             .starts_with("BLOCKED"));
+    }
+
+    #[test]
+    fn restarted_host_with_same_launch_uuid_is_a_different_generation() {
+        let tree = TestPaths::new("host-generation");
+        let launch = "00112233445566778899aabbccddeeff";
+        let first = HostLaunchCoordination::start_at(tree.paths.clone()).unwrap();
+        first.begin_launch(launch);
+        first.evidence_report(&report(launch, true));
+        let generation = query_host(&tree.paths.control).unwrap();
+        assert_eq!(generation.launch_uuid, launch);
+        assert!(confirm_host_generation(&tree.paths, &generation).is_ok());
+
+        drop(first);
+        let restarted = HostLaunchCoordination::start_at(tree.paths.clone()).unwrap();
+        restarted.begin_launch(launch);
+        restarted.evidence_report(&report(launch, true));
+        let error = confirm_host_generation(&tree.paths, &generation).unwrap_err();
+        assert!(error.to_string().contains("generation changed"));
     }
 
     #[test]

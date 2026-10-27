@@ -95,6 +95,8 @@ mod unix_main {
                scribe-lifecycle --assess-promotion\n\n\
              Exclusive decision boundary (coordination only; no authorization):\n\
                scribe-lifecycle --check-promotion-decision-boundary\n\n\
+             Boundary-aware pending-release assessment (never authorizes promotion):\n\
+               scribe-lifecycle --assess-promotion-with-boundary\n\n\
              Production host:\n\
                scribe-lifecycle --host [--service com.markrai.ignite] \\\n\
                  [--log HOST_LOG] [--child-log CHILD_LOG] \\\n\
@@ -1164,7 +1166,7 @@ fn main() {
     }
     if let Some(result) = launch_gate::run_requested_command() {
         match result {
-            Ok(()) => std::process::exit(0),
+            Ok(exit_code) => std::process::exit(exit_code),
             Err(error) => {
                 eprintln!("promotion_decision_boundary_failed: {error}");
                 std::process::exit(error.exit_code());

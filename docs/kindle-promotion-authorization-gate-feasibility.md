@@ -1,14 +1,14 @@
 # Kindle promotion authorization gate feasibility (Slice 3D-B2a)
 
-**Status: coordination prerequisites complete through Slice 3D-B2a.2; trusted compatibility
-evidence remains absent, so authorization is still blocked. No authorization interface was
-implemented.**
+**Status: coordination and boundary-aware B1 revalidation are complete through Slice 3D-B2a.3;
+trusted compatibility evidence remains absent, so authorization is still blocked. No authorization
+interface was implemented.**
 
 Slice 3D-B1 is a read-only observation. Its `REVIEW_REQUIRED` result is not an authorization and
-cannot safely be upgraded into one with the current locking arrangements. B2a requires an exclusive
-decision boundary, but no existing primitive excludes both installer mutation and a newer lifecycle
-launch. Adding a token or preflight command without that boundary would create a stale-authorization
-path, so this slice stops at the required feasibility gate.
+cannot be upgraded into one by a later caller. The original feasibility review found no primitive
+that excluded both installer mutation and a newer lifecycle launch. B2a.1 and B2a.2 added that
+boundary; B2a.3 now reruns B1 inside it. Adding an authorization token still remains unsafe until a
+trusted positive compatibility decision exists and is bound to the same snapshot.
 
 ## Existing boundaries
 
@@ -20,7 +20,7 @@ transaction lock before installed-state mutation, including `recover_install_tra
 installer/recovery/uninstall race identified here, but does not by itself exclude a lifecycle child
 spawn or drain an already queued evidence worker.
 
-The pending-health guard remains a policy check rather than a mutex. Future assessors must use the
+The pending-health guard remains a policy check rather than a mutex. Exclusive assessments use the
 manual/internal decision boundary in
 [`kindle-lifecycle-decision-boundary.md`](kindle-lifecycle-decision-boundary.md), which takes the
 updater lock in the documented global order; the B1 shared evidence lock alone still cannot exclude
@@ -87,14 +87,16 @@ A safe implementation needs all of the following cooperating changes:
    current host-generation endpoint provide bounded quiescence without relying on `/proc` scans.
 4. **Completed in Slice 3D-B2a.2.** The global order is launch gate, updater transaction lock,
    child/worker quiescence, then evidence lock; contention and process death fail closed.
-5. Revalidation of the complete B1 snapshot after all boundaries are held and immediately before any
-   authorization result is returned or a B2b transaction is prepared.
+5. **Completed in Slice 3D-B2a.3.** Revalidation of the complete B1 snapshot after all boundaries are
+   held, including an exact binding between the live host's latest launch UUID and durable
+   owner/evidence state. The host endpoint generation is checked before and after validation.
 
-The coordination changes in items 1–4 are now implemented without authorization or promotion
-behavior. B2a must still perform item 5 inside the held boundary. A double-read, process scan,
-lock-file existence check, or exclusive evidence lock alone is not an acceptable substitute.
+Items 1–5 are now implemented without authorization or promotion behavior. The manual
+`--assess-promotion-with-boundary` interface remains non-authorizing and reports
+`data_compatibility=unknown`. A double-read, process scan, lock-file existence check, or exclusive
+evidence lock alone is not an acceptable substitute for this complete boundary.
 
-## Proposed authorization binding after the boundary exists
+## Proposed authorization binding on the established boundary
 
 The eventual manual authorization challenge should use one canonical, versioned byte sequence such
 as:
@@ -126,20 +128,19 @@ invoking the command or repeating a B1 report would not be sufficient.
 No challenge should be emitted as authorizable while compatibility is unknown. No authorization
 record or persistence format is introduced in this feasibility slice.
 
-## Required B2a regression matrix
+## Remaining authorization regression matrix
 
-Once the coordination boundary exists, host tests must prove that authorization is refused for a
-stale challenge, a changed pending transaction or pending digest, damaged A or B, a replaced owner or
-evidence record, incomplete readiness, failed or unrequested exits, and unresolved compatibility.
-Process integration tests must also hold each lock in turn, start overlapping lifecycle evidence
-workers, and race installer recovery against preflight. A successful case must show that the launch
-gate prevents a newer worker from being queued, installer mutation cannot enter the boundary, and an
-exact compatibility-bound challenge is revalidated rather than trusted from a prior B1 report.
+Boundary assessment tests now cover changed pending identity, damaged A/B, stale or malformed
+owner/evidence, incomplete readiness, installer contention, queued workers, launch exclusion, and
+host disappearance/restart. Once trusted compatibility evidence and an explicit authorization
+contract exist, additional tests must refuse stale challenges and changed compatibility bindings.
+An exact compatibility-bound challenge must be revalidated inside this boundary rather than trusted
+from a prior B1 or B2a.3 report.
 
 ## B2b transaction prerequisites
 
-B2b must not begin until the boundary and compatibility-evidence work above exists. Its crash-safe
-transaction must:
+B2b must not begin until compatibility evidence and explicit authorization are added on top of this
+boundary. Its crash-safe transaction must:
 
 1. acquire the lifecycle launch gate and updater transaction lock in the defined order;
 2. drain evidence workers and take the evidence lock exclusively;

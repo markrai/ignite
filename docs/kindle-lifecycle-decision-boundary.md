@@ -1,15 +1,17 @@
-# Kindle lifecycle decision boundary
+# Kindle lifecycle decision boundary and assessment
 
-Slice 3D-B2a.2 provides coordination for a future promotion assessor. It does not assess,
-authorize, promote, roll back, or retire a release.
+Slice 3D-B2a.2 provides lifecycle coordination. Slice 3D-B2a.3 runs the existing B1 read-only
+assessment inside that boundary. Neither slice authorizes, promotes, rolls back, or retires a
+release.
 
 ## Manual/internal interface
 
 ```text
 scribe-lifecycle --check-promotion-decision-boundary
+scribe-lifecycle --assess-promotion-with-boundary
 ```
 
-This command acquires every boundary, reports the current host generation's latest completed launch
+The coordination-only command acquires every boundary, reports the current host generation's latest completed launch
 UUID as coordination context, and releases the boundary only when the in-process check returns. It
 does not execute an arbitrary external program and never reports authorization. Its output is:
 
@@ -31,9 +33,17 @@ The command refuses when the lifecycle host is missing, its current generation h
 evidence worker, a child is running, a worker is queued or incomplete, any lock is contended, the
 control endpoint is malformed, or coordination cannot be proven before the bounded deadline.
 
-The existing `--assess-promotion` command still acquires its own shared evidence lock and is not a
-boundary-aware authorization path. B2a must invoke lock-aware internal revalidation while retaining
-the private guard rather than recursively reacquiring the evidence lock or launching an assessor.
+`--assess-promotion-with-boundary` acquires the same private boundary and then executes both complete
+B1 validation passes in process. The validator receives a reference to the already-held private
+exclusive evidence guard; it does not recursively acquire the evidence lock or launch another CLI.
+Its report uses `mode=boundary-read-only`, separates `decision_boundary` from candidate checks, and
+always ends with `promotion_authorized=false`. A healthy runtime candidate is
+`REVIEW_REQUIRED` (exit 3), because `data_compatibility=unknown` remains a policy blocker. Candidate,
+coordination, corruption, or stale-generation failures are `BLOCKED` (exit 1). Initial lock
+contention retains the boundary's existing refusal status, including exit 75 where applicable.
+
+The original `--assess-promotion` remains available. It still takes the evidence lock shared and is
+useful as a standalone B1 diagnostic, but it is not an exclusive decision snapshot.
 
 ## Launch admission and worker quiescence
 
@@ -60,6 +70,12 @@ publication succeeded in the current host process. Late reports from earlier rap
 ignored. A restarted host begins with no completed launch, so evidence from a prior host generation
 cannot be silently accepted as latest.
 
+The boundary-aware assessor samples the live host before taking the evidence lock and again after
+both B1 passes. It requires the same completed launch UUID and the same owned control-socket device
+and inode, while the launch gate remains exclusive. Durable owner and evidence UUIDs must match that
+host UUID. Host disappearance, endpoint replacement, or restart therefore blocks the report even if
+a test host reports the same UUID after restarting.
+
 While a decision owns the gate exclusively, `go` cannot spawn a child or queue a worker. The host
 does not send a successful `goresult` for a refused launch.
 
@@ -70,15 +86,16 @@ The complete order is:
 1. lifecycle launch gate, exclusive for a decision and shared for launch admission;
 2. updater transaction lock;
 3. running-child exclusion and bounded evidence-worker quiescence;
-4. launch-health evidence lock, exclusive for the decision snapshot.
+4. launch-health evidence lock, exclusive for the decision snapshot and both B1 validation passes.
 
 Normal install and uninstall take only item 2. A lifecycle launch takes item 1 shared, prepares
 items 3 as shared activity tokens, then releases item 1. Evidence publication later takes item 4
 while retaining its worker token. No normal lifecycle path takes the updater transaction lock.
 
 Decision contention is bounded and fails closed. Installer contention retains exit 75. All
-decision locks remain private to the in-process operation and release on its normal return, error,
-or process death; lock files must never be unlinked by cooperating code.
+decision locks remain private to the in-process operation, are released in reverse acquisition
+order after the report has been flushed, and release on error or process death; lock files must
+never be unlinked by cooperating code.
 
 ## Availability and scope
 

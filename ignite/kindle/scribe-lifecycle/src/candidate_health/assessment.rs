@@ -2,8 +2,9 @@
 //!
 //! This module deliberately has no state-writing, repair, promotion, or rollback operation. It
 //! validates the current candidate and retained release twice while holding the evidence writer's
-//! advisory lock in shared mode, then reports whether the runtime evidence is ready for explicit
-//! compatibility review.
+//! advisory lock, then reports whether the runtime evidence is ready for explicit compatibility
+//! review. The standalone command takes that lock shared. The lifecycle decision boundary passes
+//! its private exclusive-lock guard into the same validation implementation.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -38,6 +39,21 @@ const RETAINED_ENTRIES: [&str; 18] = [
     "appreg-handler.sql",
 ];
 const MIN_POST_READY_MS: u64 = 60_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssessmentMode {
+    ReadOnly,
+    BoundaryReadOnly,
+}
+
+impl AssessmentMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::BoundaryReadOnly => "boundary-read-only",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PromotionAssessment {
@@ -121,6 +137,7 @@ impl Check {
 pub struct PromotionAssessmentReport {
     checks: Vec<Check>,
     overall: PromotionAssessment,
+    mode: AssessmentMode,
 }
 
 impl PromotionAssessmentReport {
@@ -131,6 +148,25 @@ impl PromotionAssessmentReport {
 
     pub fn exit_code(&self) -> i32 {
         self.overall.exit_code()
+    }
+
+    pub(crate) fn record_boundary_confirmation(
+        mut self,
+        launch_uuid: &str,
+        confirmation: Result<(), String>,
+    ) -> Self {
+        let check = match confirmation {
+            Ok(()) => Check::pass(
+                "decision_boundary",
+                format!(
+                    "all exclusive guards remained held and lifecycle generation {launch_uuid} was reconfirmed"
+                ),
+            ),
+            Err(detail) => Check::fail("decision_boundary", "coordination_failure", detail),
+        };
+        self.checks.insert(0, check);
+        self.overall = overall_for(&self.checks);
+        self
     }
 
     #[cfg(test)]
@@ -145,7 +181,7 @@ impl PromotionAssessmentReport {
 impl fmt::Display for PromotionAssessmentReport {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(output, "IGNITE_PROMOTION_ASSESSMENT_V1")?;
-        writeln!(output, "mode=read-only")?;
+        writeln!(output, "mode={}", self.mode.as_str())?;
         for check in &self.checks {
             writeln!(
                 output,
@@ -180,6 +216,35 @@ impl Default for AssessmentPaths {
     }
 }
 
+impl AssessmentPaths {
+    fn for_boundary(update_dir: &Path) -> Self {
+        Self {
+            update_dir: update_dir.to_owned(),
+            app: configured_assessment_path(DEFAULT_APP, "IGNITE_TEST_ASSESS_APP_PATH"),
+            lifecycle: configured_assessment_path(
+                DEFAULT_LIFECYCLE,
+                "IGNITE_TEST_ASSESS_LIFECYCLE_PATH",
+            ),
+            previous_dir: configured_assessment_path(
+                DEFAULT_PREVIOUS_DIR,
+                "IGNITE_TEST_ASSESS_PREVIOUS_DIR",
+            ),
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn configured_assessment_path(default: &str, test_variable: &str) -> PathBuf {
+    std::env::var_os(test_variable)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default))
+}
+
+#[cfg(not(debug_assertions))]
+fn configured_assessment_path(default: &str, _test_variable: &str) -> PathBuf {
+    PathBuf::from(default)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingAssessment {
     candidate: PendingCandidate,
@@ -201,6 +266,45 @@ struct ValidatedSnapshot {
 }
 
 struct AssessmentReadLock(File);
+
+enum HeldAssessmentLock<'a> {
+    Shared,
+    Decision {
+        _evidence_lock: &'a DecisionEvidenceLock,
+        latest_launch_uuid: &'a str,
+    },
+}
+
+impl HeldAssessmentLock<'_> {
+    fn mode(&self) -> AssessmentMode {
+        match self {
+            Self::Shared => AssessmentMode::ReadOnly,
+            Self::Decision { .. } => AssessmentMode::BoundaryReadOnly,
+        }
+    }
+
+    fn latest_launch_uuid(&self) -> Option<&str> {
+        match self {
+            Self::Shared => None,
+            Self::Decision {
+                latest_launch_uuid, ..
+            } => Some(latest_launch_uuid),
+        }
+    }
+
+    fn check(&self) -> Check {
+        match self {
+            Self::Shared => Check::pass(
+                "assessment_lock",
+                "existing evidence lock held shared; no state created",
+            ),
+            Self::Decision { .. } => Check::pass(
+                "assessment_lock",
+                "private decision evidence lock remains held exclusively; no recursive lock acquisition",
+            ),
+        }
+    }
+}
 
 impl AssessmentReadLock {
     fn acquire(update_dir: &Path) -> Result<Self, EvidenceError> {
@@ -239,6 +343,22 @@ pub fn assess_default_promotion() -> PromotionAssessmentReport {
     assess_paths(&AssessmentPaths::default(), || {})
 }
 
+pub(crate) fn assess_promotion_under_boundary(
+    evidence_lock: &DecisionEvidenceLock,
+    update_dir: &Path,
+    latest_launch_uuid: &str,
+) -> PromotionAssessmentReport {
+    let paths = AssessmentPaths::for_boundary(update_dir);
+    assess_paths_while_locked(
+        &paths,
+        HeldAssessmentLock::Decision {
+            _evidence_lock: evidence_lock,
+            latest_launch_uuid,
+        },
+        || {},
+    )
+}
+
 fn assess_paths<F>(paths: &AssessmentPaths, between_passes: F) -> PromotionAssessmentReport
 where
     F: FnOnce(),
@@ -258,13 +378,22 @@ where
             ));
             append_unavailable_checks(&mut checks, "assessment lock unavailable");
             checks.push(compatibility_unknown());
-            return finish(checks);
+            return finish(AssessmentMode::ReadOnly, checks);
         }
     };
-    checks.push(Check::pass(
-        "assessment_lock",
-        "existing evidence lock held shared; no state created",
-    ));
+    assess_paths_while_locked(paths, HeldAssessmentLock::Shared, between_passes)
+}
+
+fn assess_paths_while_locked<F>(
+    paths: &AssessmentPaths,
+    held_lock: HeldAssessmentLock<'_>,
+    between_passes: F,
+) -> PromotionAssessmentReport
+where
+    F: FnOnce(),
+{
+    let mut checks = Vec::with_capacity(12);
+    checks.push(held_lock.check());
 
     let pending = match load_pending(paths) {
         Ok(pending) => {
@@ -347,6 +476,28 @@ where
         }
     };
 
+    if let Some(expected) = held_lock.latest_launch_uuid() {
+        match health.as_ref() {
+            Some(health) if health.evidence.launch_uuid == expected => checks.push(Check::pass(
+                "lifecycle_generation",
+                format!("durable owner and evidence match current host launch_uuid={expected}"),
+            )),
+            Some(health) => checks.push(Check::fail(
+                "lifecycle_generation",
+                "stale_evidence",
+                format!(
+                    "current host launch_uuid={expected}, durable launch_uuid={}",
+                    health.evidence.launch_uuid
+                ),
+            )),
+            None => checks.push(Check::unknown(
+                "lifecycle_generation",
+                "dependency_unavailable",
+                "canonical matching owner and evidence are required to bind the host generation",
+            )),
+        }
+    }
+
     append_runtime_checks(&mut checks, health.as_ref().map(|health| &health.evidence));
     checks.push(compatibility_unknown());
 
@@ -384,16 +535,24 @@ where
         )),
     }
 
-    finish(checks)
+    finish(held_lock.mode(), checks)
 }
 
-fn finish(checks: Vec<Check>) -> PromotionAssessmentReport {
-    let overall = if checks.iter().any(|check| check.status == CheckStatus::Fail) {
+fn overall_for(checks: &[Check]) -> PromotionAssessment {
+    if checks.iter().any(|check| check.status == CheckStatus::Fail) {
         PromotionAssessment::Blocked
     } else {
         PromotionAssessment::ReviewRequired
-    };
-    PromotionAssessmentReport { checks, overall }
+    }
+}
+
+fn finish(mode: AssessmentMode, checks: Vec<Check>) -> PromotionAssessmentReport {
+    let overall = overall_for(&checks);
+    PromotionAssessmentReport {
+        checks,
+        overall,
+        mode,
+    }
 }
 
 fn append_unavailable_checks(checks: &mut Vec<Check>, detail: &str) {
@@ -957,6 +1116,19 @@ mod tests {
         fn assess(&self) -> PromotionAssessmentReport {
             assess_paths(&self.paths, || {})
         }
+
+        fn assess_under_boundary(&self, latest_launch_uuid: &str) -> PromotionAssessmentReport {
+            let lock = acquire_decision_evidence_lock(&self.paths.update_dir, Duration::ZERO)
+                .expect("exclusive decision evidence lock");
+            assess_paths_while_locked(
+                &self.paths,
+                HeldAssessmentLock::Decision {
+                    _evidence_lock: &lock,
+                    latest_launch_uuid,
+                },
+                || {},
+            )
+        }
     }
 
     impl Drop for AssessmentTree {
@@ -1028,6 +1200,108 @@ mod tests {
         );
         assert_eq!(report.exit_code(), 3);
         assert!(report.to_string().contains("promotion_authorized=false\n"));
+    }
+
+    #[test]
+    fn boundary_assessment_reuses_b1_without_relocking_and_binds_latest_launch() {
+        let tree = AssessmentTree::new();
+        let report = tree
+            .assess_under_boundary(LAUNCH)
+            .record_boundary_confirmation(LAUNCH, Ok(()));
+        assert_eq!(report.overall(), PromotionAssessment::ReviewRequired);
+        assert_eq!(report.mode, AssessmentMode::BoundaryReadOnly);
+        assert_eq!(report.check("decision_boundary").status, CheckStatus::Pass);
+        assert_eq!(report.check("assessment_lock").status, CheckStatus::Pass);
+        assert!(report
+            .check("assessment_lock")
+            .detail
+            .contains("no recursive lock acquisition"));
+        assert_eq!(
+            report.check("lifecycle_generation").status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            report.check("data_compatibility").status,
+            CheckStatus::Unknown
+        );
+        assert_eq!(report.exit_code(), 3);
+        assert!(report.to_string().contains("mode=boundary-read-only\n"));
+        assert!(report.to_string().contains("promotion_authorized=false\n"));
+    }
+
+    #[test]
+    fn boundary_assessment_rejects_stale_host_launch_uuid() {
+        let tree = AssessmentTree::new();
+        let report = tree.assess_under_boundary("ffeeddccbbaa99887766554433221100");
+        assert_eq!(report.overall(), PromotionAssessment::Blocked);
+        assert_eq!(
+            report.check("lifecycle_generation").status,
+            CheckStatus::Fail
+        );
+        assert_eq!(report.check("lifecycle_generation").class, "stale_evidence");
+    }
+
+    #[test]
+    fn boundary_assessment_revalidates_changed_pending_and_damaged_executables() {
+        let tree = AssessmentTree::new();
+        let pending_path = tree.paths.update_dir.join(PENDING_NAME);
+        let pending = fs::read_to_string(&pending_path).unwrap().replace(
+            "candidate_txn=20261024T120000Z-123",
+            "candidate_txn=20261024T120000Z-124",
+        );
+        fs::write(pending_path, pending).unwrap();
+        let changed_pending = tree.assess_under_boundary(LAUNCH);
+        assert_eq!(changed_pending.overall(), PromotionAssessment::Blocked);
+        assert_eq!(
+            changed_pending.check("evidence_identity").status,
+            CheckStatus::Fail
+        );
+
+        let tree = AssessmentTree::new();
+        fs::write(&tree.paths.lifecycle, b"replaced candidate lifecycle").unwrap();
+        let damaged_b = tree.assess_under_boundary(LAUNCH);
+        assert_eq!(damaged_b.overall(), PromotionAssessment::Blocked);
+        assert_eq!(
+            damaged_b.check("pending_and_live_candidate").class,
+            "corruption"
+        );
+
+        let tree = AssessmentTree::new();
+        fs::write(
+            tree.paths.previous_dir.join("scribe-app"),
+            b"replaced retained app",
+        )
+        .unwrap();
+        let damaged_a = tree.assess_under_boundary(LAUNCH);
+        assert_eq!(damaged_a.overall(), PromotionAssessment::Blocked);
+        assert_eq!(damaged_a.check("retained_release").class, "corruption");
+    }
+
+    #[test]
+    fn boundary_assessment_rejects_missing_and_malformed_evidence() {
+        let tree = AssessmentTree::new();
+        fs::remove_file(tree.paths.update_dir.join(EVIDENCE_NAME)).unwrap();
+        let missing = tree.assess_under_boundary(LAUNCH);
+        assert_eq!(missing.overall(), PromotionAssessment::Blocked);
+        assert_eq!(missing.check("evidence_identity").status, CheckStatus::Fail);
+        assert_eq!(
+            missing.check("evidence_identity").class,
+            "insufficient_evidence"
+        );
+        assert_eq!(
+            missing.check("lifecycle_generation").status,
+            CheckStatus::Unknown
+        );
+
+        let tree = AssessmentTree::new();
+        fs::write(
+            tree.paths.update_dir.join(EVIDENCE_NAME),
+            b"malformed evidence\n",
+        )
+        .unwrap();
+        let malformed = tree.assess_under_boundary(LAUNCH);
+        assert_eq!(malformed.overall(), PromotionAssessment::Blocked);
+        assert_eq!(malformed.check("evidence_identity").class, "corruption");
     }
 
     #[test]
