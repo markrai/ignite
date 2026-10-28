@@ -91,7 +91,7 @@ pub struct FolderStore {
     unreadable: Option<String>,
 }
 
-fn validate(data: &FoldersFileV1) -> Result<(), String> {
+pub(crate) fn validate(data: &FoldersFileV1) -> Result<(), String> {
     if data.v != 1 {
         return Err(format!("unsupported folders version {}", data.v));
     }

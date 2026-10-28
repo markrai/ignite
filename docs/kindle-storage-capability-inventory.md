@@ -1,8 +1,9 @@
-# Kindle storage capability inventory (Slice 3D-B2a.4.1)
+# Kindle storage capability inventory (Slices 3D-B2a.4.1–4.2a)
 
-**Status:** source inventory and compiled declaration only. This document does not establish
-pairwise compatibility, authenticate an executable, inspect device data, admit a candidate,
-authorize promotion, or make rollback safe. `data_compatibility=unknown` remains a hard blocker.
+**Status:** source inventory, compiled declaration, and a partial library-only inspection probe.
+This document does not establish pairwise compatibility, authenticate an executable, inspect all
+device data, admit a candidate, authorize promotion, or make rollback safe.
+`data_compatibility=unknown` remains a hard blocker.
 
 The exact `scribe-app` executable now exposes:
 
@@ -217,7 +218,41 @@ IDs alone. The three predecessor classes are:
 - **Unsupported A:** missing/untrusted provenance, a modified or unknown executable, or missing
   supported evidence. Automatic candidate activation remains blocked.
 
-Slice 3D-B2a.4.2 can build read-only probes and cross-version fixtures on this vocabulary. It must
-retain `coverage=incomplete`, `data_compatibility=unknown`, and `promotion_authorized=false` until
-the separate provenance, stable-state, writer-exclusion, pairwise evaluation, and admission work is
+## Library-only inspection implemented in Slice 3D-B2a.4.2a
+
+`scribe-app --inspect-storage-library --data-dir PATH` is dispatched beside the capability command,
+before normal application initialization. Its production call graph is confined to argument
+validation, `storage_inspect_library::inspect_library`, read-only file descriptors, pure
+validators/parsers, canonical report encoding, and stdout. It does not take the application
+singleton, create the root, start runtime/sync threads, open hardware, run recovery, or access the
+network.
+
+It validates the native live-library entries in this inventory: library/notebook manifests and
+titles; page headers v2–v5 and render profiles v1/v2; backgrounds; stroke v1/v2 and edit v1/v2
+journals; optional text/link records; folders; import receipts/origins; and library-local identity.
+It also reports migration/recovery markers, torn journals, temporary files, trash, and orphans
+without modifying them. Permissive historical records with unknown fields are `UNVERIFIED`, not
+silently treated as losslessly preserved. Formats for which no safe complete semantic reader exists
+(including trash/orphan layout, navigation, and page-ledger semantics in this probe) remain
+explicitly unverified.
+
+The deterministic report is `IGNITE_STORAGE_LIBRARY_INSPECTION_V1`, with sorted findings and fixed
+classification tokens: `VALID`, `UNSUPPORTED_FORMAT`, `CORRUPT`, `INCOMPLETE_TRANSACTION`,
+`MISSING_REQUIRED`, `UNVERIFIED`, and `INSPECTION_ERROR`. It always states
+`scope=library-only`, `coverage=partial`, `atomic_snapshot=false`,
+`data_compatibility=unknown`, and `promotion_authorized=false`. Tree, file, record, JSON, finding,
+and output limits are normative in the implementation and documented in
+`kindle-data-compatibility-contract.md` Section 5.2.1.
+
+The probe surrounds semantic inspection with equal path/type/size/content-hash censuses and uses
+Unix `O_NOFOLLOW` plus file-identity/hard-link checks. This demonstrates no application writes and
+detects ordinary concurrent changes, but it is not writer exclusion or an atomic snapshot. Native
+Linux tests must exercise the Unix-only path; Kindle `/mnt/us` no-follow, hard-link reporting,
+performance, and concurrent USB behavior remain hardware qualifications.
+
+Slice 3D-B2a.4.2b must cover active external sync, device/pairing state, preferences outside the
+library, retired epochs, and complete adoption/recovery state, then add cross-version fixtures.
+The existing capability command remains byte-for-byte unchanged and retains
+`coverage=incomplete`, `data_compatibility=unknown`, and `promotion_authorized=false` until the
+separate provenance, stable-state, writer-exclusion, pairwise evaluation, and admission work is
 complete.

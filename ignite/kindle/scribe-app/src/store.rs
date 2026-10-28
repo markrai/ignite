@@ -514,7 +514,7 @@ pub fn stroke_record_line(stroke: &Stroke) -> Result<String, String> {
 }
 
 /// Parse one stroke JSONL record (v1 legacy or v2 pressure) by peeking `v`.
-fn parse_stroke_record(line: &[u8]) -> Result<Stroke, String> {
+pub(crate) fn parse_stroke_record(line: &[u8]) -> Result<Stroke, String> {
     #[derive(Deserialize)]
     struct VersionPeek {
         v: u32,
@@ -635,7 +635,7 @@ pub enum EditOp {
     },
 }
 
-fn parse_edit_record_line(line: &[u8]) -> Result<EditOp, String> {
+pub(crate) fn parse_edit_record_line(line: &[u8]) -> Result<EditOp, String> {
     #[derive(Deserialize)]
     struct Peek {
         v: u32,

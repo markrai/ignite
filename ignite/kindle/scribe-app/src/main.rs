@@ -21,6 +21,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    match scribe_app::storage_inspect_library::parse_command(&args) {
+        Ok(scribe_app::storage_inspect_library::InspectionCommand::Inspect(path)) => {
+            return inspect_storage_library(&path);
+        }
+        Ok(scribe_app::storage_inspect_library::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     scribe_app::launch_clock::mark("process_entry");
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -129,6 +139,9 @@ Options:
   --storage-capabilities
                         Emit the compiled canonical storage declaration and exit without
                         application initialization. Must be used alone.
+  --inspect-storage-library --data-dir PATH
+                        Inspect one existing native library read-only and emit a bounded
+                        library-only report. Does not initialize or repair the application.
   --diagnose-fb         Read-only FBIOGET dump + Gate B check (no mmap write, no notebooks)
   --confirm-write       Required for physical write (fb mmap / stylus mode / SEND)
   --data-dir PATH       Library storage root (default /mnt/us/scribe-data)
@@ -208,6 +221,25 @@ fn emit_storage_capabilities() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn inspect_storage_library(path: &std::path::Path) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_inspect_library::inspect_library(path);
+    let bytes = match report.canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("storage library inspection unavailable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write storage library inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
 }
 
 fn diagnose_fb(args: &[String]) -> ExitCode {

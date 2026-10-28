@@ -1,9 +1,10 @@
-# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.1)
+# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.2a)
 
-**Status:** feasibility/design plus the incomplete compiled capability inventory from Slice
-3D-B2a.4.1. No compatibility approval, probe, launch admission, authorization, promotion,
-rollback, storage migration, or persistent data format is implemented. `data_compatibility=unknown`
-remains a hard blocker.
+**Status:** feasibility/design, the incomplete compiled capability inventory from Slice
+3D-B2a.4.1, and the library-only read-only inspection probe from Slice 3D-B2a.4.2a. The probe is
+not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
+admission, authorization, promotion, rollback, storage migration, or persistent data format is
+implemented. `data_compatibility=unknown` remains a hard blocker.
 
 ## Decision
 
@@ -404,6 +405,107 @@ them. Exit, signal, timeout, extra output, or noncanonical output blocks the dec
 
 This is a narrowly cooperating internal executor, not the rejected arbitrary-program wrapper from
 B2a.2.
+
+#### 5.2.1 Implemented library-only inspection (Slice 3D-B2a.4.2a)
+
+The exact `scribe-app` binary now exposes this isolated diagnostic before launch timing, the
+application singleton, runtime configuration, devices, sync, recovery, or networking:
+
+```text
+scribe-app --inspect-storage-library --data-dir PATH
+```
+
+The callable API is
+`storage_inspect_library::inspect_library(&Path) -> LibraryInspectionReport`. It inspects one
+explicit existing native library. It does not create a missing root. Its fixed report begins with
+`IGNITE_STORAGE_LIBRARY_INSPECTION_V1`, states `scope=library-only`, `coverage=partial`,
+`writer_exclusion=false`, `atomic_snapshot=false`, `data_compatibility=unknown`, and
+`promotion_authorized=false`, and ends with sorted bounded findings. Exit 0 means the implemented
+library surface was completely inspected without a non-`VALID` diagnostic. Exit 2 means the scan
+completed but detected unsupported, corrupt, incomplete, missing, or unverified state. Exit 1
+means invocation or inspection itself was incomplete. None of those results is an authorization.
+
+A clean one-notebook example is intentionally diagnostic rather than compatibility evidence:
+
+```text
+IGNITE_STORAGE_LIBRARY_INSPECTION_V1
+schema=1
+scope=library-only
+coverage=partial
+writer_exclusion=false
+atomic_snapshot=false
+external_sync=out-of-scope
+device_state=out-of-scope
+data_compatibility=unknown
+promotion_authorized=false
+inspection_action=report-only
+completed=true
+result=VALID
+libraries=1
+notebooks=1
+pages=1
+...
+observed_page_formats=v5
+...
+finding_count=0
+```
+
+The implemented validation surface is:
+
+- strict duplicate-key-free JSON for `library.meta`, every referenced `notebook.info` and
+  `notebook.meta`, and cross-file notebook/page identities and order;
+- page headers v2, v3, v4, and v5, render profiles v1/v2, background byte count/checksum/geometry,
+  and a present background identity when it is valid;
+- bounded streaming validation of stroke records v1/v2 and edit delete-v1/replace-v2 records,
+  including identity uniqueness, coordinates, profile/style compatibility, delete targets,
+  replacement targets, fragment collisions, and torn final records;
+- strict optional text and link records, including source identity checks when the library-local
+  identity exists;
+- folders v1, import receipts v1, notebook import-origin v1, and their live-layout/provenance
+  relationships; and
+- strict library-local sync identity v1 plus detection of the recovery-maintenance marker,
+  migration record/staging, temporary files, trash, and live-layout orphans.
+
+Historical page formats are validated in place and reported with the action normal open would
+take, such as `normal_open_action=migrate-to-v5`; no migration is run. A missing or invalid
+background identity is likewise reported as an unverified repair/seal requirement after the
+background bytes themselves have been checked. Torn journals are
+`INCOMPLETE_TRANSACTION` and remain byte-for-byte unchanged. Trash and orphan directories are
+identified as preserved `UNVERIFIED` recovery material rather than corruption because Ignite has
+no complete semantic reader for them. Library-local navigation and page-ledger files are also
+explicitly unverified in this partial probe rather than silently accepted.
+
+The implementation deliberately avoids these normal-open functions because their call graphs can
+write: `open_or_create_library_shell_with_hooks`, `open_or_create_notebook`,
+`migrate_all_pages`, `load_existing_page`, `repair_background_chrome`,
+`ensure_sync_identity`, `build_snapshot` (the writing variant), import recovery, and adoption
+recovery. It reuses only pure validators and parsers: the library/notebook manifest validators,
+render-profile validators, stroke/edit record parsers and semantic helpers, strict
+`sync-protocol` content/identity types, and the read-only checksum rules. Files are opened directly
+read-only; the probe never opens an append handle.
+
+Resource limits are part of V1: traversal depth 8 below the root, 200,000 tree entries, 10,000
+notebooks, 100,000 pages, 2,000,000 content records, 4 MiB ordinary metadata, 256 KiB
+`page.meta`, 64 MiB `background.raw`, 2 GiB per journal, 16 MiB per JSONL record, and 16 GiB per
+tree-census pass. JSON is limited to depth 64 and 1,000,000 values. Relative diagnostic paths are
+limited to 512 ASCII bytes, findings to 512, and canonical output to 512 KiB. Exceeding a limit is
+an explicit incomplete inspection, never silent truncation.
+
+Before semantic validation and afterward, the probe enumerates sorted path/type/size/SHA-256
+records for the complete root and requires equality. This detects ordinary concurrent changes but
+does not make an atomic snapshot: no writer-exclusion boundary exists yet, and an uncooperative
+writer could change and restore bytes between observations. On Unix, regular files are opened with
+`O_NOFOLLOW`, kernel identity is compared with the preceding metadata, and unexpected hard links
+are refused. Every relative component and the supplied root's path chain is checked for symlinks;
+special files and noncanonical names fail closed. The same API remains buildable on Windows, where
+tests exercise the portable metadata/census behavior; the Unix-specific descriptor guarantees
+require native Linux execution.
+
+This slice does not inspect active external sync/outbox/inbox/checkpoint state, device/pairing
+state, preferences outside the library, retired sync epochs, or a complete adoption workspace. It
+does not establish writer exclusion, an authoritative stable root, release provenance, pairwise
+A-writer/B-reader behavior, or rollback readability. Those omissions are why a successful result
+still leaves compatibility unknown.
 
 ### 5.3 Stable device-data identity
 
@@ -855,9 +957,11 @@ fails closed through stable-root comparison.
    exist. The host/lifecycle pre-`go` writes and unresolved format behavior are inventoried in
    `kindle-storage-capability-inventory.md`. The output remains incomplete and unauthenticated;
    missing or unverified capability remains unknown.
-2. **3D-B2a.4.2 — Read-only probes.** Add strict full-library, sync, device, transaction, and retired-
-   epoch inspection paths that share validators but never invoke migrating/repairing opens. Add
-   bounded canonical output and cross-version writer→reader fixtures.
+2. **3D-B2a.4.2 — Read-only probes (4.2a library-only portion implemented).** The exact binary now
+   has a strict bounded native-library scanner that never invokes migrating/repairing opens.
+   **4.2b** must add active sync, device/pairing, external preferences, retired epochs, complete
+   adoption/transaction coverage, and cross-version writer→reader fixtures before this becomes a
+   full storage probe.
 3. **3D-B2a.4.3 — Authenticated installed provenance and bootstrap.** Preserve the signed-release
    chain, capability digest, and exact app/lifecycle/host identities when a candidate becomes A.
    Define, sign, and test only the narrow legacy catalog needed for transitional release T. No
@@ -985,8 +1089,9 @@ The following physical acceptance remains, using disposable copied data and off-
 ## 11. Blockers and unresolved decisions
 
 - Existing A releases do not expose authenticated storage capabilities or a read-only full-state
-  probe. The first compatible predecessor policy needs either a signed exact-hash legacy catalog or
-  must block until both adjacent releases implement this contract.
+  probe. The current exact binary exposes only the library portion. The first compatible
+  predecessor policy needs either a signed exact-hash legacy catalog or must block until both
+  adjacent releases implement the complete contract.
 - The current retained inventory proves integrity relative to installation, not by itself publisher
   authenticity. Installed-release provenance must survive promotion for the next A identity.
 - The exact active-sync compatibility surface must be finalized. Treating sync state as rebuildable
@@ -1023,6 +1128,8 @@ Until these are resolved, the only defensible result is `data_compatibility=unkn
 - `notebook.rs`: notebook manifest, open-time migration, structural commits, and trash.
 - `library.rs`: library schemas, legacy migration, notebook structural commits, and trash.
 - `folders.rs`, `nav_state.rs`, `prefs.rs`, `nbk_import.rs`: auxiliary user and replica state.
+- `storage_inspect_library.rs`: bounded library-only read-only inspection and canonical diagnostic
+  report (Slice 3D-B2a.4.2a).
 - `sync_local.rs`, `sync_outbound.rs`, `sync_inbound.rs`, `sync_confirmed.rs`,
   `sync_materialize.rs`, `sync_adopt.rs`, `sync_verified.rs`, and `page_ledger.rs`: identity,
   replication, materialization, adoption, crash recovery, invalidation, and diagnostics.
