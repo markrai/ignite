@@ -59,9 +59,13 @@ Both current canonical records require `data_compatibility=unknown`. No trusted 
 capability declaration, or device-local validation result exists. Unknown must remain a hard blocker;
 a command-line assertion, `--force`, confirmation prompt, or unsigned sidecar would not resolve it.
 
-The source-grounded contract is now specified in
-[`kindle-data-compatibility-contract.md`](kindle-data-compatibility-contract.md), but none of its
-capability, data-writer exclusion, probe, provenance, or stable-state evidence is implemented.
+The source-grounded contract is specified in
+[`kindle-data-compatibility-contract.md`](kindle-data-compatibility-contract.md). Slice 3D-B2a.4.1
+implements an incomplete, unauthenticated compiled capability declaration and documents its source
+inventory in
+[`kindle-storage-capability-inventory.md`](kindle-storage-capability-inventory.md). It is not
+compatibility evidence. Data-writer exclusion, probes, authenticated provenance, and stable-state
+evidence remain unimplemented.
 At minimum the eventual evidence must:
 
 - identify the compatibility-policy/schema version;

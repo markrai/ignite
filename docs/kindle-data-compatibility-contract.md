@@ -1,8 +1,9 @@
-# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4/4.0)
+# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.1)
 
-**Status:** feasibility and contract design only. No compatibility approval, launch admission,
-authorization, promotion, rollback, storage migration, or persistent format is implemented by this slice.
-`data_compatibility=unknown` remains a hard blocker.
+**Status:** feasibility/design plus the incomplete compiled capability inventory from Slice
+3D-B2a.4.1. No compatibility approval, probe, launch admission, authorization, promotion,
+rollback, storage migration, or persistent data format is implemented. `data_compatibility=unknown`
+remains a hard blocker.
 
 ## Decision
 
@@ -293,10 +294,11 @@ B-era edits. Lossless recoverability after B writes additionally requires a reve
 dual-write representation, or a proven conversion/replay path that preserves those edits.
 
 The repository currently enforces strict parsing and crash rules for many individual formats, and
-it has explicit page and legacy-layout migrations. It does not expose a release-level reader/writer
-contract, authenticate a pairwise compatibility decision, scan all data with both exact releases,
-or retain a pre-B data snapshot. Therefore none of the three properties is currently established
-for an arbitrary A→B update.
+it has explicit page and legacy-layout migrations. Slice 3D-B2a.4.1 adds a deterministic compiled
+reader/writer inventory, but that declaration is explicitly incomplete and unauthenticated. The
+repository still does not authenticate a pairwise compatibility decision, scan all data with both
+exact releases, or retain a pre-B data snapshot. Therefore none of the three properties is
+currently established for an arbitrary A→B update.
 
 ## 3. Upgrade and rollback threat matrix
 
@@ -330,12 +332,22 @@ for an arbitrary A→B update.
 
 ### 5.1 Release storage capabilities
 
-Each future `scribe-app` should expose a side-effect-free internal command that emits one canonical,
-bounded `IGNITE_STORAGE_CAPABILITIES_V1` document before singleton/device initialization. The
-document is compiled into the exact executable and contains:
+`scribe-app --storage-capabilities` now emits one canonical, bounded
+`IGNITE_STORAGE_CAPABILITIES_V1` document before launch timing, singleton, device, library, sync,
+or pairing initialization. The implemented V1 foundation is documented in
+[`kindle-storage-capability-inventory.md`](kindle-storage-capability-inventory.md). It contains
+sorted exact format records with reader/writer, unknown-field preservation, automatic mutation,
+recovery-owner, and confidence facts, plus mandatory
+`coverage=incomplete`, `data_compatibility=unknown`, and `promotion_authorized=false` lines.
+
+The current contract deliberately does **not** include a release version, an invented fixture
+digest, or an attestation claim. A later authenticated release binding must associate its exact
+canonical bytes with the exact executable hash and real reproducible cross-version test evidence.
+The complete release contract eventually needs:
 
 - contract and policy version;
-- release version and build identity;
+- release version, build identity, and exact executable binding outside or above the current
+  compiled declaration;
 - exact accepted format identifiers for every library, page, folder, import, identity, sync,
   checkpoint, navigation, preference, and device-state component;
 - exact formats and record variants the release may emit;
@@ -344,18 +356,26 @@ document is compiled into the exact executable and contains:
 - whether unknown fields/records are rejected, preserved byte-for-byte, or dropped on rewrite;
 - the closure of formats reachable after ordinary authoring, inbound sync, import, and recovery;
   and
-- a digest of the release's compatibility fixture suite or release attestation that approved the
-  contract.
+- a digest of a real reproducible compatibility fixture suite or release attestation that approved
+  the contract, once such an artifact exists.
 
-Capabilities must use sorted exact identifiers such as `page-meta-v5` or
-`confirmed-checkpoint-v3`; an interval such as “2 through 5” is not proof that every intermediate
-format has the same semantics.
+Capabilities use sorted exact identifiers such as `page-header-v5` and
+`confirmed-checkpoint-manifest-v3`; an interval such as “2 through 5” is not proof that every
+intermediate format has the same semantics. A durable representation without an in-band version
+is named `-unversioned`, not assigned an invented version.
 
 The capability bytes are trusted only when bound to an authenticated official executable. For B,
 that binding must descend from the Ed25519-authenticated release and the pending executable hashes.
 For A, the updater must retain authenticated installed-release provenance, not merely an inventory
-that proves its files have not changed since installation. A legacy A without an authenticated
-capability document is `unknown` and cannot be promoted over under the initial policy.
+that proves its files have not changed since installation. Predecessors are classified explicitly:
+
+- **Native-contract A** has authenticated executable provenance, a compiled capability contract,
+  and an exact-A read-only probe once that probe exists.
+- **Cataloged legacy A** matches a signed catalog entry by exact official executable identities,
+  has audited capabilities backed by cross-version tests, and is scanned by a separate trusted
+  version-neutral reader. It must never claim that the original A executable ran a future probe.
+- **Unsupported A** has missing/untrusted provenance, modified or unknown executables, or missing
+  supported evidence. Automatic candidate activation is blocked.
 
 This avoids a second release-signing key. If capabilities are distributed outside the exact binary,
 their digest must instead be included in authenticated release metadata with a domain-separated
@@ -406,8 +426,21 @@ result; they must not be silently omitted.
 
 Compute the root before and after both probes and require equality. The existing local mutation
 generation and page ledger are useful diagnostics and future optimization hints, but they are not
-complete authority: the generation bumps once per process session, older/uncooperating writers may
-not record, and the verified-startup census hashes some large files by size rather than content.
+complete authority. `note_library_mutation_scoped` calls `invalidate_durable` only for the first
+successful cooperating admission associated with a library's in-process session cell. That call
+publishes a saturating increment and clears the verified stamp; later admitted writes using the same
+cell do not increment again, although they remain fenced and may add page-ledger scopes.
+`clear_registry_for` removes the cell during sync teardown and adoption, so another session in the
+same process can increment again.
+
+Current library/notebook/page/folder writers, local-identity writes, ordinary import, library/page
+migration, sync materialization, and torn-journal recovery use those admission paths. This is not
+universal write coverage: active sync and device/pairing state live outside the library counter;
+adoption publishes directory swaps; some import-receipt recovery/carry writes are not independently
+admitted; and older, manual, external, or otherwise uncooperating writers may not record anything.
+The verified-startup census can detect some missed library changes, but hashes some large files by
+size rather than content and does not cover the complete device state. Neither the counter nor the
+page ledger can establish that the proposed device-data root remained unchanged.
 
 A complete byte hash is justified here because this is a rare manual authorization operation that
 binds a specific data snapshot. It is not required on ordinary startup. If hardware measurements
@@ -708,9 +741,9 @@ must not be started merely to bypass compatibility.
 
 | Strategy | Feasibility and trust | Cost / user effect | Conclusion |
 |---|---|---|---|
-| A. Transitional release | Establishes native capability/probe/admission/provenance support for later upgrades. By itself it says nothing trustworthy about the older A it replaces, so T's first launch can still be unsafe. | One manual upgrade and a release held back from auto-promotion. Lowest long-term maintenance. | Required foundation, insufficient alone for its own bootstrap. |
-| B. Signed exact-hash legacy catalog | A maintainer-authenticated catalog can bind a finite official A executable/host set to source-audited reader behavior and cross-version tests. An exact match can substitute for a capability command that legacy A lacks; a strict version-neutral scanner must still validate current data. | Per-release audit/test burden; cannot cover custom/repacked binaries; catalog errors are security-sensitive. | Suitable only for a small supported legacy set and only with exact hashes. |
-| C. Conservative block/manual path | Makes no invented claim for unknown A. | Some users need a documented USB/off-device backup and manual transition; automatic upgrade is unavailable. Manual acknowledgment still cannot create rollback proof. | Mandatory fallback for every noncataloged or mismatched A. |
+| A. Native-contract A via a transitional release | Establishes authenticated provenance, a compiled contract, and an exact executable probe for later upgrades. By itself it says nothing trustworthy about the older A it replaces, so T's first launch can still be unsafe. | One manual upgrade and a release held back from auto-promotion. Lowest long-term maintenance. | Required foundation, insufficient alone for its own bootstrap. |
+| B. Cataloged legacy A | A signed catalog can bind a finite official A executable/host set to audited reader behavior and cross-version tests. A separate trusted version-neutral scanner validates current data; the original A is never represented as having run a future probe. | Per-release audit/test burden; cannot cover custom/repacked binaries; catalog errors are security-sensitive. | Suitable only for a small supported legacy set and only with exact hashes. |
+| C. Unsupported A / conservative manual path | Makes no invented claim for missing provenance, modified or unknown executables, or incomplete evidence. | Some users need a documented USB/off-device backup and manual transition; automatic upgrade is unavailable. Manual acknowledgment still cannot create rollback proof. | Mandatory fallback for every noncataloged or mismatched A. |
 
 The recommended bootstrap is **A plus a narrow B, with C as the fallback**:
 
@@ -817,9 +850,11 @@ fails closed through stable-root comparison.
 
 ## 9. Revised implementation slices
 
-1. **3D-B2a.4.1 — Capability inventory.** Define canonical `StorageCapabilitiesV1`, audit every
-   current format/auto-write/crash state, and add a no-I/O `scribe-app` capability command. Include
-   the host/lifecycle pre-go behavior in the release contract. Missing capability remains unknown.
+1. **3D-B2a.4.1 — Capability inventory (implemented, not authoritative).** Canonical
+   `StorageCapabilitiesV1`, the source audit, and the no-initialization `scribe-app` command now
+   exist. The host/lifecycle pre-`go` writes and unresolved format behavior are inventoried in
+   `kindle-storage-capability-inventory.md`. The output remains incomplete and unauthenticated;
+   missing or unverified capability remains unknown.
 2. **3D-B2a.4.2 — Read-only probes.** Add strict full-library, sync, device, transaction, and retired-
    epoch inspection paths that share validators but never invoke migrating/repairing opens. Add
    bounded canonical output and cross-version writer→reader fixtures.

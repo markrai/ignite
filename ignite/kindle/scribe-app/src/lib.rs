@@ -71,6 +71,7 @@ pub mod session;
 pub mod settings_ui;
 pub mod singleton;
 pub mod sleep_ui;
+pub mod storage_capabilities;
 pub mod store;
 pub mod sync_adopt;
 pub mod sync_local;

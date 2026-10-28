@@ -12,8 +12,17 @@ use std::process::ExitCode;
 use scribe_app::cadence::parse_du_interval_us;
 
 fn main() -> ExitCode {
-    scribe_app::launch_clock::mark("process_entry");
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match scribe_app::storage_capabilities::command_requested(&args) {
+        Ok(true) => return emit_storage_capabilities(),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    scribe_app::launch_clock::mark("process_entry");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
         return ExitCode::SUCCESS;
@@ -117,6 +126,9 @@ Usage:
              [--fb /dev/fb0] [--input /dev/input/stylus]
 
 Options:
+  --storage-capabilities
+                        Emit the compiled canonical storage declaration and exit without
+                        application initialization. Must be used alone.
   --diagnose-fb         Read-only FBIOGET dump + Gate B check (no mmap write, no notebooks)
   --confirm-write       Required for physical write (fb mmap / stylus mode / SEND)
   --data-dir PATH       Library storage root (default /mnt/us/scribe-data)
@@ -176,6 +188,26 @@ Does not open /dev/stylus.
 ink-probe remains the diagnostic laboratory.
 "
     );
+}
+
+fn emit_storage_capabilities() -> ExitCode {
+    use std::io::Write as _;
+
+    let bytes = match scribe_app::storage_capabilities::canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("storage capabilities unavailable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("write storage capabilities: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn diagnose_fb(args: &[String]) -> ExitCode {
