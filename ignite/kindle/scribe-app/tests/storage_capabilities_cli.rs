@@ -2,6 +2,8 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 fn isolated_root(name: &str) -> std::path::PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,6 +46,11 @@ fn command_emits_only_canonical_bytes_without_startup_side_effects() {
     assert_eq!(
         output.stdout,
         scribe_app::storage_capabilities::canonical_bytes().unwrap()
+    );
+    assert_eq!(output.stdout.len(), 12_772);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&output.stdout)),
+        "ee8be9eb76481492454dac8d83d6121c1f9bf79d93dec28632cf3bbfc976fd44"
     );
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();

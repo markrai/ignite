@@ -1,6 +1,7 @@
-# Kindle storage capability inventory (Slices 3D-B2a.4.1–4.2a)
+# Kindle storage capability inventory (Slices 3D-B2a.4.1–4.2b)
 
-**Status:** source inventory, compiled declaration, and a partial library-only inspection probe.
+**Status:** source inventory, compiled declaration, a partial library-only inspection probe, and a
+separate partial external sync/device inspection probe.
 This document does not establish pairwise compatibility, authenticate an executable, inspect all
 device data, admit a candidate, authorize promotion, or make rollback safe.
 `data_compatibility=unknown` remains a hard blocker.
@@ -250,9 +251,56 @@ detects ordinary concurrent changes, but it is not writer exclusion or an atomic
 Linux tests must exercise the Unix-only path; Kindle `/mnt/us` no-follow, hard-link reporting,
 performance, and concurrent USB behavior remain hardware qualifications.
 
-Slice 3D-B2a.4.2b must cover active external sync, device/pairing state, preferences outside the
-library, retired epochs, and complete adoption/recovery state, then add cross-version fixtures.
+## External-state inspection implemented in Slice 3D-B2a.4.2b
+
+`scribe-app --inspect-storage-external --data-dir LIBRARY --sync-dir SYNC --device-dir DEVICE
+--state-dir STATE` is dispatched before application initialization. Its callable API is
+`storage_inspect_external::inspect_external(&ExternalInspectionConfig)`. The report contract and
+limits are specified in `kindle-data-compatibility-contract.md` Section 5.2.2.
+
+The source audit that determines its exact scope is below. “Side effects” describes the normal
+reader/open path deliberately not invoked by the diagnostic. “Essential” means the bytes can be
+the only durable evidence needed to preserve or resume user work; it does not mean other rows are
+safe to delete.
+
+| Record family / namespace | Production reader and writer | Versions and pure validation | Normal-open/recovery side effects avoided | Read-only strategy and status | Unsynced-work essential |
+|---|---|---|---|---|---|
+| Library `.scribe-sync/identity.json` | `sync_local::read_identity`; `ensure_sync_identity` | identity v1; strict `IdentityFileV1::validate` | `ensure_*` creates/extends identities and lock files | strict no-follow read; bind `library_id` to active/staged/retired epoch; complete for represented v1 | Yes: identity continuity |
+| Sync `replica.json`, `replica.lock` | `ensure_replica_state` | replica v1; `ReplicaStateV1::validate` | creates identity and lock; malformed identity is refused | strict no-follow read; lock bytes non-authoritative; bind `replica_id`; complete for v1 | Yes: authored sequence identity |
+| Sync `config.json` | `read_config`, `OutboundSync::open_with`; developer provisioned | config v1 strict DTO | open can start network workers and update link state | parse without reporting URL/token; server credential validity `UNVERIFIED` | No, but needed to resume upload |
+| `sync-state.json` | `establish_epoch`, inbound/ACK persistence | state v1/v2 strict DTO plus identity/cursor checks | v1 may be rewritten v2; cursors and ACKs may be recovered and persisted | inspect v1 transition constraints and v2 relationships; future versions unsupported | Yes |
+| `genesis.json` | `establish_epoch`, genesis upload | canonical snapshot v1; `SyncSnapshotV1::validate`; SHA-256 | epoch creation captures/writes snapshot and blobs; upload mutates server/state | require exact canonical bytes, library identity, and state digest | Yes |
+| `outbox.jsonl` | `parse_journal_from`, `reconcile`, uploader; append/rewrite writers | record v1 op/prep/commit/abort; canonical envelope v1 | startup ignores torn suffix and empty records, accepts CRLF as JSON whitespace, resolves prep, re-derives operations, compacts after ACK, uploads | one bounded streamed pass into the source transaction-state core; 16 MiB/record and 64 MiB retained-input caps; noncanonical accepted bytes are `UNVERIFIED`; committed pending is `VALID_PENDING`; prep/torn is preserved incomplete | **Yes** |
+| `blobs/<sha256>` | outbound store/upload; inbound materializer | raw content addressed by lowercase SHA-256 plus referenced byte count/format | normal sync may download/write/upload; checkpoint GC is separate | merge constraints across every record family without overwrite; conflicting lengths are corrupt; stream hash every discovered reference; missing/mismatched and unreferenced cases visible; 128 MiB/file | **Yes** when referenced by queued operation/genesis |
+| `inbox.jsonl` | `load_inbox`, `finish_apply`; tail fetch/append | record v1; canonical envelope v1; contiguous server sequence | fetch appends; finish rewrites/removes consumed items | strict streamed duplicate/conflict/gap validation; pending is `VALID_PENDING`; torn suffix preserved incomplete | Yes |
+| `accepted.jsonl` | `load_accepted`, `finish_apply`; ACK append | record v1; canonical own envelope and identity uniqueness | ACK recovery can advance persisted `acked_client_seq`; finish compacts | strict streamed identity, duplicate, and monotonic server-sequence validation | Yes |
+| `apply.json` | `read_marker`, `apply_inbound`, `finish_apply` | marker v1; scanner enforces version and target cursor | normal recovery rematerializes, persists confirmed state/cursor, removes marker | strict parse; presence is an interrupted transaction, never completed by inspection | **Yes** |
+| Legacy `base-state.json` | `load_base_store`; historical writer | base v2, snapshot v1, history v1, `LibraryState::validate` | converts to checkpoint v3 and removes legacy file after promotion | bounded strict read (128 MiB), reducer validation; reported pending conversion; shadowing visible | Yes |
+| `confirmed.log` | `scan_log`, `replay_log`, `ConfirmedLog::open` | binary SCL1, CRC, contiguous sequence, canonical envelope v1 | append-open truncates torn tail; startup replay can persist recovered cursor/compact | factored source scan core over diagnostic-opened descriptor; streamed reducer replay; torn tail preserved | Yes |
+| `checkpoint/manifest.json`, `pages/<sha256>` | `read_checkpoint_head`, `materialize_checkpoint`, checkpoint writer/GC | manifest v3; strict `SnapshotPage`; snapshot/history reducer validation | startup can collect unreferenced pages and promote/compact checkpoints | strict manifest, per-page hash/identity, full assembled state validation; unreferenced pages preserved pending | Yes |
+| `local-verified-v1.json`, `.cleared`, library mutation generation/page ledger | `evaluate_fast_path`, `read_provenance`; reconcile/invalidation writers | stamp v3, generation scalar, ledger record v1 | reconcile may rewrite stamp/baseline; invalidation removes stamp/appends ledger | structural validation only; always state that generation/stamp/ledger are cache/cooperating diagnostics, not compatibility proof | No authority; ledger can aid diagnosis |
+| Recovery intent, completion, claim, and library maintenance marker | explicit `sync_recovery_exec` and `sync_verified` functions | intent v1, completion v1, canonical frozen envelopes, marker `1\n` | prepare/revalidate can bind identities, submit, reconcile, finalize, remove hold | strict invariant/candidate binding; every active marker is incomplete or historical/unverified and preserved | **Yes** |
+| Device `device.json`, `server-profile.json`, replacement temps | `client_id`, `load_profile`; private atomic writers/pairing/adoption | scanner requires v1 and strict fields/UUIDs | `client_id` regenerates malformed identity; pairing/profile publication writes credentials | strict read and server binding; secrets never emitted; authentication/server truth remains `UNVERIFIED` | Needed to resume authenticated sync |
+| External `preferences.json` in sync/device/state | `prefs::load`; `save_side_button` | preference v1 and closed side-button enum | malformed/unknown defaults; save drops unknown fields | strict parse each present location; temps reported incomplete; no fallback/defaulting | No |
+| `<sync>.adopt/{plan.json,sync,server-profile.json}`, `<library>.adopt`, `.adopt.lock` | `recover_interrupted_adoption`, `adopt_library` | plan v1 UUID and staged epoch/profile schemas | startup discards uncommitted staging or rolls committed directory swaps forward | census every workspace; strict plan; scan staged epoch and cross-bind identities; never recover/discard/swap | **Yes** |
+| `<sync>.retired-<adoption>`, `<library>.retired-<adoption>` | created by adoption publication; no semantic live reader/cleanup | closure of formats above; retired layout unversioned | no supported automatic replay or deletion | discover exact sibling grammar, full census, scan paired retired sync epoch, preserve opaque library semantics as `UNVERIFIED`; missing pair incomplete | **Yes** |
+
+The scanner also inventories unknown and atomic-temp objects rather than normalizing them. It calls
+none of `OutboundSync::open_with`, `establish_epoch`, `load_base_store`, `ConfirmedLog::open`,
+`finish_apply`, identity/replica `ensure_*`, server `client_id`, adoption recovery/publication,
+recovery submit/reconcile/release, preference fallback, or network/background-worker entry points.
+
+Same-release fixture tests cover required versus optional roots, fresh/unpaired state, v1/v2
+epochs, bounded oversized and aggregate JSONL input, canonical and historical journal encodings,
+outbound/inbound pending and torn states, accepted/apply state, legacy confirmed state,
+version/identity/digest contradictions, conflicting blob declarations, pairing unknown fields,
+preferences, adoption staging, correctly namespaced retired mismatches, recovery markers,
+filesystem/resource attacks, concurrent census changes, deterministic reports, and complete
+before/after byte preservation. Linux-only tests cover symlink, hard-link, and special-file refusal.
+These fixtures test diagnostic behavior; they are not A/B compatibility evidence.
+
 The existing capability command remains byte-for-byte unchanged and retains
-`coverage=incomplete`, `data_compatibility=unknown`, and `promotion_authorized=false` until the
-separate provenance, stable-state, writer-exclusion, pairwise evaluation, and admission work is
-complete.
+`coverage=incomplete`, `data_compatibility=unknown`, and `promotion_authorized=false`. Remaining
+work is exact historical release-pair fixtures, authenticated installed probe provenance, a stable
+writer-excluded data boundary, a composed state root, pairwise evaluation, and pre-first-launch
+admission. A clean external report is structural diagnostic information only.

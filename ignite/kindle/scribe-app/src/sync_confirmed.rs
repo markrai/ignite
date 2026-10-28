@@ -153,7 +153,22 @@ pub(crate) fn scan_log(
         .metadata()
         .map_err(|e| format!("stat {}: {e}", path.display()))?
         .len();
-    let mut r = BufReader::with_capacity(1 << 20, f);
+    scan_log_reader(
+        BufReader::with_capacity(1 << 20, f),
+        file_len,
+        &path.display().to_string(),
+        &mut each,
+    )
+}
+
+/// Read-only scan core used by storage diagnostics after they have opened a regular file with
+/// their no-follow and file-identity checks. It performs no seek, truncate, create, or repair.
+pub(crate) fn scan_log_reader(
+    mut r: impl Read,
+    file_len: u64,
+    description: &str,
+    mut each: impl FnMut(u64, &[u8]) -> Result<(), String>,
+) -> Result<LogScan, String> {
     let mut out = LogScan::default();
     let mut pos = 0u64;
     let mut prev: Option<u64> = None;
@@ -161,7 +176,7 @@ pub(crate) fn scan_log(
     let corrupt = |at: u64, why: &str| {
         format!(
             "CONFIRMED_LOG_CORRUPT at byte {at} of {}: {why} (durable history is never skipped)",
-            path.display()
+            description
         )
     };
     loop {

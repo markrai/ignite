@@ -304,7 +304,7 @@ impl LibraryInspectionReport {
     }
 }
 
-fn safe_report_field(value: &str) -> bool {
+pub(crate) fn safe_report_field(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_RELATIVE_PATH_BYTES
         && value.bytes().all(|b| {
@@ -428,14 +428,14 @@ impl<'de> Deserialize<'de> for StrictValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JsonFailure {
+pub(crate) enum JsonFailure {
     DuplicateKey,
     Invalid,
     TooDeep,
     TooManyNodes,
 }
 
-fn parse_json_strict(bytes: &[u8]) -> Result<Value, JsonFailure> {
+pub(crate) fn parse_json_strict(bytes: &[u8]) -> Result<Value, JsonFailure> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = StrictValue::deserialize(&mut deserializer).map_err(|error| {
         if error.to_string().contains("duplicate-key") {
@@ -474,7 +474,7 @@ fn validate_json_shape(value: &Value, depth: usize, nodes: &mut usize) -> Result
     Ok(())
 }
 
-fn json_reason(error: JsonFailure) -> &'static str {
+pub(crate) fn json_reason(error: JsonFailure) -> &'static str {
     match error {
         JsonFailure::DuplicateKey => "duplicate_json_key",
         JsonFailure::Invalid => "invalid_json",
@@ -505,7 +505,7 @@ struct Census {
     complete: bool,
 }
 
-fn inspect_metadata(path: &Path) -> Result<fs::Metadata, &'static str> {
+pub(crate) fn inspect_metadata(path: &Path) -> Result<fs::Metadata, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| "metadata_unavailable")?;
     if metadata.file_type().is_symlink() {
         return Err("symlink_refused");
@@ -514,7 +514,10 @@ fn inspect_metadata(path: &Path) -> Result<fs::Metadata, &'static str> {
 }
 
 #[cfg(unix)]
-fn open_regular_read_only(path: &Path, expected: &fs::Metadata) -> Result<File, &'static str> {
+pub(crate) fn open_regular_read_only(
+    path: &Path,
+    expected: &fs::Metadata,
+) -> Result<File, &'static str> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     if expected.nlink() != 1 {
@@ -537,14 +540,17 @@ fn open_regular_read_only(path: &Path, expected: &fs::Metadata) -> Result<File, 
 }
 
 #[cfg(not(unix))]
-fn open_regular_read_only(path: &Path, expected: &fs::Metadata) -> Result<File, &'static str> {
+pub(crate) fn open_regular_read_only(
+    path: &Path,
+    expected: &fs::Metadata,
+) -> Result<File, &'static str> {
     if !expected.is_file() {
         return Err("unsupported_file_type");
     }
     File::open(path).map_err(|_| "read_open_failed")
 }
 
-fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, &'static str> {
+pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, &'static str> {
     let metadata = inspect_metadata(path)?;
     if !metadata.is_file() {
         return Err("unsupported_file_type");
@@ -564,7 +570,7 @@ fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
-fn safe_component(name: &std::ffi::OsStr) -> Option<String> {
+pub(crate) fn safe_component(name: &std::ffi::OsStr) -> Option<String> {
     let value = name.to_str()?;
     if value.is_empty()
         || value.len() > 255
@@ -577,7 +583,7 @@ fn safe_component(name: &std::ffi::OsStr) -> Option<String> {
     Some(value.to_owned())
 }
 
-fn join_rel(parent: &str, child: &str) -> Option<String> {
+pub(crate) fn join_rel(parent: &str, child: &str) -> Option<String> {
     let joined = if parent == "." {
         child.to_owned()
     } else {
@@ -586,7 +592,7 @@ fn join_rel(parent: &str, child: &str) -> Option<String> {
     (joined.len() <= MAX_RELATIVE_PATH_BYTES).then_some(joined)
 }
 
-fn hash_file(path: &Path, metadata: &fs::Metadata) -> Result<String, &'static str> {
+pub(crate) fn hash_file(path: &Path, metadata: &fs::Metadata) -> Result<String, &'static str> {
     let mut file = open_regular_read_only(path, metadata)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -651,7 +657,7 @@ fn collect_census(root: &Path, report: &mut LibraryInspectionReport) -> Census {
     census
 }
 
-fn path_chain_contains_symlink(path: &Path) -> bool {
+pub(crate) fn path_chain_contains_symlink(path: &Path) -> bool {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

@@ -122,6 +122,17 @@ pub fn read_baseline(
     }
     let b: VerifiedBaselineV1 =
         serde_json::from_value(probe).map_err(|_| BaselineReject::Corrupt)?;
+    validate_baseline(&b, library_id, replica_id)?;
+    Ok(b)
+}
+
+/// Pure validation core for callers that already opened and parsed the file with stronger
+/// no-follow/duplicate-key filesystem rules.
+pub(crate) fn validate_baseline(
+    b: &VerifiedBaselineV1,
+    library_id: LibraryId,
+    replica_id: ReplicaId,
+) -> Result<(), BaselineReject> {
     let names_ok = b
         .layout
         .iter()
@@ -136,7 +147,7 @@ pub fn read_baseline(
     if b.library_id != library_id || b.replica_id != replica_id {
         return Err(BaselineReject::OtherIdentity);
     }
-    Ok(b)
+    Ok(())
 }
 
 fn fsync_dir(dir: &Path) -> Result<(), String> {

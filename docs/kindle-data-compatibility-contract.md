@@ -1,8 +1,8 @@
-# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.2a)
+# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.2b)
 
 **Status:** feasibility/design, the incomplete compiled capability inventory from Slice
-3D-B2a.4.1, and the library-only read-only inspection probe from Slice 3D-B2a.4.2a. The probe is
-not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
+3D-B2a.4.1, the library-only probe from Slice 3D-B2a.4.2a, and the external sync/device probe from
+Slice 3D-B2a.4.2b. The probes are not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
 admission, authorization, promotion, rollback, storage migration, or persistent data format is
 implemented. `data_compatibility=unknown` remains a hard blocker.
 
@@ -502,10 +502,107 @@ tests exercise the portable metadata/census behavior; the Unix-specific descript
 require native Linux execution.
 
 This slice does not inspect active external sync/outbox/inbox/checkpoint state, device/pairing
-state, preferences outside the library, retired sync epochs, or a complete adoption workspace. It
-does not establish writer exclusion, an authoritative stable root, release provenance, pairwise
-A-writer/B-reader behavior, or rollback readability. Those omissions are why a successful result
-still leaves compatibility unknown.
+state, preferences outside the library, retired sync epochs, or a complete adoption workspace.
+Slice 3D-B2a.4.2b adds that separate external-state surface below; neither report alone nor their
+composition establishes writer exclusion, an authoritative stable root, release provenance,
+pairwise A-writer/B-reader behavior, or rollback readability.
+
+#### 5.2.2 Implemented external sync/device inspection (Slice 3D-B2a.4.2b)
+
+The separately callable API is
+`storage_inspect_external::inspect_external(&ExternalInspectionConfig) -> ExternalInspectionReport`.
+The exact binary exposes it before launch timing, singleton, runtime, hardware, recovery, and
+network initialization:
+
+```text
+scribe-app --inspect-storage-external \
+  --data-dir LIBRARY --sync-dir SYNC --device-dir DEVICE --state-dir STATE
+```
+
+All four paths are mandatory and positional. The command never substitutes live Kindle defaults.
+Its report starts with `IGNITE_STORAGE_EXTERNAL_INSPECTION_V1` and fixes
+`scope=external-sync-and-device`, `coverage=partial`, `writer_exclusion=false`,
+`atomic_snapshot=false`, `data_compatibility=unknown`, `promotion_authorized=false`, and
+`inspection_action=report-only`. Findings distinguish `VALID`, `VALID_PENDING`,
+`UNSUPPORTED_FORMAT`, `CORRUPT`, `MISSING_REQUIRED`, `INCOMPLETE_TRANSACTION`, `UNVERIFIED`, and
+`INSPECTION_ERROR`. Exit 0 means the implemented structural scan completed (`VALID` or ordinary
+`VALID_PENDING`); exit 2 means completed with a problem or unverified claim; exit 3 means the
+inspection was incomplete. CLI misuse/output failure remains exit 1. No result authorizes launch,
+promotion, rollback, repair, or deletion.
+
+The library root is not optional: it must be an existing directory containing a strict,
+source-valid `library.meta` v1 manifest. A missing library root or manifest is
+`MISSING_REQUIRED`; a non-directory or inaccessible root makes the inspection incomplete. The
+sync, device, and state roots may be absent for a real fresh/unpaired library, but become required
+field-by-field once a recorded epoch or server binding refers to them. Consequently four missing
+arbitrary paths can never produce `VALID`.
+
+The active-epoch scan validates library identity v1, replica identity v1, sync-state v1/v2,
+canonical genesis snapshot v1 and digest, config v1 without exposing its token, outbox transaction
+ordering, inbound inbox/accepted sequencing, apply markers, legacy base v2, checkpoint manifest
+v3/content-addressed pages, binary `SCL1` confirmed log framing and reducer replay, referenced
+blobs, recovery intent/completion, verified stamp v3, mutation generation, page-ledger syntax, and
+external preferences v1. Device identity and server profile v1 are strictly parsed; profile,
+config, and staged-profile credentials remain `UNVERIFIED` because the diagnostic neither contacts
+the server nor treats possession of a bearer secret as proof of server identity.
+
+An LF-complete, canonical queued operation is `VALID_PENDING`, not corruption. A trailing outbox
+`prep`, inbound apply marker, torn journal suffix, recovery intent/claim, maintenance hold, or
+adoption plan remains byte-for-byte present and is reported as an incomplete transaction. No
+cursor is advanced, no operation is acknowledged, no journal is compacted/truncated, no blob is
+removed, and no recovery is run. The scanner inspects staged adoption sync state and pairing when
+a committed plan exists, inventories uncommitted staging, and scans paired retired library/sync
+siblings as preserved recovery material. Missing pairs and uninterpretable retired objects are
+visible; retired epochs are never called disposable.
+
+Journal lines are read incrementally from the buffered file descriptor. The scanner refuses a
+record before appending bytes beyond 16 MiB and caps the input represented by retained parsed
+records at 64 MiB; outbox, inbox, and accepted state therefore cannot accumulate an unbounded
+parsed vector. The outbox diagnostic feeds each strict record into the same pure transaction-state
+core as the production reader and never rereads the file. Empty lines and CRLF are historical
+production-reader inputs, so they are preserved and reported `UNVERIFIED` as noncanonical rather
+than normalized or silently called clean. An unterminated final record remains an incomplete torn
+tail. Duplicate keys and malformed JSON are corrupt; unknown fields/variants and future record
+versions are unsupported.
+
+All blob declarations share one constraint set. Repeating the same digest and byte length is
+idempotent; declaring different lengths for one digest is `CORRUPT` and does not allow a later
+reference to replace the earlier expectation. This applies across genesis, outbound, inbound,
+accepted, checkpoint, confirmed-log, and recovery evidence. Retired and adoption diagnostics carry
+their actual namespace, for example
+`retired/<id>/library/.scribe-sync/identity.json`, rather than reusing the active `library/`
+prefix.
+
+The implementation deliberately avoids `OutboundSync::open_with`, `establish_epoch`,
+`load_base_store`, `ConfirmedLog::open`, `finish_apply`, `ensure_sync_identity`,
+`ensure_replica_state`, `client_id`, `recover_interrupted_adoption`, `adopt_library`, recovery
+prepare/reconcile/release functions, `load_side_button`'s lossy fallback, and all server-link HTTP
+or worker paths. It reuses the source-owned identity/snapshot/envelope/reducer validators, the
+outbox transaction parser, a factored read-only confirmed-log scanner, checkpoint DTOs, recovery
+DTOs, page-ledger record validator, and 4.2a's strict duplicate-key JSON and safe file-open/hash
+primitives.
+
+V1 limits are: depth 8, 200,000 census entries, 16 GiB per census pass, 200,000 journal records,
+2 GiB per journal/log, 16 MiB per JSONL/checkpoint-page record, 64 MiB of input represented by
+retained parsed journal records, 128 MiB per blob/genesis/legacy-base object, 4 MiB ordinary
+metadata, JSON depth 64 and one million values, 512 findings, 512-byte safe relative paths, and a
+512 KiB report. Journals and confirmed logs are streamed. Blobs are hashed from read-only file
+descriptors. Checkpoint pages are read one content-addressed object at a time.
+
+Before and after semantic work the scanner hashes the explicit library, sync, device, and state
+roots plus the precise `.adopt`, `.adopt.lock`, and `.retired-*` sibling namespaces used by
+`sync_adopt`. Equality detects ordinary concurrent changes. It remains neither a lock nor an
+atomic snapshot and cannot detect a writer that changes and restores bytes between observations.
+On Unix it inherits 4.2a's `O_NOFOLLOW`, descriptor identity, single-link, path-chain, and special
+file refusals. Directory-component race closure and `/mnt/us` behavior still require a future
+writer-exclusion boundary and Kindle validation.
+
+Remaining partial areas are deliberate: server-side acceptance/authentication cannot be proven
+offline; local verified stamps and mutation generation are cache/invalidation diagnostics rather
+than state authority; retired library semantics are not fully replayed; and no historical exact-A
+fixtures were available for A-writer/B-reader and B-writer/A-reader testing. Same-release fixtures
+exercise parser and preservation behavior only. Therefore even two structurally clean reports
+leave data compatibility `unknown`.
 
 ### 5.3 Stable device-data identity
 
@@ -957,11 +1054,11 @@ fails closed through stable-root comparison.
    exist. The host/lifecycle pre-`go` writes and unresolved format behavior are inventoried in
    `kindle-storage-capability-inventory.md`. The output remains incomplete and unauthenticated;
    missing or unverified capability remains unknown.
-2. **3D-B2a.4.2 — Read-only probes (4.2a library-only portion implemented).** The exact binary now
-   has a strict bounded native-library scanner that never invokes migrating/repairing opens.
-   **4.2b** must add active sync, device/pairing, external preferences, retired epochs, complete
-   adoption/transaction coverage, and cross-version writer→reader fixtures before this becomes a
-   full storage probe.
+2. **3D-B2a.4.2 — Read-only probes (4.2a and 4.2b implemented, still partial).** The exact binary
+   now has separate strict bounded native-library and external sync/device scanners that never
+   invoke migrating/repairing opens. Exact historical A/B writer→reader fixtures, stable writer
+   exclusion, authenticated probe provenance, a composed canonical state root, and admission
+   integration remain separate work before this becomes a full compatibility probe.
 3. **3D-B2a.4.3 — Authenticated installed provenance and bootstrap.** Preserve the signed-release
    chain, capability digest, and exact app/lifecycle/host identities when a candidate becomes A.
    Define, sign, and test only the narrow legacy catalog needed for transitional release T. No
@@ -1130,6 +1227,8 @@ Until these are resolved, the only defensible result is `data_compatibility=unkn
 - `folders.rs`, `nav_state.rs`, `prefs.rs`, `nbk_import.rs`: auxiliary user and replica state.
 - `storage_inspect_library.rs`: bounded library-only read-only inspection and canonical diagnostic
   report (Slice 3D-B2a.4.2a).
+- `storage_inspect_external.rs`: bounded active/retired sync, recovery, device, pairing,
+  preferences, and adoption inspection plus canonical external report (Slice 3D-B2a.4.2b).
 - `sync_local.rs`, `sync_outbound.rs`, `sync_inbound.rs`, `sync_confirmed.rs`,
   `sync_materialize.rs`, `sync_adopt.rs`, `sync_verified.rs`, and `page_ledger.rs`: identity,
   replication, materialization, adoption, crash recovery, invalidation, and diagnostics.
