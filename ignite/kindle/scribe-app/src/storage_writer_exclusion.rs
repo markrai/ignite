@@ -829,7 +829,9 @@ mod tests {
                     assert_eq!(unsafe { libc::flock(file.as_raw_fd(), operation) }, 0);
                     file_guard = Some(file);
                 }
-                "singleton" => match crate::singleton::gate_startup(&path).unwrap() {
+                "singleton" => match crate::singleton::gate_startup(std::path::Path::new(&path))
+                    .unwrap()
+                {
                     crate::singleton::StartupGate::Proceed(guard) => singleton_guard = Some(guard),
                     crate::singleton::StartupGate::AlreadyRunning { .. } => {
                         panic!("singleton fixture unexpectedly contended")
