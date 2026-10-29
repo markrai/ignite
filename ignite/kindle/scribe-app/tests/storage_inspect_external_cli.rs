@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,21 +9,73 @@ use scribe_app::storage_inspect_external::{inspect_external, ExternalInspectionC
 use sha2::{Digest, Sha256};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+const OWNER_FILE: &str = ".ignite-test-root-owner";
+
+struct OwnedTestRoot {
+    path: PathBuf,
+    token: String,
+}
+
+impl OwnedTestRoot {
+    fn from_candidates(candidates: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
+        for path in candidates {
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    let token = uuid::Uuid::now_v7().to_string();
+                    let owner = path.join(OWNER_FILE);
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&owner)
+                        .map_err(|error| format!("create {}: {error}", owner.display()))?;
+                    file.write_all(token.as_bytes())
+                        .map_err(|error| format!("write {}: {error}", owner.display()))?;
+                    return Ok(Self { path, token });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create {}: {error}", path.display())),
+            }
+        }
+        Err("no exclusive process-test root candidate was available".into())
+    }
+
+    fn new() -> Self {
+        let candidates = (0..128).map(|_| {
+            std::env::temp_dir().join(format!(
+                "scribe-external-cli-{}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                uuid::Uuid::now_v7()
+            ))
+        });
+        Self::from_candidates(candidates).expect("create exclusive process-test root")
+    }
+}
+
+impl Drop for OwnedTestRoot {
+    fn drop(&mut self) {
+        let owner = self.path.join(OWNER_FILE);
+        let owned = fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            && fs::symlink_metadata(&owner)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            && fs::read_to_string(&owner).is_ok_and(|token| token.as_str() == self.token.as_str());
+        if owned {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 struct Fixture {
     root: PathBuf,
+    _owner: OwnedTestRoot,
     config: ExternalInspectionConfig,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-external-cli-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let owner = OwnedTestRoot::new();
+        let root = owner.path.clone();
         let config = ExternalInspectionConfig {
             library_root: root.join("library"),
             sync_root: root.join("sync"),
@@ -39,7 +92,11 @@ impl Fixture {
         .unwrap();
         manifest.push(b'\n');
         fs::write(config.library_root.join("library.meta"), manifest).unwrap();
-        Self { config, root }
+        Self {
+            config,
+            root,
+            _owner: owner,
+        }
     }
 
     fn args(&self) -> Vec<String> {
@@ -54,12 +111,6 @@ impl Fixture {
             "--state-dir".into(),
             self.config.state_root.to_string_lossy().into_owned(),
         ]
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -89,6 +140,24 @@ fn manifest(root: &Path) -> BTreeMap<String, (u64, String)> {
     let mut output = BTreeMap::new();
     walk(root, root, &mut output);
     output
+}
+
+#[test]
+fn process_fixture_claim_is_exclusive_and_preserves_collisions() {
+    let parent = OwnedTestRoot::new();
+    let collision = parent.path.join("collision");
+    let candidate = parent.path.join("owned");
+    fs::create_dir(&collision).unwrap();
+    let sentinel = collision.join("foreign-sentinel");
+    fs::write(&sentinel, b"preserve").unwrap();
+
+    let owned = OwnedTestRoot::from_candidates([collision.clone(), candidate.clone()])
+        .expect("skip collision and claim a distinct root");
+    assert_eq!(owned.path, candidate);
+    drop(owned);
+
+    assert!(!candidate.exists());
+    assert_eq!(fs::read(sentinel).unwrap(), b"preserve");
 }
 
 #[test]

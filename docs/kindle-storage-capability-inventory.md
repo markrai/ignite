@@ -276,8 +276,8 @@ safe to delete.
 | `accepted.jsonl` | `load_accepted`, `finish_apply`; ACK append | record v1; canonical own envelope and identity uniqueness | ACK recovery can advance persisted `acked_client_seq`; finish compacts | strict streamed identity, duplicate, and monotonic server-sequence validation | Yes |
 | `apply.json` | `read_marker`, `apply_inbound`, `finish_apply` | marker v1; scanner enforces version and target cursor | normal recovery rematerializes, persists confirmed state/cursor, removes marker | strict parse; presence is an interrupted transaction, never completed by inspection | **Yes** |
 | Legacy `base-state.json` | `load_base_store`; historical writer | base v2, snapshot v1, history v1, `LibraryState::validate` | converts to checkpoint v3 and removes legacy file after promotion | bounded strict read (128 MiB), reducer validation; reported pending conversion; shadowing visible | Yes |
-| `confirmed.log` | `scan_log`, `replay_log`, `ConfirmedLog::open` | binary SCL1, CRC, contiguous sequence, canonical envelope v1 | append-open truncates torn tail; startup replay can persist recovered cursor/compact | factored source scan core over diagnostic-opened descriptor; streamed reducer replay; torn tail preserved | Yes |
-| `checkpoint/manifest.json`, `pages/<sha256>` | `read_checkpoint_head`, `materialize_checkpoint`, checkpoint writer/GC | manifest v3; strict `SnapshotPage`; snapshot/history reducer validation | startup can collect unreferenced pages and promote/compact checkpoints | strict manifest, per-page hash/identity, full assembled state validation; unreferenced pages preserved pending | Yes |
+| `confirmed.log` | `scan_log`, `replay_log`, `ConfirmedLog::open` | binary SCL1, CRC, contiguous sequence, canonical envelope v1 | append-open truncates torn tail; startup replay can persist recovered cursor/compact | factored source scan core over diagnostic-opened descriptor; one payload at a time, 64 MiB cumulative diagnostic replay and 200,000-record limits, no retained diagnostic compaction index; torn tail preserved | Yes |
+| `checkpoint/manifest.json`, `pages/<sha256>` | `read_checkpoint_head`, `materialize_checkpoint`, checkpoint writer/GC | manifest v3; strict `SnapshotPage`; snapshot/history reducer validation | startup can collect unreferenced pages and promote/compact checkpoints | strict manifest, per-page hash/identity, full assembled state validation; streaming parse/canonical comparison, 128 MiB aggregate reconstructed source; unreferenced pages preserved pending | Yes |
 | `local-verified-v1.json`, `.cleared`, library mutation generation/page ledger | `evaluate_fast_path`, `read_provenance`; reconcile/invalidation writers | stamp v3, generation scalar, ledger record v1 | reconcile may rewrite stamp/baseline; invalidation removes stamp/appends ledger | structural validation only; always state that generation/stamp/ledger are cache/cooperating diagnostics, not compatibility proof | No authority; ledger can aid diagnosis |
 | Recovery intent, completion, claim, and library maintenance marker | explicit `sync_recovery_exec` and `sync_verified` functions | intent v1, completion v1, canonical frozen envelopes, marker `1\n` | prepare/revalidate can bind identities, submit, reconcile, finalize, remove hold | strict invariant/candidate binding; every active marker is incomplete or historical/unverified and preserved | **Yes** |
 | Device `device.json`, `server-profile.json`, replacement temps | `client_id`, `load_profile`; private atomic writers/pairing/adoption | scanner requires v1 and strict fields/UUIDs | `client_id` regenerates malformed identity; pairing/profile publication writes credentials | strict read and server binding; secrets never emitted; authentication/server truth remains `UNVERIFIED` | Needed to resume authenticated sync |
@@ -290,14 +290,32 @@ none of `OutboundSync::open_with`, `establish_epoch`, `load_base_store`, `Confir
 `finish_apply`, identity/replica `ensure_*`, server `client_id`, adoption recovery/publication,
 recovery submit/reconcile/release, preference fallback, or network/background-worker entry points.
 
+Directory discovery is fail-closed before allocation can grow past its configured cap. Every
+iterator result and safe component is checked across checkpoint pages/artifacts, blobs, device and
+state, adoption, retired siblings, and the active sync root. A read error, unsafe name, or overflow
+is `INSPECTION_ERROR`/exit 3; partial discovery is never reported as a clean scan. The retained
+sibling maps are built once per semantic pass rather than repeatedly rescanning them while pairing.
+
+Large genesis, legacy-base, and checkpoint inputs are strict-validated, deserialized, and compared
+with canonical bytes in separate streaming file passes, avoiding simultaneous raw/generic/typed/
+canonical full-size copies. JSONL keeps one at-most-16-MiB line and its typed record while retained
+semantic input is capped at 64 MiB. Reconstructed checkpoint source is capped at 128 MiB and
+diagnostic confirmed replay at 64 MiB; strict JSON duplicate tracking refuses more than 4,096 keys
+in one object. Typed reducer state and collection overhead remain resident, so these are defensible
+source bounds rather than an exact RSS guarantee. A Linux-only 24 MiB structured-input stress
+fixture is provided for `/usr/bin/time -v`; target-device memory margin is still a hardware
+qualification.
+
 Same-release fixture tests cover required versus optional roots, fresh/unpaired state, v1/v2
 epochs, bounded oversized and aggregate JSONL input, canonical and historical journal encodings,
 outbound/inbound pending and torn states, accepted/apply state, legacy confirmed state,
 version/identity/digest contradictions, conflicting blob declarations, pairing unknown fields,
 preferences, adoption staging, correctly namespaced retired mismatches, recovery markers,
-filesystem/resource attacks, concurrent census changes, deterministic reports, and complete
-before/after byte preservation. Linux-only tests cover symlink, hard-link, and special-file refusal.
-These fixtures test diagnostic behavior; they are not A/B compatibility evidence.
+filesystem/resource attacks, injected directory-enumeration errors, reduced aggregate limits,
+collision-safe owned cleanup, concurrent census changes, deterministic reports, and complete
+before/after byte preservation. Linux-only tests cover symlink, hard-link, special-file refusal, and
+the large structured-input stress fixture. These fixtures test diagnostic behavior; they are not A/B
+compatibility evidence.
 
 The existing capability command remains byte-for-byte unchanged and retains
 `coverage=incomplete`, `data_compatibility=unknown`, and `promotion_authorized=false`. Remaining

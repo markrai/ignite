@@ -6,17 +6,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use control_protocol::ServerId;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sync_engine::{HistoryV1, LibraryState};
 use sync_protocol::{
-    sha256_hex, BackgroundRef, IdentityFileV1, LibraryId, OperationId, ReplicaId, ReplicaStateV1,
-    Sha256Hex, SnapshotNotebook, SnapshotPage, SyncEnvelopeV1, SyncOperationV1, SyncSnapshotV1,
+    BackgroundRef, IdentityFileV1, LibraryId, OperationId, ReplicaId, ReplicaStateV1, Sha256Hex,
+    SnapshotNotebook, SnapshotPage, SyncEnvelopeV1, SyncOperationV1, SyncSnapshotV1,
 };
 
 use crate::storage_inspect_library::{
@@ -33,6 +33,34 @@ pub const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_RETAINED_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_BLOB_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum source bytes represented by one reconstructed confirmed state. Structured inputs are
+/// streamed and never coexist as raw bytes, generic JSON, typed data, and canonical bytes.
+pub const MAX_RECONSTRUCTED_STATE_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+/// Confirmed operations applied after a checkpoint are streamed, but their resulting semantic
+/// state remains resident. Refuse an excessively large replay before it can grow without bound.
+pub const MAX_CONFIRMED_REPLAY_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+/// Supported structured records have a small fixed field set. This generous malformed-input cap
+/// bounds the duplicate-key set retained for any one JSON object without limiting array members.
+const MAX_JSON_OBJECT_KEYS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct InspectionLimits {
+    tree_entries: usize,
+    directory_entries: usize,
+    reconstructed_state_source_bytes: u64,
+    confirmed_replay_payload_bytes: u64,
+}
+
+impl Default for InspectionLimits {
+    fn default() -> Self {
+        Self {
+            tree_entries: MAX_TREE_ENTRIES,
+            directory_entries: MAX_TREE_ENTRIES,
+            reconstructed_state_source_bytes: MAX_RECONSTRUCTED_STATE_SOURCE_BYTES,
+            confirmed_replay_payload_bytes: MAX_CONFIRMED_REPLAY_PAYLOAD_BYTES,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExternalDiagnosticClass {
@@ -332,7 +360,65 @@ struct ScopePath {
     path: PathBuf,
 }
 
-fn sibling_names(root: &Path, kind: &str) -> Result<Vec<ScopePath>, &'static str> {
+#[derive(Clone, Debug)]
+struct NamedPath {
+    name: String,
+    path: PathBuf,
+}
+
+struct CensusTraversal {
+    entries: usize,
+    bytes: u64,
+    limits: InspectionLimits,
+}
+
+fn collect_directory_results<I>(
+    entries: I,
+    max_entries: usize,
+) -> Result<Vec<NamedPath>, &'static str>
+where
+    I: IntoIterator<Item = Result<(std::ffi::OsString, PathBuf), ()>>,
+{
+    let mut found = Vec::new();
+    for result in entries {
+        if found.len() >= max_entries {
+            return Err("directory_entry_limit_exceeded");
+        }
+        let (file_name, path) = result.map_err(|()| "directory_entry_unreadable")?;
+        let name = safe_component(&file_name).ok_or("unsafe_entry_name")?;
+        found.push(NamedPath { name, path });
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(found)
+}
+
+/// `Ok(None)` means the directory does not exist. Every other inability to enumerate the whole
+/// namespace is an error; callers must not interpret a partial list as complete coverage.
+fn enumerate_directory(
+    path: &Path,
+    max_entries: usize,
+) -> Result<Option<Vec<NamedPath>>, &'static str> {
+    let read_dir = match fs::read_dir(path) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("directory_unreadable"),
+    };
+    collect_directory_results(
+        read_dir.map(|result| {
+            result
+                .map(|entry| (entry.file_name(), entry.path()))
+                .map_err(|_| ())
+        }),
+        max_entries,
+    )
+    .map(Some)
+}
+
+fn sibling_names(
+    root: &Path,
+    kind: &str,
+    max_entries: usize,
+) -> Result<Vec<ScopePath>, &'static str> {
     let parent = root.parent().ok_or("scope_root_has_no_parent")?;
     if path_chain_contains_symlink(parent) {
         return Err("scope_parent_path_contains_symlink");
@@ -342,16 +428,11 @@ fn sibling_names(root: &Path, kind: &str) -> Result<Vec<ScopePath>, &'static str
         .and_then(|name| name.to_str())
         .ok_or("scope_root_name_not_utf8")?;
     let mut found = Vec::new();
-    let read_dir = match fs::read_dir(parent) {
-        Ok(read_dir) => read_dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
-        Err(_) => return Err("scope_parent_unreadable"),
+    let Some(entries) = enumerate_directory(parent, max_entries)? else {
+        return Ok(found);
     };
-    for entry in read_dir {
-        let entry = entry.map_err(|_| "scope_parent_unreadable")?;
-        let Some(name) = safe_component(&entry.file_name()) else {
-            continue;
-        };
+    for entry in entries {
+        let name = entry.name;
         let suffix = name.strip_prefix(base);
         let relevant = match kind {
             "library" => {
@@ -366,7 +447,7 @@ fn sibling_names(root: &Path, kind: &str) -> Result<Vec<ScopePath>, &'static str
         if relevant {
             found.push(ScopePath {
                 label: format!("{kind}_sibling/{name}"),
-                path: entry.path(),
+                path: entry.path,
             });
         }
     }
@@ -374,7 +455,10 @@ fn sibling_names(root: &Path, kind: &str) -> Result<Vec<ScopePath>, &'static str
     Ok(found)
 }
 
-fn scope_paths(config: &ExternalInspectionConfig) -> Result<Vec<ScopePath>, &'static str> {
+fn scope_paths(
+    config: &ExternalInspectionConfig,
+    limits: InspectionLimits,
+) -> Result<Vec<ScopePath>, &'static str> {
     let mut paths = vec![
         ScopePath {
             label: "library".into(),
@@ -393,19 +477,31 @@ fn scope_paths(config: &ExternalInspectionConfig) -> Result<Vec<ScopePath>, &'st
             path: config.state_root.clone(),
         },
     ];
-    paths.extend(sibling_names(&config.library_root, "library")?);
-    paths.extend(sibling_names(&config.sync_root, "sync")?);
+    let library_siblings =
+        sibling_names(&config.library_root, "library", limits.directory_entries)?;
+    if paths.len().saturating_add(library_siblings.len()) > limits.tree_entries {
+        return Err("tree_entry_limit_exceeded");
+    }
+    paths.extend(library_siblings);
+    let sync_siblings = sibling_names(&config.sync_root, "sync", limits.directory_entries)?;
+    if paths.len().saturating_add(sync_siblings.len()) > limits.tree_entries {
+        return Err("tree_entry_limit_exceeded");
+    }
+    paths.extend(sync_siblings);
     paths.sort_by(|a, b| a.label.cmp(&b.label));
     Ok(paths)
 }
 
-fn collect_scope(config: &ExternalInspectionConfig) -> (ScopeCensus, Vec<ExternalFinding>) {
+fn collect_scope(
+    config: &ExternalInspectionConfig,
+    limits: InspectionLimits,
+) -> (ScopeCensus, Vec<ExternalFinding>) {
     let mut census = ScopeCensus {
         entries: BTreeMap::new(),
         complete: true,
     };
     let mut issues = Vec::new();
-    let paths = match scope_paths(config) {
+    let paths = match scope_paths(config, limits) {
         Ok(paths) => paths,
         Err(reason) => {
             census.complete = false;
@@ -417,8 +513,11 @@ fn collect_scope(config: &ExternalInspectionConfig) -> (ScopeCensus, Vec<Externa
             return (census, issues);
         }
     };
-    let mut entries = 0usize;
-    let mut bytes = 0u64;
+    let mut traversal = CensusTraversal {
+        entries: 0,
+        bytes: 0,
+        limits,
+    };
     for scope in paths {
         collect_scope_path(
             &scope.path,
@@ -426,8 +525,7 @@ fn collect_scope(config: &ExternalInspectionConfig) -> (ScopeCensus, Vec<Externa
             0,
             &mut census,
             &mut issues,
-            &mut entries,
-            &mut bytes,
+            &mut traversal,
         );
     }
     (census, issues)
@@ -439,8 +537,7 @@ fn collect_scope_path(
     depth: usize,
     census: &mut ScopeCensus,
     issues: &mut Vec<ExternalFinding>,
-    total_entries: &mut usize,
-    total_bytes: &mut u64,
+    traversal: &mut CensusTraversal,
 ) {
     if depth > MAX_TREE_DEPTH {
         census.complete = false;
@@ -492,8 +589,8 @@ fn collect_scope_path(
         });
         return;
     }
-    *total_entries = total_entries.saturating_add(1);
-    if *total_entries > MAX_TREE_ENTRIES {
+    traversal.entries = traversal.entries.saturating_add(1);
+    if traversal.entries > traversal.limits.tree_entries {
         census.complete = false;
         issues.push(ExternalFinding {
             class: ExternalDiagnosticClass::InspectionError,
@@ -503,8 +600,8 @@ fn collect_scope_path(
         return;
     }
     if metadata.is_file() {
-        *total_bytes = total_bytes.saturating_add(metadata.len());
-        if *total_bytes > MAX_TOTAL_BYTES_PER_PASS {
+        traversal.bytes = traversal.bytes.saturating_add(metadata.len());
+        if traversal.bytes > MAX_TOTAL_BYTES_PER_PASS {
             census.complete = false;
             issues.push(ExternalFinding {
                 class: ExternalDiagnosticClass::InspectionError,
@@ -552,45 +649,41 @@ fn collect_scope_path(
             sha256: "-".into(),
         },
     );
-    let read_dir = match fs::read_dir(path) {
-        Ok(read_dir) => read_dir,
-        Err(_) => {
-            census.complete = false;
-            issues.push(ExternalFinding {
-                class: ExternalDiagnosticClass::InspectionError,
-                relative_path: relative.into(),
-                reason: "directory_unreadable",
-            });
-            return;
-        }
-    };
-    let mut children = Vec::new();
-    for entry in read_dir {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
+    let remaining = traversal
+        .limits
+        .tree_entries
+        .saturating_sub(traversal.entries);
+    let children =
+        match enumerate_directory(path, remaining.min(traversal.limits.directory_entries)) {
+            Ok(Some(children)) => children,
+            Ok(None) | Err("directory_unreadable") => {
                 census.complete = false;
                 issues.push(ExternalFinding {
                     class: ExternalDiagnosticClass::InspectionError,
                     relative_path: relative.into(),
-                    reason: "directory_entry_unreadable",
+                    reason: "directory_unreadable",
                 });
-                continue;
+                return;
+            }
+            Err(reason) => {
+                let reason = if reason == "directory_entry_limit_exceeded"
+                    && remaining <= traversal.limits.directory_entries
+                {
+                    "tree_entry_limit_exceeded"
+                } else {
+                    reason
+                };
+                census.complete = false;
+                issues.push(ExternalFinding {
+                    class: ExternalDiagnosticClass::InspectionError,
+                    relative_path: relative.into(),
+                    reason,
+                });
+                return;
             }
         };
-        let Some(name) = safe_component(&entry.file_name()) else {
-            census.complete = false;
-            issues.push(ExternalFinding {
-                class: ExternalDiagnosticClass::InspectionError,
-                relative_path: relative.into(),
-                reason: "unsafe_entry_name",
-            });
-            continue;
-        };
-        children.push((name, entry.path()));
-    }
-    children.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, child) in children {
+    for child in children {
+        let name = child.name;
         let Some(child_relative) = join_rel(relative, &name) else {
             census.complete = false;
             issues.push(ExternalFinding {
@@ -601,13 +694,12 @@ fn collect_scope_path(
             continue;
         };
         collect_scope_path(
-            &child,
+            &child.path,
             &child_relative,
             depth + 1,
             census,
             issues,
-            total_entries,
-            total_bytes,
+            traversal,
         );
     }
 }
@@ -1034,8 +1126,8 @@ fn read_canonical_envelope(
     bytes: &[u8],
     expected_library: LibraryId,
 ) -> Result<SyncEnvelopeV1, &'static str> {
-    let value = parse_json_strict(bytes).map_err(|_| "invalid_or_duplicate_envelope_json")?;
-    let envelope: SyncEnvelopeV1 = serde_json::from_value(value).map_err(|error| {
+    validate_json_slice_streaming(bytes).map_err(|_| "invalid_or_duplicate_envelope_json")?;
+    let envelope: SyncEnvelopeV1 = serde_json::from_slice(bytes).map_err(|error| {
         if error.to_string().contains("unknown field")
             || error.to_string().contains("unknown variant")
         {
@@ -1054,11 +1146,7 @@ fn read_canonical_envelope(
     if envelope.library_id != expected_library {
         return Err("foreign_library_envelope");
     }
-    if envelope
-        .to_canonical_bytes()
-        .map_err(|_| "invalid_envelope")?
-        != bytes
-    {
+    if !canonical_matches_slice(&envelope, bytes).map_err(|()| "invalid_envelope")? {
         return Err("noncanonical_envelope");
     }
     Ok(envelope)
@@ -1082,6 +1170,262 @@ fn open_stream(path: &Path, max: u64) -> Result<(BufReader<fs::File>, u64), &'st
     }
     let file = open_regular_read_only(path, &metadata)?;
     Ok((BufReader::with_capacity(64 * 1024, file), metadata.len()))
+}
+
+#[derive(Default)]
+struct StreamingJsonBudget {
+    nodes: usize,
+}
+
+struct StrictJsonSeed<'a> {
+    budget: &'a mut StreamingJsonBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for StrictJsonSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.depth > crate::storage_inspect_library::MAX_JSON_DEPTH {
+            return Err(serde::de::Error::custom("json-depth-limit"));
+        }
+        self.budget.nodes = self.budget.nodes.saturating_add(1);
+        if self.budget.nodes > crate::storage_inspect_library::MAX_JSON_NODES {
+            return Err(serde::de::Error::custom("json-node-limit"));
+        }
+        deserializer.deserialize_any(StrictJsonVisitor {
+            budget: self.budget,
+            depth: self.depth,
+        })
+    }
+}
+
+struct StrictJsonVisitor<'a> {
+    budget: &'a mut StreamingJsonBudget,
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for StrictJsonVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bounded JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element_seed(StrictJsonSeed {
+                budget: &mut *self.budget,
+                depth: self.depth + 1,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if keys.len() >= MAX_JSON_OBJECT_KEYS {
+                return Err(serde::de::Error::custom("json-object-key-limit"));
+            }
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate-key"));
+            }
+            map.next_value_seed(StrictJsonSeed {
+                budget: &mut *self.budget,
+                depth: self.depth + 1,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn json_stream_failure(error: &serde_json::Error) -> crate::storage_inspect_library::JsonFailure {
+    use crate::storage_inspect_library::JsonFailure;
+    let message = error.to_string();
+    if message.contains("duplicate-key") {
+        JsonFailure::DuplicateKey
+    } else if message.contains("json-depth-limit") {
+        JsonFailure::TooDeep
+    } else if message.contains("json-node-limit") || message.contains("json-object-key-limit") {
+        JsonFailure::TooManyNodes
+    } else {
+        JsonFailure::Invalid
+    }
+}
+
+fn validate_json_streaming(
+    reader: impl Read,
+) -> Result<(), crate::storage_inspect_library::JsonFailure> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let mut budget = StreamingJsonBudget::default();
+    StrictJsonSeed {
+        budget: &mut budget,
+        depth: 0,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| json_stream_failure(&error))?;
+    deserializer
+        .end()
+        .map_err(|error| json_stream_failure(&error))
+}
+
+fn validate_json_slice_streaming(
+    bytes: &[u8],
+) -> Result<(), crate::storage_inspect_library::JsonFailure> {
+    validate_json_streaming(std::io::Cursor::new(bytes))
+}
+
+#[derive(Debug)]
+enum StructuredJsonFailure {
+    Inspection(&'static str),
+    Json(crate::storage_inspect_library::JsonFailure),
+    Typed { unsupported: bool },
+}
+
+fn read_structured_json<T: DeserializeOwned>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<T, StructuredJsonFailure> {
+    let (strict_reader, _) =
+        open_stream(path, max_bytes).map_err(StructuredJsonFailure::Inspection)?;
+    validate_json_streaming(strict_reader).map_err(StructuredJsonFailure::Json)?;
+
+    let (typed_reader, _) =
+        open_stream(path, max_bytes).map_err(StructuredJsonFailure::Inspection)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(typed_reader);
+    let parsed = T::deserialize(&mut deserializer).map_err(|error| {
+        let message = error.to_string();
+        StructuredJsonFailure::Typed {
+            unsupported: message.contains("unknown field") || message.contains("unknown variant"),
+        }
+    })?;
+    deserializer
+        .end()
+        .map_err(|_| StructuredJsonFailure::Typed { unsupported: false })?;
+    Ok(parsed)
+}
+
+struct SliceComparator<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    matches: bool,
+}
+
+impl Write for SliceComparator<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let end = self.offset.saturating_add(bytes.len());
+        if end > self.expected.len() || self.expected.get(self.offset..end) != Some(bytes) {
+            self.matches = false;
+        }
+        self.offset = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_matches_slice(value: &impl Serialize, expected: &[u8]) -> Result<bool, ()> {
+    let mut comparator = SliceComparator {
+        expected,
+        offset: 0,
+        matches: true,
+    };
+    serde_json::to_writer(&mut comparator, value).map_err(|_| ())?;
+    Ok(comparator.matches && comparator.offset == expected.len())
+}
+
+struct ReaderComparator<R> {
+    expected: R,
+    expected_len: u64,
+    consumed: u64,
+    matches: bool,
+}
+
+impl<R: Read> Write for ReaderComparator<R> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut compared = 0usize;
+        let mut buffer = [0u8; 8192];
+        while compared < bytes.len() {
+            let wanted = (bytes.len() - compared).min(buffer.len());
+            let mut got = 0usize;
+            while got < wanted {
+                match self.expected.read(&mut buffer[got..wanted])? {
+                    0 => {
+                        self.matches = false;
+                        break;
+                    }
+                    count => got += count,
+                }
+            }
+            if got != wanted || buffer[..got] != bytes[compared..compared + got] {
+                self.matches = false;
+            }
+            compared += wanted;
+        }
+        self.consumed = self.consumed.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_matches_file(
+    value: &impl Serialize,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<bool, &'static str> {
+    let (reader, expected_len) = open_stream(path, max_bytes)?;
+    let mut comparator = ReaderComparator {
+        expected: reader,
+        expected_len,
+        consumed: 0,
+        matches: true,
+    };
+    serde_json::to_writer(&mut comparator, value).map_err(|_| "record_reserialization_failed")?;
+    Ok(comparator.matches && comparator.consumed == comparator.expected_len)
 }
 
 #[derive(Clone, Copy)]
@@ -1234,14 +1578,13 @@ where
             }
             summary.retained_input_bytes = retained;
         }
-        let value = parse_json_strict(&line).map_err(jsonl_parse_failure)?;
+        validate_json_slice_streaming(&line).map_err(jsonl_parse_failure)?;
         let record: T =
-            serde_json::from_value(value).map_err(|error| jsonl_serde_failure(&error))?;
-        if serde_json::to_vec(&record).map_err(|_| JsonlFailure {
+            serde_json::from_slice(&line).map_err(|error| jsonl_serde_failure(&error))?;
+        if !canonical_matches_slice(&record, &line).map_err(|()| JsonlFailure {
             class: ExternalDiagnosticClass::InspectionError,
             reason: "record_reserialization_failed",
-        })? != line
-        {
+        })? {
             summary.noncanonical_records = summary.noncanonical_records.saturating_add(1);
         }
         visitor(record)?;
@@ -1358,13 +1701,16 @@ fn scan_outbox(
             "torn_outbox_tail_preserved",
         );
     }
-    let pending = parsed
-        .committed
-        .iter()
-        .filter(|operation| operation.seq > state.acked_client_seq)
-        .collect::<Vec<_>>();
-    if let Some(first) = pending.first() {
-        if first.seq != state.acked_client_seq.saturating_add(1) {
+    let mut first_pending_seq = None;
+    let mut pending_count = 0u64;
+    for operation in &parsed.committed {
+        if operation.seq > state.acked_client_seq {
+            first_pending_seq.get_or_insert(operation.seq);
+            pending_count = pending_count.saturating_add(1);
+        }
+    }
+    if let Some(first) = first_pending_seq {
+        if first != state.acked_client_seq.saturating_add(1) {
             report.finding(
                 ExternalDiagnosticClass::Corrupt,
                 relative.clone(),
@@ -1408,8 +1754,8 @@ fn scan_outbox(
     report.counts.outbound_operations = report
         .counts
         .outbound_operations
-        .saturating_add(pending.len() as u64);
-    if !pending.is_empty() {
+        .saturating_add(pending_count);
+    if pending_count != 0 {
         report.finding(
             ExternalDiagnosticClass::ValidPending,
             relative,
@@ -1593,13 +1939,13 @@ fn scan_accepted(
             "torn_accepted_tail_preserved",
         );
     }
-    if by_client
-        .values()
-        .map(|(server, _, _)| *server)
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|window| window[0] >= window[1])
-    {
+    let mut previous_server = None;
+    let non_increasing = by_client.values().any(|(server, _, _)| {
+        let result = previous_server.is_some_and(|previous| previous >= *server);
+        previous_server = Some(*server);
+        result
+    });
+    if non_increasing {
         report.finding(
             ExternalDiagnosticClass::Corrupt,
             relative.clone(),
@@ -1667,6 +2013,7 @@ fn checkpoint_state(
     expected_library: LibraryId,
     blobs: &mut BlobReferences,
     report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
 ) -> Option<(LibraryState, u64)> {
     let manifest_path = sync_root
         .join(crate::sync_outbound::confirmed::CHECKPOINT_DIR)
@@ -1695,6 +2042,7 @@ fn checkpoint_state(
         .join(crate::sync_outbound::confirmed::CHECKPOINT_PAGES);
     let mut notebooks = Vec::with_capacity(manifest.notebooks.len());
     let mut referenced = BTreeSet::new();
+    let mut reconstructed_source_bytes = 0u64;
     for notebook in manifest.notebooks {
         let mut pages = Vec::with_capacity(notebook.pages.len());
         for reference in notebook.pages {
@@ -1702,19 +2050,29 @@ fn checkpoint_state(
             referenced.insert(name.to_owned());
             let page_path = pages_root.join(name);
             let page_relative = format!("{prefix}/checkpoint/pages/{name}");
-            let bytes = match read_bounded(&page_path, MAX_RECORD_BYTES) {
-                Ok(bytes) => bytes,
-                Err(reason) => {
-                    let class = if reason == "metadata_unavailable" {
-                        ExternalDiagnosticClass::MissingRequired
-                    } else {
-                        ExternalDiagnosticClass::InspectionError
-                    };
-                    report.finding(class, page_relative, reason);
-                    return None;
-                }
-            };
-            if sha256_hex(&bytes) != reference.sha256 {
+            let (actual_digest, source_bytes) =
+                match hash_regular_file(&page_path, MAX_RECORD_BYTES) {
+                    Ok(file) => file,
+                    Err(reason) => {
+                        let class = if reason == "metadata_unavailable" {
+                            ExternalDiagnosticClass::MissingRequired
+                        } else {
+                            ExternalDiagnosticClass::InspectionError
+                        };
+                        report.finding(class, page_relative, reason);
+                        return None;
+                    }
+                };
+            reconstructed_source_bytes = reconstructed_source_bytes.saturating_add(source_bytes);
+            if reconstructed_source_bytes > limits.reconstructed_state_source_bytes {
+                report.finding(
+                    ExternalDiagnosticClass::InspectionError,
+                    format!("{prefix}/checkpoint"),
+                    "reconstructed_state_source_limit_exceeded",
+                );
+                return None;
+            }
+            if actual_digest != reference.sha256.as_str() {
                 report.finding(
                     ExternalDiagnosticClass::Corrupt,
                     page_relative,
@@ -1722,22 +2080,17 @@ fn checkpoint_state(
                 );
                 return None;
             }
-            let value = match parse_json_strict(&bytes) {
-                Ok(value) => value,
-                Err(error) => {
+            let page: SnapshotPage = match read_structured_json(&page_path, MAX_RECORD_BYTES) {
+                Ok(page) => page,
+                Err(StructuredJsonFailure::Json(error)) => {
                     report.finding(
                         ExternalDiagnosticClass::Corrupt,
-                        page_relative,
+                        page_relative.clone(),
                         crate::storage_inspect_library::json_reason(error),
                     );
                     return None;
                 }
-            };
-            let page: SnapshotPage = match serde_json::from_value(value) {
-                Ok(page) => page,
-                Err(error) => {
-                    let unsupported = error.to_string().contains("unknown field")
-                        || error.to_string().contains("unknown variant");
+                Err(StructuredJsonFailure::Typed { unsupported }) => {
                     report.finding(
                         if unsupported {
                             ExternalDiagnosticClass::UnsupportedFormat
@@ -1753,6 +2106,14 @@ fn checkpoint_state(
                     );
                     return None;
                 }
+                Err(StructuredJsonFailure::Inspection(reason)) => {
+                    report.finding(
+                        ExternalDiagnosticClass::InspectionError,
+                        page_relative.clone(),
+                        reason,
+                    );
+                    return None;
+                }
             };
             if page.page_id != reference.page_id {
                 report.finding(
@@ -1762,12 +2123,23 @@ fn checkpoint_state(
                 );
                 return None;
             }
-            if serde_json::to_vec(&page).is_ok_and(|canonical| canonical != bytes) {
-                report.finding(
-                    ExternalDiagnosticClass::Unverified,
-                    page_relative.clone(),
-                    "noncanonical_checkpoint_page_supported_by_reader",
-                );
+            match canonical_matches_file(&page, &page_path, MAX_RECORD_BYTES) {
+                Ok(true) => {}
+                Ok(false) => {
+                    report.finding(
+                        ExternalDiagnosticClass::Unverified,
+                        page_relative.clone(),
+                        "noncanonical_checkpoint_page_supported_by_reader",
+                    );
+                }
+                Err(reason) => {
+                    report.finding(
+                        ExternalDiagnosticClass::InspectionError,
+                        page_relative.clone(),
+                        reason,
+                    );
+                    return None;
+                }
             }
             add_background(&page.background, blobs, prefix, report);
             pages.push(page);
@@ -1797,22 +2169,20 @@ fn checkpoint_state(
         );
         return None;
     }
-    match fs::read_dir(&pages_root) {
-        Ok(read_dir) => {
-            for entry in read_dir.flatten() {
-                if let Some(name) = safe_component(&entry.file_name()) {
-                    if !referenced.contains(&name) {
-                        report.finding(
-                            ExternalDiagnosticClass::ValidPending,
-                            format!("{prefix}/checkpoint/pages/{name}"),
-                            "unreferenced_checkpoint_page_preserved",
-                        );
-                    }
+    match enumerate_directory(&pages_root, limits.directory_entries) {
+        Ok(Some(entries)) => {
+            for entry in entries {
+                if !referenced.contains(&entry.name) {
+                    report.finding(
+                        ExternalDiagnosticClass::ValidPending,
+                        format!("{prefix}/checkpoint/pages/{}", entry.name),
+                        "unreferenced_checkpoint_page_preserved",
+                    );
                 }
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && referenced.is_empty() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Ok(None) if referenced.is_empty() => {}
+        Ok(None) => {
             report.finding(
                 ExternalDiagnosticClass::MissingRequired,
                 format!("{prefix}/checkpoint/pages"),
@@ -1820,11 +2190,11 @@ fn checkpoint_state(
             );
             return None;
         }
-        Err(_) => {
+        Err(reason) => {
             report.finding(
                 ExternalDiagnosticClass::InspectionError,
                 format!("{prefix}/checkpoint/pages"),
-                "directory_unreadable",
+                reason,
             );
             return None;
         }
@@ -1839,20 +2209,70 @@ fn legacy_base_state(
     expected_library: LibraryId,
     blobs: &mut BlobReferences,
     report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
 ) -> Option<(LibraryState, u64)> {
     let path = sync_root.join(crate::sync_outbound::BASE_FILE);
     let relative = format!("{prefix}/base-state.json");
-    let base = match read_json_typed::<BaseStateV2Inspection>(
-        &path,
-        &relative,
-        MAX_BLOB_BYTES,
-        &[2],
-        report,
-    ) {
-        JsonRead::Missing | JsonRead::Invalid => return None,
-        JsonRead::Parsed(base) => base,
+    let source_bytes = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            report.finding(
+                ExternalDiagnosticClass::InspectionError,
+                relative.clone(),
+                "metadata_unavailable",
+            );
+            return None;
+        }
+        Ok(metadata) => metadata.len(),
     };
-    if base.v != 2 || base.snapshot.library_id != expected_library {
+    if source_bytes > limits.reconstructed_state_source_bytes {
+        report.finding(
+            ExternalDiagnosticClass::InspectionError,
+            relative,
+            "reconstructed_state_source_limit_exceeded",
+        );
+        return None;
+    }
+    let base = match read_structured_json::<BaseStateV2Inspection>(&path, MAX_BLOB_BYTES) {
+        Ok(base) => base,
+        Err(StructuredJsonFailure::Inspection(reason)) => {
+            report.finding(ExternalDiagnosticClass::InspectionError, relative, reason);
+            return None;
+        }
+        Err(StructuredJsonFailure::Json(error)) => {
+            report.finding(
+                ExternalDiagnosticClass::Corrupt,
+                relative,
+                crate::storage_inspect_library::json_reason(error),
+            );
+            return None;
+        }
+        Err(StructuredJsonFailure::Typed { unsupported }) => {
+            report.finding(
+                if unsupported {
+                    ExternalDiagnosticClass::UnsupportedFormat
+                } else {
+                    ExternalDiagnosticClass::Corrupt
+                },
+                relative,
+                if unsupported {
+                    "unrecognized_legacy_base_fields_or_variant"
+                } else {
+                    "invalid_legacy_base_state"
+                },
+            );
+            return None;
+        }
+    };
+    if base.v != 2 {
+        report.finding(
+            ExternalDiagnosticClass::UnsupportedFormat,
+            relative,
+            "unsupported_legacy_base_version",
+        );
+        return None;
+    }
+    if base.snapshot.library_id != expected_library {
         report.finding(
             ExternalDiagnosticClass::Corrupt,
             relative,
@@ -1887,6 +2307,7 @@ fn scan_confirmed(
     state: &crate::sync_outbound::SyncStateV1,
     epoch: &mut EpochScan,
     report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
 ) {
     let checkpoint_manifest = sync_root
         .join(crate::sync_outbound::confirmed::CHECKPOINT_DIR)
@@ -1908,6 +2329,7 @@ fn scan_confirmed(
             state.library_id,
             &mut epoch.blobs,
             report,
+            limits,
         )
     } else {
         legacy_base_state(
@@ -1916,6 +2338,7 @@ fn scan_confirmed(
             state.library_id,
             &mut epoch.blobs,
             report,
+            limits,
         )
     };
     let Some((mut reducer, through)) = base else {
@@ -1958,10 +2381,12 @@ fn scan_confirmed(
         },
     };
     let mut applied = through;
-    let scan = crate::sync_outbound::confirmed::scan_log_reader(
+    let scan = crate::sync_outbound::confirmed::scan_log_reader_bounded(
         reader,
         len,
         &relative,
+        MAX_RECORDS,
+        limits.confirmed_replay_payload_bytes,
         |server_sequence, payload| {
             if server_sequence <= through {
                 return Ok(());
@@ -1981,11 +2406,19 @@ fn scan_confirmed(
     );
     let scan = match scan {
         Ok(scan) => scan,
-        Err(_) => {
+        Err(error) => {
             report.finding(
-                ExternalDiagnosticClass::Corrupt,
+                if error.starts_with("CONFIRMED_LOG_RESOURCE_LIMIT:") {
+                    ExternalDiagnosticClass::InspectionError
+                } else {
+                    ExternalDiagnosticClass::Corrupt
+                },
                 relative,
-                "invalid_confirmed_log",
+                if error.starts_with("CONFIRMED_LOG_RESOURCE_LIMIT:") {
+                    "confirmed_replay_resource_limit_exceeded"
+                } else {
+                    "invalid_confirmed_log"
+                },
             );
             return;
         }
@@ -2023,6 +2456,7 @@ fn scan_blobs(
     prefix: &str,
     references: &BlobReferences,
     report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
 ) {
     let root = sync_root.join(crate::sync_outbound::BLOB_DIR);
     for (digest, expected_bytes) in &references.expected_bytes {
@@ -2058,34 +2492,33 @@ fn scan_blobs(
             }
         }
     }
-    let read_dir = match fs::read_dir(&root) {
-        Ok(read_dir) => read_dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(_) => {
+    let entries = match enumerate_directory(&root, limits.directory_entries) {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return,
+        Err(reason) => {
             report.finding(
                 ExternalDiagnosticClass::InspectionError,
                 format!("{prefix}/blobs"),
-                "directory_unreadable",
+                reason,
             );
             return;
         }
     };
-    for entry in read_dir.flatten() {
-        if let Some(name) = safe_component(&entry.file_name()) {
-            if !references.expected_bytes.contains_key(&name) {
-                if name.ends_with(".tmp") {
-                    report.finding(
-                        ExternalDiagnosticClass::IncompleteTransaction,
-                        format!("{prefix}/blobs/{name}"),
-                        "temporary_blob_object_preserved",
-                    );
-                } else {
-                    report.finding(
-                        ExternalDiagnosticClass::Unverified,
-                        format!("{prefix}/blobs/{name}"),
-                        "unreferenced_blob_preserved",
-                    );
-                }
+    for entry in entries {
+        let name = entry.name;
+        if !references.expected_bytes.contains_key(&name) {
+            if name.ends_with(".tmp") {
+                report.finding(
+                    ExternalDiagnosticClass::IncompleteTransaction,
+                    format!("{prefix}/blobs/{name}"),
+                    "temporary_blob_object_preserved",
+                );
+            } else {
+                report.finding(
+                    ExternalDiagnosticClass::Unverified,
+                    format!("{prefix}/blobs/{name}"),
+                    "unreferenced_blob_preserved",
+                );
             }
         }
     }
@@ -2095,24 +2528,23 @@ fn scan_checkpoint_artifacts(
     sync_root: &Path,
     prefix: &str,
     report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
 ) {
     let checkpoint = sync_root.join(crate::sync_outbound::confirmed::CHECKPOINT_DIR);
-    let read_dir = match fs::read_dir(checkpoint) {
-        Ok(read_dir) => read_dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(_) => {
+    let entries = match enumerate_directory(&checkpoint, limits.directory_entries) {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return,
+        Err(reason) => {
             report.finding(
                 ExternalDiagnosticClass::InspectionError,
                 format!("{prefix}/checkpoint"),
-                "directory_unreadable",
+                reason,
             );
             return;
         }
     };
-    for entry in read_dir.flatten() {
-        let Some(name) = safe_component(&entry.file_name()) else {
-            continue;
-        };
+    for entry in entries {
+        let name = entry.name;
         if matches!(
             name.as_str(),
             crate::sync_outbound::confirmed::CHECKPOINT_MANIFEST
@@ -2476,6 +2908,7 @@ fn scan_epoch(
     library_prefix: &str,
     prefix: &str,
     report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
 ) -> EpochScan {
     let mut epoch = EpochScan::default();
     let _ = validate_library_root(library_root, library_prefix, report);
@@ -2512,9 +2945,14 @@ fn scan_epoch(
         report,
     ) {
         JsonRead::Missing => {
-            let nontrivial = fs::read_dir(sync_root)
-                .ok()
-                .is_some_and(|mut entries| entries.next().is_some());
+            let nontrivial = match enumerate_directory(sync_root, limits.directory_entries) {
+                Ok(Some(entries)) => !entries.is_empty(),
+                Ok(None) => false,
+                Err(reason) => {
+                    report.finding(ExternalDiagnosticClass::InspectionError, prefix, reason);
+                    return epoch;
+                }
+            };
             if nontrivial {
                 report.finding(
                     ExternalDiagnosticClass::MissingRequired,
@@ -2578,53 +3016,85 @@ fn scan_epoch(
     }
     let genesis_path = sync_root.join(crate::sync_outbound::GENESIS_FILE);
     let genesis_relative = format!("{prefix}/genesis.json");
-    match read_bounded(&genesis_path, MAX_BLOB_BYTES) {
-        Ok(bytes) => {
-            let value = match parse_json_strict(&bytes) {
-                Ok(value) => Some(value),
-                Err(error) => {
+    match fs::symlink_metadata(&genesis_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => report.finding(
+            ExternalDiagnosticClass::MissingRequired,
+            genesis_relative,
+            "genesis_missing",
+        ),
+        Err(_) => report.finding(
+            ExternalDiagnosticClass::InspectionError,
+            genesis_relative,
+            "metadata_unavailable",
+        ),
+        Ok(metadata) if metadata.len() > limits.reconstructed_state_source_bytes => report.finding(
+            ExternalDiagnosticClass::InspectionError,
+            genesis_relative,
+            "reconstructed_state_source_limit_exceeded",
+        ),
+        Ok(_) => {
+            let digest = match hash_regular_file(&genesis_path, MAX_BLOB_BYTES) {
+                Ok((digest, _)) => Some(digest),
+                Err(reason) => {
                     report.finding(
-                        ExternalDiagnosticClass::Corrupt,
+                        ExternalDiagnosticClass::InspectionError,
                         genesis_relative.clone(),
-                        crate::storage_inspect_library::json_reason(error),
+                        reason,
                     );
                     None
                 }
             };
             let genesis =
-                value.and_then(
-                    |value| match serde_json::from_value::<SyncSnapshotV1>(value) {
-                        Ok(genesis) => Some(genesis),
-                        Err(error) => {
-                            let unsupported = error.to_string().contains("unknown field")
-                                || error.to_string().contains("unknown variant");
-                            report.finding(
-                                if unsupported {
-                                    ExternalDiagnosticClass::UnsupportedFormat
-                                } else {
-                                    ExternalDiagnosticClass::Corrupt
-                                },
-                                genesis_relative.clone(),
-                                if unsupported {
-                                    "unrecognized_genesis_fields_or_variant"
-                                } else {
-                                    "invalid_genesis_snapshot"
-                                },
-                            );
-                            None
-                        }
-                    },
-                );
-            if let Some(genesis) = genesis {
+                match read_structured_json::<SyncSnapshotV1>(&genesis_path, MAX_BLOB_BYTES) {
+                    Ok(genesis) => Some(genesis),
+                    Err(StructuredJsonFailure::Json(error)) => {
+                        report.finding(
+                            ExternalDiagnosticClass::Corrupt,
+                            genesis_relative.clone(),
+                            crate::storage_inspect_library::json_reason(error),
+                        );
+                        None
+                    }
+                    Err(StructuredJsonFailure::Typed { unsupported }) => {
+                        report.finding(
+                            if unsupported {
+                                ExternalDiagnosticClass::UnsupportedFormat
+                            } else {
+                                ExternalDiagnosticClass::Corrupt
+                            },
+                            genesis_relative.clone(),
+                            if unsupported {
+                                "unrecognized_genesis_fields_or_variant"
+                            } else {
+                                "invalid_genesis_snapshot"
+                            },
+                        );
+                        None
+                    }
+                    Err(StructuredJsonFailure::Inspection(reason)) => {
+                        report.finding(
+                            ExternalDiagnosticClass::InspectionError,
+                            genesis_relative.clone(),
+                            reason,
+                        );
+                        None
+                    }
+                };
+            if let (Some(digest), Some(genesis)) = (digest, genesis) {
+                let canonical = canonical_matches_file(&genesis, &genesis_path, MAX_BLOB_BYTES);
                 if genesis.validate().is_ok()
                     && genesis.library_id == state.library_id
-                    && genesis
-                        .to_canonical_bytes()
-                        .is_ok_and(|canonical| canonical == bytes)
-                    && sha256_hex(&bytes) == state.genesis_sha256
+                    && canonical == Ok(true)
+                    && digest == state.genesis_sha256.as_str()
                 {
                     add_snapshot_blobs(&genesis, &mut epoch.blobs, prefix, report);
                     report.observe(ExternalDiagnosticClass::Valid);
+                } else if let Err(reason) = canonical {
+                    report.finding(
+                        ExternalDiagnosticClass::InspectionError,
+                        genesis_relative,
+                        reason,
+                    );
                 } else {
                     report.finding(
                         ExternalDiagnosticClass::Corrupt,
@@ -2634,16 +3104,6 @@ fn scan_epoch(
                 }
             }
         }
-        Err("metadata_unavailable") => report.finding(
-            ExternalDiagnosticClass::MissingRequired,
-            genesis_relative,
-            "genesis_missing",
-        ),
-        Err(reason) => report.finding(
-            ExternalDiagnosticClass::InspectionError,
-            genesis_relative,
-            reason,
-        ),
     }
     let config_path = sync_root.join(crate::sync_outbound::CONFIG_FILE);
     let config_relative = format!("{prefix}/config.json");
@@ -2678,11 +3138,11 @@ fn scan_epoch(
     scan_inbox(sync_root, prefix, &state, &mut epoch, report);
     scan_accepted(sync_root, prefix, &state, &mut epoch, report);
     scan_apply_marker(sync_root, prefix, &state, report);
-    scan_confirmed(sync_root, prefix, &state, &mut epoch, report);
-    scan_checkpoint_artifacts(sync_root, prefix, report);
+    scan_confirmed(sync_root, prefix, &state, &mut epoch, report, limits);
+    scan_checkpoint_artifacts(sync_root, prefix, report, limits);
     scan_recovery(sync_root, prefix, &state, &mut epoch, report);
     scan_verified_state(sync_root, library_root, prefix, &state, report);
-    scan_blobs(sync_root, prefix, &epoch.blobs, report);
+    scan_blobs(sync_root, prefix, &epoch.blobs, report, limits);
     scan_preferences(
         &sync_root.join(crate::prefs::PREFERENCES_FILE),
         &format!("{prefix}/preferences.json"),
@@ -2696,6 +3156,7 @@ fn scan_device(
     config: &ExternalInspectionConfig,
     epoch: &EpochScan,
     report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
 ) {
     let device_path = config.device_root.join(crate::server_link::DEVICE_FILE);
     match read_json_typed::<DeviceFileV1Inspection>(
@@ -2788,22 +3249,16 @@ fn scan_device(
         (&config.device_root, "device"),
         (&config.state_root, "state"),
     ] {
-        let read_dir = match fs::read_dir(root) {
-            Ok(read_dir) => read_dir,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                report.finding(
-                    ExternalDiagnosticClass::InspectionError,
-                    prefix,
-                    "directory_unreadable",
-                );
+        let entries = match enumerate_directory(root, limits.directory_entries) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => continue,
+            Err(reason) => {
+                report.finding(ExternalDiagnosticClass::InspectionError, prefix, reason);
                 continue;
             }
         };
-        for entry in read_dir.flatten() {
-            let Some(name) = safe_component(&entry.file_name()) else {
-                continue;
-            };
+        for entry in entries {
+            let name = entry.name;
             let known = matches!(
                 (prefix, name.as_str()),
                 (
@@ -2838,7 +3293,11 @@ fn sibling_path(root: &Path, suffix: &str) -> Option<PathBuf> {
     Some(root.with_file_name(name))
 }
 
-fn scan_adoption(config: &ExternalInspectionConfig, report: &mut ExternalInspectionReport) {
+fn scan_adoption(
+    config: &ExternalInspectionConfig,
+    report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
+) {
     let Some(workspace) = sibling_path(&config.sync_root, ".adopt") else {
         report.finding(
             ExternalDiagnosticClass::InspectionError,
@@ -2902,6 +3361,7 @@ fn scan_adoption(config: &ExternalInspectionConfig, report: &mut ExternalInspect
             "adoption/library",
             "adoption/sync",
             report,
+            limits,
         );
         if staged_epoch.library != Some(plan.library_id)
             || staged_epoch.replica != Some(plan.replica_id)
@@ -2945,41 +3405,74 @@ fn scan_adoption(config: &ExternalInspectionConfig, report: &mut ExternalInspect
             }
         }
     }
-    if let Ok(read_dir) = fs::read_dir(&workspace) {
-        for entry in read_dir.flatten() {
-            let Some(name) = safe_component(&entry.file_name()) else {
-                continue;
-            };
-            if matches!(
-                name.as_str(),
-                crate::sync_adopt::PLAN_FILE | crate::server_link::PROFILE_FILE | "sync"
-            ) {
-                continue;
-            }
-            if name.ends_with(".tmp") {
-                report.finding(
-                    ExternalDiagnosticClass::IncompleteTransaction,
-                    format!("adoption/{name}"),
-                    "temporary_adoption_object_preserved",
-                );
-            } else {
-                report.finding(
-                    ExternalDiagnosticClass::Unverified,
-                    format!("adoption/{name}"),
-                    "unknown_adoption_object_preserved",
-                );
+    match enumerate_directory(&workspace, limits.directory_entries) {
+        Ok(Some(entries)) => {
+            for entry in entries {
+                let name = entry.name;
+                if matches!(
+                    name.as_str(),
+                    crate::sync_adopt::PLAN_FILE | crate::server_link::PROFILE_FILE | "sync"
+                ) {
+                    continue;
+                }
+                if name.ends_with(".tmp") {
+                    report.finding(
+                        ExternalDiagnosticClass::IncompleteTransaction,
+                        format!("adoption/{name}"),
+                        "temporary_adoption_object_preserved",
+                    );
+                } else {
+                    report.finding(
+                        ExternalDiagnosticClass::Unverified,
+                        format!("adoption/{name}"),
+                        "unknown_adoption_object_preserved",
+                    );
+                }
             }
         }
+        Ok(None) if !workspace_present => {}
+        Ok(None) => report.finding(
+            ExternalDiagnosticClass::InspectionError,
+            "adoption",
+            "namespace_disappeared_during_inspection",
+        ),
+        Err(reason) => report.finding(ExternalDiagnosticClass::InspectionError, "adoption", reason),
     }
 }
 
-fn scan_retired(config: &ExternalInspectionConfig, report: &mut ExternalInspectionReport) {
-    let Ok(sync_siblings) = sibling_names(&config.sync_root, "sync") else {
-        return;
+fn scan_retired(
+    config: &ExternalInspectionConfig,
+    report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
+) {
+    let sync_siblings = match sibling_names(&config.sync_root, "sync", limits.directory_entries) {
+        Ok(siblings) => siblings,
+        Err(reason) => {
+            report.finding(ExternalDiagnosticClass::InspectionError, "retired", reason);
+            return;
+        }
     };
-    let Ok(library_siblings) = sibling_names(&config.library_root, "library") else {
-        return;
-    };
+    let library_siblings =
+        match sibling_names(&config.library_root, "library", limits.directory_entries) {
+            Ok(siblings) => siblings,
+            Err(reason) => {
+                report.finding(ExternalDiagnosticClass::InspectionError, "retired", reason);
+                return;
+            }
+        };
+    let sync_suffixes = sync_siblings
+        .iter()
+        .filter_map(|scope| {
+            scope
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| {
+                    name.split_once(".retired-")
+                        .map(|(_, suffix)| suffix.to_owned())
+                })
+        })
+        .collect::<BTreeSet<_>>();
     let library_by_suffix = library_siblings
         .iter()
         .filter_map(|scope| {
@@ -3002,7 +3495,14 @@ fn scan_retired(config: &ExternalInspectionConfig, report: &mut ExternalInspecti
         let prefix = format!("retired/{suffix}/sync");
         if let Some(library) = library_by_suffix.get(suffix) {
             let library_prefix = format!("retired/{suffix}/library");
-            let _ = scan_epoch(library, &scope.path, &library_prefix, &prefix, report);
+            let _ = scan_epoch(
+                library,
+                &scope.path,
+                &library_prefix,
+                &prefix,
+                report,
+                limits,
+            );
             report.finding(
                 ExternalDiagnosticClass::Unverified,
                 format!("retired/{suffix}"),
@@ -3017,18 +3517,7 @@ fn scan_retired(config: &ExternalInspectionConfig, report: &mut ExternalInspecti
         }
     }
     for (suffix, _) in library_by_suffix {
-        let sync_name = config
-            .sync_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("{name}.retired-{suffix}"));
-        let has_sync = sync_name.is_some_and(|wanted| {
-            sibling_names(&config.sync_root, "sync")
-                .unwrap_or_default()
-                .iter()
-                .any(|scope| scope.path.file_name().and_then(|name| name.to_str()) == Some(&wanted))
-        });
-        if !has_sync {
+        if !sync_suffixes.contains(&suffix) {
             report.finding(
                 ExternalDiagnosticClass::IncompleteTransaction,
                 format!("retired/{suffix}/library"),
@@ -3038,16 +3527,17 @@ fn scan_retired(config: &ExternalInspectionConfig, report: &mut ExternalInspecti
     }
 }
 
-fn scan_sync_root_entries(sync_root: &Path, prefix: &str, report: &mut ExternalInspectionReport) {
-    let read_dir = match fs::read_dir(sync_root) {
-        Ok(read_dir) => read_dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(_) => {
-            report.finding(
-                ExternalDiagnosticClass::InspectionError,
-                prefix,
-                "directory_unreadable",
-            );
+fn scan_sync_root_entries(
+    sync_root: &Path,
+    prefix: &str,
+    report: &mut ExternalInspectionReport,
+    limits: InspectionLimits,
+) {
+    let entries = match enumerate_directory(sync_root, limits.directory_entries) {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return,
+        Err(reason) => {
+            report.finding(ExternalDiagnosticClass::InspectionError, prefix, reason);
             return;
         }
     };
@@ -3074,10 +3564,8 @@ fn scan_sync_root_entries(sync_root: &Path, prefix: &str, report: &mut ExternalI
         crate::prefs::PREFERENCES_FILE,
         "recovery-intent-v1.claim",
     ]);
-    for entry in read_dir.flatten() {
-        let Some(name) = safe_component(&entry.file_name()) else {
-            continue;
-        };
+    for entry in entries {
+        let name = entry.name;
         if known.contains(name.as_str()) {
             continue;
         }
@@ -3100,15 +3588,24 @@ fn scan_sync_root_entries(sync_root: &Path, prefix: &str, report: &mut ExternalI
 
 /// Inspect external sync and device state without taking locks or invoking normal startup.
 pub fn inspect_external(config: &ExternalInspectionConfig) -> ExternalInspectionReport {
-    inspect_external_with_hook(config, || {})
+    inspect_external_with_limits_and_hook(config, InspectionLimits::default(), || {})
 }
 
+#[cfg(test)]
 fn inspect_external_with_hook(
     config: &ExternalInspectionConfig,
     after_scan: impl FnOnce(),
 ) -> ExternalInspectionReport {
+    inspect_external_with_limits_and_hook(config, InspectionLimits::default(), after_scan)
+}
+
+fn inspect_external_with_limits_and_hook(
+    config: &ExternalInspectionConfig,
+    limits: InspectionLimits,
+    after_scan: impl FnOnce(),
+) -> ExternalInspectionReport {
     let mut report = ExternalInspectionReport::default();
-    let (before, before_issues) = collect_scope(config);
+    let (before, before_issues) = collect_scope(config, limits);
     record_census_issues(&mut report, before_issues);
     // A failed census includes a symlink/hard-link/special-file/path-limit refusal. Do not then
     // enter semantic readers: that could follow a rejected namespace or turn a partial tree into
@@ -3120,11 +3617,12 @@ fn inspect_external_with_hook(
             "library",
             "sync",
             &mut report,
+            limits,
         );
-        scan_sync_root_entries(&config.sync_root, "sync", &mut report);
-        scan_device(config, &active, &mut report);
-        scan_adoption(config, &mut report);
-        scan_retired(config, &mut report);
+        scan_sync_root_entries(&config.sync_root, "sync", &mut report, limits);
+        scan_device(config, &active, &mut report, limits);
+        scan_adoption(config, &mut report, limits);
+        scan_retired(config, &mut report, limits);
         let maintenance = config
             .library_root
             .join(crate::sync_local::SYNC_DIR)
@@ -3150,7 +3648,7 @@ fn inspect_external_with_hook(
         }
     }
     after_scan();
-    let (after, after_issues) = collect_scope(config);
+    let (after, after_issues) = collect_scope(config, limits);
     record_census_issues(&mut report, after_issues);
     if before != after {
         report.finding(
@@ -3187,14 +3685,82 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
+    use std::ops::Deref;
     use std::sync::atomic::{AtomicU64, Ordering};
     use sync_engine::testkit;
-    use sync_protocol::{IdentityFileV1, SyncOperationV1};
+    use sync_protocol::{sha256_hex, IdentityFileV1, SyncOperationV1};
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
+    const OWNER_FILE: &str = ".ignite-test-root-owner";
+
+    struct OwnedTestRoot {
+        path: PathBuf,
+        token: String,
+    }
+
+    impl OwnedTestRoot {
+        fn from_candidates(candidates: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
+            for path in candidates {
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        let token = uuid::Uuid::now_v7().to_string();
+                        let owner = path.join(OWNER_FILE);
+                        let mut file = fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&owner)
+                            .map_err(|error| format!("create {}: {error}", owner.display()))?;
+                        file.write_all(token.as_bytes())
+                            .map_err(|error| format!("write {}: {error}", owner.display()))?;
+                        return Ok(Self { path, token });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(format!("create {}: {error}", path.display())),
+                }
+            }
+            Err("no exclusive test-root candidate was available".into())
+        }
+
+        fn new(prefix: &str) -> Self {
+            let candidates = (0..128).map(|_| {
+                std::env::temp_dir().join(format!(
+                    "{prefix}-{}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed),
+                    uuid::Uuid::now_v7()
+                ))
+            });
+            Self::from_candidates(candidates).expect("create exclusive test root")
+        }
+    }
+
+    impl Deref for OwnedTestRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl Drop for OwnedTestRoot {
+        fn drop(&mut self) {
+            let owner = self.path.join(OWNER_FILE);
+            let owned = fs::symlink_metadata(&self.path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                && fs::symlink_metadata(&owner)
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                && fs::read_to_string(&owner)
+                    .is_ok_and(|token| token.as_str() == self.token.as_str());
+            if owned {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
     struct Fixture {
         root: PathBuf,
+        _owner: OwnedTestRoot,
         config: ExternalInspectionConfig,
         library: LibraryId,
         replica: ReplicaId,
@@ -3203,13 +3769,8 @@ mod tests {
 
     impl Fixture {
         fn fresh() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "scribe-external-inspect-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).unwrap();
+            let owner = OwnedTestRoot::new("scribe-external-inspect");
+            let root = owner.path.clone();
             let config = ExternalInspectionConfig {
                 library_root: root.join("library"),
                 sync_root: root.join("sync"),
@@ -3230,6 +3791,7 @@ mod tests {
             );
             Self {
                 root,
+                _owner: owner,
                 config,
                 library: testkit::library(),
                 replica: testkit::replica(1),
@@ -3390,12 +3952,6 @@ mod tests {
             let mut output = BTreeMap::new();
             walk(&self.root, &self.root, &mut output);
             output
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -4162,6 +4718,7 @@ mod tests {
             "sync",
             &wrong_count,
             &mut wrong_count_report,
+            InspectionLimits::default(),
         );
         assert!(has(&wrong_count_report, "blob_byte_count_mismatch"));
 
@@ -4184,6 +4741,7 @@ mod tests {
             "sync",
             &wrong_digest,
             &mut wrong_digest_report,
+            InspectionLimits::default(),
         );
         assert!(has(&wrong_digest_report, "blob_digest_mismatch"));
 
@@ -4201,6 +4759,7 @@ mod tests {
             "sync",
             &missing,
             &mut missing_report,
+            InspectionLimits::default(),
         );
         assert!(has(&missing_report, "referenced_blob_missing"));
     }
@@ -4331,6 +4890,166 @@ mod tests {
             "retired/broken/library/.scribe-sync/identity.json"
         );
         assert_ne!(finding.relative_path, "library/.scribe-sync/identity.json");
+    }
+
+    #[test]
+    fn directory_discovery_is_bounded_and_never_returns_partial_results() {
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
+        let unreadable =
+            collect_directory_results([Ok(("first".into(), first.clone())), Err(())], 8);
+        assert_eq!(unreadable.unwrap_err(), "directory_entry_unreadable");
+
+        let over_limit = collect_directory_results(
+            [Ok(("first".into(), first)), Ok(("second".into(), second))],
+            1,
+        );
+        assert_eq!(over_limit.unwrap_err(), "directory_entry_limit_exceeded");
+
+        let unsafe_name =
+            collect_directory_results([Ok(("../outside".into(), PathBuf::from("outside")))], 1);
+        assert_eq!(unsafe_name.unwrap_err(), "unsafe_entry_name");
+
+        let fixture = Fixture::epoch(1);
+        let directory_limited = inspect_external_with_limits_and_hook(
+            &fixture.config,
+            InspectionLimits {
+                directory_entries: 1,
+                ..InspectionLimits::default()
+            },
+            || {},
+        );
+        assert!(!directory_limited.completed);
+        assert_eq!(directory_limited.exit_code(), 3);
+        assert!(has(&directory_limited, "directory_entry_limit_exceeded"));
+
+        let tree_limited = inspect_external_with_limits_and_hook(
+            &fixture.config,
+            InspectionLimits {
+                tree_entries: 5,
+                ..InspectionLimits::default()
+            },
+            || {},
+        );
+        assert!(!tree_limited.completed);
+        assert_eq!(tree_limited.exit_code(), 3);
+        assert!(has(&tree_limited, "tree_entry_limit_exceeded"));
+    }
+
+    #[test]
+    fn structured_json_duplicate_tracking_has_an_object_key_limit() {
+        let mut json = String::from("{");
+        for key in 0..=MAX_JSON_OBJECT_KEYS {
+            if key != 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("\"key-{key}\":null"));
+        }
+        json.push('}');
+        assert_eq!(
+            validate_json_slice_streaming(json.as_bytes()),
+            Err(crate::storage_inspect_library::JsonFailure::TooManyNodes)
+        );
+    }
+
+    #[test]
+    fn exclusive_fixture_ownership_preserves_a_colliding_directory() {
+        let parent = OwnedTestRoot::new("scribe-external-collision-parent");
+        let collision = parent.join("collision");
+        let candidate = parent.join("owned");
+        fs::create_dir(&collision).unwrap();
+        let sentinel = collision.join("do-not-delete");
+        fs::write(&sentinel, b"foreign").unwrap();
+
+        let owned = OwnedTestRoot::from_candidates([collision.clone(), candidate.clone()])
+            .expect("skip colliding candidate and claim next root");
+        assert_eq!(owned.path, candidate);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"foreign");
+        drop(owned);
+
+        assert!(!candidate.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn reconstructed_inputs_and_confirmed_replay_have_aggregate_limits() {
+        let fixture = Fixture::epoch(1);
+        let genesis = fixture
+            .config
+            .sync_root
+            .join(crate::sync_outbound::GENESIS_FILE);
+        let source_bytes = fs::metadata(genesis).unwrap().len();
+        let report = inspect_external_with_limits_and_hook(
+            &fixture.config,
+            InspectionLimits {
+                reconstructed_state_source_bytes: source_bytes.saturating_sub(1),
+                ..InspectionLimits::default()
+            },
+            || {},
+        );
+        assert!(!report.completed);
+        assert_eq!(report.exit_code(), 3);
+        assert!(has(&report, "reconstructed_state_source_limit_exceeded"));
+
+        let mut framed = crate::sync_outbound::confirmed::frame(1, b"one");
+        framed.extend(crate::sync_outbound::confirmed::frame(2, b"two"));
+        let mut observed = Vec::new();
+        let production = crate::sync_outbound::confirmed::scan_log_reader(
+            std::io::Cursor::new(&framed),
+            framed.len() as u64,
+            "test confirmed log",
+            |sequence, _| {
+                observed.push(sequence);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, [1, 2]);
+        assert_eq!(production.index.len(), 2);
+
+        let error = crate::sync_outbound::confirmed::scan_log_reader_bounded(
+            std::io::Cursor::new(&framed),
+            framed.len() as u64,
+            "test confirmed log",
+            1,
+            u64::MAX,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("CONFIRMED_LOG_RESOURCE_LIMIT:"));
+
+        let error = crate::sync_outbound::confirmed::scan_log_reader_bounded(
+            std::io::Cursor::new(&framed),
+            framed.len() as u64,
+            "test confirmed log",
+            usize::MAX,
+            5,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("CONFIRMED_LOG_RESOURCE_LIMIT:"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_large_structured_input_streaming_stress_fixture() {
+        const PAYLOAD_BYTES: usize = 24 * 1024 * 1024;
+        let root = OwnedTestRoot::new("scribe-external-large-json");
+        let path = root.join("large.json");
+        let mut file = std::io::BufWriter::new(fs::File::create(&path).unwrap());
+        file.write_all(b"{\"v\":1,\"payload\":\"").unwrap();
+        let chunk = [b'x'; 64 * 1024];
+        for _ in 0..PAYLOAD_BYTES / chunk.len() {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(b"\"}").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let parsed: TestJsonlRecord =
+            read_structured_json(&path, (PAYLOAD_BYTES + 128) as u64).unwrap();
+        assert_eq!(parsed.payload.len(), PAYLOAD_BYTES);
+        assert!(canonical_matches_file(&parsed, &path, (PAYLOAD_BYTES + 128) as u64).unwrap());
     }
 
     #[test]

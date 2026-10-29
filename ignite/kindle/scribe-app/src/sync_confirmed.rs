@@ -164,15 +164,49 @@ pub(crate) fn scan_log(
 /// Read-only scan core used by storage diagnostics after they have opened a regular file with
 /// their no-follow and file-identity checks. It performs no seek, truncate, create, or repair.
 pub(crate) fn scan_log_reader(
+    r: impl Read,
+    file_len: u64,
+    description: &str,
+    each: impl FnMut(u64, &[u8]) -> Result<(), String>,
+) -> Result<LogScan, String> {
+    scan_log_reader_core(r, file_len, description, None, true, each)
+}
+
+/// Diagnostic-only scan that bounds both replay work and retained index memory. The production
+/// reader above intentionally keeps its existing persistence semantics and complete compaction
+/// index.
+pub(crate) fn scan_log_reader_bounded(
+    r: impl Read,
+    file_len: u64,
+    description: &str,
+    max_records: usize,
+    max_payload_bytes: u64,
+    each: impl FnMut(u64, &[u8]) -> Result<(), String>,
+) -> Result<LogScan, String> {
+    scan_log_reader_core(
+        r,
+        file_len,
+        description,
+        Some((max_records, max_payload_bytes)),
+        false,
+        each,
+    )
+}
+
+fn scan_log_reader_core(
     mut r: impl Read,
     file_len: u64,
     description: &str,
+    limits: Option<(usize, u64)>,
+    retain_index: bool,
     mut each: impl FnMut(u64, &[u8]) -> Result<(), String>,
 ) -> Result<LogScan, String> {
     let mut out = LogScan::default();
     let mut pos = 0u64;
     let mut prev: Option<u64> = None;
     let mut payload = Vec::new();
+    let mut records = 0usize;
+    let mut payload_bytes = 0u64;
     let corrupt = |at: u64, why: &str| {
         format!(
             "CONFIRMED_LOG_CORRUPT at byte {at} of {}: {why} (durable history is never skipped)",
@@ -203,6 +237,16 @@ pub(crate) fn scan_log_reader(
             }
             return Err(corrupt(pos, "impossible record length"));
         }
+        if let Some((max_records, max_payload_bytes)) = limits {
+            if records >= max_records {
+                return Err("CONFIRMED_LOG_RESOURCE_LIMIT: record count exceeded".into());
+            }
+            let next_payload_bytes = payload_bytes.saturating_add(u64::from(len));
+            if next_payload_bytes > max_payload_bytes {
+                return Err("CONFIRMED_LOG_RESOURCE_LIMIT: payload bytes exceeded".into());
+            }
+            payload_bytes = next_payload_bytes;
+        }
         payload.resize(len as usize, 0);
         let got = read_exact_or_eof(&mut r, &mut payload).map_err(|e| e.to_string())?;
         if got < len as usize {
@@ -224,7 +268,10 @@ pub(crate) fn scan_log_reader(
         each(seq, &payload)?;
         prev = Some(seq);
         pos = end;
-        out.index.push((seq, end));
+        records = records.saturating_add(1);
+        if retain_index {
+            out.index.push((seq, end));
+        }
     }
     out.valid_len = pos;
     Ok(out)

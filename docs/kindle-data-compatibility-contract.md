@@ -565,6 +565,14 @@ than normalized or silently called clean. An unterminated final record remains a
 tail. Duplicate keys and malformed JSON are corrupt; unknown fields/variants and future record
 versions are unsupported.
 
+Large structured inputs do not materialize raw bytes, a generic `serde_json::Value`, a typed value,
+and canonical output simultaneously. Genesis, legacy base, and checkpoint pages use separate
+streaming strict-validation, typed-deserialization, and canonical-comparison passes; JSONL retains
+only the current bounded line alongside its typed record. Checkpoint reconstruction still retains
+the resulting typed `LibraryState`, and journal transaction validation retains its bounded semantic
+state. These source-byte limits are therefore allocation controls, not a claim that peak RSS equals
+the serialized byte count.
+
 All blob declarations share one constraint set. Repeating the same digest and byte length is
 idempotent; declaring different lengths for one digest is `CORRUPT` and does not allow a later
 reference to replace the earlier expectation. This applies across genesis, outbound, inbound,
@@ -582,12 +590,32 @@ outbox transaction parser, a factored read-only confirmed-log scanner, checkpoin
 DTOs, page-ledger record validator, and 4.2a's strict duplicate-key JSON and safe file-open/hash
 primitives.
 
-V1 limits are: depth 8, 200,000 census entries, 16 GiB per census pass, 200,000 journal records,
-2 GiB per journal/log, 16 MiB per JSONL/checkpoint-page record, 64 MiB of input represented by
-retained parsed journal records, 128 MiB per blob/genesis/legacy-base object, 4 MiB ordinary
-metadata, JSON depth 64 and one million values, 512 findings, 512-byte safe relative paths, and a
-512 KiB report. Journals and confirmed logs are streamed. Blobs are hashed from read-only file
-descriptors. Checkpoint pages are read one content-addressed object at a time.
+V1 limits are: depth 8; 200,000 aggregate census entries and 200,000 entries per directory before a
+name vector can grow further; 16 GiB per census pass; 200,000 journal or diagnostic confirmed-log
+records; 2 GiB per journal/log; 16 MiB per JSONL, confirmed-log payload, or checkpoint-page record;
+64 MiB of input represented by retained parsed journal records; 64 MiB cumulative confirmed replay
+payload for this diagnostic; 128 MiB aggregate source bytes for one reconstructed checkpoint state,
+genesis, or legacy base; 128 MiB per blob; 4 MiB ordinary metadata; JSON depth 64 and one million
+values; 4,096 keys per object; 512 findings; 512-byte safe relative paths; and a 512 KiB report. The
+object-key cap bounds the duplicate-detection set for malformed input without limiting array members
+used by actual notebook/page collections. Journals and confirmed logs are streamed. The diagnostic
+confirmed-log reader does not retain the production compaction index. Blobs are hashed from
+read-only file descriptors. Checkpoint pages are read one content-addressed object at a time while
+the reconstructed typed state remains resident.
+
+Every directory iterator result is checked. An unreadable entry, unsafe name, or count overflow is
+`INSPECTION_ERROR`, makes `completed=false`, and returns exit 3; no partial enumeration is treated as
+coverage. Active device/state, sync-root, blobs, checkpoint artifacts/pages, adoption, and retired
+namespaces all follow this rule. Retired sibling names are collected once for each semantic pass
+rather than rescanned inside the pairing loop. The before/after censuses remain intentionally
+separate so concurrent mutation can be detected.
+
+The Linux-only stress fixture
+`cargo test -p scribe-app storage_inspect_external::tests::linux_large_structured_input_streaming_stress_fixture -- --exact`
+constructs a 24 MiB structured file without a same-sized fixture buffer and exercises the streaming
+strict/typed/canonical passes. Run it under `/usr/bin/time -v` on the target-class Linux runner to
+record peak RSS. Windows tests cover the same parser and reduced-limit behavior, but only native
+Linux and Kindle measurements can establish an acceptable memory margin on the 5.18.6 device.
 
 Before and after semantic work the scanner hashes the explicit library, sync, device, and state
 roots plus the precise `.adopt`, `.adopt.lock`, and `.retired-*` sibling namespaces used by
