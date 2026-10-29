@@ -159,7 +159,7 @@ pub fn authenticate_official_release(
     authenticate_with_key(manifest_bytes, signature_bytes, expected_tag, &public_key)
 }
 
-fn official_release_public_key() -> Result<[u8; 32], ReleaseVerifyError> {
+pub(crate) fn official_release_public_key() -> Result<[u8; 32], ReleaseVerifyError> {
     parse_official_public_key(OFFICIAL_RELEASE_PUBLIC_KEY_HEX)
 }
 
@@ -177,7 +177,7 @@ fn parse_official_public_key(encoded: &str) -> Result<[u8; 32], ReleaseVerifyErr
     decode_hex::<32>(hex.as_bytes()).ok_or(ReleaseVerifyError::InvalidPinnedPublicKey)
 }
 
-fn authenticate_with_key(
+pub(crate) fn authenticate_with_key(
     manifest_bytes: &[u8],
     signature_bytes: &[u8],
     expected_tag: &str,
@@ -305,7 +305,7 @@ fn ascii_field<'a>(line: &'a [u8], prefix: &[u8]) -> Result<&'a str, ReleaseVeri
     })
 }
 
-fn valid_release_version(version: &str) -> bool {
+pub(crate) fn valid_release_version(version: &str) -> bool {
     if version.is_empty() || version.len() > 64 || !version.is_ascii() {
         return false;
     }
@@ -336,7 +336,7 @@ fn valid_numeric_identifier(identifier: &str) -> bool {
         && (identifier == "0" || !identifier.starts_with('0'))
 }
 
-fn decode_hex<const N: usize>(hex: &[u8]) -> Option<[u8; N]> {
+pub(crate) fn decode_hex<const N: usize>(hex: &[u8]) -> Option<[u8; N]> {
     if hex.len() != N * 2 {
         return None;
     }
@@ -357,7 +357,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

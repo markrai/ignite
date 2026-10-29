@@ -6,6 +6,17 @@ This document does not establish pairwise compatibility, authenticate an executa
 device data, admit a candidate, authorize promotion, or make rollback safe.
 `data_compatibility=unknown` remains a hard blocker.
 
+Slice 3D-B2a.4.3's chain-of-custody audit is documented in
+[`kindle-installed-release-provenance-feasibility.md`](kindle-installed-release-provenance-feasibility.md).
+Authenticated installed provenance remains unavailable: the production key is unprovisioned, the
+signed release manifest binds only the transient whole installer, and installation preserves no
+signed component/capability closure. The declaration below is therefore still source/test evidence,
+not publisher-authenticated evidence for installed A or B.
+The new read-only provenance diagnostic can verify a future signed binding to these exact bytes in a
+caller-supplied component set, but reports `installation_binding=unverified` because it does not
+establish actual A/B slot ownership or canonical paths. Its official entry point reports
+`AUTHORITY_UNAVAILABLE` until that release/persistence chain and the production key exist.
+
 The exact `scribe-app` executable now exposes:
 
 ```text

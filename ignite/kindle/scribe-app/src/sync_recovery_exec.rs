@@ -33,6 +33,7 @@ use crate::sync_recovery_observe::DisposableTunnelHttpGuard;
 use crate::sync_recovery_plan::{
     plan_recovery, OutboxInput, PlanResult, RecoveryInputs, SequenceAuthority, ServerTailItem,
 };
+#[cfg(test)]
 pub use crate::sync_recovery_policy::require_loopback_url;
 use crate::sync_recovery_policy::{
     authorize_recovery_origin, evaluate_recovery_policy, AuthorizedOrigin, CredentialSource,

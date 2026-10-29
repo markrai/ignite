@@ -41,6 +41,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    match scribe_app::storage_release_provenance::parse_command(&args) {
+        Ok(scribe_app::storage_release_provenance::InspectionCommand::Inspect(config)) => {
+            return inspect_release_provenance(&config);
+        }
+        Ok(scribe_app::storage_release_provenance::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     scribe_app::launch_clock::mark("process_entry");
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -156,6 +166,15 @@ Options:
                              --device-dir DEVICE --state-dir STATE
                         Inspect existing external sync/device state read-only. All roots are
                         explicit; no application, recovery, network, or hardware initialization.
+  --inspect-release-provenance --subject A|B --expected-tag vX.Y.Z
+       --record PATH --record-signature PATH --release-manifest PATH
+       --release-manifest-signature PATH --capabilities PATH
+       --component ROLE=ABSOLUTE_PATH (one for every schema-v1 role)
+                        Authenticate one caller-supplied release component set. This does not prove
+                        canonical paths, installed-slot ownership, or an atomic state snapshot. It
+                        is read-only/report-only and never establishes first-launch admission, data
+                        compatibility, or promotion authorization. Production verification remains
+                        unavailable while the compile-time public-key pin is UNPROVISIONED.
   --diagnose-fb         Read-only FBIOGET dump + Gate B check (no mmap write, no notebooks)
   --confirm-write       Required for physical write (fb mmap / stylus mode / SEND)
   --data-dir PATH       Library storage root (default /mnt/us/scribe-data)
@@ -272,6 +291,21 @@ fn inspect_storage_external(
     let mut stdout = std::io::stdout().lock();
     if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
         eprintln!("write storage external inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
+}
+
+fn inspect_release_provenance(
+    config: &scribe_app::storage_release_provenance::InspectionConfig,
+) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_release_provenance::inspect_official(config);
+    let bytes = report.canonical_bytes();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write installed release provenance inspection: {error}");
         return ExitCode::FAILURE;
     }
     ExitCode::from(report.exit_code())

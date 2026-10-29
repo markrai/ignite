@@ -1087,10 +1087,19 @@ fails closed through stable-root comparison.
    invoke migrating/repairing opens. Exact historical A/B writer→reader fixtures, stable writer
    exclusion, authenticated probe provenance, a composed canonical state root, and admission
    integration remain separate work before this becomes a full compatibility probe.
-3. **3D-B2a.4.3 — Authenticated installed provenance and bootstrap.** Preserve the signed-release
-   chain, capability digest, and exact app/lifecycle/host identities when a candidate becomes A.
-   Define, sign, and test only the narrow legacy catalog needed for transitional release T. No
-   positive device compatibility result yet.
+3. **3D-B2a.4.3 — Authenticated installed provenance and bootstrap (feasibility blocked).** The
+   repository audit in
+   [`kindle-installed-release-provenance-feasibility.md`](kindle-installed-release-provenance-feasibility.md)
+   found that the production pin is still `UNPROVISIONED`, the signed v1 release manifest binds only
+   the whole installer, successful installation deletes that artifact and preserves no signed
+   component/capability closure, and no exact historical artifacts exist locally for a legacy
+   catalog. A strict read-only signed-record verifier and fail-closed diagnostic were added with
+   temporary-key tests, but production always selects the unprovisioned repository pin and therefore
+   reports `AUTHORITY_UNAVAILABLE`. Even with a provisioned key, the diagnostic authenticates only
+   the supplied component set and reports `installation_binding=unverified`; it does not bind those
+   paths to lifecycle A/B ownership or the pending transaction. A future offline-authoring/
+   release-metadata and persistence slice must close those links before installed A/B provenance can
+   be used.
 4. **3D-B2a.4.4 — Data-writer boundary.** Add singleton and sync/adoption exclusion, USB-state
    refusal where possible, a proven lock order, bounded contention, and the narrowly cooperating A/B
    probe executor. First expose it as a non-mutating diagnostic; keep launch behavior unchanged.

@@ -66,6 +66,18 @@ inventory in
 [`kindle-storage-capability-inventory.md`](kindle-storage-capability-inventory.md). It is not
 compatibility evidence. Data-writer exclusion, probes, authenticated provenance, and stable-state
 evidence remain unimplemented.
+Slice 3D-B2a.4.3's repository audit additionally found that authenticated installed provenance
+cannot yet be established: the production pin is `UNPROVISIONED`, installation preserves neither
+the signed release assets nor a signed component closure, and no exact legacy artifact catalog can
+be derived from this checkout. See
+[`kindle-installed-release-provenance-feasibility.md`](kindle-installed-release-provenance-feasibility.md).
+No authorization input may substitute the unsigned pending record or LKG inventory for that missing
+publisher identity.
+The Slice 3D-B2a.4.3 verifier is report-only and always uses the compile-time pin; temporary test
+keys are not an authorization path. It authenticates a caller-supplied component set, not lifecycle
+slot ownership, canonical production paths, or a pending transaction, and always reports
+`installation_binding=unverified`. Its successful test-fixture result, if any, is not compatibility
+evidence, and its current production result is `AUTHORITY_UNAVAILABLE`.
 At minimum the eventual evidence must:
 
 - identify the compatibility-policy/schema version;

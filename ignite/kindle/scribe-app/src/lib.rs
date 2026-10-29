@@ -74,6 +74,7 @@ pub mod sleep_ui;
 pub mod storage_capabilities;
 pub mod storage_inspect_external;
 pub mod storage_inspect_library;
+pub mod storage_release_provenance;
 pub mod store;
 pub mod sync_adopt;
 pub mod sync_local;
