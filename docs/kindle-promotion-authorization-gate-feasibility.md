@@ -146,6 +146,16 @@ Items 1–5 are now implemented without authorization or promotion behavior. The
 `data_compatibility=unknown`. A double-read, process scan, lock-file existence check, or exclusive
 evidence lock alone is not an acceptable substitute for this complete boundary.
 
+### Data-writer exclusion diagnostic (Slice 3D-B2a.4.4)
+
+The source-grounded writer audit and read-only diagnostic are documented in
+[`kindle-data-writer-exclusion.md`](kindle-data-writer-exclusion.md). The diagnostic can acquire the
+existing launch/updater/activity/application/adoption/sync/replica/identity locks in the proposed
+order without creating them. This proves useful contention behavior, not a promotion boundary:
+recovery coordination is partly in-process, lifecycle-host startup precedes `go`, and no continuous
+USB or noncooperating-writer gate exists. It therefore never reports complete exclusion and does
+not change the blocked B2a authorization finding.
+
 ## Proposed authorization binding on the established boundary
 
 The eventual manual authorization challenge should use one canonical, versioned byte sequence such

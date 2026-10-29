@@ -1,8 +1,9 @@
-# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.2b)
+# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.4)
 
 **Status:** feasibility/design, the incomplete compiled capability inventory from Slice
-3D-B2a.4.1, the library-only probe from Slice 3D-B2a.4.2a, and the external sync/device probe from
-Slice 3D-B2a.4.2b. The probes are not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
+3D-B2a.4.1, the library-only probe from Slice 3D-B2a.4.2a, the external sync/device probe from
+Slice 3D-B2a.4.2b, the read-only provenance foundation from Slice 3D-B2a.4.3, and the fail-closed
+writer-exclusion diagnostic from Slice 3D-B2a.4.4. The probes are not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
 admission, authorization, promotion, rollback, storage migration, or persistent data format is
 implemented. `data_compatibility=unknown` remains a hard blocker.
 
@@ -1075,6 +1076,22 @@ device/USB-state gate is a prerequisite. The threat model should state explicitl
 root compromise is outside the updater's guarantee; accidental independent modification still
 fails closed through stable-root comparison.
 
+### 8.2 Implemented writer-exclusion diagnostic (Slice 3D-B2a.4.4)
+
+`scribe-app --inspect-writer-exclusion --data-dir LIBRARY --sync-dir SYNC` is dispatched before
+normal initialization. It opens only pre-existing lock files read-only, takes their kernel locks in
+the extended hierarchy, and reports missing, contended, unsafe, unsupported, or cancelled checks.
+It never creates a coordination resource or starts recovery. Transaction markers are sampled only
+while every known lock is held.
+
+The source audit and complete writer/lock matrices are in
+[`kindle-data-writer-exclusion.md`](kindle-data-writer-exclusion.md). Recovery has no complete
+cross-process boundary, lifecycle-host writes precede `go`, and USB/manual writers do not
+cooperate. Therefore the command can report only `writer_exclusion=partial` or `unverified`; it has
+no successful authorization exit and can never report `established`. Its fixed safety fields retain
+`atomic_snapshot=false`, `data_compatibility=unknown`, `promotion_authorized=false`, and
+`inspection_action=report-only`.
+
 ## 9. Revised implementation slices
 
 1. **3D-B2a.4.1 — Capability inventory (implemented, not authoritative).** Canonical
@@ -1100,9 +1117,11 @@ fails closed through stable-root comparison.
    paths to lifecycle A/B ownership or the pending transaction. A future offline-authoring/
    release-metadata and persistence slice must close those links before installed A/B provenance can
    be used.
-4. **3D-B2a.4.4 — Data-writer boundary.** Add singleton and sync/adoption exclusion, USB-state
-   refusal where possible, a proven lock order, bounded contention, and the narrowly cooperating A/B
-   probe executor. First expose it as a non-mutating diagnostic; keep launch behavior unchanged.
+4. **3D-B2a.4.4 — Data-writer boundary diagnostic.** **Implemented as a conservative diagnostic.**
+   It audits singleton/sync/adoption and related locks, uses a proven inspection order with bounded
+   contention, reports USB/recovery/noncooperating gaps, and defines the narrowly cooperating A/B
+   probe-executor boundary. Complete exclusion remains infeasible without separately reviewed
+   writer and lifecycle integration; launch behavior remains unchanged.
 5. **3D-B2a.4.5 — Stable root and preflight engine.** Implement the bounded fixed-root inventory,
    run both probes between equal roots, and produce a non-authorizing `BIDIRECTIONAL_COMPATIBLE`
    result only when every Section 6.4 requirement passes. This remains manually invoked/read-only.
