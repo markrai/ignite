@@ -57,16 +57,16 @@ The inspection commands intentionally call none of them.
 
 ## Existing synchronization audit
 
-| Mechanism | Cooperating scope | Acquisition and lifetime | Crash/reboot behavior | Diagnostic limitation |
+| Mechanism | Cooperating scope | Production locking API and interoperability | Crash/reboot behavior | Diagnostic limitation |
 |---|---|---|---|---|
-| `/tmp/ignite-lifecycle-launch-gate.lock` | Production lifecycle `go` shared; decision exclusive | Safe `O_NOFOLLOW` open; nonblocking for `go`, bounded for decision | Kernel releases on process death; tmpfs resets on reboot | Host-wrapper writes precede the gate; a direct app/library caller can bypass it |
-| `/tmp/ignite-updater-transaction.lock` | Install, activation recovery, uninstall, future promotion | Exclusive `flock`, immediate exit 75; inherited and reverified across installer `exec` | Kernel releases after every inheriting holder dies | Covers installed release, not notebook/sync writers |
-| `/tmp/ignite-lifecycle-child.lock` and `...evidence-worker.lock` | Lifecycle child and asynchronous evidence worker | Shared activity token; decision takes exclusive with a deadline | Child inherits its token; process death releases | Requires current-host endpoint checks for a full lifecycle decision; this diagnostic only samples the locks |
-| `/tmp/scribe-app.lock` | Normal and directly executed `scribe-app` | Exclusive process-lifetime lock; normal acquisition creates/writes a PID | Kernel releases on death; stale bytes have no authority | Public library APIs and external writers need not acquire it |
-| `<sync>.adopt.lock` | Adoption preparation/publication and startup adoption recovery | Nonblocking exclusive file lock; normal path creates it | Kernel releases on death; plan drives recovery | No other recovery family uses it |
-| `<sync>/sync.lock` | One `OutboundSync`; adoption takes it before preparing the replacement | Nonblocking exclusive file lock retained by `OutboundSync` | Kernel releases on death | Does not cover device preferences or arbitrary sync-file writers |
-| `<sync>/replica.lock` | Replica allocation | Blocking exclusive file lock around one transaction | Kernel releases on death | No timeout and normal acquisition can create the directory/file |
-| `<library>/.scribe-sync/identity.lock` | Identity allocation/binding/retirement | Blocking exclusive file lock around one transaction | Kernel releases on death | No timeout; not a whole-library lock |
+| `/tmp/ignite-lifecycle-launch-gate.lock` | Production lifecycle `go` shared; decision exclusive | `launch_gate::KernelLock` calls `libc::flock(LOCK_SH/LOCK_EX | LOCK_NB)`; the diagnostic's Rust exclusive lock is the same Linux `flock` family | Kernel releases on process death; tmpfs resets on reboot | Host-wrapper writes precede the gate; a direct app/library caller can bypass it |
+| `/tmp/ignite-updater-transaction.lock` | Install, activation recovery, uninstall, future promotion | `updater_lock::try_lock_fd` calls `libc::flock(LOCK_EX | LOCK_NB)`; installer handoff rechecks that exact open-file description | Kernel releases after every inheriting holder dies | Covers installed release, not notebook/sync writers |
+| `/tmp/ignite-lifecycle-child.lock` and `...evidence-worker.lock` | Lifecycle child and asynchronous evidence worker | Lifecycle activity tokens call `libc::flock(LOCK_SH | LOCK_NB)`; a decision and this diagnostic request an exclusive `flock` | Child inherits its token; process death releases | Requires current-host endpoint checks for a full lifecycle decision; this diagnostic only samples the locks |
+| `/tmp/scribe-app.lock` | Normal and directly executed `scribe-app` | `singleton::gate_startup` and the diagnostic both call Rust `File::try_lock`; on Linux that is `flock(LOCK_EX | LOCK_NB)` | Kernel releases on death; stale bytes have no authority | Public library APIs and external writers need not acquire it |
+| `<sync>.adopt.lock` | Adoption preparation/publication and startup adoption recovery | `sync_adopt::adoption_lock` and the diagnostic both call Rust `File::try_lock` | Kernel releases on death; plan drives recovery | No other recovery family uses it |
+| `<sync>/sync.lock` | One `OutboundSync`; adoption takes it before preparing the replacement | `OutboundSync::open` and adoption use Rust `File::try_lock`; the diagnostic uses the same API | Kernel releases on death | Does not cover device preferences or arbitrary sync-file writers |
+| `<sync>/replica.lock` | Replica allocation | `sync_local::ExclusiveLock` calls Rust blocking `File::lock`; the diagnostic's nonblocking `try_lock` uses the same exclusive Linux `flock` family | Kernel releases on death | No timeout and normal acquisition can create the directory/file |
+| `<library>/.scribe-sync/identity.lock` | Identity allocation/binding/retirement | Same `sync_local::ExclusiveLock` and Linux `flock` semantics as the replica lock | Kernel releases on death | No timeout; not a whole-library lock |
 | Recovery `SessionCell` and `recovery-maintenance` marker | Ordinary/inbound library writes in one process | Condvar drains in-flight writes; marker is durable state, not lock authority | Process state is lost; durable marker survives | Cannot prove cross-process exclusion |
 | Launch-health evidence lock | Health owner/evidence publication and B1/B2a.3 assessment | Worker takes exclusive publication lock; decision holds exclusive | Kernel releases; durable evidence remains | Coordinates update evidence, not notebook/sync data |
 | Filesystem/database locking | File replacement and append operations; Kindle appreg SQLite | Per-file atomic rename/fsync or SQLite transaction | Format-specific recovery | No filesystem-wide snapshot or database covers Ignite’s complete state |
@@ -76,6 +76,20 @@ those normal helpers: it uses a no-follow read-only descriptor for an already ex
 linked, effective-user-owned regular file, verifies file identity, and then requests the same
 exclusive kernel lock. Missing or unsafe resources are incomplete evidence. Lock-file contents are
 ignored and remain byte-for-byte unchanged.
+
+This API compatibility is source-verified: Rust's Linux `File::lock` and `File::try_lock` currently
+call `flock`, matching the lifecycle/updater `libc::flock` calls. Native Linux tests exercise direct
+shared/exclusive `flock` holders, the real production singleton helper, and Rust blocking lock
+holders in separate processes. Existing lifecycle and installer suites separately exercise their
+production helpers. These facts prove interoperability of the cooperating APIs, not cooperation by
+arbitrary writers. The earlier Kindle `/mnt/us` probe established `flock` contention and crash
+release on that firmware/filesystem; the complete diagnostic still requires on-device validation.
+
+After acquiring each lock, the diagnostic re-reads the descriptor metadata and the no-follow
+pathname metadata and requires the same device/inode, regular-file type, single link, effective
+owner, and symlink-free path chain. Replacement between open and acquisition is therefore refused.
+A replacement after that check by a noncooperating writer remains outside this boundary and cannot
+be prevented by an advisory lock.
 
 ## Lock-order contract
 
@@ -175,9 +189,11 @@ steps. This slice implements none of the latter steps.
 
 Disposable tests cover deterministic and fail-closed reports, strict CLI dispatch, relative and
 traversal refusal, free/contended/missing/unsafe/read-only lock resources, stale lock bytes, active
-transaction markers, timeout/cancellation, separate-process application/sync/adoption/updater
-contention, concurrent inspection, process-death release, and byte preservation. Unix-only cases
-must run natively on Linux.
+transaction markers, timeout/cancellation, separate-process lifecycle/updater/application/sync/
+adoption/replica/identity contention, concurrent inspection, process-death release, post-lock
+pathname replacement, byte preservation, and ownership-verified fixture cleanup. Collision,
+directory-substitution, and symlink-substitution tests preserve unrelated sentinels. Unix-only
+cases must run natively on Linux.
 
 Still required before a positive decision:
 

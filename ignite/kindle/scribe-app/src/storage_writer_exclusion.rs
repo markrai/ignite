@@ -398,6 +398,17 @@ fn acquire_existing_lock(
     cancelled: &impl Fn() -> bool,
     held: &mut Vec<std::fs::File>,
 ) -> LockState {
+    acquire_existing_lock_after(path, deadline, cancelled, held, || {})
+}
+
+#[cfg(unix)]
+fn acquire_existing_lock_after(
+    path: &Path,
+    deadline: std::time::Instant,
+    cancelled: &impl Fn() -> bool,
+    held: &mut Vec<std::fs::File>,
+    after_lock: impl FnOnce(),
+) -> LockState {
     use std::fs::{self, TryLockError};
     use std::os::unix::fs::MetadataExt;
     use std::thread;
@@ -430,6 +441,10 @@ fn acquire_existing_lock(
         }
         match file.try_lock() {
             Ok(()) => {
+                after_lock();
+                if let Err(state) = verify_locked_path_identity(path, &file) {
+                    return state;
+                }
                 held.push(file);
                 return LockState::Acquired;
             }
@@ -443,6 +458,40 @@ fn acquire_existing_lock(
             Err(TryLockError::Error(_)) => return LockState::Error,
         }
     }
+}
+
+#[cfg(unix)]
+fn verify_locked_path_identity(path: &Path, file: &std::fs::File) -> Result<(), LockState> {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+
+    if !absolute_clean(path) || crate::storage_inspect_library::path_chain_contains_symlink(path) {
+        return Err(LockState::Unsafe);
+    }
+    let descriptor = file.metadata().map_err(|_| LockState::Error)?;
+    if !descriptor.file_type().is_file()
+        || descriptor.nlink() != 1
+        || descriptor.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(LockState::Unsafe);
+    }
+    let pathname = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LockState::Unsafe);
+        }
+        Err(_) => return Err(LockState::Error),
+    };
+    if pathname.file_type().is_symlink()
+        || !pathname.file_type().is_file()
+        || pathname.nlink() != 1
+        || pathname.uid() != unsafe { libc::geteuid() }
+        || pathname.dev() != descriptor.dev()
+        || pathname.ino() != descriptor.ino()
+    {
+        return Err(LockState::Unsafe);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -567,27 +616,112 @@ mod tests {
         use super::*;
         use std::fs::{self, File, OpenOptions};
         use std::io::Write;
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
         use std::process::{Child, Command, Stdio};
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{Duration, Instant};
 
+        const OWNER_FILE: &str = ".ignite-test-root-owner";
         static NEXT: AtomicU64 = AtomicU64::new(1);
+
+        struct OwnedTestRoot {
+            path: PathBuf,
+            token: String,
+            device: u64,
+            inode: u64,
+        }
+
+        impl OwnedTestRoot {
+            fn from_candidates(
+                candidates: impl IntoIterator<Item = PathBuf>,
+            ) -> Result<Self, String> {
+                for path in candidates {
+                    match fs::create_dir(&path) {
+                        Ok(()) => {
+                            let root_metadata = fs::symlink_metadata(&path)
+                                .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+                            if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+                                let _ = fs::remove_dir(&path);
+                                return Err(format!("unsafe test root {}", path.display()));
+                            }
+                            let token = uuid::Uuid::now_v7().to_string();
+                            let owner = path.join(OWNER_FILE);
+                            let mut file = match OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&owner)
+                            {
+                                Ok(file) => file,
+                                Err(error) => {
+                                    let _ = fs::remove_dir(&path);
+                                    return Err(format!("create {}: {error}", owner.display()));
+                                }
+                            };
+                            if let Err(error) = file.write_all(token.as_bytes()) {
+                                drop(file);
+                                let _ = fs::remove_file(&owner);
+                                let _ = fs::remove_dir(&path);
+                                return Err(format!("write {}: {error}", owner.display()));
+                            }
+                            return Ok(Self {
+                                path,
+                                token,
+                                device: root_metadata.dev(),
+                                inode: root_metadata.ino(),
+                            });
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => return Err(format!("create {}: {error}", path.display())),
+                    }
+                }
+                Err("no exclusive writer-exclusion test-root candidate was available".into())
+            }
+
+            fn new(prefix: &str) -> Self {
+                let candidates = (0..128).map(|_| {
+                    std::env::temp_dir().join(format!(
+                        "{prefix}-{}-{}-{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed),
+                        uuid::Uuid::now_v7()
+                    ))
+                });
+                Self::from_candidates(candidates)
+                    .expect("create exclusive writer-exclusion test root")
+            }
+        }
+
+        impl Drop for OwnedTestRoot {
+            fn drop(&mut self) {
+                let owner = self.path.join(OWNER_FILE);
+                let owned = fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.dev() == self.device
+                        && metadata.ino() == self.inode
+                }) && fs::symlink_metadata(&owner).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.nlink() == 1
+                }) && fs::read_to_string(&owner)
+                    .is_ok_and(|contents| contents.as_str() == self.token.as_str());
+                if owned {
+                    let _ = fs::remove_dir_all(&self.path);
+                }
+            }
+        }
 
         struct Fixture {
             root: PathBuf,
             paths: CoordinationPaths,
+            _owner: OwnedTestRoot,
         }
 
         impl Fixture {
             fn new() -> Self {
-                let root = std::env::temp_dir().join(format!(
-                    "ignite-writer-exclusion-{}-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed),
-                    uuid::Uuid::new_v4()
-                ));
-                fs::create_dir(&root).unwrap();
+                let owner = OwnedTestRoot::new("ignite-writer-exclusion");
+                let root = owner.path.clone();
                 let library = root.join("library");
                 let sync = root.join("sync");
                 fs::create_dir(&library).unwrap();
@@ -606,7 +740,11 @@ mod tests {
                 for (_, path) in paths.ordered_locks() {
                     File::create(path).unwrap();
                 }
-                Self { root, paths }
+                Self {
+                    root,
+                    paths,
+                    _owner: owner,
+                }
             }
 
             fn snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
@@ -618,13 +756,11 @@ mod tests {
             }
         }
 
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.root);
-            }
+        fn hold_child(path: &Path, root: &Path) -> (Child, PathBuf, PathBuf) {
+            hold_child_with(path, root, "rust_file")
         }
 
-        fn hold_child(path: &Path, root: &Path) -> (Child, PathBuf, PathBuf) {
+        fn hold_child_with(path: &Path, root: &Path, helper: &str) -> (Child, PathBuf, PathBuf) {
             let ready = root.join(format!("ready-{}", uuid::Uuid::new_v4()));
             let release = root.join(format!("release-{}", uuid::Uuid::new_v4()));
             let child = Command::new(std::env::current_exe().unwrap())
@@ -634,6 +770,7 @@ mod tests {
                 .env("IGNITE_WRITER_TEST_LOCK", path)
                 .env("IGNITE_WRITER_TEST_READY", &ready)
                 .env("IGNITE_WRITER_TEST_RELEASE", &release)
+                .env("IGNITE_WRITER_TEST_HELPER", helper)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -673,14 +810,100 @@ mod tests {
             };
             let ready = PathBuf::from(std::env::var_os("IGNITE_WRITER_TEST_READY").unwrap());
             let release = PathBuf::from(std::env::var_os("IGNITE_WRITER_TEST_RELEASE").unwrap());
-            let file = OpenOptions::new().read(true).open(path).unwrap();
-            file.lock().unwrap();
+            let helper = std::env::var("IGNITE_WRITER_TEST_HELPER").unwrap();
+            let mut file_guard = None;
+            let mut singleton_guard = None;
+            match helper.as_str() {
+                "rust_file" => {
+                    let file = OpenOptions::new().read(true).open(path).unwrap();
+                    file.lock().unwrap();
+                    file_guard = Some(file);
+                }
+                "libc_shared" | "libc_exclusive" => {
+                    let file = OpenOptions::new().read(true).open(path).unwrap();
+                    let operation = if helper == "libc_shared" {
+                        libc::LOCK_SH
+                    } else {
+                        libc::LOCK_EX
+                    };
+                    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), operation) }, 0);
+                    file_guard = Some(file);
+                }
+                "singleton" => match crate::singleton::gate_startup(&path).unwrap() {
+                    crate::singleton::StartupGate::Proceed(guard) => singleton_guard = Some(guard),
+                    crate::singleton::StartupGate::AlreadyRunning { .. } => {
+                        panic!("singleton fixture unexpectedly contended")
+                    }
+                },
+                other => panic!("unknown holder helper {other}"),
+            }
             fs::write(ready, b"ready").unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             while !release.exists() {
                 assert!(Instant::now() < deadline, "release timed out");
                 std::thread::sleep(Duration::from_millis(10));
             }
+            drop(singleton_guard);
+            drop(file_guard);
+        }
+
+        #[test]
+        fn exclusive_fixture_ownership_preserves_collisions_and_directory_substitutions() {
+            let parent = OwnedTestRoot::new("ignite-writer-owner-parent");
+            let collision = parent.path.join("collision");
+            let candidate = parent.path.join("candidate");
+            fs::create_dir(&collision).unwrap();
+            let collision_sentinel = collision.join("foreign-sentinel");
+            fs::write(&collision_sentinel, b"preserve collision").unwrap();
+
+            let owned =
+                OwnedTestRoot::from_candidates([collision.clone(), candidate.clone()]).unwrap();
+            assert_eq!(owned.path, candidate);
+            assert_eq!(
+                fs::read(&collision_sentinel).unwrap(),
+                b"preserve collision"
+            );
+
+            let displaced = parent.path.join("displaced-owned-root");
+            fs::rename(&candidate, &displaced).unwrap();
+            fs::create_dir(&candidate).unwrap();
+            // Even copying the unguessable marker must not make a substituted directory owned:
+            // the original directory device/inode is part of the teardown authority.
+            fs::write(candidate.join(OWNER_FILE), owned.token.as_bytes()).unwrap();
+            let replacement_sentinel = candidate.join("foreign-replacement");
+            fs::write(&replacement_sentinel, b"preserve replacement").unwrap();
+            drop(owned);
+
+            assert_eq!(
+                fs::read(&replacement_sentinel).unwrap(),
+                b"preserve replacement"
+            );
+            assert_eq!(
+                fs::read(&collision_sentinel).unwrap(),
+                b"preserve collision"
+            );
+        }
+
+        #[test]
+        fn fixture_cleanup_refuses_a_symlink_substituted_for_the_owned_root() {
+            let parent = OwnedTestRoot::new("ignite-writer-symlink-parent");
+            let foreign = OwnedTestRoot::new("ignite-writer-symlink-foreign");
+            let candidate = parent.path.join("candidate");
+            let displaced = parent.path.join("displaced");
+            let owned = OwnedTestRoot::from_candidates([candidate.clone()]).unwrap();
+            fs::rename(&candidate, &displaced).unwrap();
+            let sentinel = foreign.path.join("foreign-sentinel");
+            fs::write(&sentinel, b"never traverse").unwrap();
+            symlink(&foreign.path, &candidate).unwrap();
+
+            drop(owned);
+
+            assert!(fs::symlink_metadata(&candidate)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&sentinel).unwrap(), b"never traverse");
+            fs::remove_file(&candidate).unwrap();
         }
 
         #[test]
@@ -702,12 +925,7 @@ mod tests {
 
         #[test]
         fn active_application_sync_adoption_and_updater_each_refuse_cross_process() {
-            for label in [
-                "application_singleton",
-                "active_sync",
-                "adoption",
-                "updater_transaction",
-            ] {
+            for label in ["active_sync", "adoption", "replica", "identity"] {
                 let fixture = Fixture::new();
                 let path = fixture
                     .paths
@@ -732,6 +950,64 @@ mod tests {
                 );
                 release_child(child, &release);
             }
+        }
+
+        #[test]
+        fn production_singleton_and_direct_flock_writers_interoperate_cross_process() {
+            for (label, helper) in [
+                ("launch_gate", "libc_shared"),
+                ("updater_transaction", "libc_exclusive"),
+                ("running_child", "libc_shared"),
+                ("evidence_worker", "libc_shared"),
+                ("application_singleton", "singleton"),
+            ] {
+                let fixture = Fixture::new();
+                let path = fixture
+                    .paths
+                    .ordered_locks()
+                    .into_iter()
+                    .find_map(|(name, path)| (name == label).then_some(path.to_path_buf()))
+                    .unwrap();
+                let (mut child, ready, release) = hold_child_with(&path, &fixture.root, helper);
+                wait_ready(&mut child, &ready);
+                let report = inspect_paths(&fixture.paths, Duration::from_millis(80), || false);
+                assert_eq!(report.result_token(), "REFUSED", "label={label}");
+                assert_eq!(report.exit_code(), 75, "label={label}");
+                assert_eq!(
+                    report
+                        .locks
+                        .iter()
+                        .find(|check| check.name == label)
+                        .unwrap()
+                        .state,
+                    LockState::Contended,
+                    "label={label}"
+                );
+                release_child(child, &release);
+            }
+        }
+
+        #[test]
+        fn pathname_replacement_after_lock_is_refused_by_identity_recheck() {
+            let fixture = Fixture::new();
+            let path = fixture.paths.launch_gate.clone();
+            let displaced = fixture.root.join("displaced-launch.lock");
+            let replacement = path.clone();
+            let mut held = Vec::new();
+            let state = acquire_existing_lock_after(
+                &path,
+                Instant::now() + Duration::from_secs(1),
+                &|| false,
+                &mut held,
+                || {
+                    fs::rename(&path, &displaced).unwrap();
+                    File::create(&replacement).unwrap();
+                },
+            );
+            assert_eq!(state, LockState::Unsafe);
+            assert!(held.is_empty());
+            assert!(displaced.exists());
+            assert!(replacement.exists());
         }
 
         #[test]
