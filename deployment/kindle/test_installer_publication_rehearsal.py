@@ -22,11 +22,14 @@ from installer_publication_rehearsal import (  # noqa: E402
     PUBLISH_INTERRUPT_POINTS,
     FixtureRoot,
     RehearsalError,
+    assess_pending_publication,
+    build_canonical_lkg_inventory,
     build_release_evidence,
     classify_publication_state,
     distinguish_payload_bytes,
     init_fixture_root,
     inspect_pending_health,
+    inspect_pending_health_structure,
     observe_candidate_b,
     observe_external_state,
     observe_rehearsal,
@@ -126,14 +129,17 @@ def test_successful_a_to_b_rehearsal(tmp_path: Path) -> None:
     )
     text = report.decode("ascii")
     assert "publication_state=b-published-with-pending-health" in text
-    assert "pending_health=valid" in text
+    assert "pending_health=consistent" in text
     assert "pending_health_never_implies_qualification=true" in text
     assert "candidate=scribe-app|direct-copy|file|" in text
     assert "|match-b|APP/bin/scribe-app" in text
     assert "retained=scribe-app|direct-copy|file|" in text
     assert "|match-a|APP/previous-release/scribe-app" in text
     assert "external_error_count=0" in text
-    assert inspect_pending_health(kindle)[0] == "valid"
+    assert (
+        inspect_pending_health(kindle, evidence_a=evidence_a, evidence_b=evidence_b)[0]
+        == "consistent"
+    )
     _assert_persistent_state(persistent)
     assert observe_external_state(sentinels) == []
 
@@ -323,8 +329,11 @@ def test_publish_interrupt_observation(tmp_path: Path, point: str) -> None:
             "b-present-without-pending-health",
         }
     else:
-        assert state != "b-published-with-pending-health" or inspect_pending_health(kindle)[0] == "valid"
-        if inspect_pending_health(kindle)[0] != "valid":
+        pending = inspect_pending_health(
+            kindle, evidence_a=evidence_a, evidence_b=evidence_b
+        )[0]
+        assert state != "b-published-with-pending-health" or pending == "consistent"
+        if pending != "consistent":
             assert state != "b-published-with-pending-health"
     assert observe_external_state(sentinels) == []
     report2 = observe_rehearsal(
@@ -392,7 +401,10 @@ def test_corrupted_pending_health_is_incomplete(tmp_path: Path) -> None:
     _owned, kindle = _new_kindle(tmp_path)
     assert _run_install(payload_a, kindle).returncode == 0
     assert _run_install(payload_b, kindle).returncode == 0
-    assert inspect_pending_health(kindle)[0] == "valid"
+    assert (
+        inspect_pending_health(kindle, evidence_a=evidence_a, evidence_b=evidence_b)[0]
+        == "consistent"
+    )
     pending = kindle / "scribe-app" / "state" / "update" / "pending-health.v1"
     pending.write_text("CORRUPT\n", encoding="ascii")
     assert inspect_pending_health(kindle)[0] == "invalid"
@@ -417,7 +429,10 @@ def test_retry_after_interrupted_install(tmp_path: Path) -> None:
         payload_b, kindle, {"IGNITE_FAIL_PUBLISH": "before-pending-health-publish"}
     )
     assert crashed.returncode != 0
-    assert inspect_pending_health(kindle)[0] != "valid"
+    assert (
+        inspect_pending_health(kindle, evidence_a=evidence_a, evidence_b=evidence_b)[0]
+        != "consistent"
+    )
     pre = _state_of(kindle, evidence_a, evidence_b, had_upgrade=True)
     assert pre != "b-published-with-pending-health"
 
@@ -435,15 +450,17 @@ def test_retry_after_interrupted_install(tmp_path: Path) -> None:
     assert "promotion_authorized=false" in text
     assert observe_external_state(sentinels) == []
     state = _state_of(kindle, evidence_a, evidence_b, had_upgrade=True)
-    pending = inspect_pending_health(kindle)[0]
+    pending = inspect_pending_health(
+        kindle, evidence_a=evidence_a, evidence_b=evidence_b
+    )[0]
     if retry.returncode == 0:
         # Clean retry completed publication; still non-qualifying.
         assert state == "b-published-with-pending-health"
-        assert pending == "valid"
+        assert pending == "consistent"
         assert "pending_health_never_implies_qualification=true" in text
     else:
         # Fail-closed: unresolved/incomplete tree, never falsely complete.
-        assert pending != "valid"
+        assert pending != "consistent"
         assert state != "b-published-with-pending-health"
         assert state in {
             "b-publication-partial",
@@ -545,3 +562,227 @@ def test_generated_recovery_version_not_package_direct_copy(tmp_path: Path) -> N
     assert evidence_b.digests["recovery-version"][0] == "absent"
     assert CANDIDATE_B_DESTINATION["recovery-version"] == "REC/manifest/version"
     assert set(COMPONENT_ROLES)
+
+
+def _rewrite_pending_health(kindle: Path, **overrides: str) -> None:
+    status, fields = inspect_pending_health_structure(kindle)
+    assert status == "structurally-valid" and fields is not None
+    merged = dict(fields)
+    merged.update(overrides)
+    text = (
+        "\n".join(
+            [
+                "IGNITE_PENDING_HEALTH_V1",
+                "schema=1",
+                "status=pending-health",
+                f"candidate_version={merged['candidate_version']}",
+                f"candidate_txn={merged['candidate_txn']}",
+                f"candidate_app_bytes={merged['candidate_app_bytes']}",
+                f"candidate_app_sha256={merged['candidate_app_sha256']}",
+                f"candidate_lifecycle_bytes={merged['candidate_lifecycle_bytes']}",
+                f"candidate_lifecycle_sha256={merged['candidate_lifecycle_sha256']}",
+                "retained_version=unknown",
+                f"retained_release_identity=sha256:{merged['retained_release_identity']}",
+                f"lkg_inventory_bytes={merged['lkg_inventory_bytes']}",
+                f"lkg_inventory_sha256={merged['lkg_inventory_sha256']}",
+                "data_compatibility=unknown",
+            ]
+        )
+        + "\n"
+    )
+    path = kindle / "scribe-app" / "state" / "update" / "pending-health.v1"
+    # Avoid Windows write_text newline translation (CRLF breaks the installer contract).
+    path.write_bytes(text.encode("ascii"))
+
+
+def test_structurally_valid_pending_missing_lkg_is_incomplete(tmp_path: Path) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    inv = kindle / "scribe-app" / "previous-release" / "ignite-lkg-inventory.v1"
+    assert inv.is_file()
+    inv.unlink()
+    status, fields = inspect_pending_health_structure(kindle)
+    assert status == "structurally-valid"
+    assert fields is not None
+    ok, reasons = assess_pending_publication(
+        kindle, fields, evidence_a=evidence_a, evidence_b=evidence_b
+    )
+    assert not ok
+    assert any(r.startswith("lkg-inventory-missing") for r in reasons)
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) == (
+        "incomplete-or-inconsistent"
+    )
+
+
+def test_lkg_inventory_same_size_mutation_is_incomplete(tmp_path: Path) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    inv = kindle / "scribe-app" / "previous-release" / "ignite-lkg-inventory.v1"
+    original = inv.read_bytes()
+    mutated = b"X" + original[1:]
+    assert len(mutated) == len(original)
+    inv.write_bytes(mutated)
+    status, fields = inspect_pending_health_structure(kindle)
+    assert status == "structurally-valid" and fields is not None
+    ok, reasons = assess_pending_publication(
+        kindle, fields, evidence_a=evidence_a, evidence_b=evidence_b
+    )
+    assert not ok
+    assert "lkg-inventory-sha256-mismatch" in reasons
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) == (
+        "incomplete-or-inconsistent"
+    )
+
+
+def test_candidate_version_mismatch_blocks_complete_publication(tmp_path: Path) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    _rewrite_pending_health(kindle, candidate_version="9.9.9")
+    status, fields = inspect_pending_health_structure(kindle)
+    assert status == "structurally-valid" and fields is not None
+    ok, reasons = assess_pending_publication(
+        kindle, fields, evidence_a=evidence_a, evidence_b=evidence_b
+    )
+    assert not ok
+    assert "candidate-version-mismatch" in reasons
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) == (
+        "incomplete-or-inconsistent"
+    )
+    report = observe_rehearsal(
+        kindle, evidence_a, evidence_b, had_upgrade=True, install_rc=0
+    )
+    assert b"b-published-with-pending-health" not in report
+    assert b"pending_publication_gap=candidate-version-mismatch" in report
+
+
+def test_journal_txn_mismatch_blocks_complete_publication(tmp_path: Path) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    journal = kindle / "scribe-app" / "run" / "ignite-activate.journal"
+    journal.write_bytes(
+        b"# ignite-activate v2\n# txn=19990101T000000Z-1\n# phase=pending\n"
+    )
+    status, fields = inspect_pending_health_structure(kindle)
+    assert status == "structurally-valid" and fields is not None
+    ok, reasons = assess_pending_publication(
+        kindle, fields, evidence_a=evidence_a, evidence_b=evidence_b
+    )
+    assert not ok
+    assert "inventory-transaction-relationship-mismatch" in reasons
+    # Journal presence also surfaces as partial before consistency claims.
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) == (
+        "b-publication-partial"
+    )
+
+
+def test_retained_a_inventory_mismatch_blocks_complete_publication(
+    tmp_path: Path,
+) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    retained_app = kindle / "scribe-app" / "previous-release" / "scribe-app"
+    retained_app.write_bytes((kindle / "scribe-app" / "bin" / "scribe-app").read_bytes())
+    # Rebuild inventory to match mutated previous-release so LKG self-check passes,
+    # then retarget pending-health digests at the new inventory identity.
+    new_inv = build_canonical_lkg_inventory(kindle)
+    inv_path = kindle / "scribe-app" / "previous-release" / "ignite-lkg-inventory.v1"
+    inv_path.write_bytes(new_inv)
+    inv_sha = __import__("hashlib").sha256(new_inv).hexdigest()
+    _rewrite_pending_health(
+        kindle,
+        retained_release_identity=inv_sha,
+        lkg_inventory_bytes=str(len(new_inv)),
+        lkg_inventory_sha256=inv_sha,
+    )
+    status, fields = inspect_pending_health_structure(kindle)
+    assert status == "structurally-valid" and fields is not None
+    ok, reasons = assess_pending_publication(
+        kindle, fields, evidence_a=evidence_a, evidence_b=evidence_b
+    )
+    assert not ok
+    assert "retained-a-mismatch:scribe-app" in reasons
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) != (
+        "b-published-with-pending-health"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix execute bits not reliable on Windows")
+def test_scribe_app_without_execute_blocks_complete_publication(tmp_path: Path) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    target = kindle / "scribe-app" / "bin" / "scribe-app"
+    target.chmod(0o644)
+    row = next(
+        r for r in observe_candidate_b(kindle, evidence_b, evidence_a) if r.role == "scribe-app"
+    )
+    assert row.exec_state == "missing"
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) != (
+        "b-published-with-pending-health"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix execute bits not reliable on Windows")
+def test_scribe_lifecycle_without_execute_blocks_complete_publication(
+    tmp_path: Path,
+) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    target = kindle / "scribe-app" / "bin" / "scribe-lifecycle"
+    target.chmod(0o644)
+    row = next(
+        r
+        for r in observe_candidate_b(kindle, evidence_b, evidence_a)
+        if r.role == "scribe-lifecycle"
+    )
+    assert row.exec_state == "missing"
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) != (
+        "b-published-with-pending-health"
+    )
+
+
+def test_installer_owned_new_outside_original_four_blocks_complete(
+    tmp_path: Path,
+) -> None:
+    _require_posix_installer()
+    payload_a, payload_b, evidence_a, evidence_b = _prepare_ab(tmp_path)
+    _owned, kindle = _new_kindle(tmp_path)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    leftover = (
+        kindle
+        / "scribe-app"
+        / "tools"
+        / "ignite-release"
+        / "lib"
+        / "install-runtime.sh.new"
+    )
+    leftover.write_bytes(b"leftover-staging\n")
+    assert _state_of(kindle, evidence_a, evidence_b, had_upgrade=True) == (
+        "b-staging-present"
+    )
+    report = observe_rehearsal(
+        kindle, evidence_a, evidence_b, had_upgrade=True, install_rc=0
+    )
+    assert b"publication_state=b-staging-present" in report
+    assert b"b-published-with-pending-health" not in report

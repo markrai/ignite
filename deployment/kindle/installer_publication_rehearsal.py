@@ -89,6 +89,106 @@ _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$")
 _TXN_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9]+$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _BYTES_RE = re.compile(r"^(0|[1-9][0-9]*)$")
+_ENTRY_RE = re.compile(
+    r"^entry=(?P<name>[^|]+)\|(?P<kind>file|absent)\|(?P<bytes>0|[1-9][0-9]*)\|(?P<digest>-|[0-9a-f]{64})$"
+)
+
+# Closed LKG inventory entry order from install-runtime.sh::write_lkg_inventory.
+LKG_INVENTORY_ENTRIES: tuple[str, ...] = (
+    "scribe-app",
+    "scribe-lifecycle",
+    "scribe-lifecycle-host.sh",
+    "Scribe.sh",
+    "scribe-icon.png",
+    "OFL.txt",
+    "DESCRIPTION.en_us.html",
+    "upstream_info.md",
+    "source-sans-3-OFL.txt",
+    "install-runtime.sh",
+    "uninstall-runtime.sh",
+    "backup-runtime.sh",
+    "register-helpers.sh",
+    "install-recovery.sh",
+    "Uninstall Ignite.sh",
+    "Backup Ignite Data.sh",
+    "Diagnose Ignite.sh",
+    "appreg-handler.sql",
+)
+
+# Inventory entry → package role for independent retained-A checks. None = not
+# independently verifiable from package evidence (transformed / register-gated).
+LKG_ENTRY_TO_ROLE: dict[str, str | None] = {
+    "scribe-app": "scribe-app",
+    "scribe-lifecycle": "scribe-lifecycle",
+    "scribe-lifecycle-host.sh": "scribe-lifecycle-host",
+    "Scribe.sh": "launcher",
+    "scribe-icon.png": "icon",
+    "OFL.txt": "license-noto-emoji",
+    "DESCRIPTION.en_us.html": "license-noto-emoji-description",
+    "upstream_info.md": "license-noto-emoji-upstream-info",
+    "source-sans-3-OFL.txt": "license-source-sans-3",
+    "install-runtime.sh": "install-runtime",
+    "uninstall-runtime.sh": "uninstall-runtime",
+    "backup-runtime.sh": "backup-runtime",
+    "register-helpers.sh": "register-helpers",
+    "install-recovery.sh": "install-recovery",
+    "Uninstall Ignite.sh": "uninstall-entry",
+    "Backup Ignite Data.sh": "backup-entry",
+    "Diagnose Ignite.sh": "diagnose-entry",
+    "appreg-handler.sql": None,
+}
+
+# Roles the installer chmod 0755's before activation (Unix execute bit required).
+EXECUTABLE_ROLES: frozenset[str] = frozenset(
+    {
+        "scribe-app",
+        "scribe-lifecycle",
+        "scribe-lifecycle-host",
+        "launcher",
+        "install-runtime",
+        "uninstall-runtime",
+        "backup-runtime",
+        "register-helpers",
+        "install-recovery",
+        "uninstall-entry",
+        "backup-entry",
+        "diagnose-entry",
+    }
+)
+
+# Closed installer-owned *.new destinations from cleanup_staged_new / stage block.
+INSTALLER_OWNED_NEW_RELATIVE: tuple[str, ...] = (
+    "scribe-app/bin/scribe-app.new",
+    "scribe-app/bin/scribe-lifecycle.new",
+    "scribe-app/bin/scribe-lifecycle-host.sh.new",
+    "scribe-app/assets/scribe-icon.png.new",
+    "scribe-app/assets/licenses/noto-emoji/OFL.txt.new",
+    "scribe-app/assets/licenses/noto-emoji/DESCRIPTION.en_us.html.new",
+    "scribe-app/assets/licenses/noto-emoji/upstream_info.md.new",
+    "scribe-app/assets/licenses/source-sans-3/OFL.txt.new",
+    "scribe-app/tools/ignite-release/lib/install-runtime.sh.new",
+    "scribe-app/tools/ignite-release/lib/uninstall-runtime.sh.new",
+    "scribe-app/tools/ignite-release/lib/backup-runtime.sh.new",
+    "scribe-app/tools/ignite-release/lib/register-helpers.sh.new",
+    "scribe-app/tools/ignite-release/lib/install-recovery.sh.new",
+    "documents/Scribe.sh.new",
+    "documents/Uninstall Ignite.sh.new",
+    "documents/Backup Ignite Data.sh.new",
+    "documents/Diagnose Ignite.sh.new",
+)
+
+# Closed installer-owned temporary transition path globs (relative to kindle root).
+INSTALLER_OWNED_TMP_GLOBS: tuple[str, ...] = (
+    "scribe-app/previous-release/.ignite-lkg-inventory.*.tmp",
+    "scribe-app/previous-release/.appreg-handler.*.tmp",
+    "scribe-app/previous-release/.lkg-complete.*.tmp",
+    "scribe-app/state/update/.pending-health.*.tmp",
+    "scribe-app/state/update/.pending-verify.*.tmp",
+    "scribe-app/state/update/.lkg-verify.*.tmp",
+    "scribe-app/run/ignite-activate.committed.tmp",
+    "scribe-app/run/ignite-activate.journal.tmp",
+    "scribe-app/run/.commit-verify.*.tmp",
+)
 
 
 class RehearsalError(Exception):
@@ -112,6 +212,7 @@ class ComponentObservation:
     size: int
     sha256: str
     digest_match: str
+    exec_state: str = "not-applicable"
 
 
 @dataclass
@@ -178,8 +279,8 @@ def _same_identity(before: os.stat_result, after: os.stat_result) -> bool:
     return before.st_dev == after.st_dev and before.st_ino == after.st_ino
 
 
-def _hash_file_fd(path: Path) -> tuple[int, str]:
-    """O_NOFOLLOW open, refuse hardlinks/symlinks, hash via fd with identity checks."""
+def _observe_regular_fd(path: Path) -> tuple[int, str, int]:
+    """O_NOFOLLOW open; refuse hardlinks/symlinks; return (size, sha256, mode)."""
     path_str = os.fspath(path)
     try:
         before = os.lstat(path_str)
@@ -220,9 +321,27 @@ def _hash_file_fd(path: Path) -> tuple[int, str]:
         after = os.fstat(fd)
         if not _same_identity(opened, after):
             raise RehearsalError(f"component substituted while reading: {path}")
-        return opened.st_size, hasher.hexdigest()
+        return opened.st_size, hasher.hexdigest(), opened.st_mode
     finally:
         os.close(fd)
+
+
+def _hash_file_fd(path: Path) -> tuple[int, str]:
+    size, digest, _mode = _observe_regular_fd(path)
+    return size, digest
+
+
+def _exec_state_for_role(role: str, mode: int | None, *, present: bool) -> str:
+    if role not in EXECUTABLE_ROLES:
+        return "not-applicable"
+    if not present or mode is None:
+        return "absent"
+    if sys.platform == "win32":
+        # Native Windows fixtures cannot reliably represent Unix execute bits.
+        return "skipped-win32"
+    if mode & 0o111:
+        return "ok"
+    return "missing"
 
 
 def _lstat_regular_or_none(path: Path) -> os.stat_result | None:
@@ -316,6 +435,7 @@ def observe_candidate_b(
                     size=0,
                     sha256="-",
                     digest_match="not-applicable",
+                    exec_state=_exec_state_for_role(role, None, present=False),
                 )
             )
             continue
@@ -330,10 +450,11 @@ def observe_candidate_b(
                     size=0,
                     sha256="-",
                     digest_match="absent",
+                    exec_state=_exec_state_for_role(role, None, present=False),
                 )
             )
             continue
-        size, digest = _hash_file_fd(path)
+        size, digest, mode = _observe_regular_fd(path)
         rows.append(
             ComponentObservation(
                 role=role,
@@ -345,6 +466,7 @@ def observe_candidate_b(
                 digest_match=_digest_match(
                     "file", digest, evidence_a, evidence_b, role, prefer="b"
                 ),
+                exec_state=_exec_state_for_role(role, mode, present=True),
             )
         )
     return rows
@@ -424,16 +546,27 @@ def observe_retained_a(
     return rows
 
 
-def _has_new_staging(kindle: Path) -> bool:
-    app = kindle / "scribe-app"
-    docs = kindle / "documents"
-    patterns = [
-        app / "bin" / "scribe-app.new",
-        app / "bin" / "scribe-lifecycle.new",
-        app / "bin" / "scribe-lifecycle-host.sh.new",
-        docs / "Scribe.sh.new",
-    ]
-    return any(p.exists() or p.is_symlink() for p in patterns)
+def _path_exists_or_symlink(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _has_unresolved_installer_transitions(kindle: Path) -> bool:
+    """True when any closed installer-owned staging/temp transition remains."""
+    for rel in INSTALLER_OWNED_NEW_RELATIVE:
+        if _path_exists_or_symlink(kindle / rel):
+            return True
+    for pattern in INSTALLER_OWNED_TMP_GLOBS:
+        parent = kindle
+        parts = pattern.split("/")
+        for part in parts[:-1]:
+            parent = parent / part
+        if not parent.is_dir():
+            continue
+        glob = parts[-1]
+        for match in parent.glob(glob):
+            if _path_exists_or_symlink(match):
+                return True
+    return False
 
 
 def _retention_leftovers(kindle: Path) -> bool:
@@ -445,6 +578,14 @@ def _retention_leftovers(kindle: Path) -> bool:
 
 def _pending_health_path(kindle: Path) -> Path:
     return kindle / "scribe-app" / "state" / "update" / "pending-health.v1"
+
+
+def _lkg_inventory_path(kindle: Path) -> Path:
+    return kindle / "scribe-app" / "previous-release" / "ignite-lkg-inventory.v1"
+
+
+def _prev_dir(kindle: Path) -> Path:
+    return kindle / "scribe-app" / "previous-release"
 
 
 def _journal_path(kindle: Path) -> Path:
@@ -459,8 +600,94 @@ def _stable_life(kindle: Path) -> Path:
     return kindle / "scribe-app" / "bin" / "scribe-lifecycle"
 
 
-def inspect_pending_health(kindle: Path) -> tuple[str, dict[str, str] | None]:
-    """Return (absent|invalid|valid, fields). Mirrors install-runtime validate_pending_health."""
+def _read_ascii_regular(path: Path, *, max_size: int) -> tuple[str, int, str]:
+    size, digest, _mode = _observe_regular_fd(path)
+    if size <= 0 or size > max_size:
+        raise RehearsalError(f"file size out of bounds: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(os.fspath(path), flags)
+    try:
+        raw = os.read(fd, size + 1)
+    finally:
+        os.close(fd)
+    if len(raw) != size:
+        raise RehearsalError(f"truncated read: {path}")
+    text = raw.decode("ascii")
+    if "\r" in text:
+        raise RehearsalError(f"CRLF refused: {path}")
+    return text, size, digest
+
+
+def _lkg_inventory_entry_line(prev: Path, name: str) -> str:
+    path = prev / name
+    try:
+        st = os.lstat(os.fspath(path))
+    except OSError:
+        return f"entry={name}|absent|0|-"
+    if stat.S_ISLNK(st.st_mode):
+        raise RehearsalError(f"lkg symlink refused: {path}")
+    if not stat.S_ISREG(st.st_mode):
+        raise RehearsalError(f"lkg special refused: {path}")
+    if st.st_nlink != 1:
+        raise RehearsalError(f"lkg hardlink refused: {path}")
+    size, digest = _hash_file_fd(path)
+    return f"entry={name}|file|{size}|{digest}"
+
+
+def build_canonical_lkg_inventory(kindle: Path) -> bytes:
+    """Regenerate canonical inventory bytes from previous-release (installer contract)."""
+    prev = _prev_dir(kindle)
+    if not prev.is_dir() or prev.is_symlink():
+        raise RehearsalError("previous-release missing or unsafe")
+    lines = [
+        "IGNITE_LKG_INVENTORY_V1",
+        "schema=1",
+        "kind=ignite-application-release",
+        "entry_count=18",
+    ]
+    for name in LKG_INVENTORY_ENTRIES:
+        lines.append(_lkg_inventory_entry_line(prev, name))
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def parse_lkg_inventory_text(text: str) -> dict[str, tuple[str, int, str]]:
+    if not text.endswith("\n"):
+        raise RehearsalError("lkg inventory must end with newline")
+    lines = text[:-1].split("\n")
+    if len(lines) != 4 + len(LKG_INVENTORY_ENTRIES):
+        raise RehearsalError("lkg inventory line count mismatch")
+    if lines[:4] != [
+        "IGNITE_LKG_INVENTORY_V1",
+        "schema=1",
+        "kind=ignite-application-release",
+        "entry_count=18",
+    ]:
+        raise RehearsalError("lkg inventory header mismatch")
+    entries: dict[str, tuple[str, int, str]] = {}
+    for idx, name in enumerate(LKG_INVENTORY_ENTRIES):
+        match = _ENTRY_RE.fullmatch(lines[4 + idx])
+        if match is None or match.group("name") != name:
+            raise RehearsalError(f"lkg inventory entry malformed: {name}")
+        kind = match.group("kind")
+        size = int(match.group("bytes"))
+        digest = match.group("digest")
+        if kind == "absent":
+            if size != 0 or digest != "-":
+                raise RehearsalError(f"lkg absent entry invalid: {name}")
+        elif digest == "-":
+            raise RehearsalError(f"lkg file entry missing digest: {name}")
+        entries[name] = (kind, size, digest)
+    return entries
+
+
+def inspect_pending_health_structure(
+    kindle: Path,
+) -> tuple[str, dict[str, str] | None]:
+    """Return (absent|invalid|structurally-valid, fields) for the 14-line contract only."""
     path = _pending_health_path(kindle)
     try:
         st = os.lstat(os.fspath(path))
@@ -473,24 +700,10 @@ def inspect_pending_health(kindle: Path) -> tuple[str, dict[str, str] | None]:
     if st.st_size <= 0 or st.st_size > 4096:
         return "invalid", None
     try:
-        size, _digest = _hash_file_fd(path)
-        # Re-open via fd for exact bytes (same identity constraints).
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-        fd = os.open(os.fspath(path), flags)
-        try:
-            raw = os.read(fd, size + 1)
-        finally:
-            os.close(fd)
-        if len(raw) != size:
-            return "invalid", None
-        text = raw.decode("ascii")
+        text, _size, _digest = _read_ascii_regular(path, max_size=4096)
     except (RehearsalError, OSError, UnicodeError):
         return "invalid", None
-    if "\r" in text or not text.endswith("\n"):
+    if not text.endswith("\n"):
         return "invalid", None
     lines = text[:-1].split("\n")
     if len(lines) != 14:
@@ -551,7 +764,6 @@ def inspect_pending_health(kindle: Path) -> tuple[str, dict[str, str] | None]:
     if fields["retained_release_identity"] != fields["lkg_inventory_sha256"]:
         return "invalid", None
 
-    # Canonical 14-line re-encoding must match exactly (install-runtime contract).
     canonical = (
         "\n".join(
             [
@@ -575,26 +787,146 @@ def inspect_pending_health(kindle: Path) -> tuple[str, dict[str, str] | None]:
     )
     if text != canonical:
         return "invalid", None
+    return "structurally-valid", fields
 
-    # Live candidate app/lifecycle must match recorded digests.
+
+def assess_pending_publication(
+    kindle: Path,
+    fields: dict[str, str],
+    *,
+    evidence_a: ReleaseEvidence,
+    evidence_b: ReleaseEvidence,
+) -> tuple[bool, list[str]]:
+    """Publication-consistency checks beyond the 14-line structure.
+
+    Mirrors install-runtime validate_pending_health LKG/live binding, then adds
+    expected-B version and independently verifiable retained-A inventory checks.
+    """
+    reasons: list[str] = []
+
+    # Live candidate app/lifecycle must match recorded digests (installer contract).
     try:
         app_size, app_sha = _hash_file_fd(_stable_app(kindle))
         life_size, life_sha = _hash_file_fd(_stable_life(kindle))
-    except RehearsalError:
-        return "invalid", None
+    except RehearsalError as exc:
+        reasons.append(f"live-candidate-unreadable:{exc}")
+        return False, reasons
     if str(app_size) != fields["candidate_app_bytes"] or app_sha != fields["candidate_app_sha256"]:
-        return "invalid", None
+        reasons.append("live-app-mismatch")
     if (
         str(life_size) != fields["candidate_lifecycle_bytes"]
         or life_sha != fields["candidate_lifecycle_sha256"]
     ):
-        return "invalid", None
-    return "valid", fields
+        reasons.append("live-lifecycle-mismatch")
+
+    # Candidate version must equal expected B for complete publication.
+    if fields["candidate_version"] != evidence_b.version:
+        reasons.append("candidate-version-mismatch")
+
+    # Referenced LKG inventory must exist and match claimed size/digest.
+    inv_path = _lkg_inventory_path(kindle)
+    try:
+        inv_text, inv_size, inv_sha = _read_ascii_regular(inv_path, max_size=32768)
+    except (RehearsalError, OSError, UnicodeError) as exc:
+        reasons.append(f"lkg-inventory-missing-or-unsafe:{exc}")
+        return False, reasons
+    if str(inv_size) != fields["lkg_inventory_bytes"]:
+        reasons.append("lkg-inventory-bytes-mismatch")
+    if inv_sha != fields["lkg_inventory_sha256"]:
+        reasons.append("lkg-inventory-sha256-mismatch")
+    if inv_sha != fields["retained_release_identity"]:
+        reasons.append("retained-identity-inventory-mismatch")
+
+    try:
+        entries = parse_lkg_inventory_text(inv_text)
+        canonical = build_canonical_lkg_inventory(kindle)
+    except RehearsalError as exc:
+        reasons.append(f"lkg-inventory-format-or-regeneration:{exc}")
+        return False, reasons
+    if hashlib.sha256(canonical).hexdigest() != inv_sha:
+        reasons.append("lkg-inventory-does-not-match-previous-release")
+
+    # Journal txn relationship when a journal still exists (interrupted publish).
+    journal = _journal_path(kindle)
+    if journal.is_file() or journal.is_symlink():
+        try:
+            jtext, _jsize, _jsha = _read_ascii_regular(journal, max_size=65536)
+            journal_txn = None
+            for line in jtext.splitlines():
+                if line.startswith("# txn="):
+                    journal_txn = line[len("# txn=") :]
+            if journal_txn is None:
+                reasons.append("journal-txn-missing")
+            elif journal_txn != fields["candidate_txn"]:
+                reasons.append("inventory-transaction-relationship-mismatch")
+        except (RehearsalError, OSError, UnicodeError):
+            reasons.append("journal-unreadable-during-txn-check")
+
+    # Independently verifiable retained-A agreement via inventory digests.
+    for name, role in LKG_ENTRY_TO_ROLE.items():
+        if role is None:
+            # appreg-handler.sql is transformed / register-gated; not package-provable here.
+            continue
+        kind, _size, digest = entries[name]
+        a_pres, _a_size, a_dig = evidence_a.digests[role]
+        if a_pres == "file":
+            if kind != "file" or digest != a_dig:
+                reasons.append(f"retained-a-mismatch:{role}")
+        elif kind == "file":
+            # Package A lacked the optional file but inventory claims one.
+            if CANDIDATE_B_CLASS[role] == "optional":
+                reasons.append(f"retained-a-unexpected-optional:{role}")
+            else:
+                reasons.append(f"retained-a-unexpected:{role}")
+
+    return (len(reasons) == 0), reasons
+
+
+def inspect_pending_health(
+    kindle: Path,
+    *,
+    evidence_a: ReleaseEvidence | None = None,
+    evidence_b: ReleaseEvidence | None = None,
+) -> tuple[str, dict[str, str] | None]:
+    """Return (absent|invalid|structurally-valid|consistent, fields).
+
+    Without evidence, stops at structurally-valid after live app/lifecycle digest
+    checks only (does not imply LKG publication consistency).
+    """
+    status, fields = inspect_pending_health_structure(kindle)
+    if status != "structurally-valid" or fields is None:
+        return status, fields
+
+    # Always require live candidate digests (installer validate_pending_health).
+    try:
+        app_size, app_sha = _hash_file_fd(_stable_app(kindle))
+        life_size, life_sha = _hash_file_fd(_stable_life(kindle))
+    except RehearsalError:
+        return "invalid", fields
+    if str(app_size) != fields["candidate_app_bytes"] or app_sha != fields["candidate_app_sha256"]:
+        return "invalid", fields
+    if (
+        str(life_size) != fields["candidate_lifecycle_bytes"]
+        or life_sha != fields["candidate_lifecycle_sha256"]
+    ):
+        return "invalid", fields
+
+    if evidence_a is None or evidence_b is None:
+        return "structurally-valid", fields
+
+    ok, _reasons = assess_pending_publication(
+        kindle, fields, evidence_a=evidence_a, evidence_b=evidence_b
+    )
+    if ok:
+        return "consistent", fields
+    return "structurally-valid", fields
 
 
 def _candidate_matches_release(
     candidate_rows: list[ComponentObservation],
     evidence: ReleaseEvidence,
+    *,
+    require_exec: bool,
 ) -> bool:
     """True when live candidate slots match the given release evidence contract.
 
@@ -604,6 +936,8 @@ def _candidate_matches_release(
     digest-equal. Optional roles expected from the evidence must match;
     unexpected optional presence fails. Shared/transformed/generated roles do
     not decide completeness here.
+
+    When require_exec is True (Unix), executable roles must retain an execute bit.
     """
     by_role = {row.role: row for row in candidate_rows}
     for role in COMPONENT_ROLES:
@@ -612,9 +946,10 @@ def _candidate_matches_release(
         exp_presence, _exp_size, exp_digest = evidence.digests[role]
         if cls == "direct-copy":
             if exp_presence != "file":
-                # Package evidence must list mandatory roles as files.
                 return False
             if row.presence != "file" or row.sha256 != exp_digest:
+                return False
+            if require_exec and row.exec_state == "missing":
                 return False
         elif cls == "optional":
             if exp_presence == "file":
@@ -634,10 +969,13 @@ def classify_publication_state(
     evidence_b: ReleaseEvidence,
     had_upgrade: bool,
 ) -> str:
-    pending_status, _fields = inspect_pending_health(kindle)
+    pending_status, pending_fields = inspect_pending_health(
+        kindle, evidence_a=evidence_a, evidence_b=evidence_b
+    )
     journal = _journal_path(kindle)
-    staging = _has_new_staging(kindle)
+    staging = _has_unresolved_installer_transitions(kindle)
     retention_messy = _retention_leftovers(kindle)
+    require_exec = sys.platform != "win32"
 
     try:
         stable = _lstat_regular_or_none(_stable_app(kindle))
@@ -653,8 +991,12 @@ def classify_publication_state(
     ):
         return "no-active-release"
 
-    b_complete = _candidate_matches_release(candidate_rows, evidence_b)
-    a_active_complete = _candidate_matches_release(candidate_rows, evidence_a)
+    b_complete = _candidate_matches_release(
+        candidate_rows, evidence_b, require_exec=require_exec
+    )
+    a_active_complete = _candidate_matches_release(
+        candidate_rows, evidence_a, require_exec=require_exec
+    )
 
     # Partial B: some mandatory B-unique bytes present, but not a complete B tree.
     # Ignore roles whose A and B package digests are identical (shared fixture bytes).
@@ -683,6 +1025,11 @@ def classify_publication_state(
         else True
     )
 
+    publication_consistent = pending_status == "consistent"
+    if pending_status == "structurally-valid" and pending_fields is not None:
+        # Structure alone is never enough for complete B publication.
+        publication_consistent = False
+
     # Surface interrupted publication leftovers before claiming completeness.
     if staging:
         return "b-staging-present"
@@ -692,14 +1039,17 @@ def classify_publication_state(
         return "b-publication-partial"
     if pending_status == "invalid":
         return "incomplete-or-inconsistent"
+    if pending_status == "structurally-valid":
+        # Structurally valid but LKG/version/identity inconsistent.
+        return "incomplete-or-inconsistent"
 
     if (
         had_upgrade
         and b_complete
         and retained_a_complete
-        and pending_status == "valid"
+        and publication_consistent
     ):
-        # Valid pending-health is publication evidence only — never qualification.
+        # Consistent pending-health is publication evidence only — never qualification.
         return "b-published-with-pending-health"
     if had_upgrade and b_complete and pending_status == "absent":
         return "b-present-without-pending-health"
@@ -880,15 +1230,33 @@ def observe_rehearsal(
     )
     external_errors = observe_external_state(sentinels or {})
     notes = summarize_identity(candidate, retained)
-    pending_status, _ = inspect_pending_health(kindle)
+    pending_status, pending_fields = inspect_pending_health(
+        kindle, evidence_a=evidence_a, evidence_b=evidence_b
+    )
     notes.append(f"pending_health={pending_status}")
+    if pending_status == "structurally-valid" and pending_fields is not None:
+        _ok, reasons = assess_pending_publication(
+            kindle, pending_fields, evidence_a=evidence_a, evidence_b=evidence_b
+        )
+        for reason in reasons[:16]:
+            notes.append(f"pending_publication_gap={reason}")
     if _journal_path(kindle).is_file():
         notes.append("activate_journal=present")
+    if any(row.exec_state == "skipped-win32" for row in candidate):
+        notes.append("executable_permission_check=skipped-win32")
+    elif any(row.exec_state == "missing" for row in candidate):
+        notes.append("executable_permission_check=failed")
+    else:
+        notes.append("executable_permission_check=observed")
     notes.append(
         "recovery_version=generated-by-install-recovery-not-package-direct-copy"
     )
     notes.append("registration_source=transformed-when-register-enabled")
+    notes.append(
+        "retained_appreg_handler=not-independently-verifiable-from-package-evidence"
+    )
     notes.append("pending_health_never_implies_qualification=true")
+    notes.append("publisher_authentication=unavailable")
     return render_report(
         state=state,
         version_a=evidence_a.version,

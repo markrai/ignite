@@ -60,8 +60,14 @@ Tests: `deployment/kindle/test_installer_publication_rehearsal.py`
 - Independent A and B package evidence from `release_component_profiles`.
 - Post-condition observation of all 22 roles at symbolic destinations via
   descriptor-based hashing (`O_NOFOLLOW`, hardlink refusal, identity checks).
-- Pending-health classified only after the install-runtime canonical 14-line
-  validation contract (not mere file presence).
+- Pending-health: **structurally-valid** (exact 14-line contract) is separated from
+  **consistent** (LKG inventory exists and matches, live app/lifecycle digests
+  match, candidate version equals expected B, independently verifiable retained-A
+  inventory entries agree). `appreg-handler.sql` is not package-provable when
+  register is skipped.
+- Complete B publication also requires Unix execute bits on installer-chmod'd
+  executables (skipped on native Windows fixtures) and absence of every closed
+  installer-owned `.new`/`.tmp` transition path (not only four bin/docs paths).
 - External sentinel files for notebooks/sync/settings/user docs.
 - Cleanup refuses substituted roots, copied markers, and token/identity mismatch.
 
@@ -91,17 +97,34 @@ Adapted to `install-runtime.sh`, not an invented updater FSM:
 
 1. `no-active-release` (empty disposable fixture; no stable app)
 2. `a-active-no-pending` (first-install complete vs A evidence; no pending-health)
-3. `b-staging-present` (`*.new` leftovers)
+3. `b-staging-present` (any closed installer-owned `.new`/publication `.tmp`)
 4. `a-retention-incomplete` (`previous-release.staging` / `.prev`)
 5. `b-publication-partial` (journal or mixed digests)
 6. `b-present-without-pending-health`
-7. `b-published-with-pending-health` (complete B + retained A + **valid** pending-health)
-8. `incomplete-or-inconsistent` (malformed pending-health, wrong destinations, etc.)
+7. `b-published-with-pending-health` (complete B + retained A + **consistent** pending-health)
+8. `incomplete-or-inconsistent` (malformed or structurally-valid-but-inconsistent pending-health, wrong destinations, etc.)
+
+### LKG inventory binding (installer-authoritative)
+
+`APP/previous-release/ignite-lkg-inventory.v1`:
+
+```text
+IGNITE_LKG_INVENTORY_V1
+schema=1
+kind=ignite-application-release
+entry_count=18
+entry=<name>|file|<bytes>|<sha256>   # or |absent|0|-
+```
+
+Fixed 18-entry order from `write_lkg_inventory`. Pending-health
+`lkg_inventory_sha256` / `retained_release_identity` must equal that file’s digest;
+regenerating the inventory from `previous-release` must reproduce it.
 
 Mandatory B completeness does not ignore optional components expected from B
 evidence. Missing or altered optionals block `b-published-with-pending-health`.
 Malformed, truncated, mismatched, or symlinked pending-health records never
-produce that state. Valid pending-health **never implies qualification**.
+produce that state. Structurally valid but LKG-inconsistent records never do either.
+Consistent pending-health **never implies qualification**.
 
 Pending-health **presence is not qualification**. Reports force:
 
