@@ -1,9 +1,10 @@
-# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.4)
+# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.5)
 
 **Status:** feasibility/design, the incomplete compiled capability inventory from Slice
 3D-B2a.4.1, the library-only probe from Slice 3D-B2a.4.2a, the external sync/device probe from
-Slice 3D-B2a.4.2b, the read-only provenance foundation from Slice 3D-B2a.4.3, and the fail-closed
-writer-exclusion diagnostic from Slice 3D-B2a.4.4. The probes are not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
+Slice 3D-B2a.4.2b, the read-only provenance foundation from Slice 3D-B2a.4.3, the fail-closed
+writer-exclusion diagnostic from Slice 3D-B2a.4.4, and the observational fixed-root preflight from
+Slice 3D-B2a.4.5. The probes are not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
 admission, authorization, promotion, rollback, storage migration, or persistent data format is
 implemented. `data_compatibility=unknown` remains a hard blocker.
 
@@ -1092,6 +1093,21 @@ no successful authorization exit and can never report `established`. Its fixed s
 `atomic_snapshot=false`, `data_compatibility=unknown`, `promotion_authorized=false`, and
 `inspection_action=report-only`.
 
+### 8.3 Implemented stable-state preflight (Slice 3D-B2a.4.5)
+
+`scribe-app --inspect-compatibility-preflight` now collects a bounded canonical inventory of the
+explicit library, sync, device, application-state, activation, adoption, and retired-epoch roots.
+It runs the existing library and external-state inspectors between inventory R1 and R2 and reports
+equal, changed, or unknown observational stability. The exact manifest, bounds, coverage mapping,
+and report schema are documented in
+[`kindle-stable-state-preflight.md`](kindle-stable-state-preflight.md).
+
+This closes the reproducible byte-inventory foundation, not Section 6.4. Equal roots are not an
+atomic snapshot, B2a.4.4 still cannot establish complete writer/USB exclusion, B2a.4.3 still reports
+unverified installed-slot binding, and exact authenticated A/B reader plus future-writer evidence is
+unavailable. The production preflight therefore has no `BIDIRECTIONAL_COMPATIBLE` state, never exits
+zero, and always keeps `data_compatibility=unknown` and `promotion_authorized=false`.
+
 ## 9. Revised implementation slices
 
 1. **3D-B2a.4.1 — Capability inventory (implemented, not authoritative).** Canonical
@@ -1122,9 +1138,10 @@ no successful authorization exit and can never report `established`. Its fixed s
    contention, reports USB/recovery/noncooperating gaps, and defines the narrowly cooperating A/B
    probe-executor boundary. Complete exclusion remains infeasible without separately reviewed
    writer and lifecycle integration; launch behavior remains unchanged.
-5. **3D-B2a.4.5 — Stable root and preflight engine.** Implement the bounded fixed-root inventory,
-   run both probes between equal roots, and produce a non-authorizing `BIDIRECTIONAL_COMPATIBLE`
-   result only when every Section 6.4 requirement passes. This remains manually invoked/read-only.
+5. **3D-B2a.4.5 — Stable root and preflight engine.** **Implemented as a non-authorizing
+   observational diagnostic.** The bounded fixed-root inventory surrounds both existing probes and
+   detects changed or incomplete state. Because the remaining Section 6.4 prerequisites cannot
+   pass, no production-reachable `BIDIRECTIONAL_COMPATIBLE` result exists.
 6. **3D-B2a.4.6 — Pre-activation and first-launch admission.** Add the restricted activation
    coordinator that acquires launch gate before updater lock, transaction-bound durable admission
    state, lifecycle validation, and the lifecycle→app kernel handshake. Make normal B startup refuse

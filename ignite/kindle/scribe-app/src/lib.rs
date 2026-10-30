@@ -72,6 +72,7 @@ pub mod settings_ui;
 pub mod singleton;
 pub mod sleep_ui;
 pub mod storage_capabilities;
+pub mod storage_compatibility_preflight;
 pub mod storage_inspect_external;
 pub mod storage_inspect_library;
 pub mod storage_release_provenance;

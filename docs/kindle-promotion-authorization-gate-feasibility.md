@@ -156,6 +156,16 @@ recovery coordination is partly in-process, lifecycle-host startup precedes `go`
 USB or noncooperating-writer gate exists. It therefore never reports complete exclusion and does
 not change the blocked B2a authorization finding.
 
+### Stable-state compatibility preflight (Slice 3D-B2a.4.5)
+
+The fixed-root inventory and R1/read-only-probes/R2 composition are documented in
+[`kindle-stable-state-preflight.md`](kindle-stable-state-preflight.md). They provide deterministic
+observational change detection and explicit coverage gaps. They do not establish an atomic snapshot
+or complete writer boundary, execute authenticated exact A/B readers, bind paths to installed slots,
+or prove that A can read every durable state B may create. The report therefore retains
+`installation_binding=unverified`, `data_compatibility=unknown`, and
+`promotion_authorized=false`; it cannot satisfy authorization preflight.
+
 ## Proposed authorization binding on the established boundary
 
 The eventual manual authorization challenge should use one canonical, versioned byte sequence such
