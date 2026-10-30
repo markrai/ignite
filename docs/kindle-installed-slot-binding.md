@@ -15,6 +15,11 @@ derived from the staged release payload are documented in
 build evidence only; they do not authenticate installation or satisfy first-launch admission.
 The retained-A-future-layout profile describes how the *incoming* release would look if later
 retained; it does not authenticate a device's currently retained previous release.
+
+**B2a.4.3e:** disposable installer publication / crash-recovery rehearsal is documented in
+[`kindle-installer-publication-rehearsal.md`](kindle-installer-publication-rehearsal.md). It exercises
+the real installer under path overrides and observes A/B component identity; it does not authorize
+promotion or first-launch admission.
 Post-authentication closed-directory and transition-marker revalidation in this inspector closes the
 TOCTOU gap between observation and provenance verification.
 
