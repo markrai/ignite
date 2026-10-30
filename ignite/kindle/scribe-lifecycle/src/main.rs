@@ -15,6 +15,9 @@
 mod launch_health;
 mod protocol;
 
+#[cfg(test)]
+mod admission_model;
+
 #[cfg(unix)]
 mod candidate_health;
 

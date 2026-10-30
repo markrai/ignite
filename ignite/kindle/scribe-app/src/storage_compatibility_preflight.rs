@@ -425,19 +425,23 @@ fn path_chain_contains_symlink(path: &Path) -> bool {
     crate::storage_inspect_library::path_chain_contains_symlink(path)
 }
 
-fn observed_directory(path: &Path) -> Result<Vec<(String, MetadataSignature)>, &'static str> {
-    let mut entries = fs::read_dir(path)
-        .map_err(|_| "directory_read_failed")?
-        .map(|entry| entry.map_err(|_| "directory_entry_failed"))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    let mut observed = Vec::with_capacity(entries.len());
+fn observed_directory(
+    path: &Path,
+    max_entries: usize,
+) -> Result<Vec<(String, MetadataSignature)>, &'static str> {
+    let entries = fs::read_dir(path).map_err(|_| "directory_read_failed")?;
+    let mut observed = Vec::new();
     for entry in entries {
+        if observed.len() >= max_entries {
+            return Err("entry_count_limit_exceeded");
+        }
+        let entry = entry.map_err(|_| "directory_entry_failed")?;
         let name = crate::storage_inspect_library::safe_component(&entry.file_name())
             .ok_or("unsafe_entry_name")?;
         let metadata = fs::symlink_metadata(entry.path()).map_err(|_| "metadata_unavailable")?;
         observed.push((name, metadata_signature(&metadata)?));
     }
+    observed.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(observed)
 }
 
@@ -764,8 +768,18 @@ fn scan_directory(
         return;
     }
     snapshot.directories = snapshot.directories.saturating_add(1);
-    let observed_before = match observed_directory(path) {
+    let remaining_entries = limits.entries.saturating_sub(snapshot.entries.len());
+    let observed_before = match observed_directory(path, remaining_entries) {
         Ok(entries) => entries,
+        Err("entry_count_limit_exceeded") => {
+            snapshot.finding(
+                FindingClass::Limit,
+                role,
+                relative,
+                "entry_count_limit_exceeded",
+            );
+            return;
+        }
         Err(reason) => {
             snapshot.finding(FindingClass::Unsafe, role, relative, reason);
             return;
@@ -888,7 +902,7 @@ fn scan_directory(
             );
         }
     }
-    let observed_after = observed_directory(path);
+    let observed_after = observed_directory(path, remaining_entries);
     let directory_after = fs::symlink_metadata(path)
         .ok()
         .and_then(|metadata| metadata_signature(&metadata).ok());
@@ -1019,8 +1033,17 @@ fn discover_retired(
         }
     };
     let prefix = format!("{name}.retired-");
-    let entries = match observed_directory(parent) {
+    let entries = match observed_directory(parent, MAX_TREE_ENTRIES) {
         Ok(entries) => entries,
+        Err("entry_count_limit_exceeded") => {
+            snapshot.finding(
+                FindingClass::Limit,
+                "retired_namespace",
+                kind,
+                "parent_entry_limit_exceeded",
+            );
+            return discovered;
+        }
         Err(_) => {
             snapshot.finding(
                 FindingClass::Io,
@@ -1031,15 +1054,6 @@ fn discover_retired(
             return discovered;
         }
     };
-    if entries.len() > MAX_TREE_ENTRIES {
-        snapshot.finding(
-            FindingClass::Limit,
-            "retired_namespace",
-            kind,
-            "parent_entry_limit_exceeded",
-        );
-        return discovered;
-    }
     for (entry_name, signature) in &entries {
         let Some(suffix) = entry_name.strip_prefix(&prefix) else {
             continue;
@@ -1082,7 +1096,7 @@ fn discover_retired(
             .and_then(|metadata| metadata_signature(&metadata).ok())
             .as_ref()
             != Some(&parent_before)
-        || observed_directory(parent).as_ref() != Ok(&entries)
+        || observed_directory(parent, MAX_TREE_ENTRIES).as_ref() != Ok(&entries)
     {
         snapshot.finding(
             FindingClass::Changed,
@@ -1321,13 +1335,21 @@ pub struct PreflightReport {
 }
 
 impl PreflightReport {
+    fn first_inventory_complete(&self) -> bool {
+        self.first.complete() && self.first_digest.is_some()
+    }
+
+    fn second_inventory_complete(&self) -> bool {
+        self.second.complete() && self.second_digest.is_some()
+    }
+
     fn observational_stability(&self) -> &'static str {
         if self.first_digest.is_some()
             && self.second_digest.is_some()
             && self.first_digest != self.second_digest
         {
             "changed"
-        } else if !self.first.complete() || !self.second.complete() {
+        } else if !self.first_inventory_complete() || !self.second_inventory_complete() {
             "unknown"
         } else {
             "equal"
@@ -1352,8 +1374,8 @@ impl PreflightReport {
             || self.second.has_class(FindingClass::Limit)
         {
             "LIMIT_EXCEEDED"
-        } else if !self.first.complete()
-            || !self.second.complete()
+        } else if !self.first_inventory_complete()
+            || !self.second_inventory_complete()
             || self.library_normalized == NormalizedInspection::Incomplete
             || self.external_normalized == NormalizedInspection::Incomplete
         {
@@ -1378,7 +1400,7 @@ impl PreflightReport {
         output.push_str(&format!("result={}\n", self.result_token()));
         output.push_str(&format!(
             "inventory_coverage={}\n",
-            if self.first.complete() && self.second.complete() {
+            if self.first_inventory_complete() && self.second_inventory_complete() {
                 "complete"
             } else {
                 "incomplete"
@@ -1386,7 +1408,7 @@ impl PreflightReport {
         ));
         output.push_str(&format!(
             "inventory_first_result={}\n",
-            if self.first.complete() {
+            if self.first_inventory_complete() {
                 "complete"
             } else {
                 "incomplete"
@@ -1398,7 +1420,7 @@ impl PreflightReport {
         ));
         output.push_str(&format!(
             "inventory_second_result={}\n",
-            if self.second.complete() {
+            if self.second_inventory_complete() {
                 "complete"
             } else {
                 "incomplete"
@@ -1809,15 +1831,23 @@ mod tests {
     fn entry_depth_and_byte_limits_are_explicit() {
         let entries = Fixture::new();
         fs::write(entries.config.library_root.join("extra"), b"x").unwrap();
+        let mut opened_after_limit = false;
         let limited = collect_inventory_with(
             &entries.config,
             InventoryLimits {
-                entries: 2,
+                entries: 1,
                 ..InventoryLimits::default()
             },
-            &mut |_| true,
+            &mut |event| {
+                opened_after_limit |= matches!(event, InventoryEvent::FileOpened(_));
+                true
+            },
         );
         assert!(limited.has_class(FindingClass::Limit));
+        assert!(
+            !opened_after_limit,
+            "entry limit must stop before file opens"
+        );
 
         let depth = Fixture::new();
         fs::create_dir_all(depth.config.library_root.join("a/b/c")).unwrap();
@@ -1887,6 +1917,31 @@ mod tests {
         assert!(bytes.contains("promotion_authorized=false\n"));
         assert!(bytes.contains("inspection_action=report-only\n"));
         assert!(!bytes.contains("BIDIRECTIONAL_COMPATIBLE"));
+    }
+
+    #[test]
+    fn missing_inventory_digest_is_incomplete_and_never_observationally_equal() {
+        let mut first = InventorySnapshot::new();
+        first.finish();
+        let second = first.clone();
+        let report = PreflightReport {
+            first,
+            second,
+            first_digest: None,
+            second_digest: Some("0".repeat(64)),
+            library_result: "VALID".into(),
+            library_normalized: NormalizedInspection::Passed,
+            external_result: "VALID".into(),
+            external_normalized: NormalizedInspection::Passed,
+        };
+
+        assert_eq!(report.observational_stability(), "unknown");
+        assert_eq!(report.result_token(), "INCOMPLETE");
+        let bytes = String::from_utf8(report.canonical_bytes().unwrap()).unwrap();
+        assert!(bytes.contains("inventory_coverage=incomplete\n"));
+        assert!(bytes.contains("inventory_first_result=incomplete\n"));
+        assert!(bytes.contains("inventory_first_sha256=unavailable\n"));
+        assert!(bytes.contains("promotion_authorized=false\n"));
     }
 
     #[test]

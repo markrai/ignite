@@ -166,6 +166,20 @@ or prove that A can read every durable state B may create. The report therefore 
 `installation_binding=unverified`, `data_compatibility=unknown`, and
 `promotion_authorized=false`; it cannot satisfy authorization preflight.
 
+### First-launch admission architecture (Slice 3D-B2a.4.6a)
+
+[`kindle-first-launch-admission.md`](kindle-first-launch-admission.md) defines the restricted
+coordinator, transaction-bound state machine, lock ownership, non-replayable lifecycle-to-app
+handoff, bypass audit, and crash behavior required before B may first touch compatible data. Its
+reference implementation is compiled only for tests; it adds no production command or authority.
+
+The architecture confirms that the current installer cannot safely add admission while already
+holding the updater lock. A future coordinator must acquire the launch gate first, internalize or
+supervise a fixed activation operation, and retain the complete writer boundary through exact-B
+handoff. Production provenance, full writer/USB exclusion, exact A/B compatibility, durable
+protected state, and Kindle handoff qualification remain absent, so B2a authorization is still
+blocked.
+
 ## Proposed authorization binding on the established boundary
 
 The eventual manual authorization challenge should use one canonical, versioned byte sequence such

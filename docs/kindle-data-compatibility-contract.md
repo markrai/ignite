@@ -1,12 +1,13 @@
-# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.5)
+# Kindle data-compatibility contract and pre-first-launch gate (Slices 3D-B2a.4–4.6a)
 
 **Status:** feasibility/design, the incomplete compiled capability inventory from Slice
 3D-B2a.4.1, the library-only probe from Slice 3D-B2a.4.2a, the external sync/device probe from
 Slice 3D-B2a.4.2b, the read-only provenance foundation from Slice 3D-B2a.4.3, the fail-closed
-writer-exclusion diagnostic from Slice 3D-B2a.4.4, and the observational fixed-root preflight from
-Slice 3D-B2a.4.5. The probes are not a complete A/B compatibility check. No compatibility approval, full-device probe, launch
-admission, authorization, promotion, rollback, storage migration, or persistent data format is
-implemented. `data_compatibility=unknown` remains a hard blocker.
+writer-exclusion diagnostic from Slice 3D-B2a.4.4, the observational fixed-root preflight from
+Slice 3D-B2a.4.5, and the non-enforcing first-launch architecture/reference model from Slice
+3D-B2a.4.6a. The probes are not a complete A/B compatibility check. No compatibility approval,
+full-device probe, launch admission, authorization, promotion, rollback, storage migration, or
+persistent data format is implemented. `data_compatibility=unknown` remains a hard blocker.
 
 ## Decision
 
@@ -1108,6 +1109,17 @@ unverified installed-slot binding, and exact authenticated A/B reader plus futur
 unavailable. The production preflight therefore has no `BIDIRECTIONAL_COMPATIBLE` state, never exits
 zero, and always keeps `data_compatibility=unknown` and `promotion_authorized=false`.
 
+### 8.4 First-launch admission architecture (Slice 3D-B2a.4.6a)
+
+[`kindle-first-launch-admission.md`](kindle-first-launch-admission.md) records the complete
+install-to-first-write topology, bypass audit, transaction-bound state machine, global lock order,
+one-shot lifecycle-to-app kernel handoff, and crash matrix. A fail-closed reference model is
+compiled only in lifecycle tests and uses an unmistakable test-only issuance context.
+
+This is architecture, not enforcement. Normal Kindle startup is unchanged, no durable admission
+record or capability exists, and current provenance, writer/USB exclusion, and compatibility gaps
+still make positive admission unavailable.
+
 ## 9. Revised implementation slices
 
 1. **3D-B2a.4.1 — Capability inventory (implemented, not authoritative).** Canonical
@@ -1142,15 +1154,17 @@ zero, and always keeps `data_compatibility=unknown` and `promotion_authorized=fa
    observational diagnostic.** The bounded fixed-root inventory surrounds both existing probes and
    detects changed or incomplete state. Because the remaining Section 6.4 prerequisites cannot
    pass, no production-reachable `BIDIRECTIONAL_COMPATIBLE` result exists.
-6. **3D-B2a.4.6 — Pre-activation and first-launch admission.** Add the restricted activation
-   coordinator that acquires launch gate before updater lock, transaction-bound durable admission
-   state, lifecycle validation, and the lifecycle→app kernel handshake. Make normal B startup refuse
-   before `run_page_session` without it. Test transitional/legacy behavior before enabling use in an
-   installer.
-7. **3D-B2a.4.7 — Post-launch assessment integration.** Add current-state compatibility to
+6. **3D-B2a.4.6a — Pre-activation and first-launch architecture (implemented as design/test-only
+   model).** Define the restricted coordinator, durable state, bypass audit, ordered boundary,
+   one-use kernel handoff, and crash rules without changing startup.
+7. **3D-B2a.4.6b — Admission enforcement (blocked).** After the production and hardware
+   prerequisites exist, acquire the full boundary before B is selected, run exact probes, publish
+   durable authorization, and hand a transaction-bound one-use capability to exact B before any
+   persistent access.
+8. **3D-B2a.4.7 — Post-launch assessment integration.** Add current-state compatibility to
    `--assess-promotion-with-boundary`; retain both B1 passes, host-generation validation, and
    `promotion_authorized=false`.
-8. **3D-B2a authorization, then B2b promotion.** Bind only a fresh post-launch compatibility digest
+9. **3D-B2a authorization, then B2b promotion.** Bind only a fresh post-launch compatibility digest
    into explicit manual authorization, then implement a separate crash-safe promotion journal.
    Forward-only snapshots, reverse migration, automatic rollback, and A retirement remain separate
    projects.
