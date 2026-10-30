@@ -1276,6 +1276,12 @@ where
             AuthorityKind::Test => "test-authenticated",
         };
         verify_authenticated_relationships(config, &authenticated, &pending, &inventory)?;
+        // Post-authentication layout revalidation: closed directories and transition markers
+        // must still hold after provenance verification (TOCTOU against staged extras).
+        if config.release_role == ReleaseRole::CandidateB {
+            verify_candidate_closed_directories(config)?;
+        }
+        verify_transition_state(config)?;
         Ok::<(), SlotError>(())
     })();
 
@@ -1345,6 +1351,10 @@ mod tests {
     struct OwnedTestRoot {
         path: PathBuf,
         token: String,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
     }
 
     impl OwnedTestRoot {
@@ -1352,6 +1362,12 @@ mod tests {
             for path in candidates {
                 match fs::create_dir(&path) {
                     Ok(()) => {
+                        let root_metadata = fs::symlink_metadata(&path)
+                            .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+                        if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+                            let _ = fs::remove_dir(&path);
+                            return Err(format!("unsafe test root {}", path.display()));
+                        }
                         let token = uuid::Uuid::now_v7().to_string();
                         let owner = path.join(OWNER_FILE);
                         let mut file = match fs::OpenOptions::new()
@@ -1371,7 +1387,20 @@ mod tests {
                             let _ = fs::remove_dir(&path);
                             return Err(format!("write {}: {error}", owner.display()));
                         }
-                        return Ok(Self { path, token });
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            return Ok(Self {
+                                path,
+                                token,
+                                device: root_metadata.dev(),
+                                inode: root_metadata.ino(),
+                            });
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            return Ok(Self { path, token });
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(error) => return Err(format!("create {}: {error}", path.display())),
@@ -1396,6 +1425,22 @@ mod tests {
     impl Drop for OwnedTestRoot {
         fn drop(&mut self) {
             let owner = self.path.join(OWNER_FILE);
+            #[cfg(unix)]
+            let owned = {
+                use std::os::unix::fs::MetadataExt;
+                fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.dev() == self.device
+                        && metadata.ino() == self.inode
+                }) && fs::symlink_metadata(&owner).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.nlink() == 1
+                }) && fs::read_to_string(&owner)
+                    .is_ok_and(|token| token.as_str() == self.token.as_str())
+            };
+            #[cfg(not(unix))]
             let owned = fs::symlink_metadata(&self.path)
                 .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
                 && fs::symlink_metadata(&owner)
@@ -1929,9 +1974,16 @@ mod tests {
         fs::create_dir(&candidate).unwrap();
         let replacement = candidate.join("replacement");
         fs::write(&replacement, b"preserve replacement").unwrap();
+        #[cfg(unix)]
+        {
+            // Device/inode ownership: a copied marker must not authorize teardown.
+            fs::write(candidate.join(OWNER_FILE), owned.token.as_bytes()).unwrap();
+        }
         drop(owned);
         assert_eq!(fs::read(collision_sentinel).unwrap(), b"preserve collision");
         assert_eq!(fs::read(replacement).unwrap(), b"preserve replacement");
+        #[cfg(unix)]
+        assert!(candidate.join(OWNER_FILE).is_file());
     }
 
     #[cfg(unix)]
@@ -2027,5 +2079,40 @@ mod tests {
         });
         assert_eq!(report.result, "STATE_CHANGED");
         assert_eq!(report.failure, "mapped-component-changed");
+    }
+
+    #[test]
+    fn closed_directory_extra_between_phases_is_detected() {
+        let fixture = Fixture::new(ReleaseRole::CandidateB, 33);
+        let decoy = fixture.config.app_root.join("bin/extra-component");
+        let report = inspect_with_test_key_and_hook(&fixture.config, &fixture.public_key(), || {
+            fs::write(&decoy, b"introduced after observation\n").unwrap();
+            Ok(())
+        });
+        assert_eq!(report.result, "INCONSISTENT");
+        assert_eq!(report.failure, "extra-unregistered-component");
+        assert_ne!(report.exit_code(), 0);
+        let text = String::from_utf8(report.canonical_bytes()).unwrap();
+        assert!(text.contains("installation_binding=unverified\n"));
+        assert!(text.contains("promotion_authorized=false\n"));
+        assert!(text.contains("data_compatibility=unknown\n"));
+    }
+
+    #[test]
+    fn transition_marker_between_phases_is_detected() {
+        let fixture = Fixture::new(ReleaseRole::CandidateB, 34);
+        // Write inside the pre-existing run/ directory so app_root metadata is unchanged
+        // and the negative transition check (not root revalidation) detects the remnant.
+        let staged = fixture.config.app_root.join("run/ignite-activate.journal");
+        let report = inspect_with_test_key_and_hook(&fixture.config, &fixture.public_key(), || {
+            fs::write(&staged, b"incomplete activation remnant\n").unwrap();
+            Ok(())
+        });
+        assert_eq!(report.result, "INCONSISTENT");
+        assert_eq!(report.failure, "incomplete-installer-publication");
+        assert_ne!(report.exit_code(), 0);
+        let text = String::from_utf8(report.canonical_bytes()).unwrap();
+        assert!(text.contains("first_launch_admission=unavailable\n"));
+        assert!(text.contains("execution_binding=unverified\n"));
     }
 }

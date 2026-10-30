@@ -37,6 +37,10 @@ const INVENTORY_NAMES: [&str; 18] = [
 struct OwnedTestRoot {
     path: PathBuf,
     token: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 impl OwnedTestRoot {
@@ -50,9 +54,31 @@ impl OwnedTestRoot {
             ));
             match fs::create_dir(&path) {
                 Ok(()) => {
+                    let root_metadata = fs::symlink_metadata(&path).unwrap();
+                    assert!(root_metadata.is_dir() && !root_metadata.file_type().is_symlink());
                     let token = uuid::Uuid::now_v7().to_string();
-                    fs::write(path.join(OWNER_FILE), &token).unwrap();
-                    return Self { path, token };
+                    let marker = path.join(OWNER_FILE);
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&marker)
+                        .unwrap();
+                    use std::io::Write as _;
+                    file.write_all(token.as_bytes()).unwrap();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        return Self {
+                            path,
+                            token,
+                            device: root_metadata.dev(),
+                            inode: root_metadata.ino(),
+                        };
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Self { path, token };
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("create {}: {error}", path.display()),
@@ -65,6 +91,20 @@ impl OwnedTestRoot {
 impl Drop for OwnedTestRoot {
     fn drop(&mut self) {
         let marker = self.path.join(OWNER_FILE);
+        #[cfg(unix)]
+        let owned = {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.dev() == self.device
+                    && metadata.ino() == self.inode
+            }) && fs::symlink_metadata(&marker).is_ok_and(|metadata| {
+                metadata.is_file() && !metadata.file_type().is_symlink() && metadata.nlink() == 1
+            }) && fs::read_to_string(&marker)
+                .is_ok_and(|token| token.as_str() == self.token.as_str())
+        };
+        #[cfg(not(unix))]
         let owned = fs::symlink_metadata(&self.path)
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
             && fs::symlink_metadata(&marker)

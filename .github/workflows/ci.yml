@@ -133,6 +133,18 @@ jobs:
           cp "$src/Install Ignite v$v.sh" "$src/Install Ignite v$v.sha256" dist/kindle-release/
           (cd dist/kindle-release && sha256sum -c "Install Ignite v$v.sha256")
           python3 deployment/kindle/validate_stage.py --sfx "dist/kindle-release/Install Ignite v$v.sh" --version "$v"
+          # Slice 3D-B2a.4.3c: reproducible component profiles from the staged payload
+          # (build evidence only; not Release assets). SFX↔payload byte equivalence after
+          # customer extraction remains a separate blocked check (see docs).
+          payload="$(find target/package/kindle/staging -maxdepth 1 -type d -name "Ignite-Kindle-$v" | head -n 1)"
+          if [ -z "$payload" ] || [ ! -d "$payload" ]; then
+            echo "missing staged payload Ignite-Kindle-$v for component profiles" >&2
+            exit 1
+          fi
+          python3 deployment/kindle/release_component_profiles.py \
+            --payload "$payload" --version "$v" --check-deterministic \
+            --out-dir target/package/kindle/component-profiles
+          test -s target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1
           echo "kindle_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
       - name: Upload Kindle release artifact
         uses: actions/upload-artifact@v4

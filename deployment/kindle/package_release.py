@@ -28,6 +28,11 @@ for extra in (_HERE, _SFX):
         sys.path.insert(0, str(extra))
 
 from build_sfx import build_sfx, default_template  # noqa: E402
+from release_component_profiles import (  # noqa: E402
+    ProfileError,
+    verify_deterministic,
+    write_profiles,
+)
 from validate_stage import (  # noqa: E402
     installer_sfx_name,
     validate_payload,
@@ -294,6 +299,20 @@ def package(
     if errors:
         die("payload validation failed:\n" + "\n".join(errors))
 
+    print("== Generate release-component profiles (build evidence; not customer assets)")
+    try:
+        profiles = verify_deterministic(payload, version)
+    except ProfileError as exc:
+        die(f"component profile generation failed: {exc}")
+    profile_dir = out_root / "component-profiles"
+    write_profiles(profile_dir, profiles)
+    result_profiles = {
+        "component_profile_dir": str(profile_dir),
+        "component_profile_package_sha256": sha256_file(
+            profile_dir / "ignite-kindle-component-profile-package.v1"
+        ),
+    }
+
     print(f"== Build customer {sfx_name}")
     out_root.mkdir(parents=True, exist_ok=True)
     sfx_path.write_bytes(build_sfx(payload, version, default_template()))
@@ -310,6 +329,7 @@ def package(
         "sfx_sha256": sfx_hash,
         "sfx_bytes": sfx_path.stat().st_size,
         "sfx_checksum": str(sfx_sha_path),
+        **result_profiles,
     }
 
     if support_zip:
@@ -332,6 +352,8 @@ def package(
     print(f"customer_size_bytes:  {result['sfx_bytes']}")
     print(f"customer_sha256:      {sfx_hash}")
     print(f"customer_checksum:    {sfx_sha_path}")
+    print(f"component_profiles:   {result['component_profile_dir']} (build evidence only)")
+    print(f"package_profile_sha256: {result['component_profile_package_sha256']}")
     if support_zip:
         print(f"support ZIP (optional, not for end users): {result['support_zip']}")
         print(f"support_size_bytes:   {result['support_bytes']}")

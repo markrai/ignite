@@ -19,6 +19,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from release_component_profiles import ProfileError, inspect_package_components
+
 PAYLOAD_REQUIRED_RELATIVE = [
     "Uninstall-Ignite.sh",
     "Backup-Ignite-Data.sh",
@@ -362,6 +364,11 @@ def validate_payload(payload: Path, version: str) -> list[str]:
             header = f"# Name: {name}"
             if header not in first_lines:
                 errors.append(f"{rel} missing Library name header {header!r}")
+
+    try:
+        inspect_package_components(payload)
+    except ProfileError as exc:
+        errors.append(f"component profile: {exc}")
 
     return errors
 

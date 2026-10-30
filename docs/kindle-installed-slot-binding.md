@@ -9,6 +9,15 @@ does not consume or durably publish the authenticated release/component records;
 live/retained component profile; and pathname inspection cannot bind a later `exec` to the same
 inode.
 
+**B2a.4.3c:** deterministic package / candidate-B / retained-A-future-layout component profiles
+derived from the staged release payload are documented in
+[`kindle-release-component-profiles.md`](kindle-release-component-profiles.md). Those profiles are
+build evidence only; they do not authenticate installation or satisfy first-launch admission.
+The retained-A-future-layout profile describes how the *incoming* release would look if later
+retained; it does not authenticate a device's currently retained previous release.
+Post-authentication closed-directory and transition-marker revalidation in this inspector closes the
+TOCTOU gap between observation and provenance verification.
+
 The diagnostic is observational and always non-authorizing. Even a complete test-key fixture
 returns `REVIEW_REQUIRED` with nonzero exit status and:
 
@@ -141,8 +150,10 @@ digest/byte relationships and B app/lifecycle identities, verifies retained file
 files in release-owned closed directories, and checks known journal/staging remnants. It uses
 no-follow opens, one-link regular-file checks through the shared hashing machinery, bounded reads
 and enumeration, and before/after metadata identity. It revalidates pending, inventory, mapped
-components, and root identities after provenance verification. It creates no directory, lock,
-temporary file, repair, recovery action, network request, or process.
+components, and root identities after provenance verification, then repeats closed-directory and
+negative transition-state checks so staged extras or `.new`/journal remnants introduced between
+observation and authentication cannot pass. It creates no directory, lock, temporary file, repair,
+recovery action, network request, or process.
 
 Outcomes are always nonzero:
 
