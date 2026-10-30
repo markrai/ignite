@@ -75,6 +75,7 @@ pub mod storage_capabilities;
 pub mod storage_compatibility_preflight;
 pub mod storage_inspect_external;
 pub mod storage_inspect_library;
+pub mod storage_installed_slot_binding;
 pub mod storage_release_provenance;
 pub mod storage_writer_exclusion;
 pub mod store;

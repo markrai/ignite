@@ -51,6 +51,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    match scribe_app::storage_installed_slot_binding::parse_command(&args) {
+        Ok(scribe_app::storage_installed_slot_binding::InspectionCommand::Inspect(config)) => {
+            return inspect_installed_slot_binding(&config);
+        }
+        Ok(scribe_app::storage_installed_slot_binding::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
     match scribe_app::storage_writer_exclusion::parse_command(&args) {
         Ok(scribe_app::storage_writer_exclusion::InspectionCommand::Inspect(config)) => {
             return inspect_writer_exclusion(&config);
@@ -195,6 +205,16 @@ Options:
                         is read-only/report-only and never establishes first-launch admission, data
                         compatibility, or promotion authorization. Production verification remains
                         unavailable while the compile-time public-key pin is UNPROVISIONED.
+  --inspect-installed-slot-binding --release-role retained-a|candidate-b
+       --expected-transaction TXN --app-root APP --documents-root DOCS
+       --recovery-root RECOVERY --expected-tag vX.Y.Z
+       --record PATH --record-signature PATH --release-manifest PATH
+       --release-manifest-signature PATH --capabilities PATH
+       --component ROLE=ABSOLUTE_PATH (one for every schema-v1 role)
+                        Map authenticated component observations onto the fixed live-B or retained-A
+                        installer layout and compare pending/inventory state. This bounded read-only
+                        diagnostic never establishes installation/execution binding or admission,
+                        and always exits nonzero.
   --inspect-writer-exclusion --data-dir LIBRARY --sync-dir SYNC
                         Attempt a bounded, read-only acquisition of pre-existing coordination
                         locks and report coverage gaps. Never creates lock files, starts recovery,
@@ -335,6 +355,21 @@ fn inspect_release_provenance(
     let mut stdout = std::io::stdout().lock();
     if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
         eprintln!("write installed release provenance inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
+}
+
+fn inspect_installed_slot_binding(
+    config: &scribe_app::storage_installed_slot_binding::SlotBindingConfig,
+) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_installed_slot_binding::inspect_official(config);
+    let bytes = report.canonical_bytes();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write installed slot binding inspection: {error}");
         return ExitCode::FAILURE;
     }
     ExitCode::from(report.exit_code())

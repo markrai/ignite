@@ -207,6 +207,21 @@ impl AuthenticatedReleaseComponentSet {
     pub fn component_count(&self) -> usize {
         self.components.len()
     }
+
+    /// Returns the authenticated file identity for `role`.
+    ///
+    /// `Some(None)` is an authenticated absent claim, while `None` means the role is outside the
+    /// closed schema. This remains a claim about the caller-supplied component set; it does not
+    /// establish an installed-slot path.
+    pub(crate) fn component_file_identity(&self, role: &str) -> Option<Option<(u64, [u8; 32])>> {
+        self.components
+            .iter()
+            .find(|component| component.role == role)
+            .map(|component| match component.presence {
+                Presence::File { bytes, sha256 } => Some((bytes, sha256)),
+                Presence::Absent => None,
+            })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -305,7 +320,7 @@ impl std::fmt::Display for ProvenanceError {
 impl std::error::Error for ProvenanceError {}
 
 impl ProvenanceError {
-    fn status(&self) -> &'static str {
+    pub(crate) fn status(&self) -> &'static str {
         match self {
             Self::OfficialKeyNotProvisioned | Self::InvalidPinnedPublicKey => {
                 "AUTHORITY_UNAVAILABLE"
@@ -473,7 +488,9 @@ fn is_explicit_absolute_path(path: &Path) -> bool {
         })
 }
 
-fn validate_verification_paths(paths: &VerificationPaths) -> Result<(), ProvenanceError> {
+pub(crate) fn validate_verification_paths(
+    paths: &VerificationPaths,
+) -> Result<(), ProvenanceError> {
     for (path, label) in [
         (&paths.record, "provenance record path"),
         (&paths.record_signature, "provenance signature path"),
@@ -517,7 +534,7 @@ pub fn inspect_official(config: &InspectionConfig) -> InspectionReport {
     }
 }
 
-fn failure_token(error: &ProvenanceError) -> &'static str {
+pub(crate) fn failure_token(error: &ProvenanceError) -> &'static str {
     match error {
         ProvenanceError::OfficialKeyNotProvisioned => "official-key-not-provisioned",
         ProvenanceError::InvalidPinnedPublicKey => "official-key-invalid",
@@ -564,7 +581,7 @@ pub fn verify_official(
 }
 
 #[cfg(test)]
-fn verify_paths_with_key(
+pub(crate) fn verify_paths_with_key(
     paths: &VerificationPaths,
     public_key: &[u8; 32],
 ) -> Result<AuthenticatedReleaseComponentSet, ProvenanceError> {

@@ -1,5 +1,11 @@
 # Kindle promotion authorization gate feasibility (Slice 3D-B2a)
 
+Slice 3D-B2a.4.3b adds a non-authorizing installed-path diagnostic; see
+[`kindle-installed-slot-binding.md`](kindle-installed-slot-binding.md). Its observed transaction and
+path matches are not promotion evidence. Promotion remains blocked until publisher-authenticated
+profile closures, a crash-safe trusted installer publication generation, and execution/data
+compatibility boundaries exist.
+
 **Status: coordination and boundary-aware B1 revalidation are complete through Slice 3D-B2a.3;
 trusted compatibility evidence and pre-first-launch admission remain absent, so authorization is
 still blocked. No authorization interface was implemented.**

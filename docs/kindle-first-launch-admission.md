@@ -1,5 +1,11 @@
 # Kindle first-launch admission architecture (Slice 3D-B2a.4.6a)
 
+The read-only slot-mapping foundation is documented in
+[`kindle-installed-slot-binding.md`](kindle-installed-slot-binding.md). It eliminates ambiguity
+about current stable and retained paths but does not satisfy admission: no trusted installer
+publication record or kernel-backed verified-object handoff exists, and the current component
+profile has explicit registration/recovery gaps.
+
 ## Status and feasibility decision
 
 This slice defines a source-grounded architecture and a test-only reference model. It does not

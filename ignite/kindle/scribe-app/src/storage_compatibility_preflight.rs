@@ -1344,13 +1344,10 @@ impl PreflightReport {
     }
 
     fn observational_stability(&self) -> &'static str {
-        if self.first_digest.is_some()
-            && self.second_digest.is_some()
-            && self.first_digest != self.second_digest
-        {
-            "changed"
-        } else if !self.first_inventory_complete() || !self.second_inventory_complete() {
+        if !self.first_inventory_complete() || !self.second_inventory_complete() {
             "unknown"
+        } else if self.first_digest != self.second_digest {
+            "changed"
         } else {
             "equal"
         }
@@ -1721,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn additions_removals_renames_and_type_substitutions_change_the_second_root() {
+    fn post_mutation_difference_requires_complete_inventories_for_observational_change() {
         for mutation in ["add", "remove", "rename", "file_to_directory"] {
             let fixture = Fixture::new();
             let original = fixture.file();
@@ -1737,9 +1734,16 @@ mod tests {
                 }
                 _ => unreachable!(),
             });
-            assert_eq!(report.observational_stability(), "changed", "{mutation}");
-            assert_eq!(report.result_token(), "STATE_CHANGED", "{mutation}");
-            assert_eq!(report.exit_code(), 4);
+            assert!(report.first_inventory_complete(), "{mutation}");
+            if report.second_inventory_complete() {
+                assert_eq!(report.observational_stability(), "changed", "{mutation}");
+                assert_eq!(report.result_token(), "STATE_CHANGED", "{mutation}");
+                assert_eq!(report.exit_code(), 4);
+            } else {
+                assert_eq!(report.observational_stability(), "unknown", "{mutation}");
+                assert_eq!(report.result_token(), "INCOMPLETE", "{mutation}");
+                assert_eq!(report.exit_code(), 2);
+            }
         }
     }
 
@@ -1942,6 +1946,40 @@ mod tests {
         assert!(bytes.contains("inventory_first_result=incomplete\n"));
         assert!(bytes.contains("inventory_first_sha256=unavailable\n"));
         assert!(bytes.contains("promotion_authorized=false\n"));
+    }
+
+    #[test]
+    fn incomplete_inventories_with_different_digests_do_not_invent_state_change() {
+        let mut first = InventorySnapshot::new();
+        first.finding(
+            FindingClass::Io,
+            "test",
+            "unreadable",
+            "test-only incomplete inventory",
+        );
+        let second = InventorySnapshot::new();
+        let report = PreflightReport {
+            first,
+            second,
+            first_digest: Some("1".repeat(64)),
+            second_digest: Some("2".repeat(64)),
+            library_result: "VALID".into(),
+            library_normalized: NormalizedInspection::Passed,
+            external_result: "VALID".into(),
+            external_normalized: NormalizedInspection::Passed,
+        };
+
+        assert_eq!(report.observational_stability(), "unknown");
+        assert_eq!(report.result_token(), "INCOMPLETE");
+
+        let mut explicitly_changed = report;
+        explicitly_changed.first.finding(
+            FindingClass::Changed,
+            "test",
+            "explicit-mutation",
+            "test-only explicit mutation",
+        );
+        assert_eq!(explicitly_changed.result_token(), "STATE_CHANGED");
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Authenticated installed-release provenance feasibility (Slice 3D-B2a.4.3)
 
+> **B2a.4.3b follow-up:** [`kindle-installed-slot-binding.md`](kindle-installed-slot-binding.md)
+> now maps authenticated component observations onto the source-derived live-B and retained-A
+> paths and checks strict pending/inventory relationships. The diagnostic remains read-only and
+> non-authorizing: registration/recovery profile gaps, absent installer publication evidence,
+> `UNPROVISIONED` production authority, and pathname-to-exec TOCTOU keep installation and execution
+> binding unverified.
+
 **Status: read-only format and verifier implemented; production trust chain blocked.** This slice
 adds a closed signed-record contract, strict Ed25519/file verifier, and non-authorizing diagnostic.
 The production entry point uses only the compile-time official pin, which remains `UNPROVISIONED`,
