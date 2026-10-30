@@ -145,6 +145,15 @@ jobs:
             --payload "$payload" --version "$v" --check-deterministic \
             --out-dir target/package/kindle/component-profiles
           test -s target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1
+          # Slice 3D-B2a.4.3d: independent byte-equivalence of the copied customer
+          # Scriptlet against the staged payload + canonical package profile.
+          # Inspects dist/kindle-release (upload candidate), never executes the Scriptlet.
+          python3 deployment/kindle/verify_sfx_payload_equivalence.py \
+            --sfx "dist/kindle-release/Install Ignite v$v.sh" \
+            --payload "$payload" \
+            --version "$v" \
+            --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+            --report target/package/kindle/component-profiles/sfx-payload-equivalence.v1
           echo "kindle_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
       - name: Upload Kindle release artifact
         uses: actions/upload-artifact@v4

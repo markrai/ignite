@@ -40,6 +40,7 @@ from validate_stage import (  # noqa: E402
     validate_sfx,
     validate_zip,
 )
+from verify_sfx_payload_equivalence import verify_equivalence  # noqa: E402
 
 VERSION_RE = r"^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$"
 
@@ -319,6 +320,22 @@ def package(
     errors = validate_sfx(sfx_path, version)
     if errors:
         die("SFX validation failed:\n" + "\n".join(errors))
+
+    print("== Verify SFX ↔ staged payload ↔ package profile equivalence")
+    package_profile_path = profile_dir / "ignite-kindle-component-profile-package.v1"
+    eq_ok, eq_report = verify_equivalence(
+        sfx_path=sfx_path,
+        payload_path=payload,
+        version=version,
+        package_profile=package_profile_path.read_bytes(),
+    )
+    eq_report_path = profile_dir / "sfx-payload-equivalence.v1"
+    eq_report_path.write_bytes(eq_report)
+    if not eq_ok:
+        die(
+            "SFX payload equivalence failed:\n"
+            + eq_report.decode("ascii", errors="replace")
+        )
 
     sfx_hash = sha256_file(sfx_path)
     write_sha256sum(sfx_sha_path, sfx_hash, sfx_name)

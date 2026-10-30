@@ -111,7 +111,7 @@ the installer digest; they are written beside packaging output under
   identity checks (`dev`/`ino`/`size`/`mtime_ns`/`ctime_ns`/`nlink`/`mode`);
   refuse growth or truncation during read. No unrestricted `Path.read_bytes()`.
 
-## 6. CI reproducibility gate
+## 6. CI reproducibility and Scriptlet equivalence gate
 
 - `package_release.py` generates all three profiles twice (`verify_deterministic`) after
   payload validation and writes them under `<out-root>/component-profiles/`.
@@ -120,10 +120,48 @@ the installer digest; they are written beside packaging output under
 - `.github/workflows/ci.yml` `kindle-package` regenerates profiles from the staged
   payload with `--check-deterministic` after Scriptlet validation.
 
-**Blocked follow-up:** proving byte-identical component closure between the staged
-payload and a tree extracted from the published customer Scriptlet. SFX validation
-already checks embedded archive integrity; a full extract-and-diff gate is not wired
-here so the release pipeline is not restructured around an unproven equivalence claim.
+### Customer Scriptlet payload equivalence (Slice 3D-B2a.4.3d)
+
+Verifier: `deployment/kindle/verify_sfx_payload_equivalence.py`.
+
+**SFX format (source-verified):** the customer `Install Ignite vX.Y.Z.sh` is an immutable
+concatenation of (1) an LF-only shell prefix stamped with `IGNITE_ARCHIVE_OFFSET`,
+`IGNITE_ARCHIVE_BYTES`, `IGNITE_ARCHIVE_SHA256`, `IGNITE_ARCHIVE_MD5`, and
+`IGNITE_PACKAGE_VERSION`, then (2) a gzip-compressed ustar archive. Members are
+regular files only named `Ignite-Kindle-<version>/<payload-rel>` with modes `0755`
+for `*.sh` / `scribe-app` / `scribe-lifecycle` else `0644`, `mtime=0`, empty owner
+names. The production builder does not emit directory, symlink, hardlink, or special
+members. The Scriptlet becomes immutable once `package_release.py` writes the SFX
+bytes; CI copies that exact file to `dist/kindle-release/` before upload.
+
+**Inspection:** the verifier reads the final Scriptlet via `O_NOFOLLOW` (symlinked SFX
+paths refused; no `Path.resolve()` before the check), splits via the stamped OFFSET
+contract (`build_sfx.split_sfx`), then decompresses with `zlib.decompressobj(wbits=31)`
+so that **exactly one** gzip member is accepted (header flags/mtime, deflate body,
+CRC/trailer, `eof`, empty `unused_data` — refusing trailing zeros and empty or
+nonempty concatenated members). A raw ustar framing pass then requires
+`ustar\\0`/`00` magic/version, valid header checksums, regular-file typeflags only,
+member boundaries, and two end-of-archive zero blocks (zero padding after EOA is
+allowed; alternate GNU/PAX formats and missing EOA are refused). Member payloads
+are hashed incrementally against a single decompressed buffer. Exact tar metadata
+must match the production builder: mode `0755`/`0644` with no setuid/setgid/sticky
+bits, `uid=gid=0`, `mtime=0`, empty owner names. Absolute/`..` paths, duplicates,
+oversized members, and unbounded member counts / uncompressed size are refused.
+Embedded inventory is compared to the independently staged payload (size +
+SHA-256 + exact mode) and to the canonical package component profile (22 roles).
+Success cannot rest solely on a staging-only archive checksum.
+
+**CI placement:** after `dist/kindle-release/Install Ignite vX.Y.Z.sh` is copied and
+checksum-verified, and after package-profile regeneration; before artifact upload.
+`package_release.py` also runs the same check against its local SFX output. Report
+bytes are build evidence under `component-profiles/sfx-payload-equivalence.v1` and
+are not GitHub Release assets.
+
+**PASS means:** the inspected customer Scriptlet embeds the same release-owned
+payload bytes as the independently staged release and agrees with the package
+profile. It does **not** mean publisher authentication, installed-slot trust,
+execution binding, retained-A authentication, data compatibility, or promotion
+authorization. Non-authorizing flags remain forced in the equivalence report.
 
 ## 7. Known unclosed component mappings
 
@@ -142,6 +180,11 @@ here so the release pipeline is not restructured around an unproven equivalence 
   destinations vs Rust inspector, retained future-layout identity flags, symlink
   file/dir refusal, special-file refusal, enumeration bounds, non-admission flags,
   Rust `COMPONENT_ROLES` sync.
+- `deployment/kindle/test_sfx_payload_equivalence.py` — exact equivalence; missing/
+  extra/changed/same-size mutation; duplicates; traversal/absolute paths; symlink/
+  hardlink/fifo/directory members; truncated archive; wrong version; incorrect
+  optional presence; wrong staged profile; SFX/staged drift after profile generation;
+  size and member-count bounds; repeated identical reports; non-admission flags.
 - Slot-binding B2a.4.3b regressions: post-auth closed-directory / transition-marker
   TOCTOU tests; fixture cleanup refuses substituted roots even with a copied ownership
   marker (Unix device/inode).
