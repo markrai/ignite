@@ -36,6 +36,7 @@ RELEASE_MANIFEST_SCHEMA = "ignite-kindle-release-v1"
 RELEASE_SIGNATURE_SCHEMA = "ignite-kindle-release-signature-v1"
 TEST_EVIDENCE_SCOPE = "publisher_authentication_scope=test-trust-root-only"
 PLACEHOLDER_EVIDENCE_HEADER = "IGNITE_PUBLICATION_EVIDENCE_PROD_PLACEHOLDER_V1"
+PRODUCTION_EVIDENCE_HEADER = "IGNITE_PUBLICATION_EVIDENCE_PRODUCTION_V1"
 
 MAX_BINDING_BYTES = 2048
 MAX_EVIDENCE_BYTES = 64 * 1024
@@ -62,9 +63,10 @@ class VerificationProvenance(Enum):
 
 
 class EvidenceClaimStatus(Enum):
-    """Digest match is not schema/component-claim validation."""
+    """Digest authentication is distinct from validated production component claims."""
 
     DIGEST_AUTHENTICATED_CLAIMS_UNVERIFIED = "digest-authenticated-claims-unverified"
+    PRODUCTION_CLAIMS_VALIDATED = "production-claims-validated"
 
 
 def _load_release_sign():
@@ -124,7 +126,8 @@ def load_production_public_key() -> bytes:
 def refuse_for_production_publication_evidence(evidence: bytes) -> None:
     """Eligibility gate for production publication-evidence validation claims.
 
-    No production evidence schema is defined in this slice; every current pattern refuses.
+    Accepts only the production evidence header. Empty, placeholder, 3f test-scope,
+    and unknown schemas refuse. Full claim validation happens after digest auth.
     """
     if not evidence:
         raise ProductionTrustError("publication evidence must not be empty")
@@ -138,9 +141,10 @@ def refuse_for_production_publication_evidence(evidence: bytes) -> None:
         raise ProductionTrustError(
             "placeholder publication evidence is not production evidence"
         )
-    raise ProductionTrustError(
-        "publication evidence schema is unknown; production claims remain unvalidated"
-    )
+    if not evidence.startswith(f"{PRODUCTION_EVIDENCE_HEADER}\n".encode("ascii")):
+        raise ProductionTrustError(
+            "publication evidence schema is unknown; production claims remain unvalidated"
+        )
 
 
 def build_publication_binding(
@@ -338,6 +342,34 @@ def parse_binding(binding: bytes) -> dict[str, str]:
     }
 
 
+def _validate_evidence_claims_if_production(
+    publication_evidence: bytes, release: AuthenticatedReleaseV1
+) -> EvidenceClaimStatus:
+    """Validate production-format claims after digest authentication.
+
+    Opaque non-production fixture bytes remain digest-bound with unverified claims.
+    """
+    if not publication_evidence.startswith(
+        f"{PRODUCTION_EVIDENCE_HEADER}\n".encode("ascii")
+    ):
+        return EvidenceClaimStatus.DIGEST_AUTHENTICATED_CLAIMS_UNVERIFIED
+    from production_publication_evidence import (  # local import avoids cycle at module load
+        ProductionEvidenceError,
+        parse_and_validate_production_evidence,
+    )
+
+    try:
+        parse_and_validate_production_evidence(
+            publication_evidence,
+            expected_version=release.version,
+            expected_scriptlet_sha256=release.sha256,
+            expected_scriptlet_bytes=release.bytes_count,
+        )
+    except ProductionEvidenceError as exc:
+        raise ProductionTrustError(f"production evidence claims invalid: {exc}") from exc
+    return EvidenceClaimStatus.PRODUCTION_CLAIMS_VALIDATED
+
+
 def _authenticate_publication_chain_inner(
     *,
     release_manifest: bytes,
@@ -384,12 +416,16 @@ def _authenticate_publication_chain_inner(
             "binding publication_evidence_sha256 does not match evidence bytes"
         )
 
+    evidence_claims = _validate_evidence_claims_if_production(
+        publication_evidence, release
+    )
+
     return AuthenticatedPublicationChain(
         release=release,
         release_manifest_sha256=release_digest,
         publication_evidence_sha256=evidence_digest,
         provenance=provenance,
-        evidence_claims=EvidenceClaimStatus.DIGEST_AUTHENTICATED_CLAIMS_UNVERIFIED,
+        evidence_claims=evidence_claims,
     )
 
 
@@ -473,11 +509,17 @@ def production_trust_report(
         "promotion_authorized=false",
     ]
     if isinstance(outcome, AuthenticatedPublicationChain):
+        claims_line = (
+            "publication_evidence_claims=validated"
+            if outcome.evidence_claims
+            is EvidenceClaimStatus.PRODUCTION_CLAIMS_VALIDATED
+            else "publication_evidence_claims=unverified"
+        )
         lines.extend(
             [
                 _publisher_authentication_line(outcome.provenance),
                 "publication_evidence_digest=authenticated",
-                "publication_evidence_claims=unverified",
+                claims_line,
                 f"release_tag={outcome.release.tag}",
                 f"release_manifest_sha256={outcome.release_manifest_sha256}",
                 f"publication_evidence_sha256={outcome.publication_evidence_sha256}",

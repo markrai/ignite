@@ -92,12 +92,17 @@ Any entry that claims **production publication-evidence validation** refuses:
 
 - empty evidence
 - the disposable placeholder header `IGNITE_PUBLICATION_EVIDENCE_PROD_PLACEHOLDER_V1`
-- unknown schemas (no production schema exists yet in this slice)
+- unknown schemas
 - 3f `publisher_authentication_scope=test-trust-root-only`
 
+It accepts only `IGNITE_PUBLICATION_EVIDENCE_PRODUCTION_V1` (see
+[`kindle-production-publication-evidence.md`](kindle-production-publication-evidence.md)).
+After digest authentication, that schema is claim-validated against the shared
+component contract. Success reports `publication_evidence_claims=validated`.
+
 The isolated fixture seam may still digest-bind placeholder bytes under
-**test-only** provenance to exercise the binding contract. That outcome never
-reports validated component claims and never reports production-pin authentication.
+**test-only** provenance (`publication_evidence_claims=unverified`) to exercise
+the binding contract. That outcome never reports production-pin authentication.
 
 ### 3f format migration note
 
@@ -105,9 +110,6 @@ reports validated component claims and never reports production-pin authenticati
 `publisher_authentication_scope=test-trust-root-only`. That marker is **test
 scope**. The production boundary **refuses** any evidence containing it and does
 not reinterpret it as production authority.
-
-A future production evidence version is required before component claims can be
-validated under the pin.
 
 ## 4. Production versus test trust roots
 

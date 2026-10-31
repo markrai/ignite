@@ -277,6 +277,9 @@ def package(
     out_root: Path,
     pinned: Path,
     support_zip: bool,
+    *,
+    fixture_signing_private_key: Path | None = None,
+    fixture_signing_public_key: Path | None = None,
 ) -> dict[str, str | int]:
     app_bin = release_bin_dir / "scribe-app"
     life_bin = release_bin_dir / "scribe-lifecycle"
@@ -375,6 +378,38 @@ def package(
         print(f"support ZIP (optional, not for end users): {result['support_zip']}")
         print(f"support_size_bytes:   {result['support_bytes']}")
         print(f"support_sha256:       {result['support_sha256']}")
+
+    # Explicit fixture-only authenticated assets. Never the default packaging path.
+    # Requires both disposable key paths; refuses the production pin.
+    if fixture_signing_private_key is not None or fixture_signing_public_key is not None:
+        if fixture_signing_private_key is None or fixture_signing_public_key is None:
+            die(
+                "fixture authenticated assets require both "
+                "--fixture-signing-private-key and --fixture-signing-public-key"
+            )
+        print("== Emit fixture-only authenticated release assets (not customer release assets)")
+        from authenticated_release_assets import (  # local import keeps ordinary packaging lean
+            AuthenticatedAssetError,
+            FIXTURE_AUTH_SUBDIR,
+            emit_fixture_authenticated_assets_from_package_output,
+        )
+
+        try:
+            assets = emit_fixture_authenticated_assets_from_package_output(
+                version=version,
+                out_root=out_root,
+                private_key_path=fixture_signing_private_key,
+                public_key_path=fixture_signing_public_key,
+            )
+        except AuthenticatedAssetError as exc:
+            die(str(exc))
+        fixture_dir = out_root / FIXTURE_AUTH_SUBDIR
+        result["fixture_authenticated_assets_dir"] = str(fixture_dir)
+        result["fixture_publication_evidence_sha256"] = hashlib.sha256(
+            assets.publication_evidence
+        ).hexdigest()
+        print(f"fixture_authenticated_assets: {fixture_dir} (disposable key; not for promotion)")
+
     print("=======================================")
     return result
 
@@ -394,6 +429,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-root", type=Path, default=None)
     p.add_argument("--pinned-file", type=Path, default=None)
     p.add_argument("--no-support-zip", action="store_true", help="omit developer/support ZIP")
+    p.add_argument(
+        "--fixture-signing-private-key",
+        type=Path,
+        default=None,
+        help=(
+            "OPTIONAL fixture-only workflow: disposable OpenSSL Ed25519 private key. "
+            "Never the production pin. Writes under fixture-authenticated-assets/ only."
+        ),
+    )
+    p.add_argument(
+        "--fixture-signing-public-key",
+        type=Path,
+        default=None,
+        help=(
+            "OPTIONAL fixture-only workflow: disposable public key (64 hex + LF). "
+            "Must not be tools/release/kindle-release-public-key.hex."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -422,6 +475,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.pinned_file
             else repo / "tools" / "dropbear" / "PINNED.txt"
         )
+        fixture_priv = (
+            args.fixture_signing_private_key.resolve()
+            if args.fixture_signing_private_key
+            else None
+        )
+        fixture_pub = (
+            args.fixture_signing_public_key.resolve()
+            if args.fixture_signing_public_key
+            else None
+        )
         package(
             repo=repo,
             version=version,
@@ -430,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
             out_root=out_root,
             pinned=pinned,
             support_zip=not args.no_support_zip,
+            fixture_signing_private_key=fixture_priv,
+            fixture_signing_public_key=fixture_pub,
         )
     except PackageError as exc:
         print(f"package_release.py: {exc}", file=sys.stderr)

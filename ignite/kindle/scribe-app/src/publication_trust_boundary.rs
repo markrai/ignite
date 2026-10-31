@@ -49,6 +49,8 @@ pub enum ProductionTrustError {
     EmptyEvidence,
     PlaceholderEvidenceRefused,
     UnknownEvidenceSchema,
+    MalformedEvidence(&'static str),
+    EvidenceReleaseMismatch(&'static str),
     TagMismatch,
     EvidenceTooLarge,
 }
@@ -84,6 +86,8 @@ impl std::fmt::Display for ProductionTrustError {
             Self::UnknownEvidenceSchema => {
                 "publication evidence schema is unknown; production claims remain unvalidated"
             }
+            Self::MalformedEvidence(reason) => reason,
+            Self::EvidenceReleaseMismatch(reason) => reason,
             Self::TagMismatch => "publication binding tag does not match release-v1 tag",
             Self::EvidenceTooLarge => "publication evidence is too large",
         };
@@ -116,6 +120,7 @@ pub enum VerificationProvenance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvidenceClaimStatus {
     DigestAuthenticatedClaimsUnverified,
+    ProductionClaimsValidated,
 }
 
 /// Authenticated release-v1 + binding digests. Not an authorization grant.
@@ -209,7 +214,7 @@ pub(crate) fn authenticate_publication_chain_with_key(
 
 /// Eligibility gate for any entry that claims production publication-evidence validation.
 ///
-/// No production evidence schema is defined in this slice; every current byte pattern refuses.
+/// Accepts only the production evidence header. Full claim validation follows digest auth.
 pub fn refuse_for_production_publication_evidence(
     evidence: &[u8],
 ) -> Result<(), ProductionTrustError> {
@@ -225,8 +230,10 @@ pub fn refuse_for_production_publication_evidence(
     if evidence.starts_with(PLACEHOLDER_EVIDENCE_HEADER.as_bytes()) {
         return Err(ProductionTrustError::PlaceholderEvidenceRefused);
     }
-    // A future slice must define the production header/schema before this can succeed.
-    Err(ProductionTrustError::UnknownEvidenceSchema)
+    if !crate::publication_evidence::is_production_evidence_header(evidence) {
+        return Err(ProductionTrustError::UnknownEvidenceSchema);
+    }
+    Ok(())
 }
 
 fn authenticate_publication_chain_inner(
@@ -278,12 +285,26 @@ fn authenticate_publication_chain_inner(
         return Err(ProductionTrustError::EvidenceDigestMismatch);
     }
 
+    let evidence_claims = if crate::publication_evidence::is_production_evidence_header(
+        publication_evidence,
+    ) {
+        crate::publication_evidence::parse_and_validate_production_evidence(
+            publication_evidence,
+            Some(release.version()),
+            Some(&release.installer_sha256_hex()),
+            Some(release.installer_bytes()),
+        )?;
+        EvidenceClaimStatus::ProductionClaimsValidated
+    } else {
+        EvidenceClaimStatus::DigestAuthenticatedClaimsUnverified
+    };
+
     Ok(AuthenticatedPublicationChain {
         release,
         release_manifest_sha256: release_digest,
         publication_evidence_sha256: evidence_digest,
         provenance,
-        evidence_claims: EvidenceClaimStatus::DigestAuthenticatedClaimsUnverified,
+        evidence_claims,
     })
 }
 
@@ -438,7 +459,14 @@ pub fn production_trust_report_lines(
         Ok(auth) => {
             lines.push(publisher_authentication_line(auth.provenance()).to_string());
             lines.push("publication_evidence_digest=authenticated".to_string());
-            lines.push("publication_evidence_claims=unverified".to_string());
+            lines.push(match auth.evidence_claims() {
+                EvidenceClaimStatus::ProductionClaimsValidated => {
+                    "publication_evidence_claims=validated".to_string()
+                }
+                EvidenceClaimStatus::DigestAuthenticatedClaimsUnverified => {
+                    "publication_evidence_claims=unverified".to_string()
+                }
+            });
             lines.push(format!("release_tag={}", auth.release().tag()));
             lines.push(format!(
                 "release_manifest_sha256={}",
@@ -611,6 +639,12 @@ mod tests {
             refuse_for_production_publication_evidence(&test_scope).unwrap_err(),
             ProductionTrustError::TestOnlyEvidenceRefused
         );
+        // Production header alone is eligible; claim validation is separate.
+        let header_only = format!(
+            "{}\nschema=1\n",
+            crate::publication_evidence::EVIDENCE_HEADER
+        );
+        assert!(refuse_for_production_publication_evidence(header_only.as_bytes()).is_ok());
     }
 
     #[test]
@@ -728,5 +762,105 @@ mod tests {
             .unwrap_err(),
             ProductionTrustError::MissingSignature
         );
+    }
+
+    fn load_interop_dir() -> Option<std::path::PathBuf> {
+        std::env::var("IGNITE_PUBLICATION_INTEROP_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
+
+    fn authenticate_interop_dir(
+        dir: &std::path::Path,
+    ) -> Result<AuthenticatedPublicationChain, ProductionTrustError> {
+        let release = std::fs::read(dir.join("release.manifest")).expect("release.manifest");
+        let release_sig = std::fs::read(dir.join("release.sig")).expect("release.sig");
+        let binding = std::fs::read(dir.join("binding")).expect("binding");
+        let binding_sig = std::fs::read(dir.join("binding.sig")).expect("binding.sig");
+        let evidence = std::fs::read(dir.join("evidence")).expect("evidence");
+        let key_hex = std::fs::read_to_string(dir.join("public_key.hex")).expect("public_key.hex");
+        let tag = std::fs::read_to_string(dir.join("expected_tag"))
+            .expect("expected_tag")
+            .trim()
+            .to_string();
+        let public = decode_hex::<32>(key_hex.trim().as_bytes()).expect("public key hex");
+        assert!(
+            crate::publication_evidence::is_production_evidence_header(&evidence),
+            "host fixture must be production evidence"
+        );
+        authenticate_publication_chain_with_key(
+            &release,
+            &release_sig,
+            &binding,
+            &binding_sig,
+            &evidence,
+            &tag,
+            &public,
+        )
+    }
+
+    fn verify_interop_scriptlet(auth: &AuthenticatedPublicationChain, dir: &std::path::Path) {
+        let scriptlet_path = dir.join("scriptlet");
+        let mut file = std::fs::File::open(&scriptlet_path).expect("host Scriptlet file");
+        auth.release()
+            .verify_installer(auth.release().installer_filename(), &mut file)
+            .expect("host Scriptlet must match authenticated release-v1 identity");
+    }
+
+    /// Consumes host-produced asset bytes + the actual final Scriptlet from
+    /// `IGNITE_PUBLICATION_INTEROP_DIR`. Skipped unless the harness sets the directory.
+    #[test]
+    fn publication_interop_host_bytes() {
+        let Some(dir) = load_interop_dir() else {
+            return;
+        };
+        let auth = authenticate_interop_dir(&dir).expect("host bytes must verify");
+        assert_eq!(auth.provenance(), VerificationProvenance::TestOnlyFixtureKey);
+        assert_eq!(
+            auth.evidence_claims(),
+            EvidenceClaimStatus::ProductionClaimsValidated
+        );
+        verify_interop_scriptlet(&auth, &dir);
+        let report = production_trust_report_lines(Ok(&auth));
+        assert!(report.iter().any(|line| {
+            line == "publisher_authentication=verified-under-test-only-fixture-key"
+        }));
+        assert!(!report
+            .iter()
+            .any(|line| line == "publisher_authentication=verified-under-production-pin"));
+        assert!(report
+            .iter()
+            .any(|line| line == "publication_evidence_claims=validated"));
+        assert!(report
+            .iter()
+            .any(|line| line == "promotion_authorized=false"));
+        assert!(report
+            .iter()
+            .any(|line| line == "installation_binding=unverified"));
+    }
+
+    #[test]
+    fn publication_interop_modified_scriptlet_fails() {
+        let Some(dir) = load_interop_dir() else {
+            return;
+        };
+        if std::env::var("IGNITE_PUBLICATION_INTEROP_EXPECT")
+            .unwrap_or_default()
+            != "modified-scriptlet"
+        {
+            return;
+        }
+        let auth = authenticate_interop_dir(&dir).expect("metadata must still authenticate");
+        let scriptlet_path = dir.join("scriptlet");
+        let mut file = std::fs::File::open(&scriptlet_path).expect("scriptlet");
+        let err = auth
+            .release()
+            .verify_installer(auth.release().installer_filename(), &mut file)
+            .expect_err("modified Scriptlet must fail streaming verification");
+        assert!(matches!(
+            err,
+            crate::release_manifest::ReleaseVerifyError::ArtifactDigestMismatch
+                | crate::release_manifest::ReleaseVerifyError::ArtifactByteCountMismatch
+        ));
     }
 }
