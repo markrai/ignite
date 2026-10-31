@@ -6,6 +6,7 @@ rollback, or first-launch admission.
 
 Related: [`kindle-installed-slot-binding.md`](kindle-installed-slot-binding.md),
 [`kindle-release-component-profiles.md`](kindle-release-component-profiles.md),
+[`kindle-authenticated-publication-evidence.md`](kindle-authenticated-publication-evidence.md),
 [`kindle-pending-health-and-lkg.md`](kindle-pending-health-and-lkg.md) (if present).
 
 ## 1. Source-verified installer operation sequence
