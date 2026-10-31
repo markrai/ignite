@@ -60,6 +60,7 @@ pub mod prefs;
 pub mod pressure;
 pub mod pressure_curve;
 pub mod profile;
+pub mod publication_trust_boundary;
 pub mod release_manifest;
 pub mod render;
 #[cfg(unix)]
