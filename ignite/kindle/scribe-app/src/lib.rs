@@ -62,6 +62,7 @@ pub mod pressure_curve;
 pub mod profile;
 pub mod publication_evidence;
 pub mod publication_trust_boundary;
+pub mod release_acquisition;
 pub mod release_manifest;
 pub mod render;
 #[cfg(unix)]
@@ -99,6 +100,7 @@ mod sync_recovery_supervise;
 mod sync_recovery_tail;
 mod sync_recovery_tunnel;
 mod sync_startup_diag;
+pub mod verified_update_staging;
 #[cfg(feature = "kindle_supervisor_harness")]
 pub use kindle_supervisor_harness::run as run_kindle_supervisor_harness;
 #[cfg(test)]

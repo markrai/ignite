@@ -81,6 +81,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    match scribe_app::verified_update_staging::parse_command(&args) {
+        Ok(scribe_app::verified_update_staging::StageCommand::Stage(request)) => {
+            return stage_verified_update(request);
+        }
+        Ok(scribe_app::verified_update_staging::StageCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     scribe_app::launch_clock::mark("process_entry");
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -219,6 +229,15 @@ Options:
                         Attempt a bounded, read-only acquisition of pre-existing coordination
                         locks and report coverage gaps. Never creates lock files, starts recovery,
                         claims an atomic snapshot, or authorizes candidate execution.
+  --stage-verified-update --expected-tag vX.Y.Z
+       --github-release owner/repo | --fixture-assets-dir PATH
+       [--staging-root PATH] [--fixture-public-key HEX_PATH]
+                        Download/stage the six publication assets and authenticate them with the
+                        existing publication trust chain. Never executes the Scriptlet, never
+                        installs, activates, or promotes. Fixture mode requires an explicit
+                        --fixture-public-key and remains test-only provenance. Production mode
+                        fails closed while the pin is UNPROVISIONED. Default staging root:
+                        /mnt/us/scribe-app/state/verified-update
   --inspect-compatibility-preflight --app-root APP --data-dir LIBRARY --sync-dir SYNC
                         --device-dir DEVICE --state-dir STATE
                         Hash a bounded fixed-root inventory, run the existing read-only library and
@@ -343,6 +362,19 @@ fn inspect_storage_external(
         return ExitCode::FAILURE;
     }
     ExitCode::from(report.exit_code())
+}
+
+fn stage_verified_update(request: scribe_app::verified_update_staging::StageRequest) -> ExitCode {
+    match scribe_app::verified_update_staging::stage_verified_update(&request) {
+        Ok(result) => {
+            scribe_app::verified_update_staging::emit_stage_report(&result);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("stage-verified-update: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn inspect_release_provenance(

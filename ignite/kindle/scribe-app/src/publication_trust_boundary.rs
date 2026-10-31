@@ -285,19 +285,18 @@ fn authenticate_publication_chain_inner(
         return Err(ProductionTrustError::EvidenceDigestMismatch);
     }
 
-    let evidence_claims = if crate::publication_evidence::is_production_evidence_header(
-        publication_evidence,
-    ) {
-        crate::publication_evidence::parse_and_validate_production_evidence(
-            publication_evidence,
-            Some(release.version()),
-            Some(&release.installer_sha256_hex()),
-            Some(release.installer_bytes()),
-        )?;
-        EvidenceClaimStatus::ProductionClaimsValidated
-    } else {
-        EvidenceClaimStatus::DigestAuthenticatedClaimsUnverified
-    };
+    let evidence_claims =
+        if crate::publication_evidence::is_production_evidence_header(publication_evidence) {
+            crate::publication_evidence::parse_and_validate_production_evidence(
+                publication_evidence,
+                Some(release.version()),
+                Some(&release.installer_sha256_hex()),
+                Some(release.installer_bytes()),
+            )?;
+            EvidenceClaimStatus::ProductionClaimsValidated
+        } else {
+            EvidenceClaimStatus::DigestAuthenticatedClaimsUnverified
+        };
 
     Ok(AuthenticatedPublicationChain {
         release,
@@ -357,9 +356,8 @@ fn parse_binding(bytes: &[u8]) -> Result<AuthenticatedBinding, ProductionTrustEr
             "binding must be canonical ASCII/LF",
         ));
     }
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        ProductionTrustError::MalformedBinding("binding contains non-UTF8 bytes")
-    })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ProductionTrustError::MalformedBinding("binding contains non-UTF8 bytes"))?;
     let lines: Vec<&str> = text[..text.len() - 1].split('\n').collect();
     if lines.len() != 8 {
         return Err(ProductionTrustError::MalformedBinding(
@@ -413,9 +411,10 @@ fn parse_binding(bytes: &[u8]) -> Result<AuthenticatedBinding, ProductionTrustEr
 }
 
 fn require_prefix<'a>(line: &'a str, prefix: &str) -> Result<&'a str, ProductionTrustError> {
-    line.strip_prefix(prefix).ok_or(ProductionTrustError::MalformedBinding(
-        "binding field missing",
-    ))
+    line.strip_prefix(prefix)
+        .ok_or(ProductionTrustError::MalformedBinding(
+            "binding field missing",
+        ))
 }
 
 fn require_sha(line: &str, prefix: &str) -> Result<[u8; 32], ProductionTrustError> {
@@ -591,7 +590,10 @@ mod tests {
             &public,
         )
         .expect("valid digest-bound chain under fixture key");
-        assert_eq!(auth.provenance(), VerificationProvenance::TestOnlyFixtureKey);
+        assert_eq!(
+            auth.provenance(),
+            VerificationProvenance::TestOnlyFixtureKey
+        );
         assert_eq!(
             auth.evidence_claims(),
             EvidenceClaimStatus::DigestAuthenticatedClaimsUnverified
@@ -815,7 +817,10 @@ mod tests {
             return;
         };
         let auth = authenticate_interop_dir(&dir).expect("host bytes must verify");
-        assert_eq!(auth.provenance(), VerificationProvenance::TestOnlyFixtureKey);
+        assert_eq!(
+            auth.provenance(),
+            VerificationProvenance::TestOnlyFixtureKey
+        );
         assert_eq!(
             auth.evidence_claims(),
             EvidenceClaimStatus::ProductionClaimsValidated
@@ -844,8 +849,7 @@ mod tests {
         let Some(dir) = load_interop_dir() else {
             return;
         };
-        if std::env::var("IGNITE_PUBLICATION_INTEROP_EXPECT")
-            .unwrap_or_default()
+        if std::env::var("IGNITE_PUBLICATION_INTEROP_EXPECT").unwrap_or_default()
             != "modified-scriptlet"
         {
             return;

@@ -143,9 +143,8 @@ pub fn parse_and_validate_production_evidence(
     {
         return Err(ProductionTrustError::TestOnlyEvidenceRefused);
     }
-    let text = std::str::from_utf8(raw).map_err(|_| {
-        ProductionTrustError::MalformedEvidence("evidence contains non-UTF8 bytes")
-    })?;
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| ProductionTrustError::MalformedEvidence("evidence contains non-UTF8 bytes"))?;
     if !text.ends_with('\n') {
         return Err(ProductionTrustError::MalformedEvidence(
             "evidence must end with LF",
@@ -313,9 +312,11 @@ fn parse_component_line(
     line: &str,
     contract: &ComponentContract,
 ) -> Result<ValidatedComponentClaim, ProductionTrustError> {
-    let body = line.strip_prefix("component=").ok_or(
-        ProductionTrustError::MalformedEvidence("component line missing"),
-    )?;
+    let body = line
+        .strip_prefix("component=")
+        .ok_or(ProductionTrustError::MalformedEvidence(
+            "component line missing",
+        ))?;
     let parts: Vec<&str> = body.split('|').collect();
     if parts.len() != 7 {
         return Err(ProductionTrustError::MalformedEvidence(
@@ -408,9 +409,10 @@ fn parse_component_line(
 }
 
 fn require_field<'a>(line: &'a str, prefix: &str) -> Result<&'a str, ProductionTrustError> {
-    line.strip_prefix(prefix).ok_or(ProductionTrustError::MalformedEvidence(
-        "evidence field missing",
-    ))
+    line.strip_prefix(prefix)
+        .ok_or(ProductionTrustError::MalformedEvidence(
+            "evidence field missing",
+        ))
 }
 
 fn parse_u64_canonical(token: &str) -> Option<u64> {
@@ -431,6 +433,84 @@ pub fn embedded_contract_digest_hex() -> String {
 
 pub fn embedded_contract_role_count() -> usize {
     contracts().len()
+}
+
+/// Build a canonical production-format evidence document for fixture staging tests.
+///
+/// Required roles are present as tiny synthetic files; optional roles are absent;
+/// absent-only roles stay absent. The result validates under
+/// [`parse_and_validate_production_evidence`].
+pub(crate) fn build_minimal_production_evidence(
+    version: &str,
+    scriptlet_bytes: u64,
+    scriptlet_sha256: &str,
+    package_profile_sha256: &str,
+) -> Result<Vec<u8>, ProductionTrustError> {
+    if !valid_release_version(version) {
+        return Err(ProductionTrustError::MalformedEvidence(
+            "noncanonical version",
+        ));
+    }
+    if decode_hex::<32>(scriptlet_sha256.as_bytes()).is_none() {
+        return Err(ProductionTrustError::MalformedEvidence(
+            "noncanonical scriptlet_sha256",
+        ));
+    }
+    if decode_hex::<32>(package_profile_sha256.as_bytes()).is_none() {
+        return Err(ProductionTrustError::MalformedEvidence(
+            "noncanonical package_profile_sha256",
+        ));
+    }
+    if scriptlet_bytes == 0 {
+        return Err(ProductionTrustError::MalformedEvidence(
+            "scriptlet_bytes out of bounds",
+        ));
+    }
+    let file_digest = {
+        use sha2::{Digest, Sha256};
+        encode_hex(&Sha256::digest(b"fixture-component-bytes"))
+    };
+    let mut components = Vec::new();
+    for contract in contracts() {
+        let claim = match contract.presence_policy {
+            PackagePresencePolicy::Required => ValidatedComponentClaim {
+                role: contract.role.to_string(),
+                presence: "file".into(),
+                size: 4,
+                sha256: file_digest.clone(),
+                classification: contract.classification.to_string(),
+                mode: contract.present_mode.to_string(),
+                mapping: contract.mapping.to_string(),
+            },
+            PackagePresencePolicy::Optional | PackagePresencePolicy::AbsentOnly => {
+                ValidatedComponentClaim {
+                    role: contract.role.to_string(),
+                    presence: "absent".into(),
+                    size: 0,
+                    sha256: "-".into(),
+                    classification: contract.classification.to_string(),
+                    mode: "-".into(),
+                    mapping: contract.mapping.to_string(),
+                }
+            }
+        };
+        components.push(claim);
+    }
+    let raw = rebuild_canonical(
+        version,
+        scriptlet_bytes,
+        scriptlet_sha256,
+        package_profile_sha256,
+        &components,
+    );
+    // Self-check so fixture builders cannot drift from the validator.
+    parse_and_validate_production_evidence(
+        raw.as_bytes(),
+        Some(version),
+        Some(scriptlet_sha256),
+        Some(scriptlet_bytes),
+    )?;
+    Ok(raw.into_bytes())
 }
 
 #[cfg(test)]
