@@ -58,8 +58,10 @@ Rules:
 - Exactly the six publication assets; duplicates and unexpected names refuse.
 - GitHub metadata is **not** publisher authentication.
 
-While authenticated assets are not yet in the promote six, production GitHub
-acquisition remains fail-closed on verification (`UNPROVISIONED` pin). Fixture
+Production GitHub acquisition remains fail-closed while the pin is
+`UNPROVISIONED`. Promote now requires the authenticated six-asset Kindle bundle
+(see [`kindle-authenticated-release-publication.md`](kindle-authenticated-release-publication.md))
+but will not publish until the pin and offline ceremony are provisioned. Fixture
 rehearsal uses `--fixture-assets-dir` + explicit `--fixture-public-key` only.
 
 ## 4. Verification sequence
@@ -184,8 +186,8 @@ bytes transfer.
 - `/mnt/us` VFAT/FSP lacks robust symlink semantics; staging refuses symlinks.
 - Directory rename atomicity is best-effort on FSP; the published `STAGING_RECORD`
   is the readiness gate.
-- Official GitHub publication of the full six authenticated assets is still a
-  promote-path gap; fixture staging proves the device verification pipeline.
+- Official GitHub publication of the full six authenticated assets remains blocked
+  on pin provisioning; promote preflight/gate is covered by slice 3k.
   HTTPS hop-by-hop redirect policy is covered by host transport-decision tests
   (allowed CDN hops, forbidden hosts, HTTP downgrade, loops). A live GitHub
   download was not exercised because authenticated assets are not yet promoted.
@@ -193,10 +195,10 @@ bytes transfer.
 
 ## 10. Remaining blockers before installation authorization
 
-1. Provision production Ed25519 pin (out of scope for 3i).
-2. Extend promote/publish to include publication-evidence + binding assets.
-3. Installation authorization gate: see
+1. Provision production Ed25519 pin and complete the offline six-asset ceremony
+   (see [`kindle-authenticated-release-publication.md`](kindle-authenticated-release-publication.md)).
+2. Installation authorization gate: see
    [`kindle-installation-authorization.md`](kindle-installation-authorization.md)
    (3j). Staging observations alone still never authorize install.
-4. A/B activation, Scriptlet execution, and recovery remain unchanged and unused
+3. A/B activation, Scriptlet execution, and recovery remain unchanged and unused
    by this slice.

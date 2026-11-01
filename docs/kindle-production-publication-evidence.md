@@ -170,8 +170,11 @@ qualification boundary.
 
 ## 10. Remaining blockers
 
-1. Provision real production Ed25519 public key.
-2. Wire promotion CI to emit evidence + binding (still fail-closed today).
-3. Kindle download/staging path.
-4. Authorization gates (install / launch / promotion / rollback).
-5. Hardware ARMv7 confirmation of the production evidence validator.
+1. Provision real production Ed25519 public key (maintainer ceremony; see
+   [`kindle-authenticated-release-publication.md`](kindle-authenticated-release-publication.md)).
+2. Complete offline handoff of evidence + binding into promote
+   (`IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR`). Preflight/gate exists; production
+   publication remains fail-closed while the pin is `UNPROVISIONED`.
+3. Decide CI retention of packaging measurement inputs for the offline ceremony.
+4. Hardware ARMv7 confirmation of the production evidence validator.
+5. First real authenticated GitHub Release after pin provisioning.

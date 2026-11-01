@@ -5,15 +5,32 @@
 #   promote-release.sh guard     repository / event / confirm
 #   promote-release.sh resolve   designated CI workflow on main, version match
 #   promote-release.sh fetch     download Kindle + Linux artifacts from that run
-#   promote-release.sh verify    four CI files + authenticated Kindle metadata
-#   promote-release.sh publish   re-verify, then create a six-asset GitHub Release
+#   promote-release.sh verify    CI files + release-v1 + authenticated six-asset gate
+#   promote-release.sh dry-run   guard → resolve → fetch → verify (no GitHub mutation)
+#   promote-release.sh publish   re-verify, then create the GitHub Release
 #   promote-release.sh all       guard → resolve → fetch → verify → publish
+#
+# Authenticated Kindle publication (Slice 3k) additionally requires offline
+# ceremony outputs under IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR:
+#   ignite-kindle-vX.Y.Z.publication-evidence
+#   ignite-kindle-vX.Y.Z.publication-binding
+#   ignite-kindle-vX.Y.Z.publication-binding.sig
+#
+# verify() stages the complete nine-file candidate into $DIST, authenticates the
+# six Kindle assets from that staged candidate (repository pin only), and writes
+# a SHA-256 inventory. publish rechecks the inventory immediately before
+# gh release create. Staging+inventory is not race-free against a hostile
+# concurrent writer between the final recheck and upload.
+#
+# Production promotion remains blocked while the public-key pin is UNPROVISIONED.
+# Fixture rehearsal is not publication authority. No alternate verifier or
+# public-key substitution is accepted on the shipping path.
 #
 # Environment (tokens never on argv): IGNITE_PROMOTE_TAG, IGNITE_PROMOTE_RUN_ID,
 # IGNITE_PROMOTE_COMMIT, IGNITE_PROMOTE_CONFIRM, IGNITE_PROMOTE_KINDLE_SHA256,
 # IGNITE_PROMOTE_LINUX_SHA256, IGNITE_PROMOTE_KINDLE_SIGNATURE,
-# IGNITE_PROMOTE_WORK, GH_TOKEN, GITHUB_REPOSITORY,
-# GITHUB_EVENT_NAME, GITHUB_REF.
+# IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR, IGNITE_PROMOTE_WORK, GH_TOKEN,
+# GITHUB_REPOSITORY, GITHUB_EVENT_NAME, GITHUB_REF.
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
@@ -35,6 +52,7 @@ CONFIRM="${IGNITE_PROMOTE_CONFIRM:-}"
 KINDLE_SHA="${IGNITE_PROMOTE_KINDLE_SHA256:-}"
 LINUX_SHA="${IGNITE_PROMOTE_LINUX_SHA256:-}"
 KINDLE_SIGNATURE="${IGNITE_PROMOTE_KINDLE_SIGNATURE:-}"
+AUTH_ASSETS_DIR="${IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR:-}"
 WORK="${IGNITE_PROMOTE_WORK:-}"
 
 VERSION="$(python3 "$SIGN_TOOL" version --tag "$TAG")" \
@@ -53,7 +71,92 @@ LINUX_SUM="$LINUX.sha256"
 DIST="$WORK/dist"
 MANIFEST="ignite-kindle-v$VERSION.manifest"
 MANIFEST_SIG="$MANIFEST.sig"
+EVIDENCE="ignite-kindle-v$VERSION.publication-evidence"
+BINDING="ignite-kindle-v$VERSION.publication-binding"
+BINDING_SIG="$BINDING.sig"
 AUTH_DIR="$WORK/authenticated-metadata"
+PREFLIGHT="$ROOT/deployment/kindle/authenticated_publication_preflight.py"
+INVENTORY="$WORK/release-candidate.sha256"
+# Test-harness only: if present, names a deterministic mutation applied after
+# staging and before authentication / before publish. Shipping never creates it.
+TEST_HOOK_STAGED="$WORK/.promote-test-mutate-staged"
+TEST_HOOK_PUBLISH="$WORK/.promote-test-mutate-before-publish"
+
+_expected_dist_list() {
+  printf '%s\n' \
+    "$SFX" "$SFX_SUM" \
+    "$MANIFEST" "$MANIFEST_SIG" \
+    "$BINDING" "$BINDING_SIG" "$EVIDENCE" \
+    "$LINUX" "$LINUX_SUM" | LC_ALL=C sort
+}
+
+_refuse_symlinks_in_dist() {
+  local f
+  for f in "$DIST"/*; do
+    [ -e "$f" ] || continue
+    if [ -L "$f" ]; then
+      die "symlink refused in release candidate: $(basename "$f")"
+    fi
+    if [ ! -f "$f" ]; then
+      die "non-regular file refused in release candidate: $(basename "$f")"
+    fi
+  done
+}
+
+_write_release_inventory() {
+  local name
+  _refuse_symlinks_in_dist
+  [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(_expected_dist_list)" ] \
+    || die "release candidate file set mismatch before inventory"
+  : >"$INVENTORY"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    (cd "$DIST" && sha256sum -- "$name") >>"$INVENTORY"
+  done < <(_expected_dist_list)
+  echo "inventory: wrote $INVENTORY"
+}
+
+_recheck_release_inventory() {
+  [ -f "$INVENTORY" ] || die "release candidate inventory missing"
+  _refuse_symlinks_in_dist
+  [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(_expected_dist_list)" ] \
+    || die "release candidate file set changed before publication"
+  (cd "$DIST" && sha256sum -c "$INVENTORY") \
+    || die "release candidate bytes changed since authentication inventory"
+}
+
+_apply_test_hook() {
+  local hook="$1"
+  local action
+  [ -f "$hook" ] || return 0
+  action="$(tr -d '\r\n' <"$hook")"
+  rm -f "$hook"
+  case "$action" in
+    evidence)
+      printf '\n#promote-test-mutate\n' >>"$DIST/$EVIDENCE"
+      echo "promote-test-hook: mutated staged evidence"
+      ;;
+    binding-sig)
+      printf '\n#promote-test-mutate\n' >>"$DIST/$BINDING_SIG"
+      echo "promote-test-hook: mutated staged binding signature"
+      ;;
+    scriptlet)
+      printf '\n#promote-test-mutate\n' >>"$DIST/$SFX"
+      echo "promote-test-hook: mutated staged Scriptlet"
+      ;;
+    binding)
+      printf '\n#promote-test-mutate\n' >>"$DIST/$BINDING"
+      echo "promote-test-hook: mutated staged binding"
+      ;;
+    extra-file)
+      printf 'stray\n' >"$DIST/extra-file.txt"
+      echo "promote-test-hook: added unexpected staged file"
+      ;;
+    *)
+      die "unknown promote test hook action: ${action:-none}"
+      ;;
+  esac
+}
 
 guard() {
   [ "${GITHUB_REPOSITORY:-}" = "$REPO" ] || die "publishing runs only in $REPO (got ${GITHUB_REPOSITORY:-none})"
@@ -176,22 +279,49 @@ verify() {
     --output-dir "$AUTH_DIR" \
     || die "Kindle release metadata signature verification failed"
 
+  [ -n "$AUTH_ASSETS_DIR" ] \
+    || die "IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR is required for authenticated Kindle publication"
+  [ -d "$AUTH_ASSETS_DIR" ] \
+    || die "authenticated assets directory missing: $AUTH_ASSETS_DIR"
+  for req in "$EVIDENCE" "$BINDING" "$BINDING_SIG"; do
+    [ -f "$AUTH_ASSETS_DIR/$req" ] \
+      || die "missing offline authenticated asset: $req"
+    [ ! -L "$AUTH_ASSETS_DIR/$req" ] \
+      || die "symlink refused for offline authenticated asset: $req"
+  done
+
   [ "$source_hashes" = "$(sha256sum \
     "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" \
     "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM")" ] \
     || die "source CI artifacts changed during verification"
 
-  rm -rf "$DIST"
+  # Stage the complete publication candidate first, then authenticate those bytes.
+  rm -rf "$DIST" "$INVENTORY"
   mkdir -p "$DIST"
   cp -a \
     "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" \
     "$AUTH_DIR/$MANIFEST" "$AUTH_DIR/$MANIFEST_SIG" \
+    "$AUTH_ASSETS_DIR/$EVIDENCE" \
+    "$AUTH_ASSETS_DIR/$BINDING" \
+    "$AUTH_ASSETS_DIR/$BINDING_SIG" \
     "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM" \
     "$DIST/"
-  [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(printf '%s\n' \
-      "$SFX" "$SFX_SUM" "$MANIFEST" "$MANIFEST_SIG" "$LINUX" "$LINUX_SUM")" ] \
-    || die "staging dist does not contain exactly the six release assets"
-  echo "verify: four CI assets unchanged; authenticated metadata staged"
+  [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(_expected_dist_list)" ] \
+    || die "staging dist does not contain the authenticated Kindle bundle plus Linux pair"
+
+  # Deterministic harness mutation after staging / before authentication.
+  _apply_test_hook "$TEST_HOOK_STAGED"
+
+  # Authenticate the staged Kindle six under this tree's repository pin only.
+  python3 "$PREFLIGHT" promote-gate \
+    --release-candidate-dir "$DIST" \
+    --tag "$TAG" \
+    --source-revision "$COMMIT" \
+    --expected-workflow "$CI_WORKFLOW" \
+    || die "authenticated Kindle publication preflight refused"
+
+  _write_release_inventory
+  echo "verify: CI assets unchanged; staged candidate authenticated; inventory recorded"
 }
 
 # Sets GH_HTTP_CODE / GH_HTTP_BODY from `gh api`. Returns 0 on HTTP 200, 1 on
@@ -261,6 +391,9 @@ _publish_verified() {
     [ "$TAG_COMMIT" = "$COMMIT" ] \
       || die "git tag $TAG points at $TAG_COMMIT, not recorded commit $COMMIT"
   fi
+  # Deterministic harness mutation immediately before the inventory recheck.
+  _apply_test_hook "$TEST_HOOK_PUBLISH"
+  _recheck_release_inventory
   pre=()
   case "$TAG" in *-*) pre=(--prerelease) ;; esac
   notes="$WORK/notes.md"
@@ -268,7 +401,8 @@ _publish_verified() {
 Ignite $VERSION
 
 **Kindle application (primary):** \`$SFX\` and \`$SFX_SUM\`.
-Authenticated updater metadata: \`$MANIFEST\` and \`$MANIFEST_SIG\`.
+Authenticated updater metadata: \`$MANIFEST\`, \`$MANIFEST_SIG\`,
+\`$EVIDENCE\`, \`$BINDING\`, and \`$BINDING_SIG\`.
 Copy the installer into the Kindle Documents folder over USB. See [deployment/kindle/README.txt](https://github.com/markrai/ignite/blob/main/deployment/kindle/README.txt).
 
 **Optional Ignite Server (Linux x86_64):** \`$LINUX\` and \`$LINUX_SUM\`.
@@ -291,6 +425,17 @@ publish() {
   _publish_verified
 }
 
+dry_run() {
+  # Read-only against GitHub mutation: resolve/fetch are GETs; never release create.
+  guard
+  resolve
+  fetch
+  verify
+  echo "dry-run: would publish $TAG from run $RUN_ID commit $COMMIT with:"
+  ls -1 "$DIST" | LC_ALL=C sort | sed 's/^/  /'
+  echo "dry-run: no GitHub release create performed"
+}
+
 all() {
   guard
   resolve
@@ -304,7 +449,8 @@ case "${1:-}" in
   resolve) resolve ;;
   fetch) fetch ;;
   verify) verify ;;
+  dry-run) dry_run ;;
   publish) publish ;;
   all) all ;;
-  *) die "usage: $0 guard|resolve|fetch|verify|publish|all" ;;
+  *) die "usage: $0 guard|resolve|fetch|verify|dry-run|publish|all" ;;
 esac

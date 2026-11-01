@@ -1,5 +1,9 @@
 # Promote previously built CI artifacts to a GitHub Release without rebuilding.
 # Publication requires successful CI, recorded artifact identity, and authenticated promotion.
+# Slice 3k: also requires offline evidence+binding under
+# IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR and a provisioned production pin.
+# While tools/release/kindle-release-public-key.hex remains UNPROVISIONED, verify
+# refuses and no Release is created. Fixture-signed assets never qualify.
 # Inputs reach shell steps through env only, never through ${{ }} inside run scripts.
 name: Promote release
 

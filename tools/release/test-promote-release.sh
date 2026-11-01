@@ -77,10 +77,15 @@ openssl pkey -in "$TEST_PRIVATE_KEY" -pubout -outform DER -out "$TEST_PUBLIC_DER
 { tail -c 32 "$TEST_PUBLIC_DER" | od -An -v -tx1 | tr -d ' \n'; printf '\n'; } >"$TEST_PUBLIC_PIN"
 TEST_REPOSITORY="$T/repository"
 PUB_RUN="$TEST_REPOSITORY/tools/release/promote-release.sh"
-mkdir -p "$TEST_REPOSITORY/tools/release"
+mkdir -p "$TEST_REPOSITORY/tools/release" "$TEST_REPOSITORY/deployment"
 cp "$PUB" "$PUB_RUN"
 cp "$ROOT/tools/release/kindle_release_sign.py" "$TEST_REPOSITORY/tools/release/"
 cp "$TEST_PUBLIC_PIN" "$TEST_REPOSITORY/tools/release/kindle-release-public-key.hex"
+# Isolated harness tree: preflight uses THIS tree's pin (disposable), never a
+# shipping-path public-key or PREFLIGHT override. Fixture emitter stays test-only.
+cp -a "$ROOT/deployment/kindle" "$TEST_REPOSITORY/deployment/"
+AUTH_OFFLINE="$T/authenticated-offline"
+FIXTURE_EMIT="$ROOT/deployment/kindle/test_emit_fixture_offline_metadata.py"
 
 cat >"$MOCK/gh" <<'SH'
 #!/usr/bin/env bash
@@ -192,6 +197,17 @@ reset() {
     --output-dir "$T/signing")" || fail "could not create disposable promotion signature"
   KINDLE_SIGNATURE="$(printf '%s\n' "$sign_output" | sed -n 's/^signature_hex=//p')"
   [[ "$KINDLE_SIGNATURE" =~ ^[0-9a-f]{128}$ ]] || fail "disposable signature is malformed"
+  rm -rf "$AUTH_OFFLINE" "$T/offline-work"
+  mkdir -p "$AUTH_OFFLINE" "$T/offline-work"
+  "$PYTHON_REAL" "$FIXTURE_EMIT" \
+    --installer "$T/arts/ignite-kindle-release/Install Ignite v$V.sh" \
+    --tag "$TAG" \
+    --private-key "$TEST_PRIVATE_KEY" \
+    --public-key "$TEST_PUBLIC_PIN" \
+    --output-dir "$AUTH_OFFLINE" \
+    --work-dir "$T/offline-work" \
+    >/dev/null \
+    || fail "could not emit fixture-only offline authenticated metadata"
 }
 
 run() {
@@ -212,6 +228,7 @@ run() {
     IGNITE_PROMOTE_KINDLE_SHA256="$KINDLE_SHA"
     IGNITE_PROMOTE_KINDLE_SIGNATURE="$KINDLE_SIGNATURE"
     IGNITE_PROMOTE_LINUX_SHA256="$LINUX_SHA"
+    IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR="$AUTH_OFFLINE"
     IGNITE_PROMOTE_WORK="$T/work"
   )
   set +e
@@ -304,13 +321,16 @@ source_after="$(sha256sum \
   "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz" \
   "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz.sha256")"
 [ "$source_before" = "$source_after" ] || fail "verification changed an original CI artifact"
-[ "$(find "$T/work/dist" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6 ] \
-  || fail "verification must stage exactly six release assets"
+[ "$(find "$T/work/dist" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 9 ] \
+  || fail "verification must stage the authenticated Kindle bundle plus Linux pair"
 for asset in \
   "Install Ignite v$V.sh" \
   "Install Ignite v$V.sha256" \
   "ignite-kindle-v$V.manifest" \
   "ignite-kindle-v$V.manifest.sig" \
+  "ignite-kindle-v$V.publication-evidence" \
+  "ignite-kindle-v$V.publication-binding" \
+  "ignite-kindle-v$V.publication-binding.sig" \
   "ignite-server-$V-linux-x86_64.tar.gz" \
   "ignite-server-$V-linux-x86_64.tar.gz.sha256"; do
   [ -f "$T/work/dist/$asset" ] || fail "staged release is missing $asset"
@@ -337,7 +357,32 @@ case "${KINDLE_SIGNATURE: -1}" in
 esac
 run v-bad-auth verify IGNITE_PROMOTE_KINDLE_SIGNATURE="$BAD_SIGNATURE"; \
   refused v-bad-auth "signature verification failed"
-pass "verify: original four CI files are unchanged; only valid authenticated metadata makes six assets"
+reset; run f-ok fetch; ok f-ok
+run v-no-authdir verify IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR=; \
+  refused v-no-authdir "IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR is required"
+reset; run f-ok fetch; ok f-ok
+rm -f "$AUTH_OFFLINE/ignite-kindle-v$V.publication-evidence"
+run v-no-evidence verify; refused v-no-evidence "missing offline authenticated asset"
+[ ! -f "$T/publish.log" ] || fail "incomplete authenticated bundle reached publication"
+reset; run f-ok fetch; ok f-ok
+printf 'evidence\n' >"$T/work/.promote-test-mutate-staged"
+run v-mut-evidence verify; refused v-mut-evidence "preflight refused"
+[ ! -f "$T/publish.log" ] || fail "mutated staged evidence reached publication"
+reset; run f-ok fetch; ok f-ok
+printf 'binding-sig\n' >"$T/work/.promote-test-mutate-staged"
+run v-mut-bindsig verify; refused v-mut-bindsig "preflight refused"
+[ ! -f "$T/publish.log" ] || fail "mutated binding signature reached publication"
+reset; run f-ok fetch; ok f-ok
+printf 'scriptlet\n' >"$T/work/.promote-test-mutate-staged"
+run v-mut-scriptlet verify; refused v-mut-scriptlet "preflight refused"
+[ ! -f "$T/publish.log" ] || fail "mutated Scriptlet reached publication"
+# Shipping-path verifier substitution must never be accepted.
+reset; run f-ok fetch; ok f-ok
+run v-preflight-override verify \
+  IGNITE_PROMOTE_PREFLIGHT="$ROOT/deployment/kindle/authenticated_publication_preflight.py"
+refused v-preflight-override "IGNITE_PROMOTE_PREFLIGHT"
+[ ! -f "$T/publish.log" ] || fail "PREFLIGHT override reached publication"
+pass "verify: CI bytes unchanged; staged candidate authenticated; mutations refuse"
 
 reset
 run f-ok fetch; ok f-ok
@@ -378,6 +423,9 @@ for asset in \
   "Install Ignite v$V.sha256" \
   "ignite-kindle-v$V.manifest" \
   "ignite-kindle-v$V.manifest.sig" \
+  "ignite-kindle-v$V.publication-evidence" \
+  "ignite-kindle-v$V.publication-binding" \
+  "ignite-kindle-v$V.publication-binding.sig" \
   "ignite-server-$V-linux-x86_64.tar.gz" \
   "ignite-server-$V-linux-x86_64.tar.gz.sha256"; do
   grep -qF "$asset" "$T/publish.log" || fail "published release is missing $asset"
@@ -386,6 +434,64 @@ done
 touch "$T/release-exists"
 run p-exists publish; refused p-exists "already exists; its assets are not replaced"
 pass "publish: creates release at recorded commit; never replaces"
+
+# Staged candidate mutated after inventory: refuse before gh release create.
+reset
+run f-ok fetch; ok f-ok
+run v-ok2 verify; ok v-ok2
+rm -f "$T/publish.log"
+printf 'evidence\n' >"$T/work/.promote-test-mutate-before-publish"
+run p-mut-evidence publish; refused p-mut-evidence "changed since authentication"
+[ ! -f "$T/publish.log" ] || fail "post-inventory evidence mutation reached gh release create"
+reset
+run f-ok fetch; ok f-ok
+run v-ok3 verify; ok v-ok3
+rm -f "$T/publish.log"
+printf 'scriptlet\n' >"$T/work/.promote-test-mutate-before-publish"
+run p-mut-scriptlet publish; refused p-mut-scriptlet "changed since authentication"
+[ ! -f "$T/publish.log" ] || fail "post-inventory Scriptlet mutation reached gh release create"
+reset
+run f-ok fetch; ok f-ok
+run v-ok4 verify; ok v-ok4
+rm -f "$T/publish.log"
+printf 'binding\n' >"$T/work/.promote-test-mutate-before-publish"
+run p-mut-binding publish; refused p-mut-binding "changed since authentication"
+[ ! -f "$T/publish.log" ] || fail "post-inventory binding mutation reached gh release create"
+# Extra staged file refuses at inventory recheck (hook applied inside publish).
+reset
+run f-ok fetch; ok f-ok
+rm -f "$T/publish.log"
+printf 'extra-file\n' >"$T/work/.promote-test-mutate-before-publish"
+run p-extra publish; refused p-extra "file set changed"
+[ ! -f "$T/publish.log" ] || fail "extra staged file reached gh release create"
+pass "publish: inventory recheck refuses mutated or inconsistent staged candidates"
+
+reset
+run d-ok dry-run; ok d-ok
+grep -q "no GitHub release create performed" "$T/d-ok.out" \
+  || fail "dry-run must state that no release create occurred"
+[ ! -f "$T/publish.log" ] || fail "dry-run must not call gh release create"
+[ "$(find "$T/work/dist" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 9 ] \
+  || fail "dry-run must stage the authenticated bundle"
+inv1="$(cat "$T/work/release-candidate.sha256")"
+# Unchanged staged candidate: recomputed inventory must match the authenticated one.
+: >"$T/work/release-candidate.recheck.sha256"
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  (cd "$T/work/dist" && sha256sum -- "$name") >>"$T/work/release-candidate.recheck.sha256"
+done < <(printf '%s\n' \
+  "Install Ignite v$V.sh" \
+  "Install Ignite v$V.sha256" \
+  "ignite-kindle-v$V.manifest" \
+  "ignite-kindle-v$V.manifest.sig" \
+  "ignite-kindle-v$V.publication-binding" \
+  "ignite-kindle-v$V.publication-binding.sig" \
+  "ignite-kindle-v$V.publication-evidence" \
+  "ignite-server-$V-linux-x86_64.tar.gz" \
+  "ignite-server-$V-linux-x86_64.tar.gz.sha256" | LC_ALL=C sort)
+[ "$inv1" = "$(cat "$T/work/release-candidate.recheck.sha256")" ] \
+  || fail "unchanged staged bundle must recompute to the authenticated inventory"
+pass "dry-run: verifies authenticated bundle without GitHub mutation; inventory stable"
 
 reset
 run f-ok fetch; ok f-ok
