@@ -195,7 +195,8 @@ bytes transfer.
 
 1. Provision production Ed25519 pin (out of scope for 3i).
 2. Extend promote/publish to include publication-evidence + binding assets.
-3. Separate installation authorization gate consuming `STAGING_RECORD`
-   (not implemented here).
+3. Installation authorization gate: see
+   [`kindle-installation-authorization.md`](kindle-installation-authorization.md)
+   (3j). Staging observations alone still never authorize install.
 4. A/B activation, Scriptlet execution, and recovery remain unchanged and unused
    by this slice.

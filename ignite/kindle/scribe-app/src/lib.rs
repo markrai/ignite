@@ -35,6 +35,7 @@ pub mod fullscreen;
 pub mod home;
 pub mod ink;
 pub mod input_lag;
+pub mod installation_authorization;
 pub mod keyboard;
 #[cfg(feature = "kindle_supervisor_harness")]
 mod kindle_supervisor_harness;

@@ -493,12 +493,20 @@ pub fn enforce_trust_root_isolation(
     Ok(())
 }
 
+/// True when interrupted `.next`/`.prev` publication artifacts are present.
+pub fn staging_has_interrupted_publication(root: &Path) -> bool {
+    has_publish_leftovers(root)
+}
+
 fn has_publish_leftovers(root: &Path) -> bool {
     root.join(ASSETS_NEXT).exists()
         || root.join(RECORD_NEXT).exists()
         || root.join(ASSETS_PREV).exists()
         || root.join(RECORD_PREV).exists()
 }
+
+/// Published assets directory name under a staging root (`assets/`).
+pub const STAGED_ASSETS_DIR: &str = ASSETS_DIR;
 
 /// Conservatively reconcile interrupted `.next`/`.prev` publish artifacts.
 ///
@@ -1392,6 +1400,16 @@ fn parse_strict_record(path: &Path) -> Result<ParsedRecord, StagingError> {
     })
 }
 
+/// Completed staging observation returned by the strict 3i record parser.
+///
+/// This is never an authorization credential. Callers that need authenticity
+/// must independently re-verify signed assets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedStagingObservation {
+    pub expected_tag: String,
+    pub observations: StagingObservations,
+}
+
 /// Load a published staging *observation* hint. Incomplete/missing records refuse.
 ///
 /// Callers that need authenticity must re-verify signed assets (see
@@ -1400,6 +1418,17 @@ pub fn load_staging_record(
     root: &Path,
     kind: StagingRootKind,
 ) -> Result<StagingObservations, StagingError> {
+    Ok(require_completed_staging_observation(root, kind)?.observations)
+}
+
+/// Strictly require an existing, canonical, fully completed staging observation.
+///
+/// Reuses the 3i parser. Distinguishes absent (`NotFound`) from malformed,
+/// oversized, incomplete, symlinked, or otherwise invalid records.
+pub fn require_completed_staging_observation(
+    root: &Path,
+    kind: StagingRootKind,
+) -> Result<CompletedStagingObservation, StagingError> {
     validate_staging_root(root, kind)?;
     if root.join("work").join(INCOMPLETE_MARKER).exists() {
         return Err(StagingError::IncompleteRefused(
@@ -1411,14 +1440,20 @@ pub fn load_staging_record(
             "interrupted publish leftovers present".into(),
         ));
     }
-    let parsed = parse_strict_record(&root.join(RECORD_NAME))?;
-    if !parsed.observations.all_complete() {
-        return Err(StagingError::IncompleteRefused(
-            "staging record is not fully verified".into(),
-        ));
+    match inspect_existing_staging_record(&root.join(RECORD_NAME))? {
+        None => Err(StagingError::RecordInvalid("staging record absent".into())),
+        Some(parsed) => {
+            if !parsed.observations.all_complete() {
+                return Err(StagingError::IncompleteRefused(
+                    "staging record is not fully verified".into(),
+                ));
+            }
+            Ok(CompletedStagingObservation {
+                expected_tag: parsed.expected_tag,
+                observations: parsed.observations,
+            })
+        }
     }
-    let _ = parsed.lines;
-    Ok(parsed.observations)
 }
 
 pub fn emit_stage_report(result: &StageResult) {

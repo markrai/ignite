@@ -91,6 +91,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    match scribe_app::installation_authorization::parse_command(&args) {
+        Ok(scribe_app::installation_authorization::AuthorizeCommand::Authorize(request)) => {
+            return authorize_verified_update(request);
+        }
+        Ok(scribe_app::installation_authorization::AuthorizeCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     scribe_app::launch_clock::mark("process_entry");
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -238,6 +248,13 @@ Options:
                         --fixture-public-key and remains test-only provenance. Production mode
                         fails closed while the pin is UNPROVISIONED. Default staging root:
                         /mnt/us/scribe-app/state/verified-update
+  --authorize-verified-update --expected-tag vX.Y.Z [--staging-root PATH]
+                        Read-only installation authorization diagnostic over a staged candidate.
+                        Revalidates authenticity under the official production pin and reports
+                        each prerequisite as satisfied, refused, or not_implemented. Never
+                        installs, executes the Scriptlet, activates a slot, or writes an
+                        authorization token. Always exits nonzero while installation remains
+                        unauthorized (including while the pin is UNPROVISIONED).
   --inspect-compatibility-preflight --app-root APP --data-dir LIBRARY --sync-dir SYNC
                         --device-dir DEVICE --state-dir STATE
                         Hash a bounded fixed-root inventory, run the existing read-only library and
@@ -372,6 +389,25 @@ fn stage_verified_update(request: scribe_app::verified_update_staging::StageRequ
         }
         Err(error) => {
             eprintln!("stage-verified-update: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn authorize_verified_update(
+    request: scribe_app::installation_authorization::AuthorizeRequest,
+) -> ExitCode {
+    match scribe_app::installation_authorization::evaluate_installation_authorization(&request) {
+        Ok(decision) => {
+            scribe_app::installation_authorization::emit_authorization_report(&decision);
+            if decision.installation_authorized {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("authorize-verified-update: {error}");
             ExitCode::FAILURE
         }
     }
