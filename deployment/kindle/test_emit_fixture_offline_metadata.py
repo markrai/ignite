@@ -9,9 +9,9 @@ Scriptlet identity (size/sha256) is taken from the supplied installer bytes, but
 22-role component inventory is fabricated for tests.
 
 Never present these bytes as verified production CI component provenance.
-Actual production evidence requires trusted packaging measurement inputs that
-correspond to the exact CI-built Scriptlet; that handoff remains blocked until
-designed and approved. See docs/kindle-authenticated-release-publication.md.
+Prefer deployment/kindle/offline_packaging_handoff.py with the CI measurement
+artifact from the same Scriptlet build (Slice 3l). See
+docs/kindle-ci-packaging-measurement.md.
 
 Disposable keys only. Never touches the production private key.
 """

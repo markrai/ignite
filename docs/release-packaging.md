@@ -13,7 +13,9 @@ compatibility claims, not permission to publish.
 
 ## Artifacts (per version `X.Y.Z`)
 
-CI constructs exactly these four files (two artifact uploads):
+CI constructs these customer/release build artifacts (plus an associated
+Kindle packaging-measurement upload that is **not** a GitHub Release asset;
+see [`kindle-ci-packaging-measurement.md`](kindle-ci-packaging-measurement.md)):
 
 | Artifact | Builder |
 |----------|---------|

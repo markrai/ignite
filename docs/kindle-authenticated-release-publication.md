@@ -1,10 +1,11 @@
-# Authenticated Kindle release publication readiness (Slice 3D-B2a.4.3k)
+# Authenticated Kindle release publication readiness (Slices 3D-B2a.4.3k–3l)
 
 **Status:** non-publishing rehearsal. The production public-key pin remains
 `UNPROVISIONED`. No GitHub Release is published by this slice. No production
 private key is generated or stored in the repository.
 
-Related: [`kindle-production-publication-evidence.md`](kindle-production-publication-evidence.md),
+Related: [`kindle-ci-packaging-measurement.md`](kindle-ci-packaging-measurement.md),
+[`kindle-production-publication-evidence.md`](kindle-production-publication-evidence.md),
 [`kindle-production-trust-integration.md`](kindle-production-trust-integration.md),
 [`kindle-release-manifest.md`](kindle-release-manifest.md),
 [`kindle-verified-update-staging.md`](kindle-verified-update-staging.md),
@@ -34,25 +35,33 @@ evidence, and Scriptlet digests under one publisher key.
 ## 2. Source-of-truth CI path (today)
 
 1. CI (`ci.yml` / `kindle-package`) builds the customer Scriptlet via
-   `deployment/kindle/package_release.py` and uploads only:
-   - `Install Ignite vX.Y.Z.sh`
-   - `Install Ignite vX.Y.Z.sha256`
+   `deployment/kindle/package_release.py` **once** and uploads:
+   - Customer artifact `ignite-kindle-release`:
+     - `Install Ignite vX.Y.Z.sh`
+     - `Install Ignite vX.Y.Z.sha256`
+   - Associated build-evidence artifact `ignite-kindle-packaging-measurements`
+     (Slice 3l; not a GitHub Release asset):
+     - `ignite-kindle-ci-packaging-measurement.v1`
+     - `ignite-kindle-component-profile-package.v1`
+     - association / equivalence companions
 2. Linux job uploads `ignite-server-*-linux-x86_64.tar.gz` (+ `.sha256`).
-3. Offline operator signs release-v1 over the exact Scriptlet digest
-   (`tools/release/kindle_release_sign.py sign`) and retains only the
-   128-hex signature for promote input.
+3. Offline operator validates the measurement against the exact CI Scriptlet
+   (`offline_packaging_handoff.py verify`), prepares evidence from those
+   measurements, then signs release-v1 + binding under the production key
+   (ceremony still blocked while the pin is `UNPROVISIONED`).
 4. Promote (`release-promote.yml` → `tools/release/promote-release.sh`)
    resolves the designated CI run, fetches artifacts, verifies identity, and
-   historically staged Scriptlet + checksums + release-v1 pair + Linux pair.
+   stages Scriptlet + checksums + release-v1 pair + Linux pair + authenticated
+   evidence/binding.
 
-**Gap closed by 3k preflight/gate:** promotion now also requires the offline
+**Gap closed by 3k preflight/gate:** promotion requires the offline
 evidence + binding + binding signature directory and refuses publication while
 the pin is `UNPROVISIONED` or the authenticated bundle is incomplete.
 
-CI still does **not** upload evidence/binding. Those bytes are produced by the
-offline ceremony from exact CI Scriptlet identity plus packaging measurements.
-Choosing whether CI should also retain staged payload/profiles for that ceremony
-is a maintainer decision (see §5).
+**Gap closed by 3l measurements:** CI retains independently verifiable packaging
+measurements bound to the same Scriptlet build. CI still does **not** upload
+evidence/binding or sign with a production key. See
+[`kindle-ci-packaging-measurement.md`](kindle-ci-packaging-measurement.md).
 
 ## 3. Signing and promotion trust boundaries
 
@@ -139,12 +148,14 @@ Do **not** treat the following as decided by this slice:
    destruction policy.
 3. **Authorized operators** — named roles allowed to sign a release and to run
    promote from `main`.
-4. **Evidence measurement inputs** — expand the CI Kindle artifact to retain
-   staged payload + component profiles, versus requiring the offline operator to
-   retain the full package output from the same CI revision.
+4. **Evidence measurement inputs** — Slice 3l uploads the compact measurement
+   bundle as an associated CI artifact. Whether operators must also retain the
+   full staged payload tree beyond that bundle remains a custody preference, not
+   a blocker for measurement verification of digests/modes.
 5. **How offline evidence/binding files reach promote** — secure transfer path
    into `IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR` without placing private keys in
-   GitHub Actions secrets. The GitHub workflow still lacks this approved handoff.
+   GitHub Actions secrets. The GitHub workflow still lacks this approved handoff;
+   3l deliberately does not wire an unapproved upload/download into promote.
 6. **Failure recovery** — revoke/re-pin procedure if a signature or pin is
    compromised; policy for yanking a bad GitHub Release tag.
 
@@ -154,9 +165,11 @@ Until those decisions are explicit, production publication stays blocked.
 
 `deployment/kindle/test_emit_fixture_offline_metadata.py` builds synthetic
 component claims from `make_payload()` for harness tests. It must not be treated
-as verified CI component provenance. Production evidence requires trusted
-packaging measurement inputs corresponding to the exact CI-built Scriptlet;
-those measurements are not inferred from the Scriptlet hash alone.
+as verified CI component provenance. Prefer
+`deployment/kindle/offline_packaging_handoff.py` with the CI measurement
+artifact from the same Scriptlet build. Production evidence requires those
+trusted packaging measurements; they are not inferred from the Scriptlet hash
+alone.
 
 ## 6. GitHub Release publication requirements (when provisioned)
 
@@ -178,8 +191,10 @@ release refuses.
 ## 7. Remaining steps before genuine production signing
 
 1. Maintainer-approved key ceremony and public-key pin replacement.
-2. Wire the chosen offline asset handoff into `release-promote.yml` inputs/env.
-3. Expand or document CI retention of packaging measurement inputs if required.
+2. Wire the chosen offline asset handoff into `release-promote.yml` inputs/env
+   (still unapproved; promote stays blocked).
+3. CI packaging measurement retention is in place (3l); confirm operator custody
+   of the associated artifact alongside the customer Scriptlet.
 4. Hardware qualification of on-device verification (tracked separately).
 5. Only then: publish a real authenticated GitHub Release.
 

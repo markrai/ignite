@@ -154,12 +154,61 @@ jobs:
             --version "$v" \
             --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
             --report target/package/kindle/component-profiles/sfx-payload-equivalence.v1
+          # Slice 3D-B2a.4.3l: CI packaging measurement from the same build inputs.
+          # Associated artifact for offline ceremony; not a GitHub Release asset.
+          # Prefer the measurement already emitted by package_release.py when present.
+          meas_src="target/package/kindle/packaging-measurements"
+          if [ ! -f "$meas_src/ignite-kindle-ci-packaging-measurement.v1" ]; then
+            python3 deployment/kindle/ci_packaging_measurement.py build \
+              --version "$v" \
+              --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+              --payload "$payload" \
+              --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+              --equivalence-report target/package/kindle/component-profiles/sfx-payload-equivalence.v1 \
+              --out-dir "$meas_src" \
+              --source-revision "${GITHUB_SHA}" \
+              --workflow-run-id "${GITHUB_RUN_ID}"
+          fi
+          mkdir -p dist/kindle-packaging-measurements
+          cp "$meas_src/ignite-kindle-ci-packaging-measurement.v1" \
+             "$meas_src/ignite-kindle-component-profile-package.v1" \
+             dist/kindle-packaging-measurements/
+          if [ -f "$meas_src/sfx-payload-equivalence.v1" ]; then
+            cp "$meas_src/sfx-payload-equivalence.v1" dist/kindle-packaging-measurements/
+          fi
+          # Bind measurement to the exact upload-candidate Scriptlet (no execution).
+          python3 deployment/kindle/ci_packaging_measurement.py verify \
+            --measurement dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 \
+            --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+            --package-profile dist/kindle-packaging-measurements/ignite-kindle-component-profile-package.v1 \
+            --expected-version "$v" \
+            --expected-source-revision "${GITHUB_SHA}"
+          # Record association with the customer artifact set for the same run.
+          {
+            echo "IGNITE_CI_KINDLE_ARTIFACT_ASSOCIATION_V1"
+            echo "schema=1"
+            echo "customer_artifact=ignite-kindle-release"
+            echo "measurement_artifact=ignite-kindle-packaging-measurements"
+            echo "scriptlet=Install Ignite v$v.sh"
+            echo "scriptlet_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
+            echo "measurement_sha256=$(sha256sum dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 | awk '{print $1}')"
+            echo "source_revision=${GITHUB_SHA}"
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "github_release_asset=false"
+          } > dist/kindle-packaging-measurements/artifact-association.v1
           echo "kindle_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
       - name: Upload Kindle release artifact
         uses: actions/upload-artifact@v4
         with:
           name: ignite-kindle-release
           path: dist/kindle-release/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Upload Kindle packaging measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-kindle-packaging-measurements
+          path: dist/kindle-packaging-measurements/
           retention-days: 30
           if-no-files-found: error
 

@@ -94,6 +94,12 @@ def test_package_emits_customer_sfx(tmp_path: Path) -> None:
     assert "kindle-supervisor-harness" not in names
     assert "dropbearmulti" in names
     assert Path(str(result["support_zip"])).is_file()
+    # Slice 3l: packaging measurement from the same build (not a Release asset).
+    measurement = Path(str(result["packaging_measurement"]))
+    assert measurement.is_file()
+    assert measurement.name == "ignite-kindle-ci-packaging-measurement.v1"
+    assert result["packaging_measurement_sha256"] == sha256_file(measurement)
+    assert (out / "packaging-measurements" / "ignite-kindle-component-profile-package.v1").is_file()
 
 
 def test_package_pin_mismatch_refuses(tmp_path: Path) -> None:
