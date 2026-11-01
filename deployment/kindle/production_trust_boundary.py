@@ -107,11 +107,18 @@ AuthenticatedProductionRelease = AuthenticatedPublicationChain
 
 
 def production_pin_is_unprovisioned() -> bool:
-    """True when the repository pin is the literal UNPROVISIONED sentinel."""
+    """True only when the repository pin is exactly the UNPROVISIONED sentinel.
+
+    Missing or unreadable pins are not treated as a legitimate unprovisioned
+    state — callers must handle that as an error via
+    ``assert_production_pin_well_formed`` / ``load_production_public_key``.
+    """
     try:
         return _PRODUCTION_PIN.read_bytes() == _SIGN.UNPROVISIONED
-    except OSError:
-        return True
+    except OSError as exc:
+        raise ProductionTrustError(
+            f"cannot read production public-key pin: {exc}"
+        ) from exc
 
 
 def assert_production_pin_unprovisioned() -> None:
@@ -146,7 +153,11 @@ def refuse_fixture_use_of_production_pin(
     """Keep disposable signing identities isolated from the repository pin.
 
     Fixture helpers must not require the pin to stay UNPROVISIONED; they must
-    still refuse production pin paths and production key material.
+    still refuse production pin paths and production key material. A missing,
+    unreadable, malformed, or otherwise invalid official pin refuses *all*
+    fixture signing — including when the fixture key differs from the pin
+    bytes. Only a correct ``UNPROVISIONED`` sentinel or a valid official key
+    permits disposable fixture use (still refusing production-key reuse).
     """
     pin = _PRODUCTION_PIN.resolve()
     if private_key_path is not None and private_key_path.resolve() == pin:
@@ -157,12 +168,50 @@ def refuse_fixture_use_of_production_pin(
         raise ProductionTrustError(
             "refusing to use production pin path as fixture public key"
         )
-    if public_key is not None and not production_pin_is_unprovisioned():
+
+    candidates: list[bytes] = []
+    if public_key is not None:
+        candidates.append(public_key)
+    if public_key_path is not None:
         try:
-            official = load_production_public_key()
-        except ProductionTrustError:
-            return
-        if public_key == official:
+            raw = public_key_path.read_bytes()
+        except OSError as exc:
+            raise ProductionTrustError(
+                f"cannot read fixture public key: {exc}"
+            ) from exc
+        if raw == _SIGN.UNPROVISIONED:
+            raise ProductionTrustError("fixture public key is unprovisioned")
+        if len(raw) == 65 and raw.endswith(b"\n"):
+            try:
+                candidates.append(bytes.fromhex(raw[:-1].decode("ascii")))
+            except (ValueError, UnicodeError) as exc:
+                raise ProductionTrustError(
+                    f"malformed fixture public key: {exc}"
+                ) from exc
+
+    try:
+        official_raw = _PRODUCTION_PIN.read_bytes()
+    except OSError as exc:
+        raise ProductionTrustError(
+            "official production pin is unreadable; "
+            "refusing fixture signing until the pin is well-formed"
+        ) from exc
+    if official_raw == _SIGN.UNPROVISIONED:
+        return
+
+    # Not the sentinel: require a valid official load. Hex-decodable but
+    # officially invalid material (uppercase, known test keys, etc.) must not
+    # unlock fixture signing merely because a different fixture key was offered.
+    try:
+        official_key = load_production_public_key()
+    except ProductionTrustError as exc:
+        raise ProductionTrustError(
+            "official production pin is unreadable or malformed; "
+            "refusing fixture signing until the pin is well-formed"
+        ) from exc
+
+    for candidate in candidates:
+        if candidate == official_key:
             raise ProductionTrustError(
                 "refusing to use production public key material for fixture signing"
             )

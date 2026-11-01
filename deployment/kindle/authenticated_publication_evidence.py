@@ -263,7 +263,12 @@ def generate_test_trust_root(
 
 def assert_production_pin_unprovisioned() -> None:
     """Explicit UNPROVISIONED-state check (tests that isolate that condition)."""
-    raw = _PRODUCTION_PIN.read_bytes()
+    try:
+        raw = _PRODUCTION_PIN.read_bytes()
+    except OSError as exc:
+        raise AuthEvidenceError(
+            f"cannot read production public-key pin: {exc}"
+        ) from exc
     if raw != _SIGN.UNPROVISIONED:
         raise AuthEvidenceError("production public-key pin is not UNPROVISIONED")
 
@@ -274,19 +279,24 @@ def _refuse_fixture_collision_with_production_pin(
     pin = _PRODUCTION_PIN.resolve()
     if private_key_path is not None and private_key_path.resolve() == pin:
         raise AuthEvidenceError("refusing to use production pin path for test key")
-    if public_key is None:
-        return
     try:
         raw = _PRODUCTION_PIN.read_bytes()
-    except OSError:
-        return
+    except OSError as exc:
+        raise AuthEvidenceError(
+            "official production pin is unreadable; "
+            "refusing fixture signing until the pin is well-formed"
+        ) from exc
     if raw == _SIGN.UNPROVISIONED:
         return
+    # Valid official key required; hex-decodable-but-invalid pins refuse all
+    # fixture use (including when the fixture key differs from the pin bytes).
     try:
         official = _SIGN.load_public_key(_PRODUCTION_PIN, official=True)
-    except _SIGN.ReleaseSigningError:
-        return
-    if public_key == official:
+    except _SIGN.ReleaseSigningError as exc:
+        raise AuthEvidenceError(
+            "official production pin is malformed; refusing fixture signing"
+        ) from exc
+    if public_key is not None and public_key == official:
         raise AuthEvidenceError(
             "refusing to use production public key material for fixture signing"
         )

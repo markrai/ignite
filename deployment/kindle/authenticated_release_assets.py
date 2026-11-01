@@ -39,7 +39,6 @@ from production_publication_evidence import (  # noqa: E402
 from production_trust_boundary import (  # noqa: E402
     ProductionTrustError,
     build_publication_binding,
-    load_production_public_key,
     production_pin_is_unprovisioned,
     refuse_fixture_use_of_production_pin,
     sign_binding_for_test,
@@ -285,15 +284,15 @@ def load_fixture_public_key(path: Path) -> bytes:
             "fixture public key must be 64 lowercase hex characters plus LF"
         )
     key = bytes.fromhex(raw[:-1].decode("ascii"))
-    if not production_pin_is_unprovisioned():
+    try:
+        pin_unprovisioned = production_pin_is_unprovisioned()
+    except ProductionTrustError as exc:
+        raise AuthenticatedAssetError(str(exc)) from exc
+    if not pin_unprovisioned:
         try:
-            official = load_production_public_key()
-        except ProductionTrustError:
-            official = None
-        if official is not None and key == official:
-            raise AuthenticatedAssetError(
-                "refusing to use production public key material as a fixture key"
-            )
+            refuse_fixture_use_of_production_pin(public_key=key)
+        except ProductionTrustError as exc:
+            raise AuthenticatedAssetError(str(exc)) from exc
     return key
 
 

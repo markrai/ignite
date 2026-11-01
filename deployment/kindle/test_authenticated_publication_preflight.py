@@ -98,7 +98,10 @@ def test_fixture_bundle_production_gate_refuses(
     tmp_path: Path, disposable_root
 ) -> None:
     bundle, _, _ = _build_bundle(tmp_path, disposable_root)
-    with pytest.raises(PreflightError, match="UNPROVISIONED|unavailable|production"):
+    # UNPROVISIONED → pin refusal; provisioned → fixture sig fails official verify.
+    with pytest.raises(
+        PreflightError, match="UNPROVISIONED|unavailable|production|signature|verif"
+    ):
         run_promote_gate(release_candidate_dir=bundle, tag=TAG)
 
 
@@ -122,11 +125,14 @@ def test_alternate_public_key_not_accepted_by_promote_gate_cli(
     assert excinfo.value.code != 0
 
 
-def test_production_trust_refuses_unprovisioned(
+def test_production_trust_refuses_fixture_under_official_pin(
     tmp_path: Path, disposable_root
 ) -> None:
     bundle, _, _ = _build_bundle(tmp_path, disposable_root)
-    with pytest.raises(PreflightError, match="UNPROVISIONED|unavailable"):
+    # UNPROVISIONED → pin refusal; provisioned → fixture sig fails official verify.
+    with pytest.raises(
+        PreflightError, match="UNPROVISIONED|unavailable|signature|verif|production"
+    ):
         run_preflight(
             assets_dir=bundle,
             expected_tag=TAG,

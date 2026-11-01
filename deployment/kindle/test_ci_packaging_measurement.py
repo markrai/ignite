@@ -623,8 +623,10 @@ def test_full_fixture_rehearsal_from_real_measurements(
     assert report.fixture_rehearsal_ready is True
     assert report.production_promotion_ready is False
     assert report.ci_provenance_verified_by_preflight is False
-    # Fixture key is not production authority.
-    with pytest.raises(PreflightError, match="UNPROVISIONED|unavailable|production"):
+    # Fixture key is not production authority (pin refusal or signature mismatch).
+    with pytest.raises(
+        PreflightError, match="UNPROVISIONED|unavailable|production|signature|verif"
+    ):
         run_promote_gate(release_candidate_dir=out, tag=TAG)
 
 

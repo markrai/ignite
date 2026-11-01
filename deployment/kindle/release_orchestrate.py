@@ -275,11 +275,19 @@ def promote_env_from_bundles(
     return env
 
 
-def _pin_is_unprovisioned(pin_path: Path = _PRODUCTION_PIN) -> bool:
+def _pin_is_unprovisioned(pin_path: Path | None = None) -> bool:
+    """True only for the literal UNPROVISIONED sentinel; missing pins are errors.
+
+    Resolves ``_PRODUCTION_PIN`` at call time so test monkeypatches take effect
+    after the repository pin is provisioned.
+    """
+    path = _PRODUCTION_PIN if pin_path is None else pin_path
     try:
-        return pin_path.read_bytes() == UNPROVISIONED
-    except OSError:
-        return True
+        return path.read_bytes() == UNPROVISIONED
+    except OSError as exc:
+        raise OrchestrateError(
+            f"cannot read production public-key pin: {exc}"
+        ) from exc
 
 
 def classify_promote_gate_error(exc: BaseException) -> str:
@@ -574,8 +582,20 @@ def dry_run_release(
             lines.append("production_promote_gate=refused")
             lines.append(f"production_promote_gate_refusal_category={category}")
             lines.append(f"production_promote_gate_reason={exc}")
+        elif public_key is not None:
+            # Provisioned pin + disposable/fixture key: official gate refusal is
+            # expected. Record it and continue so shell dry-run can still run
+            # (Option A rehearsal uses IGNITE_PROMOTE_PUBLIC_KEY_FILE).
+            production_refused = True
+            refusal_category = category
+            lines.append("production_promote_gate=refused")
+            lines.append(f"production_promote_gate_refusal_category={category}")
+            lines.append(f"production_promote_gate_reason={exc}")
+            lines.append(
+                "production_promote_gate_refusal_expected_for_non_matching_key=true"
+            )
         else:
-            # Provisioned pin: any gate refusal is a hard failure.
+            # Provisioned pin without a disposable key: treat as hard failure.
             raise OrchestrateError(
                 f"production promote-gate refused ({category}): {exc}"
             ) from exc
@@ -589,7 +609,12 @@ def dry_run_release(
         lines.append("promote_shell_dry_run=skipped")
         lines.append("promote_shell_dry_run_reason=skip-promote-shell")
         lines.append("verification_scope=partial")
-        outcome = DryRunOutcome.PARTIAL
+        # Disposable-signed candidate under a provisioned pin is not a successful
+        # partial rehearsal of the official gate — fail closed (exit 1).
+        if (not pin_unprovisioned) and production_refused:
+            outcome = DryRunOutcome.FAILED
+        else:
+            outcome = DryRunOutcome.PARTIAL
     elif not _PROMOTE_SH.is_file():
         lines.append("promote_shell_dry_run=not-performed")
         lines.append("promote_shell_dry_run_reason=promote-release.sh missing")
