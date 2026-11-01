@@ -119,7 +119,9 @@ def load_production_public_key() -> bytes:
     except _SIGN.ReleaseSigningError as exc:
         message = str(exc)
         if "not provisioned" in message:
-            raise ProductionTrustError("official release public key is not provisioned") from exc
+            raise ProductionTrustError(
+                "official release public key is not provisioned"
+            ) from exc
         raise ProductionTrustError(message) from exc
 
 
@@ -184,9 +186,9 @@ def build_publication_binding(
 def binding_signature_envelope(signature: bytes) -> bytes:
     if len(signature) != 64:
         raise ProductionTrustError("Ed25519 signature must be 64 bytes")
-    return (
-        f"schema={BINDING_SIGNATURE_SCHEMA}\nsignature={signature.hex()}\n"
-    ).encode("ascii")
+    return (f"schema={BINDING_SIGNATURE_SCHEMA}\nsignature={signature.hex()}\n").encode(
+        "ascii"
+    )
 
 
 def parse_binding_signature(raw: bytes) -> bytes:
@@ -366,7 +368,9 @@ def _validate_evidence_claims_if_production(
             expected_scriptlet_bytes=release.bytes_count,
         )
     except ProductionEvidenceError as exc:
-        raise ProductionTrustError(f"production evidence claims invalid: {exc}") from exc
+        raise ProductionTrustError(
+            f"production evidence claims invalid: {exc}"
+        ) from exc
     return EvidenceClaimStatus.PRODUCTION_CLAIMS_VALIDATED
 
 
@@ -526,7 +530,9 @@ def production_trust_report(
                 "authorization=none",
             ]
         )
-    elif isinstance(outcome, ProductionTrustError) and "not provisioned" in str(outcome):
+    elif isinstance(outcome, ProductionTrustError) and "not provisioned" in str(
+        outcome
+    ):
         lines.extend(
             [
                 "publisher_authentication=unavailable",
@@ -545,34 +551,129 @@ def production_trust_report(
     return "\n".join(lines) + "\n"
 
 
+def sign_publication_binding(
+    binding: bytes,
+    *,
+    private_key_path: Path,
+    public_key: bytes,
+    release_manifest: bytes | None = None,
+    publication_evidence: bytes | None = None,
+) -> bytes:
+    """Sign a publication binding with an offline Ed25519 private key (OpenSSL).
+
+    Production maintainer interface. Does **not** require the repository pin to
+    remain UNPROVISIONED. Caller-supplied ``public_key`` must verify the
+    signature (same identity). Never logs key or passphrase material.
+
+    Always validates the canonical eight-line binding via ``parse_binding``
+    before any private-key operation. When ``release_manifest`` and/or
+    ``publication_evidence`` are supplied, also validates digest relationships.
+    """
+    if not private_key_path.is_file():
+        raise ProductionTrustError("offline private key file is unavailable")
+    if private_key_path.resolve() == _PRODUCTION_PIN.resolve():
+        raise ProductionTrustError(
+            "refusing to use the production public-key pin path as a private key"
+        )
+    if len(public_key) != 32:
+        raise ProductionTrustError("public key must be 32 raw Ed25519 bytes")
+
+    # Canonical structure first — refuse before OpenSSL.
+    parsed = parse_binding(binding)
+    if release_manifest is not None:
+        release = parse_release_v1(release_manifest)
+        if release.tag != parsed["release_tag"] or release.version != parsed["release_version"]:
+            raise ProductionTrustError(
+                "binding release identity does not match release-v1 manifest"
+            )
+        if hashlib.sha256(release_manifest).hexdigest() != parsed["release_manifest_sha256"]:
+            raise ProductionTrustError(
+                "binding release_manifest_sha256 does not match release-v1 bytes"
+            )
+        if release.sha256 != parsed["scriptlet_sha256"]:
+            raise ProductionTrustError(
+                "binding scriptlet_sha256 does not match release-v1 artifact digest"
+            )
+    if publication_evidence is not None:
+        if hashlib.sha256(publication_evidence).hexdigest() != parsed[
+            "publication_evidence_sha256"
+        ]:
+            raise ProductionTrustError(
+                "binding publication_evidence_sha256 does not match evidence bytes"
+            )
+
+    with tempfile.TemporaryDirectory(prefix="ignite-prod-bind-sign-") as temporary:
+        work = Path(temporary)
+        try:
+            signature = _SIGN.sign_manifest(binding, private_key_path, work)
+            _SIGN.verify_signature(binding, signature, public_key, work)
+        except _SIGN.ReleaseSigningError as exc:
+            raise ProductionTrustError(str(exc)) from exc
+    return binding_signature_envelope(signature)
+
+
+def sign_release_manifest(
+    release_manifest: bytes, *, private_key_path: Path, public_key: bytes
+) -> bytes:
+    """Sign a release-v1 manifest with an offline Ed25519 private key (OpenSSL).
+
+    Production maintainer interface. Independent of pin UNPROVISIONED state.
+    """
+    if not release_manifest:
+        raise ProductionTrustError("release-v1 manifest must not be empty")
+    if len(release_manifest) > MAX_RELEASE_MANIFEST_BYTES or b"\r" in release_manifest:
+        raise ProductionTrustError("release-v1 manifest refused")
+    if not private_key_path.is_file():
+        raise ProductionTrustError("offline private key file is unavailable")
+    if private_key_path.resolve() == _PRODUCTION_PIN.resolve():
+        raise ProductionTrustError(
+            "refusing to use the production public-key pin path as a private key"
+        )
+    if len(public_key) != 32:
+        raise ProductionTrustError("public key must be 32 raw Ed25519 bytes")
+    # Validate shape before OpenSSL.
+    parse_release_v1(release_manifest)
+    with tempfile.TemporaryDirectory(prefix="ignite-prod-rel-sign-") as temporary:
+        work = Path(temporary)
+        try:
+            signature = _SIGN.sign_manifest(release_manifest, private_key_path, work)
+            _SIGN.verify_signature(release_manifest, signature, public_key, work)
+        except _SIGN.ReleaseSigningError as exc:
+            raise ProductionTrustError(str(exc)) from exc
+    return release_signature_envelope(signature)
+
+
 def sign_binding_for_test(
     binding: bytes, *, private_key_path: Path, public_key: bytes
 ) -> bytes:
-    """Sign a binding with a disposable key. Never writes the production pin."""
+    """Sign a binding with a disposable key. Never writes the production pin.
+
+    Fixture-only: requires the repository pin to remain UNPROVISIONED so tests
+    cannot accidentally exercise production authority helpers.
+    """
     assert_production_pin_unprovisioned()
     if _PRODUCTION_PIN.resolve() == private_key_path.resolve():
-        raise ProductionTrustError("refusing to use production pin path for test signing")
-    with tempfile.TemporaryDirectory(prefix="ignite-prod-bind-sign-") as temporary:
-        work = Path(temporary)
-        signature = _SIGN.sign_manifest(binding, private_key_path, work)
-        _SIGN.verify_signature(binding, signature, public_key, work)
-    return binding_signature_envelope(signature)
+        raise ProductionTrustError(
+            "refusing to use production pin path for test signing"
+        )
+    return sign_publication_binding(
+        binding, private_key_path=private_key_path, public_key=public_key
+    )
 
 
 def release_signature_envelope(signature: bytes) -> bytes:
     if len(signature) != 64:
         raise ProductionTrustError("Ed25519 signature must be 64 bytes")
-    return (
-        f"schema={RELEASE_SIGNATURE_SCHEMA}\nsignature={signature.hex()}\n"
-    ).encode("ascii")
+    return (f"schema={RELEASE_SIGNATURE_SCHEMA}\nsignature={signature.hex()}\n").encode(
+        "ascii"
+    )
 
 
 def sign_release_for_test(
     release_manifest: bytes, *, private_key_path: Path, public_key: bytes
 ) -> bytes:
+    """Fixture-only release-v1 signing; requires pin UNPROVISIONED."""
     assert_production_pin_unprovisioned()
-    with tempfile.TemporaryDirectory(prefix="ignite-prod-rel-sign-") as temporary:
-        work = Path(temporary)
-        signature = _SIGN.sign_manifest(release_manifest, private_key_path, work)
-        _SIGN.verify_signature(release_manifest, signature, public_key, work)
-    return release_signature_envelope(signature)
+    return sign_release_manifest(
+        release_manifest, private_key_path=private_key_path, public_key=public_key
+    )

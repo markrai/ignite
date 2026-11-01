@@ -181,7 +181,10 @@ def _digest_bytes(name: str, data: bytes) -> AssetDigest:
     )
 
 
-def _production_signing_status(pin_path: Path = _PRODUCTION_PIN) -> str:
+def _production_signing_status(pin_path: Path | None = None) -> str:
+    # Resolve the pin at call time so isolated/test pin rebinds are observed.
+    if pin_path is None:
+        pin_path = _PRODUCTION_PIN
     try:
         raw = pin_path.read_bytes()
     except OSError:

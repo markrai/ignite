@@ -129,11 +129,27 @@ Approved direction: production private key stays outside GitHub Actions.
 Export public CI measurement material
   → independent offline validation
   → prepare production-format evidence from validated measurements
-  → (future) offline sign release-v1 + publication binding
+  → offline sign release-v1 + publication binding
+    (tools/release/ignite_kindle_offline_sign.py)
   → return only public signed metadata to promote
 ```
 
-Implemented rehearsal entry points:
+Preferred one-command path (Slice 3n):
+
+```text
+python tools/release/ignite_kindle_offline_sign.py prepare --tag vX.Y.Z --ci-artifacts <dir>
+python tools/release/ignite_kindle_offline_sign.py sign \
+  --tag vX.Y.Z --ci-artifacts <dir> \
+  --private-key <offline.pem> --public-key <matching.hex> --output <out>
+```
+
+CI artifacts must include the Scriptlet, its canonical `.sha256` sidecar, the
+packaging measurement, and the package profile exactly once under the tree
+(flat or nested layouts are fine; duplicates and symlink aliases are refused).
+Sign stages outputs privately and finalizes only after signature verification
+and six-asset preflight succeed against the staged candidate.
+
+Lower-level rehearsal entry points:
 
 ```text
 python deployment/kindle/offline_packaging_handoff.py verify \

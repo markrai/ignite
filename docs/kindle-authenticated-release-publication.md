@@ -84,7 +84,71 @@ Hard rules:
 - Existing releases are never overwritten; partial upload failure refuses rather
   than leaving an authenticated-looking incomplete release as authoritative.
 
-## 4. Rehearsal procedure (non-publishing)
+## 4. Offline ceremony and rehearsal (non-publishing)
+
+### One-command prepare (no private key)
+
+Place the CI customer Scriptlet and packaging-measurement files under one
+directory (flat or nested). Then:
+
+```text
+python tools/release/ignite_kindle_offline_sign.py prepare \
+  --tag vX.Y.Z \
+  --ci-artifacts <dir> \
+  --expected-source-revision <40-char sha> \
+  --receipt-out prepare.receipt.v1
+```
+
+Validates Scriptlet identity, 22-role inventory, canonical package profile, and
+the required Scriptlet SHA-256 sidecar. Refuses ambiguous/duplicate CI artifacts
+(including symlink aliases). Writes a machine-readable readiness receipt. Does
+**not** sign and does **not** establish CI provenance
+(`ci_provenance_established_by_this_ceremony=false`;
+`publisher_signatures_verified=false`).
+
+### One-command sign (explicit offline private key)
+
+```text
+# Optional: export IGNITE_SIGNING_KEY_PASSPHRASE for an encrypted PEM
+python tools/release/ignite_kindle_offline_sign.py sign \
+  --tag vX.Y.Z \
+  --ci-artifacts <dir> \
+  --private-key <offline.pem> \
+  --public-key <matching.hex> \
+  --output <out-dir> \
+  --expected-source-revision <40-char sha>
+```
+
+Stages the authenticated six-asset bundle privately, independently verifies
+signatures and six-asset preflight against staged bytes, then publishes the
+completed directory only after validation succeeds. Emits a signing receipt
+(`ignite-kindle-vX.Y.Z.signing-receipt.v1`) whose hashes describe those validated
+output bytes, plus `promote-authenticated-assets/` containing evidence + binding
++ binding.sig for a future handoff into `IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR`.
+
+Requirements:
+
+- Private key must be supplied explicitly; presence on disk alone never signs.
+- Binding is parsed/canonicalized before any private-key operation.
+- Caller public key must verify both release-v1 and binding signatures.
+- Encrypted PEMs use `IGNITE_SIGNING_KEY_PASSPHRASE` (never argv/logs/receipt).
+- Output destination must be new/unused; no private-key material in staging.
+- Outputs refuse overwrite; no GitHub mutation; Scriptlet is not executed.
+- Receipt distinguishes content integrity, signature verification, CI provenance,
+  production publisher authority, and production promotion readiness.
+
+Standalone binding signing (same OpenSSL contract; requires digest context):
+
+```text
+python tools/release/ignite_kindle_offline_sign.py sign-binding \
+  --binding <publication-binding> \
+  --release-manifest <release-v1> \
+  --publication-evidence <evidence> \
+  --private-key <offline.pem> --public-key <matching.hex> --out <binding.sig>
+```
+
+Detailed custody / handoff / recovery design:
+[`draft/kindle-production-signing-ceremony.md`](draft/kindle-production-signing-ceremony.md).
 
 ### Fixture six-asset rehearsal
 
@@ -192,7 +256,8 @@ release refuses.
 
 1. Maintainer-approved key ceremony and public-key pin replacement.
 2. Wire the chosen offline asset handoff into `release-promote.yml` inputs/env
-   (still unapproved; promote stays blocked).
+   (still unapproved; promote stays blocked). Local ceremony already emits
+   `promote-authenticated-assets/` for that future handoff.
 3. CI packaging measurement retention is in place (3l); confirm operator custody
    of the associated artifact alongside the customer Scriptlet.
 4. Hardware qualification of on-device verification (tracked separately).
