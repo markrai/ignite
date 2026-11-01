@@ -68,7 +68,7 @@ MOCK="$T/bin"
 mkdir -p "$MOCK"
 
 # One disposable key per harness run. Only its public half reaches the promotion
-# verifier; the real repository pin remains UNPROVISIONED.
+# verifier. The harness never writes the real repository pin.
 TEST_PRIVATE_KEY="$T/disposable-private.pem"
 TEST_PUBLIC_DER="$T/disposable-public.der"
 TEST_PUBLIC_PIN="$T/disposable-public.hex"

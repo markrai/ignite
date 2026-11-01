@@ -46,7 +46,10 @@ from offline_packaging_handoff import (  # noqa: E402
 from production_publication_evidence import (  # noqa: E402
     parse_and_validate_production_evidence,
 )
-from production_trust_boundary import assert_production_pin_unprovisioned  # noqa: E402
+from production_trust_boundary import (  # noqa: E402
+    assert_production_pin_well_formed,
+    refuse_fixture_use_of_production_pin,
+)
 from release_component_profiles import COMPONENT_ROLES, generate_profiles  # noqa: E402
 from test_validate_stage import make_payload  # noqa: E402
 from verify_sfx_payload_equivalence import verify_equivalence  # noqa: E402
@@ -113,15 +116,23 @@ def _measurement_bundle(
     )
 
 
+_REPO_PIN = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
+_REPO_PIN_AT_IMPORT = _REPO_PIN.read_bytes()
+
+
+def _assert_repo_pin_untouched() -> None:
+    assert _REPO_PIN.read_bytes() == _REPO_PIN_AT_IMPORT
+
+
 @pytest.fixture
 def disposable_root(tmp_path: Path):
-    assert_production_pin_unprovisioned()
+    assert_production_pin_well_formed()
     return generate_test_trust_root(tmp_path / "keys", label="slice-3l-handoff")
 
 
-def test_production_pin_remains_unprovisioned() -> None:
-    pin = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    assert pin.read_bytes() == b"UNPROVISIONED\n"
+def test_production_pin_is_well_formed() -> None:
+    assert_production_pin_well_formed()
+    _assert_repo_pin_untouched()
 
 
 def test_build_and_verify_measurement_roundtrip(tmp_path: Path) -> None:
@@ -236,13 +247,19 @@ def test_unsigned_verify_and_prepare_independent_of_provisioned_pin(
 
     fake_pin = tmp_path / "kindle-release-public-key.hex"
     # Syntactically valid pin bytes (64 lowercase hex + LF); not the repo pin.
+    # Use a non-known-test key pattern that is still distinct from disposable fixtures.
     fake_pin.write_bytes(("ab" * 32).encode("ascii") + b"\n")
     monkeypatch.setattr(ptb, "_PRODUCTION_PIN", fake_pin)
-    # Fixture signing helpers still require UNPROVISIONED — unsigned path must not.
+    # Pin is no longer UNPROVISIONED under the monkeypatch.
     from production_trust_boundary import ProductionTrustError
 
     with pytest.raises(ProductionTrustError):
         ptb.assert_production_pin_unprovisioned()
+    # Fixture helpers remain available via isolation checks, not UNPROVISIONED.
+    refuse_fixture_use_of_production_pin(
+        private_key_path=tmp_path / "disposable.pem",
+        public_key=bytes.fromhex("cd" * 32),
+    )
 
     scriptlet, meas_path, profile_path, _ = _measurement_bundle(tmp_path / "pkg")
     handoff = verify_handoff_inputs(
@@ -269,9 +286,8 @@ def test_unsigned_verify_and_prepare_independent_of_provisioned_pin(
         expected_scriptlet_bytes=scriptlet.stat().st_size,
     )
     assert validated.version == VERSION
-    # Real repository pin must remain untouched.
-    real_pin = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    assert real_pin.read_bytes() == b"UNPROVISIONED\n"
+    # Real repository pin must remain untouched by the monkeypatch.
+    _assert_repo_pin_untouched()
 
 
 def test_oversized_measurement_refused(tmp_path: Path) -> None:

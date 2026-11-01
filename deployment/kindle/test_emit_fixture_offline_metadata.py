@@ -41,7 +41,7 @@ from production_publication_evidence import (  # noqa: E402
     build_production_publication_evidence,
 )
 from production_trust_boundary import (  # noqa: E402
-    assert_production_pin_unprovisioned,
+    assert_production_pin_well_formed,
     build_publication_binding,
     sign_binding_for_test,
 )
@@ -58,7 +58,7 @@ def emit_fixture_offline_metadata(
     work_dir: Path,
 ) -> None:
     """Write fixture-only evidence/binding/binding.sig for harness tests."""
-    assert_production_pin_unprovisioned()
+    assert_production_pin_well_formed()
     version = version_from_tag(tag)
     identity = measure_scriptlet(
         installer, expected_name=f"Install Ignite v{version}.sh"

@@ -37,8 +37,11 @@ from production_publication_evidence import (  # noqa: E402
     build_production_publication_evidence,
 )
 from production_trust_boundary import (  # noqa: E402
-    assert_production_pin_unprovisioned,
+    ProductionTrustError,
     build_publication_binding,
+    load_production_public_key,
+    production_pin_is_unprovisioned,
+    refuse_fixture_use_of_production_pin,
     sign_binding_for_test,
     sign_release_for_test,
 )
@@ -163,7 +166,9 @@ def build_authenticated_release_assets(
     ``private_key_path`` / ``public_key`` must be disposable fixture material.
     Never the production pin.
     """
-    assert_production_pin_unprovisioned()
+    refuse_fixture_use_of_production_pin(
+        private_key_path=private_key_path, public_key=public_key
+    )
     _refuse_production_key_paths(private_key_path)
     if payload.name != f"Ignite-Kindle-{version}":
         raise AuthenticatedAssetError("payload directory name mismatch")
@@ -279,7 +284,17 @@ def load_fixture_public_key(path: Path) -> bytes:
         raise AuthenticatedAssetError(
             "fixture public key must be 64 lowercase hex characters plus LF"
         )
-    return bytes.fromhex(raw[:-1].decode("ascii"))
+    key = bytes.fromhex(raw[:-1].decode("ascii"))
+    if not production_pin_is_unprovisioned():
+        try:
+            official = load_production_public_key()
+        except ProductionTrustError:
+            official = None
+        if official is not None and key == official:
+            raise AuthenticatedAssetError(
+                "refusing to use production public key material as a fixture key"
+            )
+    return key
 
 
 def emit_fixture_authenticated_assets_from_package_output(
@@ -299,7 +314,9 @@ def emit_fixture_authenticated_assets_from_package_output(
     Writes fixture-signed assets only under ``fixture-authenticated-assets/``.
     Does not replace or relabel the customer Scriptlet or checksum sidecars.
     """
-    assert_production_pin_unprovisioned()
+    refuse_fixture_use_of_production_pin(
+        private_key_path=private_key_path, public_key_path=public_key_path
+    )
     _refuse_production_key_paths(private_key_path, public_key_path)
     scriptlet = out_root / f"Install Ignite v{version}.sh"
     payload = out_root / "staging" / f"Ignite-Kindle-{version}"
@@ -339,7 +356,9 @@ def emit_authenticated_assets_after_package(
     private_key_path: Path,
     public_key: bytes,
 ) -> AuthenticatedReleaseAssetSet:
-    assert_production_pin_unprovisioned()
+    refuse_fixture_use_of_production_pin(
+        private_key_path=private_key_path, public_key=public_key
+    )
     _refuse_production_key_paths(private_key_path)
     profile = package_profile_path.read_bytes()
     assets = build_authenticated_release_assets(

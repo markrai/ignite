@@ -1,7 +1,7 @@
 """Disposable-key rehearsal of the proposed production signing ceremony (3m).
 
 This is NOT the production ceremony. It uses isolated fixture keys only and
-keeps tools/release/kindle-release-public-key.hex as UNPROVISIONED.
+does not require the repository pin to remain permanently UNPROVISIONED.
 
 Demonstrates the proposed operator sequence with current tooling:
   packaging measurement verify → evidence prepare → release-v1 + binding sign
@@ -42,7 +42,9 @@ from offline_packaging_handoff import (  # noqa: E402
 from production_trust_boundary import (  # noqa: E402
     ProductionTrustError,
     assert_production_pin_unprovisioned,
+    assert_production_pin_well_formed,
     authenticate_publication_chain_with_key,
+    refuse_fixture_use_of_production_pin,
 )
 from release_component_profiles import generate_profiles  # noqa: E402
 from test_validate_stage import make_payload  # noqa: E402
@@ -104,15 +106,23 @@ def _ceremony_inputs(tmp: Path, *, tag: bytes = b"CEREMONY") -> dict[str, Path |
     }
 
 
+_REPO_PIN = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
+_REPO_PIN_AT_IMPORT = _REPO_PIN.read_bytes()
+
+
+def _assert_repo_pin_untouched() -> None:
+    assert _REPO_PIN.read_bytes() == _REPO_PIN_AT_IMPORT
+
+
 @pytest.fixture
 def disposable_root(tmp_path: Path):
-    assert_production_pin_unprovisioned()
+    assert_production_pin_well_formed()
     return generate_test_trust_root(tmp_path / "keys", label="slice-3m-ceremony")
 
 
-def test_production_pin_remains_unprovisioned() -> None:
-    pin = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    assert pin.read_bytes() == b"UNPROVISIONED\n"
+def test_production_pin_is_well_formed() -> None:
+    assert_production_pin_well_formed()
+    _assert_repo_pin_untouched()
 
 
 def test_proposed_ceremony_rehearsal_with_disposable_keys(
@@ -196,14 +206,14 @@ def test_proposed_ceremony_rehearsal_with_disposable_keys(
     assert report.ci_provenance_verified_by_preflight is False
     assert report.verification_provenance == "verified-under-test-only-fixture-key"
 
-    # Production promote-gate must refuse while pin is UNPROVISIONED.
-    with pytest.raises(PreflightError, match="UNPROVISIONED|unavailable|production"):
+    # Production promote-gate must refuse fixture-signed assets under the real pin
+    # (UNPROVISIONED refusal, or signature refusal once a real pin is provisioned).
+    with pytest.raises(
+        PreflightError, match="UNPROVISIONED|unavailable|production|signature|verif"
+    ):
         run_promote_gate(release_candidate_dir=out, tag=TAG)
 
-    # Real pin untouched.
-    assert (
-        _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    ).read_bytes() == b"UNPROVISIONED\n"
+    _assert_repo_pin_untouched()
 
 
 def test_ceremony_refuses_changed_ci_artifact(tmp_path: Path, disposable_root) -> None:
@@ -305,23 +315,31 @@ def test_ceremony_refuses_incorrect_provenance_assertion(
         )
 
 
-def test_fixture_signing_helpers_stay_isolated_while_unprovisioned() -> None:
-    """Fixture signing remains available only while the production pin is UNPROVISIONED.
-
-    A future production binding-signing CLI is a planned post-approval
-    implementation (see docs/draft/kindle-production-signing-ceremony.md), not a
-    permanent absence invariant for this test suite.
-    """
+def test_fixture_signing_helpers_isolated_from_production_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fixture signing stays available under a provisioned pin via isolation checks."""
     import kindle_release_sign as krs
     import production_trust_boundary as ptb
 
-    assert (
-        _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    ).read_bytes() == b"UNPROVISIONED\n"
-    assert_production_pin_unprovisioned()
+    assert_production_pin_well_formed()
     assert hasattr(krs, "command_sign")
     assert hasattr(ptb, "sign_binding_for_test")
     assert hasattr(ptb, "sign_release_for_test")
+
+    fake_pin = tmp_path / "kindle-release-public-key.hex"
+    fake_pin.write_bytes(("ab" * 32).encode("ascii") + b"\n")
+    monkeypatch.setattr(ptb, "_PRODUCTION_PIN", fake_pin)
+    with pytest.raises(ProductionTrustError):
+        assert_production_pin_unprovisioned()
+    # Disposable material must still be acceptable when the pin is provisioned.
+    refuse_fixture_use_of_production_pin(
+        private_key_path=tmp_path / "disposable.pem",
+        public_key=bytes.fromhex("cd" * 32),
+    )
+    with pytest.raises(ProductionTrustError, match="production pin path"):
+        refuse_fixture_use_of_production_pin(private_key_path=fake_pin)
+    _assert_repo_pin_untouched()
 
 
 def test_fixture_never_grants_production_authority(

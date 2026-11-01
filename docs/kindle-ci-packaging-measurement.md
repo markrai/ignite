@@ -199,7 +199,9 @@ and/or missing handoff configuration). Fixture rehearsal never sets
 - Measurement scope is `ci-build-evidence-only`, not release authentication.
 - `test_emit_fixture_offline_metadata.py` remains a harness helper with synthetic
   inventories; prefer this measurement path for ceremony-shaped rehearsals.
-- Production pin must stay `UNPROVISIONED` through this slice.
+- Production pin may be `UNPROVISIONED` or an intentionally provisioned official
+  key; fixture signing stays isolated either way. Tests must not require the pin
+  to remain permanently `UNPROVISIONED`.
 
 ## 8. Explicit non-goals
 

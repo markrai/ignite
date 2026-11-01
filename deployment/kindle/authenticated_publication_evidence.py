@@ -262,9 +262,34 @@ def generate_test_trust_root(
 
 
 def assert_production_pin_unprovisioned() -> None:
+    """Explicit UNPROVISIONED-state check (tests that isolate that condition)."""
     raw = _PRODUCTION_PIN.read_bytes()
     if raw != _SIGN.UNPROVISIONED:
         raise AuthEvidenceError("production public-key pin is not UNPROVISIONED")
+
+
+def _refuse_fixture_collision_with_production_pin(
+    *, private_key_path: Path | None = None, public_key: bytes | None = None
+) -> None:
+    pin = _PRODUCTION_PIN.resolve()
+    if private_key_path is not None and private_key_path.resolve() == pin:
+        raise AuthEvidenceError("refusing to use production pin path for test key")
+    if public_key is None:
+        return
+    try:
+        raw = _PRODUCTION_PIN.read_bytes()
+    except OSError:
+        return
+    if raw == _SIGN.UNPROVISIONED:
+        return
+    try:
+        official = _SIGN.load_public_key(_PRODUCTION_PIN, official=True)
+    except _SIGN.ReleaseSigningError:
+        return
+    if public_key == official:
+        raise AuthEvidenceError(
+            "refusing to use production public key material for fixture signing"
+        )
 
 
 def _mode_token_for_package_role(role: str, presence: str, rel: str | None) -> str:
@@ -361,7 +386,10 @@ def sign_publication_evidence(
 ) -> bytes:
     if trust_root.private_key_path is None:
         raise AuthEvidenceError("test trust root has no private key for signing")
-    assert_production_pin_unprovisioned()
+    _refuse_fixture_collision_with_production_pin(
+        private_key_path=trust_root.private_key_path,
+        public_key=trust_root.public_key,
+    )
     with tempfile.TemporaryDirectory(prefix="ignite-pub-ev-sign-") as temporary:
         work = Path(temporary)
         signature = _SIGN.sign_manifest(manifest, trust_root.private_key_path, work)
@@ -514,7 +542,10 @@ def authenticate_publication_evidence(
     trust_root: PublicationTestTrustRoot,
 ) -> AuthenticatedPublicationEvidence:
     """Verify detached Ed25519 signature before treating claims as authenticated."""
-    assert_production_pin_unprovisioned()
+    _refuse_fixture_collision_with_production_pin(
+        private_key_path=trust_root.private_key_path,
+        public_key=trust_root.public_key,
+    )
     if not signature_bytes:
         raise AuthEvidenceError("signature missing")
     signature = parse_signature_envelope(signature_bytes)

@@ -39,7 +39,7 @@ from offline_release_ceremony import (  # noqa: E402
 )
 from production_trust_boundary import (  # noqa: E402
     ProductionTrustError,
-    assert_production_pin_unprovisioned,
+    assert_production_pin_well_formed,
     parse_binding,
     sign_publication_binding,
 )
@@ -112,9 +112,17 @@ def _nested_ci_artifacts(tmp: Path) -> Path:
     return root
 
 
+_REPO_PIN = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
+_REPO_PIN_AT_IMPORT = _REPO_PIN.read_bytes()
+
+
+def _assert_repo_pin_untouched() -> None:
+    assert _REPO_PIN.read_bytes() == _REPO_PIN_AT_IMPORT
+
+
 @pytest.fixture
 def disposable_root(tmp_path: Path):
-    assert_production_pin_unprovisioned()
+    assert_production_pin_well_formed()
     return generate_test_trust_root(tmp_path / "keys", label="slice-3n-ceremony")
 
 
@@ -155,9 +163,9 @@ def _pub_from_pem(pem: Path, out: Path, *, passphrase: str | None = None) -> Pat
     return out
 
 
-def test_production_pin_remains_unprovisioned() -> None:
-    pin = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    assert pin.read_bytes() == b"UNPROVISIONED\n"
+def test_production_pin_is_well_formed() -> None:
+    assert_production_pin_well_formed()
+    _assert_repo_pin_untouched()
 
 
 def test_prepare_cli_success(tmp_path: Path) -> None:
@@ -726,9 +734,7 @@ def test_ceremony_with_isolated_provisioned_pin(
     # not claim promotion readiness or CI provenance.
     gate = run_promote_gate(release_candidate_dir=out, tag=TAG)
     assert gate.production_promotion_ready is True
-    assert (
-        _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    ).read_bytes() == b"UNPROVISIONED\n"
+    _assert_repo_pin_untouched()
 
 
 def test_alternate_key_with_isolated_provisioned_pin_no_authority(
@@ -765,9 +771,7 @@ def test_alternate_key_with_isolated_provisioned_pin_no_authority(
     assert "production_promotion_ready=false" in receipt
     with pytest.raises(PreflightError):
         run_promote_gate(release_candidate_dir=out, tag=TAG)
-    assert (
-        _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    ).read_bytes() == b"UNPROVISIONED\n"
+    _assert_repo_pin_untouched()
 
 
 def test_production_binding_signer_independent_of_pin(
@@ -791,9 +795,7 @@ def test_production_binding_signer_independent_of_pin(
         publication_evidence=prepared.evidence,
     )
     assert b"signature=" in envelope
-    assert (
-        _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    ).read_bytes() == b"UNPROVISIONED\n"
+    _assert_repo_pin_untouched()
 
 
 def test_tools_release_entry_point(tmp_path: Path, disposable_root) -> None:

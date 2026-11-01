@@ -106,10 +106,66 @@ class AuthenticatedPublicationChain:
 AuthenticatedProductionRelease = AuthenticatedPublicationChain
 
 
+def production_pin_is_unprovisioned() -> bool:
+    """True when the repository pin is the literal UNPROVISIONED sentinel."""
+    try:
+        return _PRODUCTION_PIN.read_bytes() == _SIGN.UNPROVISIONED
+    except OSError:
+        return True
+
+
 def assert_production_pin_unprovisioned() -> None:
-    raw = _PRODUCTION_PIN.read_bytes()
-    if raw != _SIGN.UNPROVISIONED:
+    """Refuse unless the pin is exactly UNPROVISIONED (explicit state tests only)."""
+    if not production_pin_is_unprovisioned():
         raise ProductionTrustError("production public-key pin is not UNPROVISIONED")
+
+
+def assert_production_pin_well_formed() -> None:
+    """CI-safe pin check: UNPROVISIONED sentinel or a valid official Ed25519 key.
+
+    Does not require the pin to remain permanently UNPROVISIONED. Known test
+    vectors remain rejected as the official pin via ``load_public_key``.
+    """
+    try:
+        raw = _PRODUCTION_PIN.read_bytes()
+    except OSError as exc:
+        raise ProductionTrustError(
+            f"cannot read production public-key pin: {exc}"
+        ) from exc
+    if raw == _SIGN.UNPROVISIONED:
+        return
+    load_production_public_key()
+
+
+def refuse_fixture_use_of_production_pin(
+    *,
+    private_key_path: Path | None = None,
+    public_key: bytes | None = None,
+    public_key_path: Path | None = None,
+) -> None:
+    """Keep disposable signing identities isolated from the repository pin.
+
+    Fixture helpers must not require the pin to stay UNPROVISIONED; they must
+    still refuse production pin paths and production key material.
+    """
+    pin = _PRODUCTION_PIN.resolve()
+    if private_key_path is not None and private_key_path.resolve() == pin:
+        raise ProductionTrustError(
+            "refusing to use production pin path for test signing"
+        )
+    if public_key_path is not None and public_key_path.resolve() == pin:
+        raise ProductionTrustError(
+            "refusing to use production pin path as fixture public key"
+        )
+    if public_key is not None and not production_pin_is_unprovisioned():
+        try:
+            official = load_production_public_key()
+        except ProductionTrustError:
+            return
+        if public_key == official:
+            raise ProductionTrustError(
+                "refusing to use production public key material for fixture signing"
+            )
 
 
 def load_production_public_key() -> bytes:
@@ -648,14 +704,12 @@ def sign_binding_for_test(
 ) -> bytes:
     """Sign a binding with a disposable key. Never writes the production pin.
 
-    Fixture-only: requires the repository pin to remain UNPROVISIONED so tests
-    cannot accidentally exercise production authority helpers.
+    Fixture-only: isolated from production pin paths and key material. Does not
+    require the repository pin to remain UNPROVISIONED.
     """
-    assert_production_pin_unprovisioned()
-    if _PRODUCTION_PIN.resolve() == private_key_path.resolve():
-        raise ProductionTrustError(
-            "refusing to use production pin path for test signing"
-        )
+    refuse_fixture_use_of_production_pin(
+        private_key_path=private_key_path, public_key=public_key
+    )
     return sign_publication_binding(
         binding, private_key_path=private_key_path, public_key=public_key
     )
@@ -672,8 +726,10 @@ def release_signature_envelope(signature: bytes) -> bytes:
 def sign_release_for_test(
     release_manifest: bytes, *, private_key_path: Path, public_key: bytes
 ) -> bytes:
-    """Fixture-only release-v1 signing; requires pin UNPROVISIONED."""
-    assert_production_pin_unprovisioned()
+    """Fixture-only release-v1 signing; isolated from the production pin."""
+    refuse_fixture_use_of_production_pin(
+        private_key_path=private_key_path, public_key=public_key
+    )
     return sign_release_manifest(
         release_manifest, private_key_path=private_key_path, public_key=public_key
     )

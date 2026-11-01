@@ -80,9 +80,13 @@ def trust_root(tmp_path_factory: pytest.TempPathFactory) -> PublicationTestTrust
     return generate_test_trust_root(root, label="slice-3f-test-publisher")
 
 
-def test_production_pin_remains_unprovisioned() -> None:
+def test_production_pin_is_well_formed() -> None:
+    from production_trust_boundary import assert_production_pin_well_formed
+
+    assert_production_pin_well_formed()
     pin = _HERE.parents[1] / "tools" / "release" / "kindle-release-public-key.hex"
-    assert pin.read_bytes() == b"UNPROVISIONED\n"
+    # Suite must not mutate the committed pin (UNPROVISIONED or provisioned).
+    assert pin.is_file()
 
 
 def test_valid_signed_a_and_b_disposable_install(

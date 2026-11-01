@@ -56,8 +56,9 @@ from ci_packaging_measurement import (  # noqa: E402
     verify_measurement_against_scriptlet,
 )
 from production_trust_boundary import (  # noqa: E402
-    assert_production_pin_unprovisioned,
+    ProductionTrustError,
     build_publication_binding,
+    refuse_fixture_use_of_production_pin,
     sign_binding_for_test,
     sign_release_for_test,
 )
@@ -225,9 +226,14 @@ def rehearse_fixture_signing_from_measurement(
 
     Disposable keys only. Never production authority. Never GitHub mutation.
     """
-    # Fixture signing stays isolated from production authority; pin must remain
-    # UNPROVISIONED for disposable key ceremony helpers.
-    assert_production_pin_unprovisioned()
+    # Fixture signing stays isolated from production authority without requiring
+    # the repository pin to remain permanently UNPROVISIONED.
+    try:
+        refuse_fixture_use_of_production_pin(
+            private_key_path=private_key_path, public_key_path=public_key_path
+        )
+    except ProductionTrustError as exc:
+        raise HandoffError(str(exc)) from exc
     if (
         private_key_path.resolve()
         == (_RELEASE / "kindle-release-public-key.hex").resolve()

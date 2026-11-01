@@ -31,7 +31,7 @@ from authenticated_release_assets import (  # noqa: E402
     build_authenticated_release_assets,
     write_authenticated_release_assets,
 )
-from production_trust_boundary import assert_production_pin_unprovisioned  # noqa: E402
+from production_trust_boundary import assert_production_pin_well_formed  # noqa: E402
 from release_component_profiles import generate_profiles  # noqa: E402
 from test_validate_stage import make_payload, write_sfx  # noqa: E402
 
@@ -67,7 +67,7 @@ def _build_bundle(tmp_path: Path, root):
 
 @pytest.fixture
 def disposable_root(tmp_path: Path):
-    assert_production_pin_unprovisioned()
+    assert_production_pin_well_formed()
     return generate_test_trust_root(tmp_path / "keys", label="slice-3k-preflight")
 
 

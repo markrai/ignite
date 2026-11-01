@@ -10,6 +10,8 @@ import pytest
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
+_REPO_PIN = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
+_REPO_PIN_AT_IMPORT = _REPO_PIN.read_bytes()
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
@@ -25,7 +27,7 @@ from production_trust_boundary import (  # noqa: E402
     EvidenceClaimStatus,
     ProductionTrustError,
     VerificationProvenance,
-    assert_production_pin_unprovisioned,
+    assert_production_pin_well_formed,
     authenticate_official_publication_chain,
     authenticate_publication_chain_with_key,
     build_publication_binding,
@@ -72,8 +74,12 @@ def _test_scope_evidence() -> bytes:
 
 @pytest.fixture
 def disposable_root(tmp_path: Path):
-    assert_production_pin_unprovisioned()
+    assert_production_pin_well_formed()
     return generate_test_trust_root(tmp_path / "keys", label="slice-3g-publisher")
+
+
+def _assert_repo_pin_untouched() -> None:
+    assert _REPO_PIN.read_bytes() == _REPO_PIN_AT_IMPORT
 
 
 def _signed_chain(root, *, evidence: bytes | None = None, installer: bytes = INSTALLER):
@@ -100,11 +106,20 @@ def _signed_chain(root, *, evidence: bytes | None = None, installer: bytes = INS
     return release, release_sig, binding, binding_sig, evidence
 
 
-def test_production_pin_remains_unprovisioned() -> None:
-    assert_production_pin_unprovisioned()
+def test_production_pin_is_well_formed() -> None:
+    """Compatible with UNPROVISIONED or an intentionally provisioned official pin."""
+    assert_production_pin_well_formed()
+    _assert_repo_pin_untouched()
 
 
-def test_official_entry_refuses_unprovisioned_pin(disposable_root) -> None:
+def test_official_entry_refuses_unprovisioned_pin(
+    disposable_root, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import production_trust_boundary as ptb
+
+    pin = tmp_path / "kindle-release-public-key.hex"
+    pin.write_bytes(b"UNPROVISIONED\n")
+    monkeypatch.setattr(ptb, "_PRODUCTION_PIN", pin)
     release, release_sig, binding, binding_sig, evidence = _signed_chain(disposable_root)
     with pytest.raises(ProductionTrustError, match="not provisioned"):
         authenticate_official_publication_chain(
@@ -118,6 +133,7 @@ def test_official_entry_refuses_unprovisioned_pin(disposable_root) -> None:
     report = production_trust_report(
         ProductionTrustError("official release public key is not provisioned")
     )
+    _assert_repo_pin_untouched()
     assert "publisher_authentication=unavailable" in report
     assert "publication_evidence_claims=unverified" in report
     assert "promotion_authorized=false" in report

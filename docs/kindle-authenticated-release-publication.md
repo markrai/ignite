@@ -366,6 +366,8 @@ release refuses.
 ## 8. Explicit non-goals of this slice
 
 - No production key provisioning.
-- No change to the `UNPROVISIONED` pin contents.
+- This documentation does not authorize changing the production pin; provisioning
+  is a separate maintainer action. Test suites must remain compatible once a
+  valid official pin is committed.
 - No GitHub Actions signing secret.
 - No tag push, Release upload, Scriptlet execution, or Kindle install/activation.

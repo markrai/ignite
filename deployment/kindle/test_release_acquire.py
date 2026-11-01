@@ -70,6 +70,16 @@ SOURCE_REV = "a" * 40
 RUN_ID = 424242
 OLDER_RUN_ID = 100001
 WORKFLOW_ID = 55
+_REPO_PIN = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
+_REPO_PIN_AT_IMPORT = _REPO_PIN.read_bytes()
+
+
+def _assert_repo_pin_untouched() -> None:
+    assert _REPO_PIN.read_bytes() == _REPO_PIN_AT_IMPORT
+
+
+def _pin_is_unprovisioned() -> bool:
+    return _REPO_PIN.read_bytes() == b"UNPROVISIONED\n"
 
 
 def _sha(data: bytes) -> str:
@@ -714,6 +724,7 @@ def test_full_flow_isolated_and_unprovisioned_refusal(
 ) -> None:
     import authenticated_publication_preflight as ap
     import production_trust_boundary as ptb
+    import release_orchestrate as ro
 
     state = _seed_mock_state(tmp_path)
     gh = MockGh(state)
@@ -744,7 +755,14 @@ def test_full_flow_isolated_and_unprovisioned_refusal(
         expected_workflow=EXPECTED_WORKFLOW,
     )
     assert gate.production_promotion_ready is True
-    monkeypatch.undo()
+
+    # Unprovisioned refusal rehearsal uses an isolated UNPROVISIONED pin so CI
+    # still passes after the real repository pin is provisioned.
+    unprov = tmp_path / "unprovisioned-pin.hex"
+    unprov.write_bytes(b"UNPROVISIONED\n")
+    monkeypatch.setattr(ap, "_PRODUCTION_PIN", unprov)
+    monkeypatch.setattr(ptb, "_PRODUCTION_PIN", unprov)
+    monkeypatch.setattr(ro, "_PRODUCTION_PIN", unprov)
 
     report = dry_run_release(
         tag=TAG,
@@ -761,9 +779,7 @@ def test_full_flow_isolated_and_unprovisioned_refusal(
     assert report.outcome == DryRunOutcome.PARTIAL
     assert report.exit_status == 2
     assert "dry_run_outcome=partial-verification" in "\n".join(report.lines)
-    assert (
-        _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    ).read_bytes() == b"UNPROVISIONED\n"
+    _assert_repo_pin_untouched()
 
 
 def test_cli_acquire_via_ignite_release_gh(
@@ -845,12 +861,21 @@ def test_cli_acquire_via_ignite_release_gh(
         text=True,
     )
     # Partial verification (--skip-promote-shell) must not share complete-success exit.
-    assert completed.returncode == 2, completed.stdout + completed.stderr
-    assert "production_promote_gate_refusal_category=official-pin-unprovisioned" in (
-        completed.stdout
+    # When the real pin is still UNPROVISIONED, expect the pin-boundary partial.
+    # Once provisioned, disposable-signed dry-run fails closed (exit 1) instead.
+    out = completed.stdout + completed.stderr
+    if _pin_is_unprovisioned():
+        assert completed.returncode == 2, out
+        assert "production_promote_gate_refusal_category=official-pin-unprovisioned" in (
+            completed.stdout
+        )
+        assert "dry_run_outcome=partial-verification" in completed.stdout
+    else:
+        assert completed.returncode == 1, out
+    assert "isolated_cryptographic_verification=pass" in completed.stdout or (
+        completed.returncode == 1
     )
-    assert "isolated_cryptographic_verification=pass" in completed.stdout
-    assert "dry_run_outcome=partial-verification" in completed.stdout
+    _assert_repo_pin_untouched()
 
 
 def _bash_available() -> str | None:
@@ -877,6 +902,10 @@ def _signed_bundle_for_shell(tmp_path: Path):
 
 
 @pytest.mark.skipif(_bash_available() is None, reason="bash required for promote shell")
+@pytest.mark.skipif(
+    not _pin_is_unprovisioned(),
+    reason="real-shell unprovisioned boundary requires repository pin UNPROVISIONED",
+)
 def test_cli_dry_run_real_promote_shell_unprovisioned_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -920,9 +949,7 @@ def test_cli_dry_run_real_promote_shell_unprovisioned_boundary(
     assert "promote_shell_phase_fetch_ok=true" in completed.stdout
     assert "promote_shell_phase_verify=true" in completed.stdout
     assert "promote_shell_refusal_marker=official-pin-unprovisioned" in completed.stdout
-    assert (
-        _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    ).read_bytes() == b"UNPROVISIONED\n"
+    _assert_repo_pin_untouched()
 
 
 @pytest.mark.skipif(_bash_available() is None, reason="bash required for promote shell")
@@ -1217,9 +1244,32 @@ def test_promote_publish_forbids_public_key_override(tmp_path: Path) -> None:
     )
 
 
-def test_production_pin_unprovisioned() -> None:
-    pin = _REPO / "tools" / "release" / "kindle-release-public-key.hex"
-    assert pin.read_bytes() == b"UNPROVISIONED\n"
+def test_production_pin_is_well_formed() -> None:
+    from production_trust_boundary import assert_production_pin_well_formed
+
+    assert_production_pin_well_formed()
+    _assert_repo_pin_untouched()
+
+
+def test_unprovisioned_pin_refusal_still_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserve explicit UNPROVISIONED refusal coverage via an isolated pin."""
+    import authenticated_publication_preflight as ap
+    import production_trust_boundary as ptb
+
+    unprov = tmp_path / "kindle-release-public-key.hex"
+    unprov.write_bytes(b"UNPROVISIONED\n")
+    monkeypatch.setattr(ap, "_PRODUCTION_PIN", unprov)
+    monkeypatch.setattr(ptb, "_PRODUCTION_PIN", unprov)
+    with pytest.raises(Exception, match="UNPROVISIONED|unavailable|production"):
+        run_promote_gate(
+            release_candidate_dir=tmp_path / "missing",
+            tag=TAG,
+            source_revision=SOURCE_REV,
+            expected_workflow=EXPECTED_WORKFLOW,
+        )
+    _assert_repo_pin_untouched()
 
 
 def test_max_run_search_pages_documented() -> None:
