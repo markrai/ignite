@@ -31,6 +31,8 @@
 # IGNITE_PROMOTE_LINUX_SHA256, IGNITE_PROMOTE_KINDLE_SIGNATURE,
 # IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR, IGNITE_PROMOTE_WORK, GH_TOKEN,
 # GITHUB_REPOSITORY, GITHUB_EVENT_NAME, GITHUB_REF.
+# IGNITE_PROMOTE_PUBLIC_KEY_FILE is dry-run rehearsal only (forbidden for
+# publish/all). It never substitutes for the promote-gate repository pin.
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
@@ -41,9 +43,28 @@ CI_WORKFLOW_FILE=ci.yml
 MAIN_BRANCH=main
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SIGN_TOOL="$ROOT/tools/release/kindle_release_sign.py"
+# Default: repository pin only. Alternate-key override is permitted solely for
+# the nonpublishing dry-run rehearsal below — never for publish/all.
 PUBLIC_KEY_FILE="$ROOT/tools/release/kindle-release-public-key.hex"
 
 die() { echo "promote-release.sh: $*" >&2; exit 1; }
+
+case "${1:-}" in
+  dry-run)
+    if [ -n "${IGNITE_PROMOTE_PUBLIC_KEY_FILE:-}" ]; then
+      [ -f "$IGNITE_PROMOTE_PUBLIC_KEY_FILE" ] \
+        || die "IGNITE_PROMOTE_PUBLIC_KEY_FILE not found"
+      PUBLIC_KEY_FILE="$IGNITE_PROMOTE_PUBLIC_KEY_FILE"
+      echo "promote-rehearsal-public-key-override=true"
+      echo "promote-rehearsal-public-key-is-not-production-pin-authority=true"
+    fi
+    ;;
+  publish|all)
+    if [ -n "${IGNITE_PROMOTE_PUBLIC_KEY_FILE:-}" ]; then
+      die "IGNITE_PROMOTE_PUBLIC_KEY_FILE is forbidden for $1 (dry-run rehearsal only)"
+    fi
+    ;;
+esac
 
 TAG="${IGNITE_PROMOTE_TAG:-}"
 RUN_ID="${IGNITE_PROMOTE_RUN_ID:-}"
@@ -80,6 +101,7 @@ INVENTORY="$WORK/release-candidate.sha256"
 # Test-harness only: if present, names a deterministic mutation applied after
 # staging and before authentication / before publish. Shipping never creates it.
 TEST_HOOK_STAGED="$WORK/.promote-test-mutate-staged"
+TEST_HOOK_INVENTORY="$WORK/.promote-test-mutate-before-inventory"
 TEST_HOOK_PUBLISH="$WORK/.promote-test-mutate-before-publish"
 
 _expected_dist_list() {
@@ -108,11 +130,13 @@ _write_release_inventory() {
   _refuse_symlinks_in_dist
   [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(_expected_dist_list)" ] \
     || die "release candidate file set mismatch before inventory"
-  : >"$INVENTORY"
+  : >"$INVENTORY" || die "cannot create release candidate inventory"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    (cd "$DIST" && sha256sum -- "$name") >>"$INVENTORY"
+    (cd "$DIST" && sha256sum -- "$name") >>"$INVENTORY" \
+      || die "inventory hash failed for $name"
   done < <(_expected_dist_list)
+  [ -s "$INVENTORY" ] || die "release candidate inventory is empty"
   echo "inventory: wrote $INVENTORY"
 }
 
@@ -235,32 +259,46 @@ _list_files() {
 }
 
 verify() {
+  # Fail-closed without relying on errexit: Bash suppresses set -e inside
+  # functions invoked from conditionals, $(...), or pipelines. Every
+  # security-relevant step must use explicit || die / nonzero exit.
   local kfiles lfiles have_k have_l source_hashes
-  kfiles="$(_list_files "$WORK/kindle")"
-  lfiles="$(_list_files "$WORK/linux")"
+  kfiles="$(_list_files "$WORK/kindle")" \
+    || die "cannot list Kindle artifact files"
+  lfiles="$(_list_files "$WORK/linux")" \
+    || die "cannot list Linux artifact files"
   [ "$kfiles" = "$(printf '%s\n' "$SFX" "$SFX_SUM")" ] \
     || die "Kindle artifact file set mismatch: $kfiles"
   [ "$lfiles" = "$(printf '%s\n' "$LINUX" "$LINUX_SUM")" ] \
     || die "Linux artifact file set mismatch: $lfiles"
 
-  (cd "$WORK/kindle" && sha256sum -c "$SFX_SUM")
-  (cd "$WORK/linux" && sha256sum -c "$LINUX_SUM")
+  (cd "$WORK/kindle" && sha256sum -c "$SFX_SUM") \
+    || die "Kindle Scriptlet checksum sidecar validation failed"
+  (cd "$WORK/linux" && sha256sum -c "$LINUX_SUM") \
+    || die "Linux archive checksum sidecar validation failed"
 
-  have_k="$(sha256sum "$WORK/kindle/$SFX" | awk '{print $1}')"
-  have_l="$(sha256sum "$WORK/linux/$LINUX" | awk '{print $1}')"
+  have_k="$(sha256sum "$WORK/kindle/$SFX" | awk '{print $1}')" \
+    || die "cannot hash Kindle installer"
+  have_l="$(sha256sum "$WORK/linux/$LINUX" | awk '{print $1}')" \
+    || die "cannot hash Linux archive"
+  [ -n "$have_k" ] || die "Kindle installer sha256 empty"
+  [ -n "$have_l" ] || die "Linux archive sha256 empty"
   [ "$have_k" = "$KINDLE_SHA" ] \
     || die "Kindle installer sha256 $have_k != recorded $KINDLE_SHA (refusing to publish untested bytes)"
   [ "$have_l" = "$LINUX_SHA" ] \
     || die "Linux bundle sha256 $have_l != recorded $LINUX_SHA (refusing to publish untested bytes)"
   source_hashes="$(sha256sum \
     "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" \
-    "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM")"
+    "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM")" \
+    || die "cannot fingerprint source CI artifacts"
 
   python3 "$ROOT/deployment/kindle/validate_stage.py" \
     --sfx "$WORK/kindle/$SFX" --version "$VERSION" \
     || die "Kindle installer failed validate_stage.py"
 
-  tar -xzf "$WORK/linux/$LINUX" -C "$WORK"
+  # --force-local: paths like C:/... must not be parsed as host:file on Git Bash.
+  tar --force-local -xzf "$WORK/linux/$LINUX" -C "$WORK" \
+    || die "Linux archive extraction failed"
   grep -qx "version=$VERSION" "$WORK/${LINUX%.tar.gz}/.ignite-bundle" \
     || die "bundle metadata version is not $VERSION"
   grep -qx "arch=$ARCH" "$WORK/${LINUX%.tar.gz}/.ignite-bundle" \
@@ -297,7 +335,7 @@ verify() {
 
   # Stage the complete publication candidate first, then authenticate those bytes.
   rm -rf "$DIST" "$INVENTORY"
-  mkdir -p "$DIST"
+  mkdir -p "$DIST" || die "cannot create staging dist directory"
   cp -a \
     "$WORK/kindle/$SFX" "$WORK/kindle/$SFX_SUM" \
     "$AUTH_DIR/$MANIFEST" "$AUTH_DIR/$MANIFEST_SIG" \
@@ -305,7 +343,8 @@ verify() {
     "$AUTH_ASSETS_DIR/$BINDING" \
     "$AUTH_ASSETS_DIR/$BINDING_SIG" \
     "$WORK/linux/$LINUX" "$WORK/linux/$LINUX_SUM" \
-    "$DIST/"
+    "$DIST/" \
+    || die "cannot stage nine-file release candidate"
   [ "$(ls -1 "$DIST" | LC_ALL=C sort)" = "$(_expected_dist_list)" ] \
     || die "staging dist does not contain the authenticated Kindle bundle plus Linux pair"
 
@@ -320,7 +359,11 @@ verify() {
     --expected-workflow "$CI_WORKFLOW" \
     || die "authenticated Kindle publication preflight refused"
 
-  _write_release_inventory
+  # Deterministic harness mutation after authentication / before inventory.
+  _apply_test_hook "$TEST_HOOK_INVENTORY"
+
+  _write_release_inventory \
+    || die "release inventory creation failed"
   echo "verify: CI assets unchanged; staged candidate authenticated; inventory recorded"
 }
 
@@ -427,10 +470,50 @@ publish() {
 
 dry_run() {
   # Read-only against GitHub mutation: resolve/fetch are GETs; never release create.
+  # Emit stable phase markers so callers can distinguish pin refusal from earlier failure.
+  #
+  # Do NOT capture verify via $(verify) / if verify / verify || — those contexts
+  # suppress errexit inside the function. verify() is fail-closed via explicit
+  # || die; we only disable errexit around the top-level call so we can classify
+  # the exit status (pin boundary vs other) without aborting before markers.
+  local verify_log verify_rc
+  echo "promote-phase=guard"
   guard
+  echo "promote-phase=guard-ok"
+  echo "promote-phase=resolve"
   resolve
+  echo "promote-phase=resolve-ok"
+  echo "promote-phase=fetch"
   fetch
-  verify
+  echo "promote-phase=fetch-ok"
+  echo "promote-phase=verify"
+  verify_log="$(mktemp)" || die "cannot create verify log"
+  # Subshell so die/exit inside verify cannot skip refusal classification below.
+  # Re-enable errexit inside the subshell; verify() also guards with || die.
+  set +e
+  (
+    set -euo pipefail
+    shopt -s inherit_errexit 2>/dev/null || true
+    verify
+  ) >"$verify_log" 2>&1
+  verify_rc=$?
+  set -e
+  cat "$verify_log"
+  if [ "$verify_rc" -ne 0 ]; then
+    # Classify only the official-pin unavailable boundary — not a generic substring.
+    if grep -Eq \
+      'production signing unavailable because the pin is UNPROVISIONED|official release public key is not provisioned' \
+      "$verify_log"; then
+      echo "promote-shell-refusal=official-pin-unprovisioned"
+    else
+      echo "promote-shell-refusal=other"
+    fi
+    echo "promote-phase=verify-failed"
+    rm -f "$verify_log"
+    exit "$verify_rc"
+  fi
+  rm -f "$verify_log"
+  echo "promote-phase=verify-ok"
   echo "dry-run: would publish $TAG from run $RUN_ID commit $COMMIT with:"
   ls -1 "$DIST" | LC_ALL=C sort | sed 's/^/  /'
   echo "dry-run: no GitHub release create performed"

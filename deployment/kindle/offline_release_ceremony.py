@@ -78,6 +78,8 @@ RECEIPT_SCHEMA = "1"
 RECEIPT_BASENAME_TMPL = "ignite-kindle-v{version}.signing-receipt.v1"
 PROMOTE_ASSETS_SUBDIR = "promote-authenticated-assets"
 MAX_RECEIPT_BYTES = 64 * 1024
+# Canonical sha256sum sidecar is one short LF line (digest + two spaces + name).
+MAX_CHECKSUM_SIDECAR_BYTES = 256
 _SHA_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 
 
@@ -205,6 +207,10 @@ def _validate_checksum_sidecar(
         raise CeremonyError(f"cannot read checksum sidecar: {exc}") from exc
     if not raw or b"\r" in raw or not raw.endswith(b"\n"):
         raise CeremonyError("checksum sidecar must be LF-terminated ASCII")
+    if len(raw) > MAX_CHECKSUM_SIDECAR_BYTES:
+        raise CeremonyError(
+            f"checksum sidecar exceeds {MAX_CHECKSUM_SIDECAR_BYTES} bytes"
+        )
     lines = raw.decode("ascii").splitlines()
     if len(lines) != 1:
         raise CeremonyError("checksum sidecar must contain exactly one line")
@@ -384,7 +390,7 @@ def prepare_ceremony(
 
 
 def _write_bytes_exclusive(path: Path, content: bytes) -> None:
-    """Create ``path`` exclusively; unlink on failure so no partial output remains."""
+    """Create ``path`` exclusively; handle short writes; unlink on failure."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or _lstat_is_symlink(path):
         raise CeremonyError(f"refusing to overwrite {path.name}")
@@ -394,7 +400,13 @@ def _write_bytes_exclusive(path: Path, content: bytes) -> None:
     fd = os.open(os.fspath(path), flags, 0o644)
     try:
         try:
-            os.write(fd, content)
+            view = memoryview(content)
+            written = 0
+            while written < len(content):
+                n = os.write(fd, view[written:])
+                if n <= 0:
+                    raise CeremonyError(f"short write while creating {path.name}")
+                written += n
         except BaseException:
             os.close(fd)
             fd = -1

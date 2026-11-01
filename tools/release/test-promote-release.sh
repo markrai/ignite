@@ -382,6 +382,48 @@ run v-preflight-override verify \
   IGNITE_PROMOTE_PREFLIGHT="$ROOT/deployment/kindle/authenticated_publication_preflight.py"
 refused v-preflight-override "IGNITE_PROMOTE_PREFLIGHT"
 [ ! -f "$T/publish.log" ] || fail "PREFLIGHT override reached publication"
+
+# Fail-closed: sidecar disagrees while separately supplied digest still matches bytes.
+reset; run f-ok fetch; ok f-ok
+printf '%s  Install Ignite v%s.sh\n' "$(printf 'a%.0s' {1..64})" "$V" \
+  >"$T/work/kindle/Install Ignite v$V.sha256"
+run v-bad-kindle-sum verify; refused v-bad-kindle-sum "Kindle Scriptlet checksum sidecar validation failed"
+reset; run f-ok fetch; ok f-ok
+printf '%s  ignite-server-%s-linux-x86_64.tar.gz\n' "$(printf 'b%.0s' {1..64})" "$V" \
+  >"$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz.sha256"
+run v-bad-linux-sum verify; refused v-bad-linux-sum "Linux archive checksum sidecar validation failed"
+
+# Extract failure after digests agree (garbage archive matching supplied LINUX_SHA).
+reset; run f-ok fetch; ok f-ok
+printf 'not-a-tar-gz\n' >"$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz"
+BAD_LINUX_SHA="$(sha256sum "$T/work/linux/ignite-server-$V-linux-x86_64.tar.gz" | awk '{print $1}')"
+(cd "$T/work/linux" && sha256sum "ignite-server-$V-linux-x86_64.tar.gz" \
+  >"ignite-server-$V-linux-x86_64.tar.gz.sha256")
+run v-bad-extract verify IGNITE_PROMOTE_LINUX_SHA256="$BAD_LINUX_SHA"
+refused v-bad-extract "Linux archive extraction failed"
+
+# Inventory creation refuses after authentication when staged set is mutated.
+reset; run f-ok fetch; ok f-ok
+printf 'extra-file\n' >"$T/work/.promote-test-mutate-before-inventory"
+run v-bad-inventory verify; refused v-bad-inventory "file set mismatch before inventory"
+
+# dry-run must propagate the same verify failures (not swallow under capture).
+# Corrupt the seeded artifact so dry-run's own fetch picks up the bad sidecar.
+reset
+printf '%s  Install Ignite v%s.sh\n' "$(printf 'a%.0s' {1..64})" "$V" \
+  >"$T/arts/ignite-kindle-release/Install Ignite v$V.sha256"
+run d-bad-kindle-sum dry-run
+[ "$RC" != 0 ] || fail "d-bad-kindle-sum: dry-run must be nonzero"
+# dry-run captures verify (incl. die text) onto stdout via the verify log.
+grep -qF "Kindle Scriptlet checksum sidecar validation failed" "$T/d-bad-kindle-sum.out" \
+  || { cat "$T/d-bad-kindle-sum.out" "$T/d-bad-kindle-sum.err" >&2; fail "d-bad-kindle-sum: missing sidecar refusal"; }
+grep -q "promote-shell-refusal=other" "$T/d-bad-kindle-sum.out" \
+  || { cat "$T/d-bad-kindle-sum.out" "$T/d-bad-kindle-sum.err" >&2; fail "dry-run must mark refusal=other"; }
+grep -q "promote-shell-refusal=official-pin-unprovisioned" "$T/d-bad-kindle-sum.out" \
+  && fail "sidecar failure must not be labeled official-pin-unprovisioned"
+grep -q "promote-phase=verify-failed" "$T/d-bad-kindle-sum.out" \
+  || fail "dry-run must mark verify-failed after sidecar refusal"
+
 pass "verify: CI bytes unchanged; staged candidate authenticated; mutations refuse"
 
 reset
@@ -468,6 +510,10 @@ pass "publish: inventory recheck refuses mutated or inconsistent staged candidat
 
 reset
 run d-ok dry-run; ok d-ok
+grep -q "promote-phase=guard-ok" "$T/d-ok.out" || fail "dry-run must mark guard-ok"
+grep -q "promote-phase=resolve-ok" "$T/d-ok.out" || fail "dry-run must mark resolve-ok"
+grep -q "promote-phase=fetch-ok" "$T/d-ok.out" || fail "dry-run must mark fetch-ok"
+grep -q "promote-phase=verify-ok" "$T/d-ok.out" || fail "dry-run must mark verify-ok"
 grep -q "no GitHub release create performed" "$T/d-ok.out" \
   || fail "dry-run must state that no release create occurred"
 [ ! -f "$T/publish.log" ] || fail "dry-run must not call gh release create"
@@ -492,6 +538,14 @@ done < <(printf '%s\n' \
 [ "$inv1" = "$(cat "$T/work/release-candidate.recheck.sha256")" ] \
   || fail "unchanged staged bundle must recompute to the authenticated inventory"
 pass "dry-run: verifies authenticated bundle without GitHub mutation; inventory stable"
+
+reset
+run p-override-forbidden publish IGNITE_PROMOTE_PUBLIC_KEY_FILE="$TEST_PUBLIC_PIN"
+refused p-override-forbidden "IGNITE_PROMOTE_PUBLIC_KEY_FILE is forbidden for publish"
+run a-override-forbidden all IGNITE_PROMOTE_PUBLIC_KEY_FILE="$TEST_PUBLIC_PIN"
+refused a-override-forbidden "IGNITE_PROMOTE_PUBLIC_KEY_FILE is forbidden for all"
+[ ! -f "$T/publish.log" ] || fail "public-key override must not reach publication"
+pass "publish/all refuse IGNITE_PROMOTE_PUBLIC_KEY_FILE override"
 
 reset
 run f-ok fetch; ok f-ok

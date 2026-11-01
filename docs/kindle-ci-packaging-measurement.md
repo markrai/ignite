@@ -134,7 +134,22 @@ Export public CI measurement material
   → return only public signed metadata to promote
 ```
 
-Preferred one-command path (Slice 3n):
+Preferred automated path (Slice 3o → 3n):
+
+```text
+python tools/release/ignite_release.py acquire --tag vX.Y.Z --output acquired/
+python tools/release/ignite_release.py sign \
+  --acquired acquired/ \
+  --private-key <offline.pem> --public-key <matching.hex> --output signed/
+```
+
+`acquire` downloads the Kindle customer artifact, packaging-measurements, and
+Linux release artifact for one trusted `ci.yml` run, cross-checks unsigned
+measurement/association fields against GitHub API run identity, and writes
+`acquisition.receipt.v1`. `sign` consumes `acquired/ci-artifacts/` via the 3n
+ceremony. Operator hash comparison of already-validated digests is not required.
+
+Lower-level 3n path (manual layout):
 
 ```text
 python tools/release/ignite_kindle_offline_sign.py prepare --tag vX.Y.Z --ci-artifacts <dir>

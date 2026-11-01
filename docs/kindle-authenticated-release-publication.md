@@ -1,8 +1,9 @@
-# Authenticated Kindle release publication readiness (Slices 3D-B2a.4.3k–3l)
+# Authenticated Kindle release publication readiness (Slices 3D-B2a.4.3k–3o)
 
 **Status:** non-publishing rehearsal. The production public-key pin remains
 `UNPROVISIONED`. No GitHub Release is published by this slice. No production
-private key is generated or stored in the repository.
+private key is generated or stored in the repository. Slice 3o automates CI
+artifact acquisition and local signed-metadata handoff into promote.
 
 Related: [`kindle-ci-packaging-measurement.md`](kindle-ci-packaging-measurement.md),
 [`kindle-production-publication-evidence.md`](kindle-production-publication-evidence.md),
@@ -85,6 +86,105 @@ Hard rules:
   than leaving an authenticated-looking incomplete release as authoritative.
 
 ## 4. Offline ceremony and rehearsal (non-publishing)
+
+### Automated acquire → sign → dry-run (Slice 3o)
+
+Preferred maintainer path. Uses authenticated GitHub API / `gh` for run
+identity, then the existing 3n ceremony and Option A local promote handoff
+(`IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR`). API provenance association is
+**not** cryptographic build attestation.
+
+**Release selection policy:** when `--run-id` is omitted, choose the highest
+numeric successful completed `ci.yml` run on `main` with event `push` or
+`workflow_dispatch`, matching `ignite/VERSION` at `head_sha`, that still
+exposes unexpired `ignite-kindle-release`,
+`ignite-kindle-packaging-measurements`, and `ignite-server-linux-release`.
+Never combine artifacts across runs.
+
+```text
+# Networked host (read-only GitHub credentials; no release:write required)
+python tools/release/ignite_release.py acquire \
+  --tag vX.Y.Z \
+  --output acquired-vX.Y.Z
+# optional: --run-id <id>
+
+# Transfer only the public acquired/ directory to the offline signing host.
+# Do not copy private keys into acquired/.
+
+# Offline signing host (no GitHub network required)
+python tools/release/ignite_release.py sign \
+  --acquired acquired-vX.Y.Z \
+  --private-key <offline.pem> \
+  --public-key <publisher.hex> \
+  --output signed-vX.Y.Z
+
+# Return signed-vX.Y.Z/promote-authenticated-assets/ (public metadata only).
+
+# Nonpublishing dry run — verifies isolated crypto, requires UNPROVISIONED
+# promote-gate refusal, and invokes promote-release.sh dry-run (guard→resolve→
+# fetch→verify). Exit 0 only for a complete verified rehearsal.
+python tools/release/ignite_release.py dry-run \
+  --tag vX.Y.Z \
+  --run-id <id> \
+  --signed-assets signed-vX.Y.Z \
+  --acquired acquired-vX.Y.Z \
+  --work dry-run-work \
+  --public-key <publisher-or-disposable.hex>
+```
+
+Machine-readable `dry_run_outcome=` (and matching exit status):
+
+| Outcome | Exit | Meaning |
+| --- | --- | --- |
+| `complete-verification-pass` | 0 | Provisioned pin; full shell verify passed |
+| `complete-rehearsal-unprovisioned-boundary` | 0 | Shell reached verify; refused at official pin `UNPROVISIONED` |
+| `partial-verification` | 2 | Intentional `--skip-promote-shell` (or equivalent partial scope) |
+| `verification-failed` | 1 | Resolve/fetch/signature/unrelated shell failure, etc. |
+| `verification-not-performed` | 3 | Bash/shell unavailable |
+
+Complete unprovisioned rehearsal requires phase markers
+`promote-phase=guard-ok|resolve-ok|fetch-ok|verify` plus
+`promote-shell-refusal=official-pin-unprovisioned` — never a generic
+substring match on the word `unprovisioned`.
+
+What each check establishes:
+
+- **GitHub API association** — `acquire` / promote `resolve` bind run id, workflow,
+  branch/event, and artifact IDs. Not cryptographic build attestation.
+- **Internal transfer consistency** — `load_acquired_bundle` revalidates receipts,
+  sidecars, measurement/profile, and extracted-tree digests after offline copy.
+  Symlinks / non-regular entries in retained trees are refused.
+- **Cryptographic integrity** — offline ceremony signatures + isolated six-asset
+  preflight under the supplied public key.
+- **Official publisher authority** — only the repository pin via production
+  promote-gate / `promote-release.sh` verify. While `UNPROVISIONED`, gate refusal
+  category must be `official-pin-unprovisioned` (malformed candidates are hard
+  failures, not “expected pin refusal”).
+
+`IGNITE_PROMOTE_PUBLIC_KEY_FILE` is dry-run rehearsal only (isolated disposable
+key). `publish` / `all` refuse that override; the promote-gate always reads the
+repository pin. An inherited override is stripped unless dry-run opts in.
+
+Acquisition emits `acquisition.receipt.v1` / `release-identity.v1`, ceremony
+`ci-artifacts/`, `linux/`, and `artifact-trees/` (extracted trees for digest
+revalidation — **not** GitHub zip archive digests). Bounded run search
+(`MAX_RUN_SEARCH_PAGES`) is recorded when `--run-id` is omitted.
+
+Local promotion handoff (Option A): `dry-run` sets
+`IGNITE_PROMOTE_AUTHENTICATED_ASSETS_DIR` and invokes
+`tools/release/promote-release.sh dry-run`. Explicit future publication:
+
+```text
+# same env as dry-run (without IGNITE_PROMOTE_PUBLIC_KEY_FILE), then:
+bash tools/release/promote-release.sh publish   # or all — never automatic
+```
+
+**Still blocks production publication today:** repository pin
+`UNPROVISIONED`, and the explicit promote publish confirmation.
+
+**Interrupted operations:** acquire and sign use private staging and finalize
+only after validation; delete partial staging directories and re-run into a new
+unused output path. Do not reuse a truncated destination.
 
 ### One-command prepare (no private key)
 
