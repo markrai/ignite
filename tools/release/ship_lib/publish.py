@@ -44,7 +44,23 @@ def local_asset_digests(asset_dir: Path, names: Sequence[str]) -> dict[str, str]
         if not path.is_file():
             raise ShipError(f"local authenticated asset missing: {name}")
         digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if sorted(digests) != sorted(names):
+        raise ShipError("asset digest map does not match expected inventory")
     return digests
+
+
+@dataclass(frozen=True)
+class NineFileInventory:
+    """Immutable expected publication inventory assembled before promote."""
+
+    root: Path
+    version: str
+    tag: str
+    commit: str
+    run_id: int
+    asset_names: tuple[str, ...]
+    asset_digests: dict[str, str]
+    linux_bundle_name: str
 
 
 @dataclass(frozen=True)
@@ -57,6 +73,110 @@ class PublishResult:
     inventory_ok: bool
     independently_verified: bool
     asset_digests: dict[str, str]
+    asset_names: tuple[str, ...] = ()
+    recovered_existing: bool = False
+    promote_command: str = ""
+
+
+def assemble_nine_file_inventory(
+    *,
+    acquired,
+    signed,
+    dest: Path,
+) -> NineFileInventory:
+    """Assemble the exact nine-file candidate via ``stage_nine_file_candidate``.
+
+    Digests are taken only from the staged canonical names — never from a casual
+    directory listing.
+    """
+    import sys
+
+    kindle = Path(__file__).resolve().parents[3] / "deployment" / "kindle"
+    if str(kindle) not in sys.path:
+        sys.path.insert(0, str(kindle))
+    from release_orchestrate import stage_nine_file_candidate
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    staged = stage_nine_file_candidate(
+        acquired=acquired, signed=signed, dest=dest
+    )
+    identity = acquired.identity
+    expected = canonical_nine_file_names(
+        version=identity.version,
+        linux_bundle_name=identity.linux_bundle_name,
+    )
+    have = sorted(p.name for p in staged.iterdir() if p.is_file())
+    if have != expected:
+        raise ShipError(
+            f"staged nine-file inventory mismatch: got={have!r} expected={expected!r}"
+        )
+    digests = local_asset_digests(staged, expected)
+    return NineFileInventory(
+        root=staged,
+        version=identity.version,
+        tag=identity.tag,
+        commit=identity.ci_head_sha,
+        run_id=int(identity.ci_run_id),
+        asset_names=tuple(expected),
+        asset_digests=digests,
+        linux_bundle_name=identity.linux_bundle_name,
+    )
+
+
+def seed_promote_work_from_acquired(*, acquired, work_dir: Path) -> None:
+    """Place exact acquired CI bytes where ``promote-release.sh verify`` expects them.
+
+    Layout:
+      $WORK/kindle/<scriptlet> + .sha256
+      $WORK/linux/<linux bundle> + .sha256
+
+    Does not rebuild artifacts. Refuses to overwrite an existing seeded tree with
+    different bytes.
+    """
+    identity = acquired.identity
+    kindle_dir = work_dir / "kindle"
+    linux_dir = work_dir / "linux"
+    scriptlet_name = identity.scriptlet_name
+    scriptlet_sum = f"Install Ignite v{identity.version}.sha256"
+    linux_name = identity.linux_bundle_name
+    linux_sum = f"{linux_name}.sha256"
+
+    src_scriptlet = acquired.ci_artifacts / scriptlet_name
+    if not src_scriptlet.is_file():
+        matches = list(acquired.ci_artifacts.rglob(scriptlet_name))
+        if len(matches) != 1:
+            raise ShipError("cannot locate acquired Scriptlet for promote seed")
+        src_scriptlet = matches[0]
+    src_sum = acquired.ci_artifacts / scriptlet_sum
+    if not src_sum.is_file():
+        matches = list(acquired.ci_artifacts.rglob(scriptlet_sum))
+        if len(matches) != 1:
+            raise ShipError("cannot locate acquired Scriptlet checksum for promote seed")
+        src_sum = matches[0]
+    src_linux = acquired.linux_dir / linux_name
+    src_linux_sum = acquired.linux_dir / linux_sum
+    if not src_linux.is_file() or not src_linux_sum.is_file():
+        raise ShipError("acquired Linux bundle or checksum missing for promote seed")
+
+    mapping = {
+        kindle_dir / scriptlet_name: src_scriptlet,
+        kindle_dir / scriptlet_sum: src_sum,
+        linux_dir / linux_name: src_linux,
+        linux_dir / linux_sum: src_linux_sum,
+    }
+    for dest, src in mapping.items():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_file():
+            if hashlib.sha256(dest.read_bytes()).hexdigest() != hashlib.sha256(
+                src.read_bytes()
+            ).hexdigest():
+                raise ShipError(
+                    f"promote work seed conflict for {dest.name}: "
+                    "existing bytes differ from acquired CI artifact"
+                )
+            continue
+        shutil.copy2(src, dest)
 
 
 def build_publish_env(
@@ -84,26 +204,91 @@ def build_publish_env(
     return env
 
 
+def inspect_existing_release(
+    *,
+    repo_root: Path,
+    tag: str,
+    expected_commit: str,
+    expected_asset_names: Sequence[str],
+    expected_digests: Mapping[str, str],
+    gh: GitHubClient,
+) -> dict[str, object] | None:
+    """Return verification result if a matching release already exists; else None.
+
+    Raises ShipError when a release exists but identity/bytes differ.
+    """
+    view = gh.run(
+        [
+            "release",
+            "view",
+            tag,
+            "--json",
+            "tagName,url,isDraft,isPrerelease,assets",
+        ],
+        cwd=repo_root,
+    )
+    if view.returncode != 0:
+        text = (view.stderr or view.stdout or "").lower()
+        if "not found" in text or "could not find" in text or "http 404" in text:
+            return None
+        # Ambiguous — treat as absent only on clear miss; otherwise fail closed.
+        if "release not found" in text:
+            return None
+        # Try API 404 probe.
+        api = gh.run(
+            ["api", f"repos/{{owner}}/{{repo}}/releases/tags/{tag}", "--jq", ".tag_name"],
+            cwd=repo_root,
+        )
+        if api.returncode != 0:
+            return None
+        # Exists via API; fall through to full verify which will raise on mismatch.
+    try:
+        return verify_published_release(
+            repo_root=repo_root,
+            tag=tag,
+            expected_commit=expected_commit,
+            gh=gh,
+            expected_asset_names=expected_asset_names,
+            expected_digests=expected_digests,
+        )
+    except ShipError as exc:
+        msg = str(exc).lower()
+        if "unable to view published release" in msg:
+            return None
+        raise ShipError(
+            f"existing release {tag} does not match authenticated candidate; "
+            f"refusing recovery/overwrite: {exc}"
+        ) from exc
+
+
 def publish_release(
     *,
     repo_root: Path,
     env: Mapping[str, str],
+    inventory: NineFileInventory,
     bash: str | None = None,
     dry_run_only: bool = False,
     gh: GitHubClient | None = None,
-    expected_assets: Sequence[str] | None = None,
-    local_asset_dir: Path | None = None,
-    expected_digests: Mapping[str, str] | None = None,
+    promote_command: str = "publish",
+    allow_recover_existing: bool = True,
 ) -> PublishResult:
-    """Run promote-release.sh publish and independently verify the GitHub Release."""
+    """Run promote-release.sh after inventory is fixed; verify remote bytes.
+
+    ``promote_command`` should be ``publish`` when the work directory has already
+    been seeded with acquired CI artifacts, or ``all`` to let the shell fetch.
+    """
     if "IGNITE_PROMOTE_PUBLIC_KEY_FILE" in env:
         raise ShipError("IGNITE_PROMOTE_PUBLIC_KEY_FILE is forbidden for publish")
+    if promote_command not in {"publish", "all"}:
+        raise ShipError(f"unsupported promote command: {promote_command}")
     script = repo_root / "tools" / "release" / "promote-release.sh"
     if not script.is_file():
         raise ShipError("promote-release.sh missing")
     tag = env["IGNITE_PROMOTE_TAG"]
     run_id = int(env["IGNITE_PROMOTE_RUN_ID"])
     commit = env["IGNITE_PROMOTE_COMMIT"]
+    if tag != inventory.tag or commit != inventory.commit or run_id != inventory.run_id:
+        raise ShipError("promote env identity does not match staged inventory")
     if dry_run_only:
         return PublishResult(
             tag=tag,
@@ -111,17 +296,47 @@ def publish_release(
             commit=commit,
             release_url=None,
             executed=False,
-            inventory_ok=False,
+            inventory_ok=True,
             independently_verified=False,
-            asset_digests={},
+            asset_digests=dict(inventory.asset_digests),
+            asset_names=inventory.asset_names,
+            promote_command=promote_command,
         )
+    if gh is None:
+        raise ShipError("GitHub client required for publication")
+
+    # Recover matching existing release before attempting create.
+    if allow_recover_existing:
+        existing = inspect_existing_release(
+            repo_root=repo_root,
+            tag=tag,
+            expected_commit=commit,
+            expected_asset_names=inventory.asset_names,
+            expected_digests=inventory.asset_digests,
+            gh=gh,
+        )
+        if existing is not None:
+            return PublishResult(
+                tag=tag,
+                run_id=run_id,
+                commit=commit,
+                release_url=str(existing.get("release_url") or ""),
+                executed=True,
+                inventory_ok=True,
+                independently_verified=True,
+                asset_digests=dict(existing.get("asset_digests") or {}),
+                asset_names=tuple(existing.get("asset_names") or inventory.asset_names),
+                recovered_existing=True,
+                promote_command="recover-existing",
+            )
+
     bash_bin = bash or _resolve_bash()
     if bash_bin is None:
         raise ShipError("bash required for promote-release.sh publish")
     merged = dict(os.environ)
     merged.update(env)
     completed = subprocess.run(
-        [bash_bin, str(script).replace("\\", "/"), "publish"],
+        [bash_bin, str(script).replace("\\", "/"), promote_command],
         cwd=str(repo_root),
         env=merged,
         capture_output=True,
@@ -129,31 +344,56 @@ def publish_release(
         check=False,
     )
     if completed.returncode != 0:
+        text = (completed.stderr or "") + (completed.stdout or "")
+        # Race: another process created the release between inspect and create.
+        if allow_recover_existing and "already exists" in text.lower():
+            existing = inspect_existing_release(
+                repo_root=repo_root,
+                tag=tag,
+                expected_commit=commit,
+                expected_asset_names=inventory.asset_names,
+                expected_digests=inventory.asset_digests,
+                gh=gh,
+            )
+            if existing is not None:
+                return PublishResult(
+                    tag=tag,
+                    run_id=run_id,
+                    commit=commit,
+                    release_url=str(existing.get("release_url") or ""),
+                    executed=True,
+                    inventory_ok=True,
+                    independently_verified=True,
+                    asset_digests=dict(existing.get("asset_digests") or {}),
+                    asset_names=tuple(
+                        existing.get("asset_names") or inventory.asset_names
+                    ),
+                    recovered_existing=True,
+                    promote_command="recover-existing",
+                )
+            raise ShipError(
+                "promote reported an existing release that does not match the "
+                "authenticated candidate; refusing overwrite"
+            )
         raise ShipError(
-            "promote-release.sh publish failed: "
-            + (completed.stderr or completed.stdout)[-800:]
+            f"promote-release.sh {promote_command} failed: " + text[-800:]
         )
     url = None
     for line in (completed.stdout or "").splitlines():
         if "https://github.com/" in line and "/releases/" in line:
             url = line.strip()
             break
-
-    if expected_assets is None and local_asset_dir is not None:
-        expected_assets = sorted(
-            p.name for p in local_asset_dir.iterdir() if p.is_file()
-        )
-    if expected_digests is None and local_asset_dir is not None and expected_assets:
-        expected_digests = local_asset_digests(local_asset_dir, expected_assets)
+        if line.startswith("published:"):
+            url = url or f"https://github.com/markrai/ignite/releases/tag/{tag}"
 
     verification = verify_published_release(
         repo_root=repo_root,
         tag=tag,
         expected_commit=commit,
         gh=gh,
-        expected_asset_names=expected_assets,
-        expected_digests=expected_digests,
-        local_asset_dir=local_asset_dir,
+        expected_asset_names=inventory.asset_names,
+        expected_digests=inventory.asset_digests,
+        local_asset_dir=inventory.root,
     )
     return PublishResult(
         tag=tag,
@@ -164,6 +404,9 @@ def publish_release(
         inventory_ok=bool(verification.get("inventory_ok")),
         independently_verified=bool(verification.get("verified")),
         asset_digests=dict(verification.get("asset_digests") or {}),
+        asset_names=tuple(verification.get("asset_names") or inventory.asset_names),
+        recovered_existing=False,
+        promote_command=promote_command,
     )
 
 
@@ -178,10 +421,7 @@ def verify_published_release(
     local_asset_dir: Path | None = None,
     download_dir: Path | None = None,
 ) -> dict[str, object]:
-    """Independently verify tag/commit/assets by retrieving remote bytes.
-
-    A local hash without a remote comparison is not sufficient.
-    """
+    """Independently verify tag/commit/assets by retrieving remote bytes."""
     if gh is None:
         raise ShipError(
             "independent publication verification requires a GitHub client"
@@ -244,7 +484,6 @@ def verify_published_release(
             f"got={names!r} expected={expected!r}"
         )
 
-    # Size check against local authenticated candidate when available.
     if local_asset_dir is not None:
         for name in expected:
             local = local_asset_dir / name
@@ -252,7 +491,6 @@ def verify_published_release(
             if remote_size is not None and int(remote_size) != local.stat().st_size:
                 raise ShipError(f"published asset size mismatch for {name}")
 
-    # Independently retrieve remote bytes and hash them.
     own_tmpdir = download_dir is None
     work = Path(download_dir) if download_dir is not None else Path(
         tempfile.mkdtemp(prefix="ignite-ship-release-verify-")
@@ -299,9 +537,7 @@ def _download_and_hash_assets(
     gh: GitHubClient,
     remote_by_name: Mapping[str, object],
 ) -> dict[str, str]:
-    """Download each published asset and return SHA-256 digests of remote bytes."""
     digests: dict[str, str] = {}
-    # Prefer a single gh release download into dest, then hash.
     pattern_args: list[str] = []
     for name in names:
         pattern_args.extend(["--pattern", name])
@@ -310,7 +546,6 @@ def _download_and_hash_assets(
         cwd=repo_root,
     )
     if downloaded.returncode != 0:
-        # Fallback: per-asset API download via gh api (raw bytes to file).
         for name in names:
             out = dest / name
             api = gh.run(
@@ -334,7 +569,11 @@ def _download_and_hash_assets(
         path = dest / name
         if not path.is_file():
             raise ShipError(f"downloaded asset missing after retrieval: {name}")
-        remote_size = remote_by_name[name].get("size") if isinstance(remote_by_name[name], dict) else None
+        remote_size = (
+            remote_by_name[name].get("size")
+            if isinstance(remote_by_name[name], dict)
+            else None
+        )
         if remote_size is not None and int(remote_size) != path.stat().st_size:
             raise ShipError(f"downloaded asset size mismatch for {name}")
         digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()

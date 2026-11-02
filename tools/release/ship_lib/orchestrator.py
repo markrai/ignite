@@ -54,10 +54,10 @@ from .outcomes import (
 )
 from .pin_provision import provision_public_pin
 from .publish import (
+    assemble_nine_file_inventory,
     build_publish_env,
-    canonical_nine_file_names,
-    local_asset_digests,
     publish_release,
+    seed_promote_work_from_acquired,
     verify_published_release,
 )
 from .recovery import (
@@ -1124,112 +1124,22 @@ class ShipOrchestrator:
         journal.mark_in_progress(PHASE_PUBLISH)
         gh = self.hooks.gh or SubprocessGitHub()
         if self.hooks.publish_fn is not None:
+            # Unit-test seam only. Integration tests must exercise the real shell path.
             result = self.hooks.publish_fn(journal=journal, gh=gh)
-        else:
-            kindle = self.config.repo_root / "deployment" / "kindle"
-            if str(kindle) not in sys.path:
-                sys.path.insert(0, str(kindle))
-            from release_acquire import load_acquired_bundle
-            from release_orchestrate import match_signed_to_acquired
-
-            acquired = load_acquired_bundle(
-                Path(str(journal.fields["acquired_dir"]))
-            )
-            signed = match_signed_to_acquired(
-                signed=Path(str(journal.fields["signed_dir"])),
-                identity=acquired.identity,
-            )
-            env = build_publish_env(
-                acquired=acquired,
-                signed=signed,
-                work_dir=self.config.work_dir / "promote-publish",
-            )
-            linux_name = acquired.identity.linux_bundle_name
-            expected_names = canonical_nine_file_names(
-                version=journal.version,
-                linux_bundle_name=linux_name,
-            )
-            # Prefer the staged nine-file candidate when present; else signed root.
-            asset_dir = Path(str(journal.fields.get("signed_dir") or ""))
-            nine = self.config.work_dir / "promote-publish" / "dist"
-            if nine.is_dir():
-                asset_dir = nine
-            expected_digests = local_asset_digests(asset_dir, expected_names)
-            result = publish_release(
-                repo_root=self.config.repo_root,
-                env=env,
-                dry_run_only=False,
-                gh=gh,
-                expected_assets=expected_names,
-                expected_digests=expected_digests,
-                local_asset_dir=asset_dir,
-            )
-        verified = bool(
-            getattr(result, "independently_verified", False)
-            or (
-                isinstance(result, dict)
-                and result.get("independently_verified")
-            )
-        )
-        published = bool(
-            getattr(result, "executed", False)
-            or (isinstance(result, dict) and result.get("executed"))
-        )
-        if not published or not verified:
-            # Safe retry: if promote created a release but verification failed,
-            # attempt independent verification without marking success.
-            try:
-                expected_names = list(
-                    journal.fields.get("asset_names")
-                    or (
-                        result.get("asset_names")
-                        if isinstance(result, dict)
-                        else []
-                    )
-                    or []
+            verified = bool(
+                getattr(result, "independently_verified", False)
+                or (
+                    isinstance(result, dict)
+                    and result.get("independently_verified")
                 )
-                expected_digests = dict(
-                    journal.fields.get("expected_asset_digests")
-                    or (
-                        result.get("expected_asset_digests")
-                        if isinstance(result, dict)
-                        else {}
-                    )
-                    or {}
-                )
-                if not expected_names or not expected_digests:
-                    raise ShipError(
-                        "cannot retry publish verification without expected "
-                        "asset inventory and digests"
-                    )
-                verification = verify_published_release(
-                    repo_root=self.config.repo_root,
-                    tag=journal.tag,
-                    expected_commit=str(
-                        journal.fields.get("main_sha")
-                        or journal.fields.get("source_revision")
-                        or ""
-                    ),
-                    gh=gh,
-                    expected_asset_names=expected_names,
-                    expected_digests=expected_digests,
-                )
-                verified = bool(verification.get("verified"))
-                published = verified
-                release_url = str(verification.get("release_url") or "")
-                asset_digests = dict(verification.get("asset_digests") or {})
-                asset_names = list(verification.get("asset_names") or expected_names)
-            except ShipError as exc:
+            )
+            if not verified:
                 journal.mark_failed(
-                    PHASE_PUBLISH,
-                    executed=published,
-                    independently_verified=False,
-                    error=str(exc),
+                    PHASE_PUBLISH, executed=True, independently_verified=False
                 )
                 raise ShipError(
                     "publication not independently verified; refusing success"
-                ) from exc
-        else:
+                )
             release_url = str(
                 getattr(result, "release_url", None)
                 or (result.get("release_url") if isinstance(result, dict) else "")
@@ -1245,15 +1155,134 @@ class ShipOrchestrator:
                 or (result.get("asset_names") if isinstance(result, dict) else [])
                 or sorted(asset_digests)
             )
-        if not verified:
-            journal.mark_failed(
+            recovered = bool(
+                getattr(result, "recovered_existing", False)
+                or (
+                    isinstance(result, dict) and result.get("recovered_existing")
+                )
+            )
+        else:
+            kindle = self.config.repo_root / "deployment" / "kindle"
+            if str(kindle) not in sys.path:
+                sys.path.insert(0, str(kindle))
+            from release_acquire import load_acquired_bundle
+            from release_orchestrate import match_signed_to_acquired
+
+            acquired = load_acquired_bundle(
+                Path(str(journal.fields["acquired_dir"]))
+            )
+            signed = match_signed_to_acquired(
+                signed=Path(str(journal.fields["signed_dir"])),
+                identity=acquired.identity,
+            )
+            main_sha = str(
+                journal.fields.get("main_sha")
+                or journal.fields.get("source_revision")
+                or ""
+            )
+            if main_sha and acquired.identity.ci_head_sha != main_sha:
+                raise ShipError(
+                    "acquired CI SHA does not match merged main before publish"
+                )
+
+            work_dir = self.config.work_dir / "promote-publish"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            nine_dest = work_dir / "nine-file-candidate"
+            inventory = assemble_nine_file_inventory(
+                acquired=acquired,
+                signed=signed,
+                dest=nine_dest,
+            )
+            # Persist immutable expected inventory before any GitHub mutation.
+            journal.mark_in_progress(
                 PHASE_PUBLISH,
-                executed=True,
-                independently_verified=False,
+                expected_asset_names=list(inventory.asset_names),
+                expected_asset_digests=dict(inventory.asset_digests),
+                nine_file_candidate=str(inventory.root),
+                publish_commit=inventory.commit,
+                publish_run_id=inventory.run_id,
             )
-            raise ShipError(
-                "publication not independently verified; refusing success"
+            report.emit(
+                f"nine_file_inventory={','.join(inventory.asset_names)}"
             )
+
+            env = build_publish_env(
+                acquired=acquired,
+                signed=signed,
+                work_dir=work_dir,
+            )
+            # Seed exact acquired CI bytes into the promote work directory so a
+            # fresh WORK is valid for ``publish`` (guard→resolve→verify→create).
+            seed_promote_work_from_acquired(acquired=acquired, work_dir=work_dir)
+
+            from .publish import PublishResult
+
+            try:
+                result = publish_release(
+                    repo_root=self.config.repo_root,
+                    env=env,
+                    inventory=inventory,
+                    dry_run_only=False,
+                    gh=gh,
+                    promote_command="publish",
+                    allow_recover_existing=True,
+                )
+            except ShipError as exc:
+                # After create / during download: try recover from journal inventory.
+                try:
+                    verification = verify_published_release(
+                        repo_root=self.config.repo_root,
+                        tag=journal.tag,
+                        expected_commit=inventory.commit,
+                        gh=gh,
+                        expected_asset_names=inventory.asset_names,
+                        expected_digests=inventory.asset_digests,
+                        local_asset_dir=inventory.root,
+                    )
+                    result = PublishResult(
+                        tag=journal.tag,
+                        run_id=inventory.run_id,
+                        commit=inventory.commit,
+                        release_url=str(verification.get("release_url") or ""),
+                        executed=True,
+                        inventory_ok=True,
+                        independently_verified=True,
+                        asset_digests=dict(verification.get("asset_digests") or {}),
+                        asset_names=tuple(
+                            verification.get("asset_names") or inventory.asset_names
+                        ),
+                        recovered_existing=True,
+                        promote_command="recover-existing",
+                    )
+                    report.emit(f"publish_recover_after_error={exc}")
+                except ShipError:
+                    journal.mark_failed(
+                        PHASE_PUBLISH,
+                        executed=False,
+                        independently_verified=False,
+                        error=str(exc),
+                        expected_asset_names=list(inventory.asset_names),
+                        expected_asset_digests=dict(inventory.asset_digests),
+                    )
+                    raise
+
+            verified = bool(result.independently_verified)
+            if not verified:
+                journal.mark_failed(
+                    PHASE_PUBLISH,
+                    executed=bool(result.executed),
+                    independently_verified=False,
+                    expected_asset_names=list(inventory.asset_names),
+                    expected_asset_digests=dict(inventory.asset_digests),
+                )
+                raise ShipError(
+                    "publication not independently verified; refusing success"
+                )
+            release_url = result.release_url or ""
+            asset_digests = dict(result.asset_digests)
+            asset_names = list(result.asset_names or inventory.asset_names)
+            recovered = bool(result.recovered_existing)
+
         journal.mark_completed(
             PHASE_PUBLISH,
             identity=self._identity_binding(
@@ -1264,14 +1293,21 @@ class ShipOrchestrator:
             independently_verified=True,
             release_url=release_url,
             commit=str(
-                journal.fields.get("main_sha")
+                journal.fields.get("publish_commit")
+                or journal.fields.get("main_sha")
                 or journal.fields.get("source_revision")
                 or ""
             ),
             asset_digests=asset_digests,
             asset_names=asset_names,
+            expected_asset_digests=dict(
+                journal.fields.get("expected_asset_digests") or asset_digests
+            ),
+            recovered_existing=recovered,
         )
         report.emit("phase=publish:ok")
         report.emit("published=true")
+        if recovered:
+            report.emit("publish_recovered_existing=true")
         if release_url:
             report.emit(f"release_url={release_url}")
