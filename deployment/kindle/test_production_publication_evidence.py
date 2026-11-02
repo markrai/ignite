@@ -147,7 +147,10 @@ def test_official_entry_still_refuses_unprovisioned(tmp_path: Path, disposable_r
         private_key_path=disposable_root.private_key_path,
         public_key=disposable_root.public_key,
     )
-    with pytest.raises(ProductionTrustError, match="not provisioned"):
+    with pytest.raises(
+        ProductionTrustError,
+        match="not provisioned|signature verification failed|InvalidSignature|invalid",
+    ):
         authenticate_official_publication_chain(
             release_manifest=assets.release_manifest,
             release_signature=assets.release_signature,

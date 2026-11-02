@@ -484,20 +484,19 @@ impl DownloadProbe for CurlProbe {
         let header_path = self.body_path.with_extension("hdr");
         let _ = fs::remove_file(&self.body_path);
         let _ = fs::remove_file(&header_path);
+        // Kindle system curl rejects `--max-filesize=N` (equals form) as unknown
+        // while accepting `--max-filesize N`. Prefer separate argv tokens.
         let output = Command::new("curl")
             .arg("--silent")
             .arg("--show-error")
             .arg("--proto")
             .arg("=https")
-            .arg(format!("--max-filesize={}", self.size_limit))
-            .arg(format!(
-                "--connect-timeout={}",
-                self.connect_timeout.as_secs().max(1)
-            ))
-            .arg(format!(
-                "--max-time={}",
-                self.transfer_timeout.as_secs().max(1)
-            ))
+            .arg("--max-filesize")
+            .arg(self.size_limit.to_string())
+            .arg("--connect-timeout")
+            .arg(self.connect_timeout.as_secs().max(1).to_string())
+            .arg("--max-time")
+            .arg(self.transfer_timeout.as_secs().max(1).to_string())
             .arg("--dump-header")
             .arg(&header_path)
             .arg("--output")

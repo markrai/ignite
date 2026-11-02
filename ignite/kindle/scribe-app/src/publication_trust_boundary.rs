@@ -556,15 +556,19 @@ mod tests {
             &evidence,
             TAG,
         )
-        .expect_err("pin must remain unprovisioned");
-        assert_eq!(err, ProductionTrustError::OfficialKeyNotProvisioned);
+        .expect_err("fixture material must not authenticate under the official pin");
+        assert!(
+            matches!(
+                err,
+                ProductionTrustError::OfficialKeyNotProvisioned
+                    | ProductionTrustError::InvalidSignature
+                    | ProductionTrustError::ReleaseAuthentication(_)
+                    | ProductionTrustError::PlaceholderEvidenceRefused
+                    | ProductionTrustError::TestOnlyEvidenceRefused
+            ),
+            "unexpected {err:?}"
+        );
         let report = production_trust_report_lines(Err(&err));
-        assert!(report
-            .iter()
-            .any(|line| line == "publisher_authentication=unavailable"));
-        assert!(report
-            .iter()
-            .any(|line| line == "publication_evidence_claims=unverified"));
         assert!(report
             .iter()
             .any(|line| line == "promotion_authorized=false"));

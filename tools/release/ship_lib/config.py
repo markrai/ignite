@@ -54,6 +54,7 @@ class ShipConfig:
     allow_live: bool = False
     allow_insecure_store: bool = False
     hardware_device_id: str | None = None
+    hardware_ssh_host: str | None = None
     ci_poll_seconds: int = 30
     ci_timeout_seconds: int = 3600
     # Public release always requires hardware acceptance; this flag only
@@ -101,6 +102,7 @@ def load_ship_config(
     recovery_key_dir: Path | None = None,
     allow_live: bool = False,
     hardware_device_id: str | None = None,
+    hardware_ssh_host: str | None = None,
     require_hardware: bool | None = None,
 ) -> ShipConfig:
     root = (repo_root or _REPO).resolve()
@@ -149,6 +151,9 @@ def load_ship_config(
     insecure = os.environ.get("IGNITE_SHIP_ALLOW_INSECURE_STORE", "").strip() == "1"
     live = allow_live or os.environ.get("IGNITE_SHIP_ALLOW_LIVE", "").strip() == "1"
     hw = hardware_device_id or os.environ.get("IGNITE_SHIP_KINDLE_DEVICE_ID")
+    ssh_host = hardware_ssh_host or os.environ.get("IGNITE_SHIP_KINDLE_SSH_HOST")
+    if ssh_host is not None:
+        ssh_host = ssh_host.strip() or None
     # Public release acceptance is mandatory; env cannot permanently disable it.
     # doctor may still report the configured preference.
     req_hw = (
@@ -164,5 +169,6 @@ def load_ship_config(
         allow_live=live,
         allow_insecure_store=insecure,
         hardware_device_id=hw,
+        hardware_ssh_host=ssh_host,
         require_hardware=req_hw,
     )

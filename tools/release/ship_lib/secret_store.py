@@ -4,8 +4,9 @@ Windows: DPAPI (CryptProtectData / CryptUnprotectData) seals bytes to the
 current user for *local at-rest* protection only.
 
 DPAPI alone is **not** an off-machine recovery mechanism. Independent recovery
-uses OpenSSL AES-256-CBC + PBKDF2 with a recovery authority key stored only
-under ``IGNITE_SHIP_RECOVERY_DIR`` (see ``recovery.py``).
+uses AES-256-GCM with a recovery authority key stored only under
+``IGNITE_SHIP_RECOVERY_KEY_DIR``, separated from ciphertext under
+``IGNITE_SHIP_RECOVERY_DIR`` (see ``recovery.py``).
 
 Insecure file store is available only for disposable tests and is hard-refused
 for live / production signing even when the development environment variable is

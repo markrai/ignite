@@ -745,6 +745,50 @@ class ShipOrchestratorBoundaryTests(unittest.TestCase):
             ).read_bytes(),
         )
 
+    def test_cli_init_authority_requires_recovery_domains(self) -> None:
+        env = os.environ.copy()
+        env["IGNITE_SHIP_HOME"] = str(self.home)
+        env.pop("IGNITE_SHIP_RECOVERY_DIR", None)
+        env.pop("IGNITE_SHIP_RECOVERY_KEY_DIR", None)
+        env["IGNITE_SHIP_ALLOW_INSECURE_STORE"] = "1"
+        script = _RELEASE / "ignite_ship.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--repo-root",
+                str(self.repo),
+                "init-authority",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("ship_outcome=failed", result.stdout)
+        self.assertFalse(authority_present(self.config))
+        pin_result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--repo-root",
+                str(self.repo),
+                "provision-pin",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, pin_result.returncode)
+        self.assertEqual(
+            b"UNPROVISIONED\n",
+            (
+                self.repo / "tools" / "release" / "kindle-release-public-key.hex"
+            ).read_bytes(),
+        )
+
     def test_version_validation(self) -> None:
         validate_version_string("0.9.15")
         with self.assertRaises(ShipError):

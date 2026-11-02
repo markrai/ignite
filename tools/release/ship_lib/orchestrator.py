@@ -32,7 +32,9 @@ from .git_coord import (
 from .hardware import (
     HardwareAcceptanceHarness,
     HardwareProbe,
+    KindleSshHardwareProbe,
     MockHardwareProbe,
+    build_default_kindle_probe,
 )
 from .journal import ShipJournal
 from .outcomes import (
@@ -64,6 +66,7 @@ from .recovery import (
     assert_dpapi_alone_insufficient_label,
     recovery_backup_paths,
     recovery_key_path,
+    verify_independent_restore,
 )
 from .secret_store import SecretStore, select_secret_store
 from .signing_service import RestrictedSigningService, SignReleaseRequest
@@ -147,9 +150,27 @@ class ShipOrchestrator:
             f"hardware_device_id={self.config.hardware_device_id or 'UNSET'}"
         )
         report.emit(
+            f"hardware_ssh_host={self.config.hardware_ssh_host or 'UNSET'}"
+        )
+        report.emit(
             f"require_hardware={str(self.config.require_hardware).lower()}"
         )
         return report
+
+    def _hardware_probe_for_config(self) -> HardwareProbe:
+        if self.hooks.hardware_probe is not None:
+            return self.hooks.hardware_probe
+        if self.config.hardware_ssh_host and self.config.hardware_device_id:
+            pin = self.config.pin_path.read_text(encoding="ascii")
+            evidence = self.config.ship_home / "hardware-evidence"
+            return build_default_kindle_probe(
+                ssh_host=self.config.hardware_ssh_host,
+                evidence_dir=evidence,
+                repo_pin_hex=pin.strip(),
+            )
+        from .hardware import NullHardwareProbe
+
+        return NullHardwareProbe()
 
     def doctor(self) -> ShipReport:
         report = self.status()
@@ -204,12 +225,133 @@ class ShipOrchestrator:
             report.emit("hardware=unconfigured")
         else:
             report.emit("hardware=configured")
+        if not self.config.hardware_ssh_host:
+            problems.append("hardware ssh host unset")
+            report.emit("hardware_ssh=unconfigured")
+        else:
+            report.emit("hardware_ssh=configured")
+            probe = self._hardware_probe_for_config()
+            if isinstance(probe, KindleSshHardwareProbe):
+                for line in probe.doctor_connectivity(
+                    device_id=self.config.hardware_device_id or ""
+                ):
+                    report.emit(line)
+                    if line.startswith("hardware_probe=unreachable") or line.endswith(
+                        "device-mismatch"
+                    ):
+                        problems.append(line)
+            else:
+                report.emit("hardware_probe=not-kindle-ssh")
+        report.emit("hardware_production_acceptance=blocked-until-provisioned-ota")
         if problems:
             report.outcome = ShipOutcome.BLOCKED_CONFIG
             report.emit("doctor=failed")
         else:
             report.outcome = ShipOutcome.READY
             report.emit("doctor=ok")
+        return report
+
+    def init_authority(self) -> ShipReport:
+        """Standalone production publisher initialization.
+
+        Generates a new Ed25519 identity only when absent, seals with the
+        OS-backed store (Windows DPAPI), establishes independent AES-256-GCM
+        recovery, and verifies restore. Never touches Git, CI, releases, or
+        the Kindle. Never overwrites an existing authority.
+        """
+        report = ShipReport(outcome=ShipOutcome.READY, version="", tag="")
+        report.emit("schema=ignite-ship-init-authority-v1")
+        report.emit(f"ship_home={self.config.ship_home}")
+        report.emit(f"recovery_dir={self.config.recovery_dir or 'UNSET'}")
+        report.emit(
+            f"recovery_key_dir={self.config.recovery_key_dir or 'UNSET'}"
+        )
+        report.emit(assert_dpapi_alone_insufficient_label())
+        try:
+            if authority_present(self.config):
+                auth = load_authority(self.config)
+                report.emit("authority=already-initialized")
+                report.emit(f"fingerprint_sha256={auth.fingerprint_sha256}")
+                report.emit(f"secret_store={auth.store_name}")
+                report.emit(
+                    f"recovery_verified={str(auth.recovery_verified).lower()}"
+                )
+                report.emit(f"recovery_mechanism={auth.recovery_mechanism}")
+                report.fields["fingerprint_sha256"] = auth.fingerprint_sha256
+                report.fields["created"] = False
+                if not auth.recovery_verified:
+                    report.outcome = ShipOutcome.BLOCKED_CONFIG
+                    report.emit(
+                        "error=existing authority lacks independent recovery verification"
+                    )
+                return report
+            auth = initialize_authority(
+                self.config,
+                store=self.hooks.secret_store,
+                production=True,
+            )
+            if self.config.recovery_dir is None or self.config.recovery_key_dir is None:
+                raise ShipConfigError(
+                    "recovery domains must remain configured after authority init"
+                )
+            restored = verify_independent_restore(
+                recovery_dir=self.config.recovery_dir,
+                recovery_key_dir=self.config.recovery_key_dir,
+                expected_public=auth.public_key,
+                expected_fingerprint=auth.fingerprint_sha256,
+            )
+            report.emit("authority=created")
+            report.emit(f"fingerprint_sha256={auth.fingerprint_sha256}")
+            report.emit(f"secret_store={auth.store_name}")
+            report.emit(
+                f"recovery_verified={str(auth.recovery_verified).lower()}"
+            )
+            report.emit(f"recovery_mechanism={auth.recovery_mechanism}")
+            report.emit(
+                f"independent_restore_recheck={str(restored).lower()}"
+            )
+            report.fields["fingerprint_sha256"] = auth.fingerprint_sha256
+            report.fields["created"] = True
+            if not auth.recovery_verified or not restored:
+                report.outcome = ShipOutcome.FAILED
+                report.emit("error=recovery verification failed after init")
+            else:
+                report.outcome = ShipOutcome.SUCCESS
+        except (ShipError, ShipConfigError) as exc:
+            report.outcome = ShipOutcome.FAILED
+            report.emit(f"error={exc}")
+        return report
+
+    def provision_pin(self) -> ShipReport:
+        """Replace UNPROVISIONED with the active authority public key.
+
+        Does not stage, commit, push, publish, or install. Leaves the pin
+        change for the operator to review unstaged.
+        """
+        report = ShipReport(outcome=ShipOutcome.READY, version="", tag="")
+        report.emit("schema=ignite-ship-provision-pin-v1")
+        try:
+            if not authority_present(self.config):
+                raise ShipError("cannot provision pin without initialized authority")
+            auth = load_authority(self.config)
+            if not auth.recovery_verified:
+                raise ShipError(
+                    "authority independent recovery was not verified; refusing pin provision"
+                )
+            before = self.config.pin_path.read_bytes()
+            fingerprint = provision_public_pin(self.config, authority=auth)
+            after = self.config.pin_path.read_bytes()
+            report.emit(f"fingerprint_sha256={fingerprint}")
+            report.emit(f"repository_pin_hex={after[:-1].decode('ascii')}")
+            report.emit(
+                f"pin_changed={str(before != after).lower()}"
+            )
+            report.emit("pin_git_action=none-left-unstaged")
+            report.fields["fingerprint_sha256"] = fingerprint
+            report.outcome = ShipOutcome.SUCCESS
+        except (ShipError, ShipConfigError) as exc:
+            report.outcome = ShipOutcome.FAILED
+            report.emit(f"error={exc}")
         return report
 
     def plan(self, version: str) -> ShipReport:
@@ -1042,11 +1184,7 @@ class ShipOrchestrator:
         harness = HardwareAcceptanceHarness(
             required_device_id=self.config.hardware_device_id
         )
-        probe = self.hooks.hardware_probe
-        if probe is None:
-            from .hardware import NullHardwareProbe
-
-            probe = NullHardwareProbe()
+        probe = self._hardware_probe_for_config()
         if isinstance(probe, MockHardwareProbe):
             journal.mark_blocked(
                 PHASE_HARDWARE,
@@ -1066,12 +1204,19 @@ class ShipOrchestrator:
             version=version,
             probe=probe,
         )
+        for case in result.case_results:
+            report.emit(f"hardware_case={case}")
+        report.emit(f"hardware_pre_release_ready={str(result.pre_release_ready).lower()}")
+        report.emit(f"hardware_embedded_pin_state={result.embedded_pin_state}")
         if not result.authorizes_publication:
             journal.mark_blocked(
                 PHASE_HARDWARE,
                 device_id=result.device_id,
                 details=list(result.details),
                 production_evidence=result.production_evidence,
+                pre_release_ready=result.pre_release_ready,
+                embedded_pin_state=result.embedded_pin_state,
+                case_results=list(result.case_results),
             )
             raise ShipBlockedError(
                 "release-blocked: hardware-acceptance-unavailable "

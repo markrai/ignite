@@ -680,6 +680,16 @@ pub fn cleanup_staging_root(root: &Path, kind: StagingRootKind) -> Result<(), St
 pub fn stage_verified_update(request: &StageRequest) -> Result<StageResult, StagingError> {
     validate_staging_root(&request.staging_root, request.root_kind)?;
     enforce_trust_root_isolation(&request.staging_root, &request.trust, request.root_kind)?;
+    // Production mode must fail closed on an UNPROVISIONED pin before any network
+    // acquisition or work-tree mutation.
+    if matches!(request.trust, TrustMode::Production) {
+        crate::release_manifest::official_release_public_key().map_err(|err| match err {
+            crate::release_manifest::ReleaseVerifyError::OfficialKeyNotProvisioned => {
+                StagingError::ProductionPinBlocks
+            }
+            other => StagingError::Trust(ProductionTrustError::from(other)),
+        })?;
+    }
     let names = ReleaseAssetNames::for_version(&request.version)?;
 
     // Fail-closed reconciliation of interrupted .next/.prev artifacts before any
@@ -1658,7 +1668,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                StagingError::ProductionPinBlocks | StagingError::TrustModeMismatch
+                StagingError::ProductionPinBlocks
+                    | StagingError::TrustModeMismatch
+                    | StagingError::Trust(_)
             ),
             "unexpected {err}"
         );
@@ -2004,8 +2016,14 @@ mod tests {
             trust: TrustMode::Production,
             root_kind: StagingRootKind::HostTest,
         };
-        let err = stage_verified_update(&req).expect_err("pin blocked");
-        assert!(matches!(err, StagingError::ProductionPinBlocks));
+        let err = stage_verified_update(&req).expect_err("production refused");
+        assert!(
+            matches!(
+                err,
+                StagingError::ProductionPinBlocks | StagingError::Trust(_)
+            ),
+            "unexpected {err}"
+        );
         let _ = fs::remove_dir_all(src.parent().unwrap());
     }
 

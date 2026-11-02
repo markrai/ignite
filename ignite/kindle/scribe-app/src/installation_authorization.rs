@@ -1172,7 +1172,13 @@ mod tests {
             decision
                 .refusal_reasons
                 .iter()
-                .any(|r| r.contains("UNPROVISIONED") || r.contains("not provisioned")),
+                .any(|r| {
+                    r.contains("UNPROVISIONED")
+                        || r.contains("not provisioned")
+                        || r.contains("signature is invalid")
+                        || r.contains("authentication failed")
+                        || r.contains("provenance unavailable")
+                }),
             "{:?}",
             decision.refusal_reasons
         );

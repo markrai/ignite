@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-"""Ignite autonomous release orchestrator (Slice 3D-B2a.4.3q / 3q.1).
+"""Ignite autonomous release orchestrator (Slice 3D-B2a.4.3q / 3q.1 / 3t).
 
 Commands:
 
-  status   Read-only signing authority / pin / readiness report
-  doctor   Verify local dependencies and configuration
-  plan     Read-only release rehearsal (never mutates authority/pin/versions/Git)
-  ship     Run the phased release workflow for a version
-  resume   Resume an interrupted ship journal for a version
+  status          Read-only signing authority / pin / readiness report
+  doctor          Verify local dependencies and configuration
+  init-authority  One-time production publisher identity + recovery (no Git/CI/release)
+  provision-pin   Write the authority public key into the repository pin (unstaged)
+  plan            Read-only release rehearsal (never mutates authority/pin/versions/Git)
+  ship            Run the phased release workflow for a version
+  resume          Resume an interrupted ship journal for a version
 
 Default ``ship`` without ``--allow-live --execute-live`` is non-mutating: it
 records plans/deferred phases and never claims publication success.
 
-Live GitHub mutation, production-key activation, and Kindle publication require
-explicit ``--allow-live --execute-live`` plus ``IGNITE_SHIP_HOME`` /
-``IGNITE_SHIP_RECOVERY_DIR``. This engineering checkout leaves changes unstaged
-and does not execute live publish.
+``init-authority`` and ``provision-pin`` are deliberate local mutations that do
+not require ``--allow-live``. They never commit, push, open PRs, publish
+GitHub releases, or install on Kindle.
+
+Live GitHub mutation and Kindle publication require explicit
+``--allow-live --execute-live`` plus ``IGNITE_SHIP_HOME`` /
+``IGNITE_SHIP_RECOVERY_DIR`` / ``IGNITE_SHIP_RECOVERY_KEY_DIR``.
 
 Security tradeoff: unattended signing requires a connected, controlled signing
 host. A compromised host or authorized signing-service identity can compromise
 publisher authority. The system is not air-gapped. DPAPI is local at-rest only;
-off-machine recovery uses OpenSSL AES-256-CBC+PBKDF2 with a recovery authority
-key under ``IGNITE_SHIP_RECOVERY_DIR``.
+off-machine recovery uses AES-256-GCM with a recovery authority key under
+``IGNITE_SHIP_RECOVERY_KEY_DIR``, separated from ciphertext under
+``IGNITE_SHIP_RECOVERY_DIR``.
 """
 
 from __future__ import annotations
@@ -80,6 +86,20 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="read-only readiness report")
     sub.add_parser("doctor", help="verify local ship prerequisites")
+    sub.add_parser(
+        "init-authority",
+        help=(
+            "initialize production publisher identity + independent recovery "
+            "(no Git/CI/release/Kindle)"
+        ),
+    )
+    sub.add_parser(
+        "provision-pin",
+        help=(
+            "replace UNPROVISIONED with the active authority public key "
+            "(leaves change unstaged; no Git/CI/release)"
+        ),
+    )
 
     plan = sub.add_parser(
         "plan",
@@ -120,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
         report = orch.status()
     elif args.command == "doctor":
         report = orch.doctor()
+    elif args.command == "init-authority":
+        report = orch.init_authority()
+    elif args.command == "provision-pin":
+        report = orch.provision_pin()
     elif args.command == "plan":
         report = orch.plan(args.version)
     elif args.command == "ship":
