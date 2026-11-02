@@ -73,6 +73,7 @@ mod s2_erase_parity_tests;
 pub mod server_link;
 pub mod session;
 pub mod settings_ui;
+pub mod software_update;
 pub mod singleton;
 pub mod sleep_ui;
 pub mod storage_capabilities;

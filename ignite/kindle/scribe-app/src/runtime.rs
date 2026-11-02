@@ -318,10 +318,16 @@ impl KindleTransport {
     fn render_preferences(
         &mut self,
         action: SideButtonAction,
+        update: &crate::software_update::SoftwareUpdateState,
         dialog: Option<&DialogSpec>,
     ) -> Result<(), String> {
         self.chrome_on_panel = false;
-        crate::settings_ui::render_preferences(self.fb.as_slice_mut(), &self.geometry, action)?;
+        crate::settings_ui::render_preferences(
+            self.fb.as_slice_mut(),
+            &self.geometry,
+            action,
+            update,
+        )?;
         if let Some(spec) = dialog {
             render_dialog(self.fb.as_slice_mut(), &self.geometry, spec)?;
         }
@@ -2197,6 +2203,8 @@ struct UiExec<'a> {
     stop: &'a Arc<AtomicBool>,
     /// NBK import in progress (Tools screen); one source per idle loop pass.
     import_run: &'a mut Option<ImportRun>,
+    /// Software Update discovery job (Preferences); completes off the UI thread.
+    update_check: &'a mut Option<UpdateCheckJob>,
     /// Replica-local preferences.json (outside the library).
     prefs_path: &'a Path,
     /// `--sync-dir` (Restore from Server replaces it with the library).
@@ -2214,6 +2222,91 @@ struct ImportRun {
     imported: usize,
     skipped: usize,
     failures: Vec<crate::tools_ui::ImportFailureLine>,
+}
+
+/// Background GitHub release discovery. Never installs; results are advisory.
+struct UpdateCheckJob {
+    generation: u64,
+    rx: std::sync::mpsc::Receiver<
+        Result<
+            crate::software_update::UpdateCheckOutcome,
+            crate::software_update::UpdateDiscoveryError,
+        >,
+    >,
+}
+
+fn start_software_update_check(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+) -> Result<(), String> {
+    if x.update_check.is_some() || x.ui.software_update.busy() {
+        println!("software_update=check_ignored reason=already_checking");
+        return present_ui(x, ctrl, None);
+    }
+    let Some(generation) = x.ui.software_update.begin_check() else {
+        println!("software_update=check_ignored reason=already_checking");
+        return present_ui(x, ctrl, None);
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let installed = crate::software_update::installed_version().to_string();
+    match std::thread::Builder::new()
+        .name("ignite-update-check".into())
+        .spawn(move || {
+            let transport = crate::software_update::CurlMetadataTransport::default();
+            let result =
+                crate::software_update::discover_latest_stable(&transport, &installed);
+            let _ = tx.send(result);
+        }) {
+        Ok(_) => {
+            *x.update_check = Some(UpdateCheckJob { generation, rx });
+            println!("software_update=checking generation={generation}");
+            present_ui(x, ctrl, None)
+        }
+        Err(e) => {
+            let _ = x.ui.software_update.apply_result(
+                generation,
+                Err(crate::software_update::UpdateDiscoveryError::Transport(
+                    format!("spawn failed: {e}"),
+                )),
+            );
+            eprintln!("software_update=spawn_failed detail={e}");
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
+fn poll_software_update_check(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+) -> Result<bool, String> {
+    let Some(job) = x.update_check.as_mut() else {
+        return Ok(false);
+    };
+    let result = match job.rx.try_recv() {
+        Ok(r) => r,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(crate::software_update::UpdateDiscoveryError::Transport(
+                "update check worker ended without a result".into(),
+            ))
+        }
+    };
+    let generation = job.generation;
+    *x.update_check = None;
+    let applied = x.ui.software_update.apply_result(generation, result);
+    if applied {
+        println!(
+            "software_update=result generation={generation} phase={:?}",
+            std::mem::discriminant(&x.ui.software_update.phase)
+        );
+    } else {
+        println!("software_update=stale_result generation={generation}");
+    }
+    if applied && x.ui.view == AppView::Preferences && !x.ui.modal_open() {
+        present_ui(x, ctrl, None)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn tools_scan_phase(
@@ -2520,8 +2613,11 @@ fn present_ui(
         AppView::Tools => ctrl.transport_mut().render_tools(&x.ui.tools),
         AppView::Preferences => {
             let dialog = x.ui.modal.as_ref().and_then(dialog_spec);
-            ctrl.transport_mut()
-                .render_preferences(x.ui.side_button, dialog.as_ref())
+            ctrl.transport_mut().render_preferences(
+                x.ui.side_button,
+                &x.ui.software_update,
+                dialog.as_ref(),
+            )
         }
         AppView::LinkTargetPicker => {
             let dialog = x.ui.modal.as_ref().and_then(dialog_spec);
@@ -3124,6 +3220,9 @@ fn execute_ui_command(
                 println!("side_button={:?}", update.action);
             }
             present_ui(x, ctrl, None)
+        }
+        UiCommand::CheckForUpdates => {
+            start_software_update_check(x, ctrl)
         }
         UiCommand::BeginCreateLink { x: px, y: py } => begin_create_link(x, ctrl, px, py),
         UiCommand::LinkPickerCancel => leave_link_picker(x, ctrl),
@@ -3942,6 +4041,7 @@ pub fn run_page_session(
     let mut stylus_mode_disarm_failed = false;
     let mut sleep_guard: Option<crate::sleep_ui::SleepGuard> = None;
     let mut import_run: Option<ImportRun> = None;
+    let mut update_check: Option<UpdateCheckJob> = None;
     let mut input_lag = crate::input_lag::InputLag::default();
     let mut last_stylus_us = 0u64;
     let mut sync_capture_max_us = 0u64;
@@ -4067,6 +4167,7 @@ pub fn run_page_session(
                     hosted: cfg.display_events_stdin,
                     stop: &stop,
                     import_run: &mut import_run,
+                    update_check: &mut update_check,
                     prefs_path: &prefs_path,
                     sync_dir: cfg.sync_dir.as_deref(),
                     lasso: &mut lasso,
@@ -4202,6 +4303,20 @@ pub fn run_page_session(
             RESTART_REQUESTED.store(true, Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
             continue;
+        }
+
+        if structure_eligible && pending_ui.is_none() && update_check.is_some() {
+            match poll_software_update_check(&mut ui_exec!(), &mut ctrl) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("error: software update present: {e}");
+                    let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                    shutdown_safe = safe;
+                    stylus_mode_disarm_failed = disarm_fail;
+                    break 1;
+                }
+            }
         }
 
         // S2C inbound materialization: only at the same safe point as structural work, never
