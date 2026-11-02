@@ -479,6 +479,37 @@ validate_pending_health() {
   return 0
 }
 
+# Recover crash windows from ignite-qualify.journal without deleting rollback evidence
+# while pending-health still exists (phase=prepared).
+reconcile_qualification_journal() {
+  ensure_update_dir || return 1
+  QUALIFY_JOURNAL=$UPDATE_DIR/ignite-qualify.journal
+  if [ ! -e "$QUALIFY_JOURNAL" ] && [ ! -L "$QUALIFY_JOURNAL" ]; then
+    return 0
+  fi
+  refuse_symlink "$QUALIFY_JOURNAL" "qualification journal" || return 1
+  [ -f "$QUALIFY_JOURNAL" ] || return 1
+  q_phase=$(grep '^phase=' "$QUALIFY_JOURNAL" 2>/dev/null | tail -n 1 | sed 's/^phase=//') || true
+  case "$q_phase" in
+    prepared)
+      # pending-health should still be present; leave for a later successful qualify.
+      return 0
+      ;;
+    pending_removed|complete)
+      # Pending already retired; finish LKG metadata cleanup so the next install is not
+      # stuck on ambiguous LKG-without-pending, then drop the journal.
+      rm -f "$LKG_INVENTORY" "$LKG_HANDLER" || return 1
+      rm -f "$QUALIFY_JOURNAL" || return 1
+      sync
+      return 0
+      ;;
+    *)
+      log "qualify_journal_invalid: unsupported phase '$q_phase'"
+      return 1
+      ;;
+  esac
+}
+
 guard_pending_health() {
   ensure_update_dir || die "pending health state path is unsafe"
   if [ -e "$PENDING_HEALTH" ] || [ -L "$PENDING_HEALTH" ]; then
@@ -1103,6 +1134,10 @@ mkdir -p "$APP_ROOT/bin" \
 
 recover_install_transaction || die "interrupted: could not finish recovery from a previous incomplete Install Ignite. Notebooks were not deleted. Copy Ignite-Diagnose from Documents over USB."
 
+# Finish interrupted qualification (pending removed, LKG cleanup incomplete) before the
+# ambiguous LKG-without-pending guard can permanently block subsequent updates.
+reconcile_qualification_journal || die "interrupted: could not finish recovery from a previous incomplete health qualification. Notebooks were not deleted. Retained rollback evidence was preserved."
+
 # A committed candidate awaiting qualification owns the retained A snapshot.
 # No installer invocation is authorized to replace either one in this slice.
 guard_pending_health
@@ -1287,6 +1322,11 @@ rm -f "$JOURNAL"
 publish_crash before-prev-cleanup
 rm -rf "$PREV_OLD"
 rm -f "$COMMITTED" "$COMMITTED.tmp"
+# Deferred install instruction is consumed once the authenticated installer committed.
+rm -f "$UPDATE_DIR/install-intent.v1" \
+  "$UPDATE_DIR"/.install-intent.*.tmp \
+  "$APP_ROOT/run"/ignite-authorized-install-*.sh \
+  "$APP_ROOT/run"/ignite-authorized-install-*.receipt 2>/dev/null || true
 
 log "install_ok profile=full-feature package=$PACKAGE_ROOT recovery=installed spawned=no"
 log "notebook data path untouched: $DATA_DIR"

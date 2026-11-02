@@ -101,6 +101,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    match scribe_app::seal_authorized_install::parse_command(&args) {
+        Ok(scribe_app::seal_authorized_install::SealCommand::Seal(request)) => {
+            return seal_authorized_install(request);
+        }
+        Ok(scribe_app::seal_authorized_install::SealCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     scribe_app::launch_clock::mark("process_entry");
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -408,6 +418,21 @@ fn authorize_verified_update(
         }
         Err(error) => {
             eprintln!("authorize-verified-update: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn seal_authorized_install(
+    request: scribe_app::seal_authorized_install::SealRequest,
+) -> ExitCode {
+    match scribe_app::seal_authorized_install::seal_authorized_install(&request) {
+        Ok(result) => {
+            scribe_app::seal_authorized_install::emit_seal_report(&result);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("seal-authorized-install: {error}");
             ExitCode::FAILURE
         }
     }

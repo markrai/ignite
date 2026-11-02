@@ -12,6 +12,9 @@ set -eu
 # Stamped at packaging time. Fixed-width numeric fields so OFFSET can be patched
 # in place without changing the prefix length.
 IGNITE_PACKAGE_VERSION='@@IGNITE_PACKAGE_VERSION@@'
+# Authenticated storage-contract claim (must match assets/storage-contract.v1 and the
+# running binary's ignite-storage-v1). Digested as part of the signed Scriptlet.
+IGNITE_STORAGE_CONTRACT='ignite-storage-v1'
 IGNITE_ARCHIVE_OFFSET=0000000000
 IGNITE_ARCHIVE_BYTES=0000000000
 IGNITE_ARCHIVE_SHA256=0000000000000000000000000000000000000000000000000000000000000000

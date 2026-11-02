@@ -76,6 +76,12 @@ pub mod settings_ui;
 pub mod software_update;
 pub mod singleton;
 pub mod sleep_ui;
+pub mod install_intent;
+pub mod seal_authorized_install;
+pub mod storage_contract;
+pub mod update_qualification;
+#[cfg(test)]
+mod updater_lifecycle_host_tests;
 pub mod storage_capabilities;
 pub mod storage_compatibility_preflight;
 pub mod storage_inspect_external;

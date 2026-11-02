@@ -83,6 +83,12 @@ pub enum UiCommand {
     SetSideButton(crate::prefs::SideButtonAction),
     /// Preferences: advisory GitHub release discovery (never installs).
     CheckForUpdates,
+    /// Preferences: begin downloading the staged update candidate.
+    DownloadUpdate,
+    /// Preferences: user confirms install of the ready candidate.
+    ConfirmInstallUpdate,
+    /// Preferences: user cancels the ready candidate, returning to Available.
+    CancelReadyInstall,
     /// Tools: scan the Kindle's notebooks (read-only).
     ToolsScan,
     /// Tools: import every eligible Kindle notebook (one-way copy).
@@ -596,6 +602,21 @@ impl UiState {
                     UiCommand::CheckForUpdates
                 }
             }
+            Some(PreferencesHit::DownloadUpdate) => {
+                if self.software_update.busy() {
+                    UiCommand::None
+                } else {
+                    UiCommand::DownloadUpdate
+                }
+            }
+            Some(PreferencesHit::ConfirmInstallUpdate) => {
+                if self.software_update.busy() {
+                    UiCommand::None
+                } else {
+                    UiCommand::ConfirmInstallUpdate
+                }
+            }
+            Some(PreferencesHit::CancelReadyInstall) => UiCommand::CancelReadyInstall,
         }
     }
 

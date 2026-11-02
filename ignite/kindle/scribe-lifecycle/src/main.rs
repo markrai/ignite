@@ -22,10 +22,16 @@ mod admission_model;
 mod candidate_health;
 
 #[cfg(unix)]
+mod deferred_install;
+
+#[cfg(unix)]
 mod lipc;
 
 #[cfg(unix)]
 mod launch_gate;
+
+#[cfg(unix)]
+mod qualification;
 
 #[cfg(unix)]
 mod updater_lock;
@@ -40,7 +46,8 @@ mod unix_main {
         DEFAULT_UPDATE_DIR,
     };
     use crate::launch_gate::{
-        block_decisions_after_setup_failure, EvidenceWorkerActivity, HostLaunchCoordination,
+        block_decisions_after_setup_failure, DecisionBoundary, EvidenceWorkerActivity,
+        HostLaunchCoordination,
     };
     use crate::launch_health::{
         clear_handshake_environment, LaunchState, ObserverEvent, PreparedLaunchHealth,
@@ -1154,8 +1161,79 @@ mod unix_main {
             state().pause_seen.load(Ordering::SeqCst),
             state().unload_seen.load(Ordering::SeqCst)
         ));
+        // Post-shutdown path (not inside on_unload): host generation is still live for
+        // DecisionBoundary confirmation; child is already reaped.
+        run_post_shutdown_work();
         lib().close(handle);
         std::process::exit(0);
+    }
+
+    fn run_post_shutdown_work() {
+        let update_dir = PathBuf::from(DEFAULT_UPDATE_DIR);
+        #[cfg(debug_assertions)]
+        let update_dir = std::env::var_os("IGNITE_TEST_UPDATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or(update_dir);
+
+        // 1) Reconcile interrupted qualification before any install attempt.
+        let previous = update_dir
+            .parent()
+            .and_then(|state| state.parent())
+            .map(|app| app.join("previous-release"))
+            .unwrap_or_else(|| PathBuf::from("/mnt/us/scribe-app/previous-release"));
+        if let Err(err) =
+            crate::qualification::reconcile_interrupted_qualification(&update_dir, &previous)
+        {
+            state().log(&format!("qualify_reconcile_failed detail={err}"));
+        }
+
+        // 2) Deferred install intent takes precedence (reauth + sealed exec).
+        match crate::deferred_install::load_intent(&update_dir) {
+            Ok(_) => match crate::deferred_install::run_deferred_install(&update_dir) {
+                Ok(()) => {}
+                Err(err) => state().log(&format!("deferred_install_failed detail={err}")),
+            },
+            Err(crate::deferred_install::DeferredError::MissingIntent) => {
+                // 3) Otherwise attempt scoped qualification while host generation is live.
+                if let Err(err) = attempt_scoped_qualification(&update_dir, &previous) {
+                    state().log(&format!("qualify_skipped_or_failed detail={err}"));
+                }
+            }
+            Err(err) => state().log(&format!("install_intent_invalid detail={err}")),
+        }
+    }
+
+    fn attempt_scoped_qualification(
+        update_dir: &std::path::Path,
+        previous: &std::path::Path,
+    ) -> Result<(), String> {
+        use crate::candidate_health::assess_promotion_under_boundary;
+
+        let boundary = DecisionBoundary::acquire().map_err(|e| e.to_string())?;
+        let launch_uuid = boundary.host_generation_launch_uuid();
+        let report =
+            assess_promotion_under_boundary(boundary.evidence_lock(), update_dir, &launch_uuid);
+        let confirmation = boundary.confirm_generation().map_err(|e| e.to_string());
+        let report = report.record_boundary_confirmation(&launch_uuid, confirmation);
+        state().log(&format!(
+            "qualify_assessment overall_exit={}",
+            report.exit_code()
+        ));
+        // Scoped policy: require data_compatibility PASS in the report text.
+        let text = report.to_string();
+        if !text.contains("check.data_compatibility=PASS") {
+            return Err(
+                "data_compatibility not PASS under scoped storage-contract policy".into(),
+            );
+        }
+        // Keep promotion_authorized=false in assessment output; qualification only clears pending.
+        if !text.contains("promotion_authorized=false") {
+            return Err("assessment must remain promotion_authorized=false".into());
+        }
+        crate::qualification::commit_qualification(update_dir, previous, "ignite-storage-v1")
+            .map_err(|e| e.to_string())?;
+        state().log("qualify_committed pending_health_retired");
+        Ok(())
     }
 }
 
@@ -1182,6 +1260,16 @@ fn main() {
             Err(error) => {
                 eprintln!("updater_lock_failed: {error}");
                 std::process::exit(error.exit_code());
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    if let Some(result) = deferred_install::run_requested_command() {
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("deferred_install_failed: {error}");
+                std::process::exit(1);
             }
         }
     }

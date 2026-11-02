@@ -377,7 +377,7 @@ where
                 error.to_string(),
             ));
             append_unavailable_checks(&mut checks, "assessment lock unavailable");
-            checks.push(compatibility_unknown());
+            checks.push(evaluate_scoped_storage_contract(paths));
             return finish(AssessmentMode::ReadOnly, checks);
         }
     };
@@ -499,7 +499,7 @@ where
     }
 
     append_runtime_checks(&mut checks, health.as_ref().map(|health| &health.evidence));
-    checks.push(compatibility_unknown());
+    checks.push(evaluate_scoped_storage_contract(paths));
 
     let first = match (pending, retained, health) {
         (Some(pending), Some(inventory_sha256), Some(health)) => Some(ValidatedSnapshot {
@@ -577,6 +577,81 @@ fn compatibility_unknown() -> Check {
         "policy_blocker",
         "pending and evidence state explicitly say data_compatibility=unknown",
     )
+}
+
+/// Scoped no-migration updater policy: matching `storage-contract.v1` between the live
+/// candidate tree and retained previous-release. Does not claim capability coverage=complete.
+fn evaluate_scoped_storage_contract(paths: &AssessmentPaths) -> Check {
+    const CONTRACT_NAME: &str = "storage-contract.v1";
+    const EXPECTED: &str = "ignite-storage-v1";
+    let live = paths
+        .app
+        .parent()
+        .map(|bin| bin.join(CONTRACT_NAME))
+        .unwrap_or_else(|| PathBuf::from(CONTRACT_NAME));
+    // Prefer contract beside binaries under app root / previous-release.
+    let live_contract = if live.is_file() {
+        live
+    } else {
+        paths
+            .previous_dir
+            .parent()
+            .map(|app| app.join("bin").join(CONTRACT_NAME))
+            .unwrap_or(live)
+    };
+    let retained = paths.previous_dir.join(CONTRACT_NAME);
+    match (read_contract_id(&live_contract), read_contract_id(&retained)) {
+        (Ok(live_id), Ok(retained_id))
+            if live_id == retained_id && live_id == EXPECTED =>
+        {
+            Check::pass(
+                "data_compatibility",
+                format!(
+                    "scoped storage_contract={live_id} matches live and retained (no-migration policy; capability diagnostics remain incomplete)"
+                ),
+            )
+        }
+        (Ok(live_id), Ok(retained_id)) => Check::fail(
+            "data_compatibility",
+            "storage_contract_mismatch",
+            format!("live={live_id} retained={retained_id}; migrations unsupported"),
+        ),
+        (Err(live_err), Err(retained_err)) => Check::unknown(
+            "data_compatibility",
+            "policy_blocker",
+            format!(
+                "scoped storage-contract unavailable live={live_err} retained={retained_err}; pending evidence still records data_compatibility=unknown"
+            ),
+        ),
+        (Err(err), _) | (_, Err(err)) => Check::unknown(
+            "data_compatibility",
+            "policy_blocker",
+            format!("scoped storage-contract incomplete: {err}"),
+        ),
+    }
+}
+
+fn read_contract_id(path: &Path) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if meta.file_type().is_symlink() {
+        return Err("symlink refused".into());
+    }
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if !text.ends_with('\n') || text.contains('\r') {
+        return Err("non-canonical encoding".into());
+    }
+    let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+    if lines.len() != 3 || lines[0] != "IGNITE_STORAGE_CONTRACT_V1" || lines[1] != "schema=1" {
+        return Err("malformed contract".into());
+    }
+    lines[2]
+        .strip_prefix("storage_contract=")
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "missing storage_contract".into())
 }
 
 fn load_pending(paths: &AssessmentPaths) -> Result<PendingAssessment, EvidenceError> {

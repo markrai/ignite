@@ -1,0 +1,4 @@
+IGNITE_AUTHORIZED_INSTALL_SEAL_V1
+schema=1
+authorization_revalidated=true
+storage_contract=ignite-storage-v1

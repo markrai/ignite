@@ -230,6 +230,17 @@ pub fn run_requested_command() -> Option<Result<(), LockError>> {
 
 fn exec_with_lock(path: &Path, command: &[OsString]) -> Result<(), LockError> {
     let lock = acquire_at(path)?;
+    exec_already_holding(lock, command)
+}
+
+/// Acquire the updater transaction lock and exec `command`, inheriting the descriptor.
+/// Used by the lifecycle post-shutdown deferred installer so `install-runtime.sh` sees
+/// `IGNITE_UPDATER_LOCK_HELD=1` / `IGNITE_UPDATER_LOCK_FD` and does not self-contend.
+pub(crate) fn exec_with_lock_for_deferred(command: &[OsString]) -> Result<(), LockError> {
+    exec_with_lock(&configured_lock_path(), command)
+}
+
+fn exec_already_holding(lock: File, command: &[OsString]) -> Result<(), LockError> {
     let fd = lock.as_raw_fd();
     clear_cloexec(fd)?;
 

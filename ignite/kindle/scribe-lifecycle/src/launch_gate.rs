@@ -275,9 +275,11 @@ enum LatestWorker {
 }
 
 impl LatestWorker {
-    fn response(&self) -> String {
+    fn response(&self, host_instance: &str) -> String {
         match self {
-            Self::Complete { launch_uuid } => format!("READY launch_uuid={launch_uuid}\n"),
+            Self::Complete { launch_uuid } => {
+                format!("READY launch_uuid={launch_uuid} host_instance={host_instance}\n")
+            }
             Self::NoLaunchInThisHost => {
                 "BLOCKED reason=no_launch_completed_in_current_host\n".to_owned()
             }
@@ -316,11 +318,13 @@ impl HostLaunchCoordination {
             "lifecycle host lease",
         )?;
         let listener = bind_control_socket(&paths.control)?;
+        let host_instance = uuid::Uuid::new_v4().simple().to_string();
         let latest = Arc::new(Mutex::new(LatestWorker::NoLaunchInThisHost));
         let server_latest = Arc::clone(&latest);
+        let server_instance = host_instance.clone();
         let server = thread::Builder::new()
             .name("ignite-lifecycle-control".to_owned())
-            .spawn(move || serve_control(listener, server_latest))
+            .spawn(move || serve_control(listener, server_latest, server_instance))
             .map_err(|error| io_error("start lifecycle control server", error))?;
         Ok(Self {
             paths,
@@ -452,7 +456,11 @@ fn bind_control_socket(path: &Path) -> Result<UnixListener, BoundaryError> {
     Ok(listener)
 }
 
-fn serve_control(listener: UnixListener, latest: Arc<Mutex<LatestWorker>>) {
+fn serve_control(
+    listener: UnixListener,
+    latest: Arc<Mutex<LatestWorker>>,
+    host_instance: String,
+) {
     for connection in listener.incoming() {
         let Ok(mut connection) = connection else {
             break;
@@ -466,7 +474,7 @@ fn serve_control(listener: UnixListener, latest: Arc<Mutex<LatestWorker>>) {
         }
         let response = latest
             .lock()
-            .map(|state| state.response())
+            .map(|state| state.response(&host_instance))
             .unwrap_or_else(|_| "BLOCKED reason=host_state_unavailable\n".to_owned());
         let _ = connection.write_all(response.as_bytes());
     }
@@ -475,11 +483,12 @@ fn serve_control(listener: UnixListener, latest: Arc<Mutex<LatestWorker>>) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HostGeneration {
     launch_uuid: String,
+    host_instance: String,
     control_device: u64,
     control_inode: u64,
 }
 
-struct DecisionBoundary {
+pub(crate) struct DecisionBoundary {
     // Field order intentionally releases locks in reverse acquisition order.
     _evidence: DecisionEvidenceLock,
     _workers: KernelLock,
@@ -491,7 +500,7 @@ struct DecisionBoundary {
 }
 
 impl DecisionBoundary {
-    fn acquire() -> Result<Self, BoundaryError> {
+    pub(crate) fn acquire() -> Result<Self, BoundaryError> {
         let paths = CoordinationPaths::configured();
         let timeout = decision_timeout();
         let gate = KernelLock::acquire(
@@ -534,8 +543,20 @@ impl DecisionBoundary {
         })
     }
 
-    fn confirm_host_generation(&self) -> Result<(), BoundaryError> {
+    pub(crate) fn confirm_host_generation(&self) -> Result<(), BoundaryError> {
         confirm_host_generation(&self.paths, &self.host_generation)
+    }
+
+    pub(crate) fn host_generation_launch_uuid(&self) -> String {
+        self.host_generation.launch_uuid.clone()
+    }
+
+    pub(crate) fn evidence_lock(&self) -> &DecisionEvidenceLock {
+        &self._evidence
+    }
+
+    pub(crate) fn confirm_generation(&self) -> Result<(), BoundaryError> {
+        self.confirm_host_generation()
     }
 }
 
@@ -597,7 +618,7 @@ fn query_host(path: &Path) -> Result<HostGeneration, BoundaryError> {
         .map_err(|error| io_error("read lifecycle quiescence response", error))?;
     let response = std::str::from_utf8(&response)
         .map_err(|_| BoundaryError::Unavailable("non-UTF-8 host response".to_owned()))?;
-    let Some(uuid) = response
+    let Some(rest) = response
         .strip_prefix("READY launch_uuid=")
         .and_then(|value| value.strip_suffix('\n'))
     else {
@@ -606,9 +627,24 @@ fn query_host(path: &Path) -> Result<HostGeneration, BoundaryError> {
             response.trim_end()
         )));
     };
+    let Some((uuid, instance_field)) = rest.split_once(' ') else {
+        return Err(BoundaryError::Unavailable(
+            "lifecycle host READY response missing host_instance".to_owned(),
+        ));
+    };
+    let Some(host_instance) = instance_field.strip_prefix("host_instance=") else {
+        return Err(BoundaryError::Unavailable(
+            "lifecycle host READY response host_instance field malformed".to_owned(),
+        ));
+    };
     if !crate::launch_health::valid_attempt_id(uuid) {
         return Err(BoundaryError::Unavailable(
             "lifecycle host returned a malformed launch UUID".to_owned(),
+        ));
+    }
+    if host_instance.len() != 32 || !host_instance.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(BoundaryError::Unavailable(
+            "lifecycle host returned a malformed host_instance".to_owned(),
         ));
     }
     let current_metadata = fs::symlink_metadata(path)
@@ -625,6 +661,7 @@ fn query_host(path: &Path) -> Result<HostGeneration, BoundaryError> {
     }
     Ok(HostGeneration {
         launch_uuid: uuid.to_owned(),
+        host_instance: host_instance.to_owned(),
         control_device: metadata.dev(),
         control_inode: metadata.ino(),
     })
@@ -1047,7 +1084,7 @@ mod tests {
             .latest
             .lock()
             .unwrap()
-            .response()
+            .response("unused")
             .starts_with("BLOCKED"));
         let launch = "00112233445566778899aabbccddeeff";
         host.begin_launch(launch);
@@ -1056,7 +1093,7 @@ mod tests {
             .latest
             .lock()
             .unwrap()
-            .response()
+            .response("unused")
             .starts_with("BLOCKED"));
     }
 
@@ -1109,7 +1146,7 @@ mod tests {
             .latest
             .lock()
             .unwrap()
-            .response()
+            .response("unused")
             .starts_with("BLOCKED"));
     }
 

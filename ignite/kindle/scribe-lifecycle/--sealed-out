@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+IGNITE_STORAGE_CONTRACT='ignite-storage-v1'
+# SFX-compatible $0 resolution (same pattern as Install-Ignite.sfx.sh).
+_self=$0
+case "$_self" in
+/*) ;;
+*)
+_self="$(CDPATH= cd -- "$(dirname -- "$_self")" && pwd)/$(basename -- "$_self")"
+;;
+esac
+[ -n "${IGNITE_UPDATER_LOCK_HELD:-}" ] || { echo 'missing updater lock held' >&2; exit 41; }
+[ -n "${IGNITE_UPDATER_LOCK_FD:-}" ] || { echo 'missing updater lock fd' >&2; exit 42; }
+[ -e "/proc/self/fd/${IGNITE_UPDATER_LOCK_FD}" ] || { echo 'lock fd closed' >&2; exit 43; }
+printf 'self=%s\nheld=%s\nfd=%s\n' "$_self" "$IGNITE_UPDATER_LOCK_HELD" "$IGNITE_UPDATER_LOCK_FD" > "/tmp/ignite-deferred-it-deferred-ok-773-3e49c854c127467ab7e7f8a401966f41/install.ok"
+exit 0

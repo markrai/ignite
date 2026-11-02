@@ -120,6 +120,9 @@ pub enum PreferencesHit {
     NavigationUndo,
     CreateLink,
     CheckForUpdates,
+    DownloadUpdate,
+    ConfirmInstallUpdate,
+    CancelReadyInstall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +131,8 @@ pub struct PreferencesLayout {
     pub nav_undo: Rect,
     pub create_link: Rect,
     pub check_updates: Option<Rect>,
+    pub cancel_install: Option<Rect>,
+    update_primary_hit: Option<PreferencesHit>,
 }
 
 const SECTION_Y: u32 = 260;
@@ -139,18 +144,63 @@ const UPDATE_SECTION_Y: u32 = 1180;
 const UPDATE_BODY_Y: u32 = 1280;
 const UPDATE_BUTTON_Y: u32 = 1680;
 const UPDATE_BUTTON_H: u32 = 160;
+const UPDATE_CANCEL_GAP: u32 = 20;
+const UPDATE_CANCEL_W: u32 = 300;
 
 impl PreferencesLayout {
     pub fn new(geo: &FbGeometry, update: &SoftwareUpdateState) -> Self {
+        use crate::software_update::UpdateCheckPhase;
         let w = geo.xres.saturating_sub(2 * MARGIN);
-        let check_updates = software_update::primary_action_label(update).map(|_| {
-            Rect::new(MARGIN, UPDATE_BUTTON_Y, w, UPDATE_BUTTON_H)
-        });
+        let update_primary_hit = match &update.phase {
+            UpdateCheckPhase::Idle | UpdateCheckPhase::UpToDate { .. } => {
+                Some(PreferencesHit::CheckForUpdates)
+            }
+            UpdateCheckPhase::Error { .. } => Some(PreferencesHit::CheckForUpdates),
+            UpdateCheckPhase::Available(_) => Some(PreferencesHit::DownloadUpdate),
+            UpdateCheckPhase::ReadyToInstall { .. } => Some(PreferencesHit::ConfirmInstallUpdate),
+            UpdateCheckPhase::InstallFailed {
+                retryable,
+                handoff,
+                ready_residual,
+                ..
+            } => {
+                if *retryable && ready_residual.is_some() {
+                    // Post-stage residual: RETRY re-enters ready install without re-download.
+                    Some(PreferencesHit::ConfirmInstallUpdate)
+                } else if *retryable && handoff.is_some() {
+                    Some(PreferencesHit::DownloadUpdate)
+                } else {
+                    Some(PreferencesHit::CheckForUpdates)
+                }
+            }
+            UpdateCheckPhase::Checking { .. }
+            | UpdateCheckPhase::Downloading { .. }
+            | UpdateCheckPhase::Verifying { .. }
+            | UpdateCheckPhase::Installing { .. } => None,
+        };
+        let check_updates = if update_primary_hit.is_some() {
+            Some(Rect::new(MARGIN, UPDATE_BUTTON_Y, w, UPDATE_BUTTON_H))
+        } else {
+            None
+        };
+        let cancel_install = if matches!(update.phase, UpdateCheckPhase::ReadyToInstall { .. }) {
+            let cancel_x = geo.xres.saturating_sub(MARGIN).saturating_sub(UPDATE_CANCEL_W);
+            Some(Rect::new(
+                cancel_x,
+                UPDATE_BUTTON_Y + UPDATE_BUTTON_H + UPDATE_CANCEL_GAP,
+                UPDATE_CANCEL_W,
+                UPDATE_BUTTON_H,
+            ))
+        } else {
+            None
+        };
         Self {
             chrome: SettingsChrome::new(geo),
             nav_undo: Rect::new(MARGIN, CHOICE_Y, w, CHOICE_H),
             create_link: Rect::new(MARGIN, CHOICE_Y + CHOICE_H + CHOICE_GAP, w, CHOICE_H),
             check_updates,
+            cancel_install,
+            update_primary_hit,
         }
     }
 
@@ -169,7 +219,14 @@ impl PreferencesLayout {
             .as_ref()
             .is_some_and(|r| r.contains(x, y))
         {
-            return Some(PreferencesHit::CheckForUpdates);
+            return self.update_primary_hit;
+        }
+        if self
+            .cancel_install
+            .as_ref()
+            .is_some_and(|r| r.contains(x, y))
+        {
+            return Some(PreferencesHit::CancelReadyInstall);
         }
         None
     }
@@ -228,6 +285,13 @@ pub fn render_preferences(
     if let (Some(rect), Some(label)) = (
         layout.check_updates,
         software_update::primary_action_label(update),
+    ) {
+        c.frame(rect, 5, BLACK);
+        c.text_centered(rect.inset(8), 7, label, BLACK);
+    }
+    if let (Some(rect), Some(label)) = (
+        layout.cancel_install,
+        software_update::secondary_action_label(update),
     ) {
         c.frame(rect, 5, BLACK);
         c.text_centered(rect.inset(8), 7, label, BLACK);

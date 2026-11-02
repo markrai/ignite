@@ -12,12 +12,15 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 #[cfg(test)]
 use crate::publication_trust_boundary::authenticate_publication_chain_with_key;
 use crate::publication_trust_boundary::{
     authenticate_official_publication_chain, AuthenticatedPublicationChain, EvidenceClaimStatus,
     ProductionTrustError, VerificationProvenance,
 };
+use crate::software_update::{compare_stable_versions, is_stable_release_version};
 use crate::release_acquisition::{ReleaseAssetNames, MAX_METADATA_ASSET_BYTES};
 #[cfg(test)]
 use crate::verified_update_staging::RECORD_NAME;
@@ -82,15 +85,20 @@ pub struct AuthorizationDecision {
     pub upgrade_compatible: PrerequisiteStatus,
     pub recovery_ready: PrerequisiteStatus,
     pub data_compatibility_verified: PrerequisiteStatus,
+    /// Scoped no-migration updater policy: staged `storage-contract.v1` must match
+    /// the running binary. Separate from incomplete capability diagnostics.
+    pub storage_contract_compatible: PrerequisiteStatus,
     pub execution_binding: PrerequisiteStatus,
     pub installation_policy_satisfied: PrerequisiteStatus,
     pub installation_authorized: bool,
     pub refusal_reasons: Vec<String>,
     pub report_lines: Vec<String>,
+    pub bound_scriptlet_path: Option<PathBuf>,
+    pub bound_scriptlet_sha256: Option<String>,
 }
 
 impl AuthorizationDecision {
-    fn all_gate_statuses(&self) -> [&PrerequisiteStatus; 9] {
+    fn all_gate_statuses(&self) -> [&PrerequisiteStatus; 10] {
         [
             &self.candidate_authenticated,
             &self.publication_claims_validated,
@@ -99,6 +107,7 @@ impl AuthorizationDecision {
             &self.upgrade_compatible,
             &self.recovery_ready,
             &self.data_compatibility_verified,
+            &self.storage_contract_compatible,
             &self.execution_binding,
             &self.installation_policy_satisfied,
         ]
@@ -136,6 +145,8 @@ pub struct AuthorizeRequest {
     pub staging_root: PathBuf,
     pub root_kind: StagingRootKind,
     pub device: DeviceFacts,
+    pub installed_version: String,
+    pub user_approved: bool,
 }
 
 #[derive(Debug)]
@@ -223,6 +234,8 @@ pub fn parse_command(args: &[String]) -> Result<AuthorizeCommand, AuthorizeError
         staging_root,
         root_kind: StagingRootKind::Production,
         device: DeviceFacts::kindle_defaults_from_host(),
+        installed_version: crate::settings_ui::product_version_digits().to_string(),
+        user_approved: false,
     }))
 }
 
@@ -385,54 +398,39 @@ fn evaluate_with_authenticator(
     // candidate_authenticated may still report satisfied when the fixture chain verifies.
 
     let device_compatible = evaluate_device_compatibility(&request.device);
-    let upgrade_compatible = PrerequisiteStatus::NotImplemented(
-        "version-transition / upgrade-compatibility gate is not implemented".into(),
-    );
+    let upgrade_compatible =
+        evaluate_upgrade_compatible(&request.version, &request.installed_version);
     let recovery_ready = evaluate_recovery_readiness(&request.device);
-    let data_compatibility_verified = PrerequisiteStatus::Refused(
-        "data_compatibility=unknown; positive trusted data-compatibility preflight is not implemented"
-            .into(),
+    let data_compatibility_verified = evaluate_data_compatibility_verified(
+        &request.device.data_root,
+        &request.device.app_root,
+        &request.staging_root,
     );
-    let execution_binding = PrerequisiteStatus::NotImplemented(
-        "verified-to-execution handoff is not implemented; installer must re-bind the artifact at use"
-            .into(),
-    );
-    let installation_policy_satisfied = PrerequisiteStatus::NotImplemented(
-        "no trusted installation-policy approval mechanism is provisioned".into(),
-    );
-
-    #[cfg(test)]
-    let (
-        device_compatible,
-        upgrade_compatible,
-        recovery_ready,
-        data_compatibility_verified,
-        execution_binding,
-        installation_policy_satisfied,
-    ) = if matches!(
-        authenticator,
-        Authenticator::TestHarnessProductionKey { .. }
-    ) {
-        // Isolated harness: prove the authorization AND only when every gate is
-        // genuinely marked Satisfied. Not reachable from the shipping CLI.
-        (
-            PrerequisiteStatus::Satisfied,
-            PrerequisiteStatus::Satisfied,
-            PrerequisiteStatus::Satisfied,
-            PrerequisiteStatus::Satisfied,
-            PrerequisiteStatus::Satisfied,
-            PrerequisiteStatus::Satisfied,
-        )
-    } else {
-        (
-            device_compatible,
-            upgrade_compatible,
-            recovery_ready,
-            data_compatibility_verified,
-            execution_binding,
-            installation_policy_satisfied,
-        )
-    };
+    let storage_contract_compatible =
+        evaluate_storage_contract_compatible(&assets, &names, &artifact_identity_bound);
+    let (execution_binding, bound_scriptlet_path, bound_scriptlet_sha256) =
+        if artifact_identity_bound.is_satisfied() {
+            if let Some(ref auth) = evaluated.auth {
+                evaluate_execution_binding(&assets, &names, auth)
+            } else {
+                (
+                    PrerequisiteStatus::Refused(
+                        "authenticated chain unavailable for execution binding".into(),
+                    ),
+                    None,
+                    None,
+                )
+            }
+        } else {
+            (
+                PrerequisiteStatus::Refused(
+                    "artifact identity not bound; cannot bind execution".into(),
+                ),
+                None,
+                None,
+            )
+        };
+    let installation_policy_satisfied = evaluate_installation_policy(request.user_approved);
 
     let mut decision = AuthorizationDecision {
         expected_tag: request.expected_tag.clone(),
@@ -445,11 +443,14 @@ fn evaluate_with_authenticator(
         upgrade_compatible,
         recovery_ready,
         data_compatibility_verified,
+        storage_contract_compatible,
         execution_binding,
         installation_policy_satisfied,
         installation_authorized: false,
         refusal_reasons: Vec::new(),
         report_lines: Vec::new(),
+        bound_scriptlet_path,
+        bound_scriptlet_sha256,
     };
 
     decision.installation_authorized = derive_installation_authorized(&decision);
@@ -504,26 +505,28 @@ fn refused_all(
         provenance,
         candidate_authenticated: primary,
         publication_claims_validated: blocked.clone(),
-        artifact_identity_bound: blocked.clone(),
+        artifact_identity_bound: blocked,
         device_compatible: evaluate_device_compatibility(&request.device),
-        upgrade_compatible: PrerequisiteStatus::NotImplemented(
-            "version-transition / upgrade-compatibility gate is not implemented".into(),
-        ),
+        upgrade_compatible: evaluate_upgrade_compatible(&request.version, &request.installed_version),
         recovery_ready: evaluate_recovery_readiness(&request.device),
-        data_compatibility_verified: PrerequisiteStatus::Refused(
-            "data_compatibility=unknown; positive trusted data-compatibility preflight is not implemented"
+        data_compatibility_verified: evaluate_data_compatibility_verified(
+            &request.device.data_root,
+            &request.device.app_root,
+            &request.staging_root,
+        ),
+        storage_contract_compatible: PrerequisiteStatus::Refused(
+            "storage-contract cannot be release-bound until Scriptlet identity is authenticated"
                 .into(),
         ),
-        execution_binding: PrerequisiteStatus::NotImplemented(
-            "verified-to-execution handoff is not implemented; installer must re-bind the artifact at use"
-                .into(),
+        execution_binding: PrerequisiteStatus::Refused(
+            "no staged artifact available; authentication failed before execution binding".into(),
         ),
-        installation_policy_satisfied: PrerequisiteStatus::NotImplemented(
-            "no trusted installation-policy approval mechanism is provisioned".into(),
-        ),
+        installation_policy_satisfied: evaluate_installation_policy(request.user_approved),
         installation_authorized: false,
         refusal_reasons: Vec::new(),
         report_lines: Vec::new(),
+        bound_scriptlet_path: None,
+        bound_scriptlet_sha256: None,
     };
     decision.installation_authorized = derive_installation_authorized(&decision);
     decision.refusal_reasons = collect_refusal_reasons(&decision);
@@ -565,6 +568,7 @@ struct StagedAssetEvaluation {
     publication_claims_validated: PrerequisiteStatus,
     artifact_identity_bound: PrerequisiteStatus,
     release_tag: Option<String>,
+    auth: Option<AuthenticatedPublicationChain>,
 }
 
 /// Authenticate the publication chain and stream-verify the Scriptlet as
@@ -589,6 +593,7 @@ fn evaluate_staged_publication_and_scriptlet(
                     "artifact identity unavailable because candidate authentication failed".into(),
                 ),
                 release_tag: None,
+                auth: None,
             };
         }
     };
@@ -600,12 +605,15 @@ fn evaluate_staged_publication_and_scriptlet(
         ),
     };
     let artifact = verify_staged_scriptlet(assets, names, &auth);
+    let provenance = auth.provenance();
+    let release_tag = auth.release().tag().to_string();
     StagedAssetEvaluation {
-        provenance: Some(auth.provenance()),
+        provenance: Some(provenance),
         candidate_authenticated: PrerequisiteStatus::Satisfied,
         publication_claims_validated: claims,
         artifact_identity_bound: artifact,
-        release_tag: Some(auth.release().tag().to_string()),
+        release_tag: Some(release_tag),
+        auth: Some(auth),
     }
 }
 
@@ -752,14 +760,467 @@ fn evaluate_device_compatibility(device: &DeviceFacts) -> PrerequisiteStatus {
     }
 }
 
+fn evaluate_upgrade_compatible(candidate_version: &str, installed_version: &str) -> PrerequisiteStatus {
+    if !is_stable_release_version(candidate_version) {
+        return PrerequisiteStatus::Refused(format!(
+            "candidate version '{candidate_version}' is not a stable release version"
+        ));
+    }
+    if !is_stable_release_version(installed_version) {
+        return PrerequisiteStatus::Refused(format!(
+            "installed version '{installed_version}' is not a recognizable stable release version"
+        ));
+    }
+    match compare_stable_versions(candidate_version, installed_version) {
+        Some(std::cmp::Ordering::Greater) => PrerequisiteStatus::Satisfied,
+        Some(std::cmp::Ordering::Equal) => PrerequisiteStatus::Refused(format!(
+            "candidate {candidate_version} == installed {installed_version}; not an upgrade"
+        )),
+        Some(std::cmp::Ordering::Less) => PrerequisiteStatus::Refused(format!(
+            "candidate {candidate_version} < installed {installed_version}; downgrade refused"
+        )),
+        None => PrerequisiteStatus::Refused(format!(
+            "cannot compare candidate '{candidate_version}' with installed '{installed_version}'"
+        )),
+    }
+}
+
+fn evaluate_data_compatibility_verified(
+    data_root: &Path,
+    app_root: &Path,
+    staging_root: &Path,
+) -> PrerequisiteStatus {
+    let meta = match fs::symlink_metadata(data_root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return PrerequisiteStatus::Satisfied;
+        }
+        Err(e) => return PrerequisiteStatus::Refused(format!("cannot stat data_root: {e}")),
+        Ok(m) => m,
+    };
+    if meta.file_type().is_symlink() {
+        return PrerequisiteStatus::Refused("data_root must not be a symlink".into());
+    }
+    if !meta.is_dir() {
+        return PrerequisiteStatus::Refused(
+            "data_root exists but is not a real directory".into(),
+        );
+    }
+    // Fail-closed: existing data_root must resolve; never silently proceed on canonicalize failure.
+    let canon_data = match data_root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot resolve data_root path: {e}"
+            ));
+        }
+    };
+    let canon_app = match app_root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot resolve app_root path for data compatibility: {e}"
+            ));
+        }
+    };
+    let canon_staging = match staging_root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot resolve staging_root path for data compatibility: {e}"
+            ));
+        }
+    };
+    if canon_data.starts_with(&canon_app) || canon_data.starts_with(&canon_staging) {
+        return PrerequisiteStatus::Refused(
+            "data_root overlaps app_root or staging_root".into(),
+        );
+    }
+    let library_meta = data_root.join("library.meta");
+    let library_meta_verified = match fs::symlink_metadata(&library_meta) {
+        Ok(lm) if lm.is_file() && !lm.file_type().is_symlink() => {
+            let bytes = match fs::read(&library_meta) {
+                Ok(b) => b,
+                Err(e) => {
+                    return PrerequisiteStatus::Refused(format!(
+                        "cannot read library.meta: {e}"
+                    ));
+                }
+            };
+            let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    return PrerequisiteStatus::Refused(
+                        "library.meta is not valid JSON; existing data cannot be positively verified".into(),
+                    );
+                }
+            };
+            match v.get("v") {
+                Some(serde_json::Value::Number(n)) if n.as_i64() == Some(1) => true,
+                _ => {
+                    return PrerequisiteStatus::Refused(
+                        "library.meta schema version must be integer 1; existing data cannot be positively verified".into(),
+                    );
+                }
+            }
+        }
+        Ok(_) => {
+            return PrerequisiteStatus::Refused(
+                "library.meta exists but is not a regular file; existing data cannot be positively verified".into(),
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!("cannot stat library.meta: {e}"));
+        }
+    };
+    let notebooks = data_root.join("notebooks");
+    match fs::symlink_metadata(&notebooks) {
+        Ok(nm) => {
+            if nm.file_type().is_symlink() {
+                return PrerequisiteStatus::Refused(
+                    "data_root/notebooks must not be a symlink".into(),
+                );
+            }
+            if !nm.is_dir() {
+                return PrerequisiteStatus::Refused(
+                    "data_root/notebooks exists but is not a directory".into(),
+                );
+            }
+            // Notebooks indicate existing customer data; require positively verified library.meta.
+            if !library_meta_verified {
+                return PrerequisiteStatus::Refused(
+                    "existing notebooks present without positively verified library.meta; refusing without migration".into(),
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot stat data_root/notebooks: {e}"
+            ));
+        }
+    }
+    PrerequisiteStatus::Satisfied
+}
+
+fn evaluate_storage_contract_compatible(
+    assets_dir: &Path,
+    names: &ReleaseAssetNames,
+    artifact_identity_bound: &PrerequisiteStatus,
+) -> PrerequisiteStatus {
+    // Contract file alone is not a trust anchor. Require the claim inside the
+    // already-authenticated Scriptlet bytes (or refuse when artifact is unbound).
+    if !artifact_identity_bound.is_satisfied() {
+        return PrerequisiteStatus::Refused(
+            "storage-contract cannot be release-bound until Scriptlet identity is authenticated"
+                .into(),
+        );
+    }
+    let scriptlet_path = assets_dir.join(&names.scriptlet);
+    let scriptlet_bytes = match fs::read(&scriptlet_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot read authenticated Scriptlet for storage-contract claim: {err}"
+            ));
+        }
+    };
+    match crate::storage_contract::require_release_bound_storage_contract(
+        assets_dir,
+        &scriptlet_bytes,
+    ) {
+        Ok(_) => PrerequisiteStatus::Satisfied,
+        Err(err) => PrerequisiteStatus::Refused(err.to_string()),
+    }
+}
+
+/// Mirrors installer `guard_pending_health`: refuse when pending-health, ambiguous LKG
+/// metadata, or orphan temps are present. Never deletes evidence.
+fn evaluate_pending_health_preflight(app_root: &Path) -> PrerequisiteStatus {
+    let update_dir = app_root.join("state").join("update");
+    let pending = update_dir.join("pending-health.v1");
+    // symlink_metadata Ok covers regular files and symlinks (including dangling), matching
+    // installer `[ -e ] || [ -L ]` without following or deleting.
+    match fs::symlink_metadata(&pending) {
+        Ok(_) => {
+            return PrerequisiteStatus::Refused(
+                "update blocked: candidate is still pending health qualification; retained last-known-good was preserved"
+                    .into(),
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot stat pending-health.v1: {e}"
+            ));
+        }
+    }
+
+    let prev = app_root.join("previous-release");
+    let lkg_inventory = prev.join("ignite-lkg-inventory.v1");
+    let lkg_handler = prev.join("appreg-handler.sql");
+    let lkg_inventory_present = match fs::symlink_metadata(&lkg_inventory) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot stat LKG inventory: {e}"
+            ));
+        }
+    };
+    let lkg_handler_present = match fs::symlink_metadata(&lkg_handler) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot stat LKG handler: {e}"
+            ));
+        }
+    };
+    if lkg_inventory_present || lkg_handler_present {
+        return PrerequisiteStatus::Refused(
+            "pending health state is missing but retained qualification metadata remains; refusing ambiguous installation without deleting evidence"
+                .into(),
+        );
+    }
+
+    match fs::read_dir(&update_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let orphan = name.starts_with(".pending-health.") && name.ends_with(".tmp")
+                    || name.starts_with(".pending-verify.") && name.ends_with(".tmp")
+                    || name.starts_with(".lkg-verify.") && name.ends_with(".tmp");
+                if orphan {
+                    return PrerequisiteStatus::Refused(
+                        "pending health state has an orphaned temporary file; refusing ambiguous installation without deleting evidence"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot read update state directory: {e}"
+            ));
+        }
+    }
+    PrerequisiteStatus::Satisfied
+}
+
+fn refuse_unresolved_recovery_leftover(path: &Path, label: &str) -> PrerequisiteStatus {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PrerequisiteStatus::Satisfied,
+        Err(e) => PrerequisiteStatus::Refused(format!("cannot stat {label}: {e}")),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                PrerequisiteStatus::Refused(format!(
+                    "{label} must not be a symlink; unresolved recovery evidence preserved"
+                ))
+            } else {
+                PrerequisiteStatus::Refused(format!(
+                    "{label} present; incomplete retention refuses authorization without deleting evidence"
+                ))
+            }
+        }
+    }
+}
+
 fn evaluate_recovery_readiness(device: &DeviceFacts) -> PrerequisiteStatus {
-    // Observational only: presence of recovery/previous-release paths is not a
-    // readiness proof. Keep fail-closed as not-implemented until a real gate exists.
-    let _ = device.recovery_root.exists();
-    let _ = device.app_root.join("previous-release").exists();
-    PrerequisiteStatus::NotImplemented(
-        "A/B recovery and rollback readiness gate is not implemented".into(),
-    )
+    let app_root = &device.app_root;
+    match fs::symlink_metadata(app_root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return PrerequisiteStatus::Refused(format!(
+                "app_root '{}' does not exist; cannot verify recovery readiness",
+                app_root.display()
+            ));
+        }
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot stat app_root: {e}"
+            ));
+        }
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return PrerequisiteStatus::Refused("app_root must not be a symlink".into());
+            }
+            if !meta.is_dir() {
+                return PrerequisiteStatus::Refused("app_root is not a directory".into());
+            }
+        }
+    }
+
+    // Pending-health / LKG preflight must refuse before any install authorization.
+    if let status @ PrerequisiteStatus::Refused(_) = evaluate_pending_health_preflight(app_root) {
+        return status;
+    }
+
+    let prev = app_root.join("previous-release");
+    match fs::symlink_metadata(&prev) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return PrerequisiteStatus::Refused(
+                    "previous-release must not be a symlink".into(),
+                );
+            }
+            if !meta.is_dir() {
+                return PrerequisiteStatus::Refused(
+                    "previous-release exists but is not a directory".into(),
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot stat previous-release: {e}"
+            ));
+        }
+    }
+
+    // Match installer spirit: refuse unresolved previous-release.staging / .prev leftovers.
+    if let status @ PrerequisiteStatus::Refused(_) =
+        refuse_unresolved_recovery_leftover(&app_root.join("previous-release.staging"), "previous-release.staging")
+    {
+        return status;
+    }
+    if let status @ PrerequisiteStatus::Refused(_) =
+        refuse_unresolved_recovery_leftover(&app_root.join("previous-release.prev"), "previous-release.prev")
+    {
+        return status;
+    }
+
+    let journal = app_root.join("run").join("ignite-activate.journal");
+    let committed = app_root.join("run").join("ignite-activate.committed");
+    match fs::symlink_metadata(&journal) {
+        Ok(_) => {
+            if !committed.exists() {
+                match fs::symlink_metadata(&prev) {
+                    Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                        // Installer snapshot is flat: previous-release/scribe-app (not bin/).
+                        let scribe_app = prev.join("scribe-app");
+                        if !scribe_app.exists() {
+                            return PrerequisiteStatus::Refused(
+                                "activate journal without commit marker present; previous-release/scribe-app missing; rollback not possible".into(),
+                            );
+                        }
+                    }
+                    _ => {
+                        return PrerequisiteStatus::Refused(
+                            "activate journal without commit marker present; previous-release missing; rollback not possible".into(),
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return PrerequisiteStatus::Refused(format!(
+                "cannot stat activate journal: {e}"
+            ));
+        }
+    }
+    PrerequisiteStatus::Satisfied
+}
+
+fn evaluate_execution_binding(
+    assets: &Path,
+    names: &ReleaseAssetNames,
+    auth: &AuthenticatedPublicationChain,
+) -> (PrerequisiteStatus, Option<PathBuf>, Option<String>) {
+    let scriptlet = assets.join(&names.scriptlet);
+    let meta = match fs::symlink_metadata(&scriptlet) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                PrerequisiteStatus::Refused("staged Scriptlet missing for execution binding".into()),
+                None,
+                None,
+            );
+        }
+        Err(e) => {
+            return (
+                PrerequisiteStatus::Refused(format!("cannot stat Scriptlet for binding: {e}")),
+                None,
+                None,
+            );
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return (
+            PrerequisiteStatus::Refused("Scriptlet must not be a symlink".into()),
+            None,
+            None,
+        );
+    }
+    if !meta.is_file() {
+        return (
+            PrerequisiteStatus::Refused("Scriptlet is not a regular file".into()),
+            None,
+            None,
+        );
+    }
+    let bytes = match fs::read(&scriptlet) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                PrerequisiteStatus::Refused(format!("cannot read Scriptlet for binding: {e}")),
+                None,
+                None,
+            );
+        }
+    };
+    let sha256_bytes = Sha256::digest(&bytes);
+    let sha256_hex = encode_hex_bytes(&sha256_bytes);
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    match auth
+        .release()
+        .verify_installer(auth.release().installer_filename(), &mut cursor)
+    {
+        Ok(()) => {
+            let abs_path = match scriptlet.canonicalize() {
+                Ok(p) => p,
+                Err(_) => scriptlet.clone(),
+            };
+            (PrerequisiteStatus::Satisfied, Some(abs_path), Some(sha256_hex))
+        }
+        Err(e) => (
+            PrerequisiteStatus::Refused(format!(
+                "Scriptlet re-verification failed during execution binding: {e}"
+            )),
+            None,
+            None,
+        ),
+    }
+}
+
+fn evaluate_installation_policy(user_approved: bool) -> PrerequisiteStatus {
+    if user_approved {
+        PrerequisiteStatus::Satisfied
+    } else {
+        PrerequisiteStatus::Refused("explicit user installation approval required".into())
+    }
+}
+
+pub fn revalidate_execution_binding(path: &Path, expected_sha256: &str) -> bool {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return false;
+    }
+    let actual = encode_hex_bytes(&Sha256::digest(&bytes));
+    actual == expected_sha256
+}
+
+fn encode_hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn read_bounded_file(
@@ -910,6 +1371,10 @@ fn build_report_lines(
             "data_compatibility_verified={}",
             decision.data_compatibility_verified.as_word()
         ),
+        format!(
+            "storage_contract_compatible={}",
+            decision.storage_contract_compatible.as_word()
+        ),
         format!("execution_binding={}", decision.execution_binding.as_word()),
         format!(
             "installation_policy_satisfied={}",
@@ -935,6 +1400,12 @@ fn build_report_lines(
     ];
     if let Some(tag) = authenticated_release_tag {
         lines.push(format!("authenticated_release_tag={tag}"));
+    }
+    if let Some(ref p) = decision.bound_scriptlet_path {
+        lines.push(format!("bound_scriptlet_path={}", p.display()));
+    }
+    if let Some(ref sha) = decision.bound_scriptlet_sha256 {
+        lines.push(format!("bound_scriptlet_sha256={sha}"));
     }
     for status in decision.all_gate_statuses() {
         if let Some(detail) = status.detail() {
@@ -993,7 +1464,8 @@ mod tests {
 
     const VERSION: &str = "3.3.1";
     const TAG: &str = "v3.3.1";
-    const INSTALLER: &[u8] = b"#!/bin/sh\necho fixture-scriptlet\n";
+    const INSTALLER: &[u8] =
+        b"#!/bin/sh\nIGNITE_STORAGE_CONTRACT='ignite-storage-v1'\necho fixture-scriptlet\n";
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[21_u8; 32])
@@ -1098,6 +1570,11 @@ mod tests {
             root_kind: StagingRootKind::HostTest,
         })
         .expect("fixture stage");
+        crate::storage_contract::write_contract_file_atomic(
+            &staging.join(STAGED_ASSETS_DIR),
+            &crate::storage_contract::StorageContract::current(),
+        )
+        .expect("write staged storage contract");
     }
 
     fn authorize_req(staging: &Path, device: DeviceFacts) -> AuthorizeRequest {
@@ -1107,6 +1584,8 @@ mod tests {
             staging_root: staging.to_path_buf(),
             root_kind: StagingRootKind::HostTest,
             device,
+            installed_version: "0.9.14".into(),
+            user_approved: false,
         }
     }
 
@@ -1534,9 +2013,9 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_gates_block_authorization() {
+    fn policy_gate_refuses_without_user_approval() {
         let key = signing_key();
-        let (src, staging) = temp_pair("gates");
+        let (src, staging) = temp_pair("policy-gate");
         stage_fixture(&src, &staging, &key);
         let device = kindle_like_device(src.parent().unwrap());
         let decision = evaluate_installation_authorization_fixture(
@@ -1544,28 +2023,103 @@ mod tests {
             &key.verifying_key().to_bytes(),
         )
         .unwrap();
-        assert!(matches!(
-            decision.upgrade_compatible,
-            PrerequisiteStatus::NotImplemented(_)
-        ));
-        assert!(matches!(
-            decision.recovery_ready,
-            PrerequisiteStatus::NotImplemented(_)
-        ));
-        assert!(matches!(
-            decision.execution_binding,
-            PrerequisiteStatus::NotImplemented(_)
-        ));
-        assert!(matches!(
-            decision.installation_policy_satisfied,
-            PrerequisiteStatus::NotImplemented(_)
-        ));
-        assert!(matches!(
-            decision.data_compatibility_verified,
-            PrerequisiteStatus::Refused(_)
-        ));
+        assert!(
+            matches!(decision.installation_policy_satisfied, PrerequisiteStatus::Refused(_)),
+            "policy must be Refused when user_approved=false"
+        );
         assert!(!decision.installation_authorized);
         let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn upgrade_compatible_gate_refuses_downgrade() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("downgrade");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        let mut req = authorize_req(&staging, device);
+        req.installed_version = "9.9.9".into();
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(decision.upgrade_compatible, PrerequisiteStatus::Refused(_)),
+            "downgrade must be refused; got {:?}",
+            decision.upgrade_compatible
+        );
+        assert!(!decision.installation_authorized);
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn user_approved_with_good_layout_satisfies_policy_but_not_production_authorized() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("policy-ok");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(decision.installation_policy_satisfied, PrerequisiteStatus::Satisfied),
+            "policy must be Satisfied with user_approved=true"
+        );
+        assert!(
+            matches!(decision.upgrade_compatible, PrerequisiteStatus::Satisfied),
+            "upgrade_compatible must be Satisfied with older installed version"
+        );
+        assert!(
+            matches!(decision.recovery_ready, PrerequisiteStatus::Satisfied),
+            "recovery_ready must be Satisfied with real app_root"
+        );
+        assert!(
+            matches!(decision.data_compatibility_verified, PrerequisiteStatus::Satisfied),
+            "data_compatibility_verified must be Satisfied with absent data_root"
+        );
+        assert!(
+            matches!(decision.execution_binding, PrerequisiteStatus::Satisfied),
+            "execution_binding must be Satisfied when artifact passes re-verification"
+        );
+        assert!(
+            decision.bound_scriptlet_sha256.is_some(),
+            "bound_scriptlet_sha256 must be recorded on successful binding"
+        );
+        assert!(
+            !decision.installation_authorized,
+            "fixture provenance cannot authorize production installation"
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
+    }
+
+    #[test]
+    fn revalidate_execution_binding_detects_tamper() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("toctou");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        let path = decision.bound_scriptlet_path.expect("binding must produce path");
+        let sha256 = decision.bound_scriptlet_sha256.expect("binding must produce sha256");
+        assert!(
+            revalidate_execution_binding(&path, &sha256),
+            "revalidation must succeed on untampered file"
+        );
+        fs::write(&path, b"tampered-after-binding").unwrap();
+        assert!(
+            !revalidate_execution_binding(&path, &sha256),
+            "revalidation must fail after file is modified"
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
     }
 
     #[test]
@@ -1815,15 +2369,18 @@ mod tests {
             upgrade_compatible: PrerequisiteStatus::Satisfied,
             recovery_ready: PrerequisiteStatus::Satisfied,
             data_compatibility_verified: PrerequisiteStatus::Satisfied,
+            storage_contract_compatible: PrerequisiteStatus::Satisfied,
             execution_binding: PrerequisiteStatus::Satisfied,
             installation_policy_satisfied: PrerequisiteStatus::Satisfied,
             installation_authorized: false,
             refusal_reasons: Vec::new(),
             report_lines: Vec::new(),
+            bound_scriptlet_path: None,
+            bound_scriptlet_sha256: None,
         };
         assert!(derive_installation_authorized(&decision));
         decision.execution_binding =
-            PrerequisiteStatus::NotImplemented("missing execution binding".into());
+            PrerequisiteStatus::Refused("missing execution binding".into());
         assert!(!derive_installation_authorized(&decision));
         decision.execution_binding = PrerequisiteStatus::Satisfied;
         decision.provenance = Some(VerificationProvenance::TestOnlyFixtureKey);
@@ -1836,8 +2393,12 @@ mod tests {
         let (src, staging) = temp_pair("harness");
         stage_fixture(&src, &staging, &key);
         let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        req.installed_version = "0.9.14".into();
         let decision = evaluate_with_authenticator(
-            &authorize_req(&staging, device),
+            &req,
             Authenticator::TestHarnessProductionKey {
                 public_key: key.verifying_key().to_bytes(),
             },
@@ -1852,7 +2413,10 @@ mod tests {
             decision.provenance,
             Some(VerificationProvenance::OfficialProductionPin)
         );
+        assert!(decision.bound_scriptlet_path.is_some());
+        assert!(decision.bound_scriptlet_sha256.is_some());
         let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
     }
 
     #[test]
@@ -1872,6 +2436,430 @@ mod tests {
             .report_lines
             .iter()
             .any(|l| l == "scriptlet_executed=false"));
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn data_compat_satisfied_when_data_root_absent() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("dc-absent");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(decision.data_compatibility_verified, PrerequisiteStatus::Satisfied),
+            "absent data_root must be Satisfied (fresh install): got {:?}",
+            decision.data_compatibility_verified
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
+    }
+
+    #[test]
+    fn data_compat_refuses_when_data_root_is_a_file() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("dc-file");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        fs::write(&device.data_root, b"not-a-directory").unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(decision.data_compatibility_verified, PrerequisiteStatus::Refused(_)),
+            "data_root that is a file must be Refused: got {:?}",
+            decision.data_compatibility_verified
+        );
+        assert!(!decision.installation_authorized);
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_compat_refuses_on_enotdir_stat_error() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("dc-enotdir");
+        stage_fixture(&src, &staging, &key);
+        let mut device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let blocker = device.data_root.parent().unwrap().to_path_buf();
+        fs::write(&blocker, b"blocking-file").unwrap();
+        let inner = blocker.join("child");
+        device.data_root = inner;
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        match &decision.data_compatibility_verified {
+            PrerequisiteStatus::Refused(detail) => {
+                assert!(
+                    detail.contains("cannot stat data_root"),
+                    "expected fail-closed refusal message, got: {detail}"
+                );
+            }
+            other => panic!(
+                "ENOTDIR on data_root stat must be Refused (fail-closed), got {:?}",
+                other
+            ),
+        }
+        assert!(!decision.installation_authorized);
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
+    }
+
+    #[test]
+    fn authorized_decision_bound_path_and_sha256_are_set() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("bound-path");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision = evaluate_with_authenticator(
+            &req,
+            Authenticator::TestHarnessProductionKey {
+                public_key: key.verifying_key().to_bytes(),
+            },
+        )
+        .unwrap();
+        assert!(decision.installation_authorized);
+        let path = decision.bound_scriptlet_path.expect("bound_scriptlet_path must be set");
+        let sha256 = decision.bound_scriptlet_sha256.expect("bound_scriptlet_sha256 must be set");
+        assert!(path.exists(), "bound_scriptlet_path must point to an existing file");
+        assert_eq!(sha256.len(), 64, "sha256 hex must be 64 characters");
+        assert!(
+            revalidate_execution_binding(&path, &sha256),
+            "bound path and sha256 from decision must pass revalidation"
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
+    }
+
+    #[test]
+    fn install_authorization_bound_path_differs_from_stale_hint_after_file_replace() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("stale-hint");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let first = evaluate_with_authenticator(
+            &req,
+            Authenticator::TestHarnessProductionKey {
+                public_key: key.verifying_key().to_bytes(),
+            },
+        )
+        .unwrap();
+        assert!(first.installation_authorized);
+        let stale_path = first.bound_scriptlet_path.as_ref().unwrap();
+        let stale_sha = first.bound_scriptlet_sha256.as_ref().unwrap();
+        fs::write(stale_path, b"tampered-installer").unwrap();
+        let second = evaluate_with_authenticator(
+            &req,
+            Authenticator::TestHarnessProductionKey {
+                public_key: key.verifying_key().to_bytes(),
+            },
+        )
+        .unwrap();
+        assert!(
+            !second.installation_authorized,
+            "tampered scriptlet must refuse authorization"
+        );
+        assert!(
+            !revalidate_execution_binding(stale_path, stale_sha),
+            "stale sha256 hint must fail revalidation after scriptlet tamper"
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = device;
+    }
+
+    #[test]
+    fn pending_health_v1_refuses_recovery_and_preserves_evidence() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("pending-health");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let update_dir = device.app_root.join("state").join("update");
+        fs::create_dir_all(&update_dir).unwrap();
+        let pending = update_dir.join("pending-health.v1");
+        let evidence = b"IGNITE_PENDING_HEALTH_V1\nschema=1\nstatus=pending-health\n";
+        fs::write(&pending, evidence).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision = evaluate_with_authenticator(
+            &req,
+            Authenticator::TestHarnessProductionKey {
+                public_key: key.verifying_key().to_bytes(),
+            },
+        )
+        .unwrap();
+        match &decision.recovery_ready {
+            PrerequisiteStatus::Refused(detail) => {
+                assert!(
+                    detail.contains("pending health qualification"),
+                    "expected pending-health refusal, got {detail}"
+                );
+            }
+            other => panic!("pending-health.v1 must refuse recovery_ready, got {other:?}"),
+        }
+        assert!(!decision.installation_authorized);
+        assert!(
+            pending.exists(),
+            "pending-health.v1 must not be deleted by authorization"
+        );
+        assert_eq!(fs::read(&pending).unwrap(), evidence);
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn pending_health_absent_allows_recovery_preflight() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("pending-absent");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(decision.recovery_ready, PrerequisiteStatus::Satisfied),
+            "absent pending-health must leave recovery preflight Satisfied: {:?}",
+            decision.recovery_ready
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn lkg_metadata_without_pending_refuses_ambiguous_recovery() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("lkg-no-pending");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let prev = device.app_root.join("previous-release");
+        fs::create_dir_all(&prev).unwrap();
+        fs::write(prev.join("ignite-lkg-inventory.v1"), b"inventory").unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        match &decision.recovery_ready {
+            PrerequisiteStatus::Refused(detail) => {
+                assert!(
+                    detail.contains("retained qualification metadata"),
+                    "expected ambiguous LKG refusal, got {detail}"
+                );
+            }
+            other => panic!("LKG without pending must refuse, got {other:?}"),
+        }
+        assert!(prev.join("ignite-lkg-inventory.v1").exists());
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn flat_previous_release_scribe_app_satisfies_journal_recovery() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("flat-prev");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let prev = device.app_root.join("previous-release");
+        fs::create_dir_all(&prev).unwrap();
+        fs::write(prev.join("scribe-app"), b"#!/bin/sh\n").unwrap();
+        let run = device.app_root.join("run");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("ignite-activate.journal"), b"journal").unwrap();
+        // No commit marker → journal recovery path requires flat previous-release/scribe-app.
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(decision.recovery_ready, PrerequisiteStatus::Satisfied),
+            "flat previous-release/scribe-app must satisfy journal recovery: {:?}",
+            decision.recovery_ready
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn nested_bin_previous_release_scribe_app_is_not_sufficient_for_journal_recovery() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("nested-bin-prev");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let nested = device
+            .app_root
+            .join("previous-release")
+            .join("bin");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("scribe-app"), b"#!/bin/sh\n").unwrap();
+        let run = device.app_root.join("run");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("ignite-activate.journal"), b"journal").unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        match &decision.recovery_ready {
+            PrerequisiteStatus::Refused(detail) => {
+                assert!(
+                    detail.contains("previous-release/scribe-app missing"),
+                    "nested bin/ path must not satisfy flat layout, got {detail}"
+                );
+            }
+            other => panic!("bin/ nested previous-release must refuse, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn previous_release_staging_leftover_refuses_recovery() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("prev-staging");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        fs::create_dir_all(device.app_root.join("previous-release.staging")).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(decision.recovery_ready, PrerequisiteStatus::Refused(_)),
+            "previous-release.staging leftover must refuse: {:?}",
+            decision.recovery_ready
+        );
+        assert!(device.app_root.join("previous-release.staging").exists());
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_compat_refuses_unresolved_canonicalize() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("dc-unresolved");
+        stage_fixture(&src, &staging, &key);
+        let mut device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        // Create data_root, then replace its parent path component with a broken symlink so
+        // symlink_metadata on the final path fails or canonicalize cannot resolve.
+        let data_parent = device.data_root.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&device.data_root).unwrap();
+        // Point data_root at a path whose canonicalize fails: file used as directory prefix.
+        let blocker = data_parent.join("block-file");
+        fs::write(&blocker, b"x").unwrap();
+        device.data_root = blocker.join("nested-data");
+        // Ensure staging/app exist for other gates; data_root stat may NotFound or ENOTDIR.
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        assert!(
+            matches!(
+                decision.data_compatibility_verified,
+                PrerequisiteStatus::Refused(_)
+            ),
+            "unresolved data_root must refuse: {:?}",
+            decision.data_compatibility_verified
+        );
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn data_compat_refuses_notebooks_without_verified_library_meta() {
+        let key = signing_key();
+        let (src, staging) = temp_pair("dc-notebooks");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        fs::create_dir_all(device.data_root.join("notebooks")).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision =
+            evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
+                .unwrap();
+        match &decision.data_compatibility_verified {
+            PrerequisiteStatus::Refused(detail) => {
+                assert!(
+                    detail.contains("positively verified"),
+                    "expected unverified existing data refusal, got {detail}"
+                );
+            }
+            other => panic!("notebooks without library.meta must refuse, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn ready_to_install_does_not_mean_install_runtime_accepts_live_process() {
+        // Contract documentation: ReadyToInstall / installation_authorized only means
+        // cryptographic + policy gates passed. install-runtime.sh still refuses while
+        // scribe-app is running (spawn-before-exit). No post-exit supervisor exists yet.
+        let key = signing_key();
+        let (src, staging) = temp_pair("live-proc-contract");
+        stage_fixture(&src, &staging, &key);
+        let device = kindle_like_device(src.parent().unwrap());
+        fs::create_dir_all(&device.app_root).unwrap();
+        let mut req = authorize_req(&staging, device.clone());
+        req.user_approved = true;
+        let decision = evaluate_with_authenticator(
+            &req,
+            Authenticator::TestHarnessProductionKey {
+                public_key: key.verifying_key().to_bytes(),
+            },
+        )
+        .unwrap();
+        assert!(
+            decision.installation_authorized,
+            "authorization can succeed while the process is still live"
+        );
+        let mut update_state = crate::software_update::SoftwareUpdateState::default();
+        update_state.phase = crate::software_update::UpdateCheckPhase::ReadyToInstall {
+            handoff: crate::software_update::UpdateDiscoveryHandoff {
+                installed_version: "0.9.14".into(),
+                candidate_version: VERSION.into(),
+                candidate_tag: TAG.into(),
+                official_origin: "markrai/ignite".into(),
+                eligibility: crate::software_update::UpdateEligibility::NewerStableAvailable,
+                release_name: None,
+                published_at: None,
+            },
+            staging_root: staging.clone(),
+            scriptlet_path: decision.bound_scriptlet_path.clone().unwrap(),
+            scriptlet_sha256: decision.bound_scriptlet_sha256.clone().unwrap(),
+        };
+        let (headline, details) = crate::software_update::status_copy(&update_state);
+        let blob = format!("{headline} {}", details.join(" ")).to_lowercase();
+        assert!(
+            blob.contains("cannot start while") || blob.contains("exit") || blob.contains("leave"),
+            "ReadyToInstall copy must not imply install-runtime accepts a live process: {blob}"
+        );
+        assert!(
+            !blob.contains("will restart into") && !blob.contains("install is underway"),
+            "must not claim successful install handoff: {blob}"
+        );
         let _ = fs::remove_dir_all(src.parent().unwrap());
     }
 }
