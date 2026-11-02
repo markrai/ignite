@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -12,6 +11,12 @@ from pathlib import Path
 
 from .config import ShipConfig
 from .errors import ShipConfigError, ShipError
+from .recovery import (
+    assert_dpapi_alone_insufficient_label,
+    ensure_recovery_destination,
+    ensure_recovery_key_destination,
+    write_and_verify_independent_recovery,
+)
 from .secret_store import (
     SecretStore,
     read_sealed_file,
@@ -27,7 +32,7 @@ _KNOWN_TEST_PUBLIC_KEYS = {
 }
 
 _SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
-_META_SCHEMA = "ignite-ship-authority-meta-v1"
+_META_SCHEMA = "ignite-ship-authority-meta-v2"
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,7 @@ class PublisherAuthority:
     sealed_private_path: Path
     store_name: str
     recovery_verified: bool
+    recovery_mechanism: str
 
 
 def authority_present(config: ShipConfig) -> bool:
@@ -58,20 +64,28 @@ def load_authority(config: ShipConfig) -> PublisherAuthority:
     if fingerprint != expected:
         raise ShipError("publisher fingerprint does not match public key")
     meta = config.authority_meta_path.read_text(encoding="ascii")
-    if f"schema={_META_SCHEMA}" not in meta:
+    if f"schema={_META_SCHEMA}" not in meta and "schema=ignite-ship-authority-meta-v1" not in meta:
         raise ShipError("authority metadata schema mismatch")
     recovery_verified = "recovery_verified=true" in meta
+    independent = "independent_recovery_verified=true" in meta
+    if "schema=ignite-ship-authority-meta-v1" in meta and not independent:
+        # Legacy DPAPI-only "recovery" is not accepted as production authority.
+        recovery_verified = False
     store_name = "unknown"
+    mechanism = "unset"
     for line in meta.splitlines():
         if line.startswith("secret_store="):
             store_name = line.split("=", 1)[1]
+        if line.startswith("recovery_mechanism="):
+            mechanism = line.split("=", 1)[1]
     return PublisherAuthority(
         public_key=public,
         fingerprint_sha256=fingerprint,
         public_key_path=config.public_key_path,
         sealed_private_path=config.sealed_private_path,
         store_name=store_name,
-        recovery_verified=recovery_verified,
+        recovery_verified=recovery_verified and independent,
+        recovery_mechanism=mechanism,
     )
 
 
@@ -80,29 +94,46 @@ def initialize_authority(
     *,
     store: SecretStore | None = None,
     force: bool = False,
+    production: bool = False,
 ) -> PublisherAuthority:
     """One-time production publisher identity initialization.
 
     Never regenerates an existing authority unless ``force`` is set (tests only).
-    Requires an independent recovery destination.
+    Requires independent off-machine recovery (OpenSSL + recovery authority key).
+    Same-user DPAPI round-trip alone does not satisfy recovery requirements.
     """
     if authority_present(config) and not force:
         raise ShipError(
             "publisher authority already exists; refusing automatic regeneration"
         )
-    if config.recovery_dir is None:
-        raise ShipConfigError(
-            "IGNITE_SHIP_RECOVERY_DIR is required before initializing signing authority"
-        )
+    recovery_dir = ensure_recovery_destination(
+        config.recovery_dir,
+        ship_home=config.ship_home,
+        repo_root=config.repo_root,
+    )
+    recovery_key_dir = ensure_recovery_key_destination(
+        config.recovery_key_dir,
+        recovery_dir=recovery_dir,
+        ship_home=config.ship_home,
+        repo_root=config.repo_root,
+    )
     if not force and config.pin_path.is_file():
         raw = config.pin_path.read_bytes()
         if raw != b"UNPROVISIONED\n" and len(raw) == 65:
-            # Do not invent a second production identity while a pin is already set.
             raise ShipError(
                 "repository pin is already provisioned; refusing new authority init"
             )
 
-    store = store or select_secret_store(allow_insecure=config.allow_insecure_store)
+    if store is None:
+        store = select_secret_store(
+            allow_insecure=config.allow_insecure_store and not production,
+            production=production,
+        )
+    elif production and getattr(store, "name", "") == "insecure-file":
+        raise ShipConfigError(
+            "insecure signing store is forbidden for live / production authority activation"
+        )
+
     config.authority_dir.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(config.authority_dir, 0o700)
@@ -130,18 +161,20 @@ def initialize_authority(
         if public in _KNOWN_TEST_PUBLIC_KEYS:
             raise ShipError("refusing known test public key as production authority")
         _verify_keypair(private_pem, public)
+        pem_bytes = private_pem.read_bytes()
 
-        sealed = store.seal(private_pem.read_bytes())
-        # Recovery backup: encrypted copy of the sealed blob + public materials.
-        recovery_ok = _write_and_verify_recovery(
-            config=config,
-            sealed=sealed,
-            public=public,
-            store=store,
-            private_pem_bytes=private_pem.read_bytes(),
+        # Independent recovery FIRST — refuse activation if it fails.
+        recovery = write_and_verify_independent_recovery(
+            recovery_dir=recovery_dir,
+            recovery_key_dir=recovery_key_dir,
+            private_pem=pem_bytes,
+            public_key=public,
         )
-        if not recovery_ok:
-            raise ShipError("recovery backup verification failed; authority not activated")
+
+        # Local at-rest seal (DPAPI / test store) — not a substitute for recovery.
+        sealed = store.seal(pem_bytes)
+        if store.unseal(sealed) != pem_bytes:
+            raise ShipError("local secret-store seal round-trip failed")
 
         write_sealed_file(config.sealed_private_path, sealed)
         config.public_key_path.write_bytes(public.hex().encode("ascii") + b"\n")
@@ -156,6 +189,9 @@ def initialize_authority(
             f"secret_store={store.name}\n"
             f"fingerprint_sha256={fingerprint}\n"
             f"recovery_verified=true\n"
+            f"independent_recovery_verified=true\n"
+            f"recovery_mechanism={recovery.mechanism}\n"
+            f"local_at_rest_note={assert_dpapi_alone_insufficient_label()}\n"
             f"public_key_hex={public.hex()}\n"
         )
         config.authority_meta_path.write_text(meta, encoding="ascii")
@@ -168,6 +204,7 @@ def export_private_pem_to_work(
     work_dir: Path,
     *,
     store: SecretStore | None = None,
+    production: bool = False,
 ) -> Path:
     """Unseal private PEM into an exclusive work file for a single signing call.
 
@@ -175,8 +212,18 @@ def export_private_pem_to_work(
     """
     auth = load_authority(config)
     if not auth.recovery_verified:
-        raise ShipError("authority recovery was not verified; refusing to sign")
-    store = store or select_secret_store(allow_insecure=config.allow_insecure_store)
+        raise ShipError(
+            "authority independent recovery was not verified; refusing to sign"
+        )
+    if store is None:
+        store = select_secret_store(
+            allow_insecure=config.allow_insecure_store and not production,
+            production=production,
+        )
+    elif production and getattr(store, "name", "") == "insecure-file":
+        raise ShipConfigError(
+            "insecure signing store is forbidden for live / production signing"
+        )
     sealed = read_sealed_file(config.sealed_private_path)
     pem = store.unseal(sealed)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -193,7 +240,6 @@ def export_private_pem_to_work(
         os.write(fd, pem)
     finally:
         os.close(fd)
-    # Confirm public correspondence before handing the path to OpenSSL.
     derived = _derive_public_from_pem(out)
     if derived != auth.public_key:
         out.unlink(missing_ok=True)
@@ -201,55 +247,8 @@ def export_private_pem_to_work(
     return out
 
 
-def _write_and_verify_recovery(
-    *,
-    config: ShipConfig,
-    sealed: bytes,
-    public: bytes,
-    store: SecretStore,
-    private_pem_bytes: bytes,
-) -> bool:
-    assert config.recovery_dir is not None
-    recovery = config.recovery_dir
-    recovery.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(recovery, 0o700)
-    except OSError:
-        pass
-    sealed_backup = recovery / "publisher-private.sealed.backup"
-    pub_backup = recovery / "publisher-public.hex"
-    fp_backup = recovery / "publisher-fingerprint.sha256"
-    # Verify the sealed blob round-trips before durable persistence.
-    if store.unseal(sealed) != private_pem_bytes:
-        return False
-    write_sealed_file(sealed_backup, sealed)
-    pub_backup.write_bytes(public.hex().encode("ascii") + b"\n")
-    fp_backup.write_text(_fingerprint(public) + "\n", encoding="ascii")
-
-    # Restoration verification from the backup file — does not replace active.
-    with tempfile.TemporaryDirectory(prefix="ignite-ship-recovery-verify-") as tmp:
-        verify_root = Path(tmp)
-        restored_sealed = verify_root / "restored.sealed"
-        shutil.copy2(sealed_backup, restored_sealed)
-        backup_bytes = restored_sealed.read_bytes()
-        if backup_bytes != sealed:
-            return False
-        restored_pem = store.unseal(backup_bytes)
-        if restored_pem != private_pem_bytes:
-            return False
-        pem_path = verify_root / "restored.pem"
-        pem_path.write_bytes(restored_pem)
-        derived = _derive_public_from_pem(pem_path)
-        if derived != public:
-            return False
-        if _fingerprint(derived) != fp_backup.read_text(encoding="ascii").strip():
-            return False
-    return True
-
-
 def _fingerprint(public: bytes) -> str:
-    der = _SPKI_PREFIX + public
-    return hashlib.sha256(der).hexdigest()
+    return hashlib.sha256(_SPKI_PREFIX + public).hexdigest()
 
 
 def _load_public_hex(path: Path) -> bytes:
@@ -290,15 +289,11 @@ def _derive_public_from_pem(private_pem: Path) -> bytes:
 
 
 def _verify_keypair(private_pem: Path, public: bytes) -> None:
-    """Sign and verify a fixed probe message with OpenSSL raw Ed25519."""
     with tempfile.TemporaryDirectory(prefix="ignite-ship-probe-") as tmp:
         work = Path(tmp)
         msg = work / "probe.bin"
         msg.write_bytes(b"ignite-ship-authority-probe-v1")
         sig = work / "probe.sig"
-        pub_raw = work / "pub.raw"
-        pub_raw.write_bytes(public)
-        # Build a temporary public PEM via DER for pkeyutl -verify.
         pub_der = work / "pub.der"
         pub_der.write_bytes(_SPKI_PREFIX + public)
         pub_pem = work / "pub.pem"

@@ -20,6 +20,7 @@ class HardwareAcceptanceReport:
     staging_interrupt_ok: bool
     authorization_behavior_ok: bool
     notebooks_intact: bool
+    production_evidence: bool
     details: list[str] = field(default_factory=list)
 
     @property
@@ -36,6 +37,10 @@ class HardwareAcceptanceReport:
                 self.notebooks_intact,
             )
         )
+
+    @property
+    def authorizes_publication(self) -> bool:
+        return self.passed and self.production_evidence
 
 
 class HardwareAcceptanceHarness:
@@ -92,7 +97,7 @@ class NullHardwareProbe(HardwareProbe):
 
 
 class MockHardwareProbe(HardwareProbe):
-    """Deterministic probe for unit tests (not ARM/device evidence)."""
+    """Deterministic host mock — never production evidence; cannot authorize publish."""
 
     def __init__(self, *, pass_all: bool = True) -> None:
         self._pass_all = pass_all
@@ -112,5 +117,50 @@ class MockHardwareProbe(HardwareProbe):
             staging_interrupt_ok=ok,
             authorization_behavior_ok=ok,
             notebooks_intact=ok,
+            production_evidence=False,
             details=["mock-host-probe-not-arm-device"],
+        )
+
+
+class ScriptedHardwareProbe(HardwareProbe):
+    """Test seam simulating a live-capable probe (not used by default ship).
+
+    Production publication still requires ``production_evidence=True``. Unit
+    tests that exercise the verified-publish path may inject this seam; the
+    default CLI never installs it.
+    """
+
+    def __init__(
+        self,
+        *,
+        pass_all: bool = True,
+        production_evidence: bool = True,
+        firmware: str = "5.18.6-qa",
+    ) -> None:
+        self._pass_all = pass_all
+        self._production_evidence = production_evidence
+        self._firmware = firmware
+
+    def evaluate(
+        self, *, device_id: str, public_key_hex: str
+    ) -> HardwareAcceptanceReport:
+        ok = self._pass_all
+        details = (
+            ["scripted-live-capable-probe"]
+            if self._production_evidence
+            else ["scripted-probe-without-production-evidence"]
+        )
+        return HardwareAcceptanceReport(
+            device_id=device_id,
+            firmware=self._firmware,
+            arm_package_embeds_pin=ok and len(public_key_hex) == 64,
+            matching_release_accepted=ok,
+            wrong_key_refused=ok,
+            corrupted_metadata_refused=ok,
+            version_rules_ok=ok,
+            staging_interrupt_ok=ok,
+            authorization_behavior_ok=ok,
+            notebooks_intact=ok,
+            production_evidence=bool(self._production_evidence and ok),
+            details=details,
         )

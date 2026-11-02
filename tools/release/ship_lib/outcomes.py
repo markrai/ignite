@@ -1,4 +1,4 @@
-"""Machine-readable ship outcomes and exit codes."""
+"""Machine-readable ship outcomes, phase names, and phase states."""
 
 from __future__ import annotations
 
@@ -16,11 +16,22 @@ class ShipOutcome(str, Enum):
     PARTIAL = "partial-resume-available"
     FAILED = "failed"
     NOT_PERFORMED = "not-performed"
+    PLANNED = "planned"
+
+
+class PhaseState(str, Enum):
+    PLANNED = "planned"
+    DEFERRED = "deferred"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    BLOCKED = "blocked"
 
 
 SHIP_EXIT: dict[ShipOutcome, int] = {
     ShipOutcome.SUCCESS: 0,
     ShipOutcome.READY: 0,
+    ShipOutcome.PLANNED: 0,
     ShipOutcome.BLOCKED_CONFIG: 10,
     ShipOutcome.BLOCKED_POLICY: 11,
     ShipOutcome.BLOCKED_HARDWARE: 12,
@@ -61,4 +72,21 @@ SHIP_PHASES: tuple[str, ...] = (
     PHASE_HARDWARE,
     PHASE_PUBLISH,
     PHASE_DONE,
+)
+
+# Identity fields that bind completed phases (no secrets).
+IDENTITY_KEYS: tuple[str, ...] = (
+    "repository",
+    "version",
+    "tag",
+    "fingerprint_sha256",
+    "source_revision",
+    "main_sha",
+    "ci_run_id",
+    "ci_run_attempt",
+    "scriptlet_sha256",
+    "scriptlet_bytes",
+    "signed_scriptlet_sha256",
+    "release_url",
+    "published",
 )

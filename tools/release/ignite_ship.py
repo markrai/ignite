@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Ignite autonomous release orchestrator (Slice 3D-B2a.4.3q).
+"""Ignite autonomous release orchestrator (Slice 3D-B2a.4.3q / 3q.1).
 
 Commands:
 
   status   Read-only signing authority / pin / readiness report
   doctor   Verify local dependencies and configuration
+  plan     Read-only release rehearsal (never mutates authority/pin/versions/Git)
   ship     Run the phased release workflow for a version
   resume   Resume an interrupted ship journal for a version
 
-Live GitHub mutation, production-key activation against a maintainer host, and
-Kindle publication require explicit configuration (IGNITE_SHIP_HOME,
-IGNITE_SHIP_RECOVERY_DIR, optional IGNITE_SHIP_ALLOW_LIVE). This engineering
-checkout leaves changes unstaged and does not execute live publish.
+Default ``ship`` without ``--allow-live --execute-live`` is non-mutating: it
+records plans/deferred phases and never claims publication success.
+
+Live GitHub mutation, production-key activation, and Kindle publication require
+explicit ``--allow-live --execute-live`` plus ``IGNITE_SHIP_HOME`` /
+``IGNITE_SHIP_RECOVERY_DIR``. This engineering checkout leaves changes unstaged
+and does not execute live publish.
 
 Security tradeoff: unattended signing requires a connected, controlled signing
 host. A compromised host or authorized signing-service identity can compromise
-publisher authority. The system is not air-gapped.
+publisher authority. The system is not air-gapped. DPAPI is local at-rest only;
+off-machine recovery uses OpenSSL AES-256-CBC+PBKDF2 with a recovery authority
+key under ``IGNITE_SHIP_RECOVERY_DIR``.
 """
 
 from __future__ import annotations
@@ -54,7 +60,16 @@ def main(argv: list[str] | None = None) -> int:
         "--recovery-dir",
         type=Path,
         default=None,
-        help="override IGNITE_SHIP_RECOVERY_DIR (independent durable backup root)",
+        help="override IGNITE_SHIP_RECOVERY_DIR (encrypted backup destination)",
+    )
+    parser.add_argument(
+        "--recovery-key-dir",
+        type=Path,
+        default=None,
+        help=(
+            "override IGNITE_SHIP_RECOVERY_KEY_DIR (decryption authority; "
+            "must not overlap the backup destination)"
+        ),
     )
     parser.add_argument(
         "--allow-live",
@@ -66,18 +81,21 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="read-only readiness report")
     sub.add_parser("doctor", help="verify local ship prerequisites")
 
+    plan = sub.add_parser(
+        "plan",
+        help="read-only release rehearsal (no authority/pin/version/Git mutations)",
+    )
+    plan.add_argument("--version", required=True, help="release version e.g. 0.9.15")
+
     ship = sub.add_parser("ship", help="autonomous release workflow for a version")
     ship.add_argument("--version", required=True, help="release version e.g. 0.9.15")
     ship.add_argument(
         "--execute-live",
         action="store_true",
-        help="execute live git/CI/publish phases (default: plan/defer non-local phases)",
-    )
-    ship.add_argument(
-        "--require-hardware",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="require designated Kindle hardware acceptance before publish",
+        help=(
+            "execute production mutations (authority/pin/version/git/CI/sign/publish). "
+            "Requires --allow-live. Default ship is non-mutating."
+        ),
     )
 
     resume = sub.add_parser("resume", help="resume an interrupted ship journal")
@@ -89,10 +107,8 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=args.repo_root,
         ship_home=args.ship_home,
         recovery_dir=args.recovery_dir,
+        recovery_key_dir=args.recovery_key_dir,
         allow_live=bool(args.allow_live),
-        require_hardware=args.require_hardware
-        if getattr(args, "require_hardware", None) is not None
-        else None,
     )
     hooks = ShipHooks(
         execute_live_mutations=bool(getattr(args, "execute_live", False))
@@ -104,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         report = orch.status()
     elif args.command == "doctor":
         report = orch.doctor()
+    elif args.command == "plan":
+        report = orch.plan(args.version)
     elif args.command == "ship":
         report = orch.ship(args.version, resume=False)
     elif args.command == "resume":

@@ -1,10 +1,15 @@
 """OS-backed secret store for publisher private-key material.
 
 Windows: DPAPI (CryptProtectData / CryptUnprotectData) seals bytes to the
-current user. DPAPI alone is not an off-machine recovery mechanism — recovery
-backups must use a separately configured destination.
+current user for *local at-rest* protection only.
 
-Insecure file store is available only when explicitly allowed for tests.
+DPAPI alone is **not** an off-machine recovery mechanism. Independent recovery
+uses OpenSSL AES-256-CBC + PBKDF2 with a recovery authority key stored only
+under ``IGNITE_SHIP_RECOVERY_DIR`` (see ``recovery.py``).
+
+Insecure file store is available only for disposable tests and is hard-refused
+for live / production signing even when the development environment variable is
+set.
 """
 
 from __future__ import annotations
@@ -39,7 +44,6 @@ class InsecureFileStore:
                 "insecure secret store refused; configure an OS-backed store "
                 "or set IGNITE_SHIP_ALLOW_INSECURE_STORE=1 only for disposable tests"
             )
-        # Deliberately weak framing so tests never confuse this with DPAPI blobs.
         return b"IGNITE-INSECURE-SEAL-V1\n" + plaintext
 
     def unseal(self, sealed: bytes) -> bytes:
@@ -52,7 +56,7 @@ class InsecureFileStore:
 
 
 class WindowsDpapiStore:
-    """Seal secrets to the current Windows user via DPAPI."""
+    """Seal secrets to the current Windows user via DPAPI (local at-rest only)."""
 
     name = "windows-dpapi"
 
@@ -63,45 +67,57 @@ class WindowsDpapiStore:
         return _dpapi_unprotect(sealed)
 
 
-def select_secret_store(*, allow_insecure: bool = False) -> SecretStore:
+def select_secret_store(
+    *,
+    allow_insecure: bool = False,
+    production: bool = False,
+) -> SecretStore:
+    """Select a local secret store.
+
+    ``production=True`` (live ship / authority activation) never permits the
+    insecure file store, even when ``IGNITE_SHIP_ALLOW_INSECURE_STORE=1``.
+    """
+    if production and allow_insecure:
+        raise ShipConfigError(
+            "insecure signing store is forbidden for live / production release; "
+            "unset IGNITE_SHIP_ALLOW_INSECURE_STORE and configure an OS-backed store"
+        )
     if sys.platform == "win32":
         try:
-            # Probe DPAPI availability.
             probe = WindowsDpapiStore()
             roundtrip = probe.unseal(probe.seal(b"ignite-dpapi-probe"))
             if roundtrip != b"ignite-dpapi-probe":
                 raise ShipError("DPAPI probe mismatch")
             return probe
         except ShipError:
-            if allow_insecure:
+            if allow_insecure and not production:
                 return InsecureFileStore(allow_insecure=True)
             raise ShipConfigError(
                 "Windows DPAPI unavailable; refusing to store publisher keys. "
-                "Fix the OS secret store or use a disposable insecure store only "
-                "under IGNITE_SHIP_ALLOW_INSECURE_STORE=1 for tests."
+                "Fix the OS secret store. Disposable insecure store is only for "
+                "non-production tests under IGNITE_SHIP_ALLOW_INSECURE_STORE=1."
             ) from None
-    if allow_insecure:
+    if allow_insecure and not production:
         return InsecureFileStore(allow_insecure=True)
     raise ShipConfigError(
         f"no OS-backed secret store implemented for platform {sys.platform!r}; "
-        "configure recovery + an approved store, or enable the insecure test store "
-        "explicitly for disposable environments only"
+        "configure an approved store, or enable the insecure test store "
+        "explicitly for disposable non-production environments only"
     )
 
 
 def write_sealed_file(path: Path, sealed: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    if tmp.exists() or path.exists():
-        # Exclusive create for the temp file; replace is atomic on the same volume.
-        if tmp.exists():
-            tmp.unlink()
+    if tmp.exists():
+        tmp.unlink()
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
     fd = os.open(tmp, flags, 0o600)
     try:
         os.write(fd, sealed)
+        os.fsync(fd)
     finally:
         os.close(fd)
     os.replace(tmp, path)
