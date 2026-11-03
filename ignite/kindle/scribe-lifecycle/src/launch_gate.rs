@@ -456,11 +456,7 @@ fn bind_control_socket(path: &Path) -> Result<UnixListener, BoundaryError> {
     Ok(listener)
 }
 
-fn serve_control(
-    listener: UnixListener,
-    latest: Arc<Mutex<LatestWorker>>,
-    host_instance: String,
-) {
+fn serve_control(listener: UnixListener, latest: Arc<Mutex<LatestWorker>>, host_instance: String) {
     for connection in listener.incoming() {
         let Ok(mut connection) = connection else {
             break;

@@ -423,9 +423,7 @@ fn authorize_verified_update(
     }
 }
 
-fn seal_authorized_install(
-    request: scribe_app::seal_authorized_install::SealRequest,
-) -> ExitCode {
+fn seal_authorized_install(request: scribe_app::seal_authorized_install::SealRequest) -> ExitCode {
     match scribe_app::seal_authorized_install::seal_authorized_install(&request) {
         Ok(result) => {
             scribe_app::seal_authorized_install::emit_seal_report(&result);

@@ -89,11 +89,16 @@ else {
 
 # Prefer Git Bash. WindowsApps/WSL `bash.exe` mangles Windows paths and cannot
 # run tools/dropbear/docker_build.sh from this wrapper.
+# ProgramFiles is unset on Linux pwsh CI hosts — skip those candidates there.
 $bashExe = $null
-foreach ($candidate in @(
+$gitBashCandidates = @()
+if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles})) {
+    $gitBashCandidates += @(
         (Join-Path ${env:ProgramFiles} "Git\bin\bash.exe"),
         (Join-Path ${env:ProgramFiles} "Git\usr\bin\bash.exe")
-    )) {
+    )
+}
+foreach ($candidate in $gitBashCandidates) {
     if (Test-Path -LiteralPath $candidate) {
         $bashExe = $candidate
         break

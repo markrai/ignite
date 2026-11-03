@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::installation_authorization::{
-    evaluate_installation_authorization, AuthorizeRequest, AuthorizationDecision, DeviceFacts,
-};
-use crate::storage_contract::{
-    require_release_bound_storage_contract, StorageContract, CONTRACT_FILE_NAME, STORAGE_CONTRACT_ID,
+    evaluate_installation_authorization, AuthorizationDecision, AuthorizeRequest, DeviceFacts,
 };
 use crate::release_acquisition::ReleaseAssetNames;
+use crate::storage_contract::{
+    require_release_bound_storage_contract, StorageContract, CONTRACT_FILE_NAME,
+    STORAGE_CONTRACT_ID,
+};
 use crate::verified_update_staging::STAGED_ASSETS_DIR;
 
 pub const SEAL_HEADER: &str = "IGNITE_AUTHORIZED_INSTALL_SEAL_V1";
@@ -172,7 +173,9 @@ pub fn seal_from_authorized_decision(
     let expected_asset = assets.join(&names.scriptlet);
     if bound_path != &expected_asset {
         // Allow canonicalized equality.
-        let left = bound_path.canonicalize().unwrap_or_else(|_| bound_path.clone());
+        let left = bound_path
+            .canonicalize()
+            .unwrap_or_else(|_| bound_path.clone());
         let right = expected_asset
             .canonicalize()
             .unwrap_or_else(|_| expected_asset.clone());
@@ -237,10 +240,14 @@ pub fn seal_from_authorized_decision(
 fn read_regular_file_bytes(path: &Path) -> Result<Vec<u8>, SealError> {
     let meta = fs::symlink_metadata(path).map_err(|e| SealError::Scriptlet(e.to_string()))?;
     if meta.file_type().is_symlink() {
-        return Err(SealError::Scriptlet("scriptlet must not be a symlink".into()));
+        return Err(SealError::Scriptlet(
+            "scriptlet must not be a symlink".into(),
+        ));
     }
     if !meta.is_file() {
-        return Err(SealError::Scriptlet("scriptlet is not a regular file".into()));
+        return Err(SealError::Scriptlet(
+            "scriptlet is not a regular file".into(),
+        ));
     }
     if meta.len() > MAX_SCRIPTLET_BYTES {
         return Err(SealError::Scriptlet("scriptlet exceeds size limit".into()));
@@ -259,16 +266,16 @@ fn write_bytes_exclusive(path: &Path, bytes: &[u8]) -> Result<(), SealError> {
     if path.exists() {
         let meta = fs::symlink_metadata(path).map_err(|e| SealError::Io(e.to_string()))?;
         if meta.file_type().is_symlink() {
-            return Err(SealError::Io("refusing to replace symlink seal path".into()));
+            return Err(SealError::Io(
+                "refusing to replace symlink seal path".into(),
+            ));
         }
         fs::remove_file(path).map_err(|e| SealError::Io(e.to_string()))?;
     }
     let tmp = path.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
-        path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("seal")
+        path.extension().and_then(|e| e.to_str()).unwrap_or("seal")
     ));
     if tmp.exists() {
         fs::remove_file(&tmp).map_err(|e| SealError::Io(e.to_string()))?;
@@ -281,8 +288,7 @@ fn write_bytes_exclusive(path: &Path, bytes: &[u8]) -> Result<(), SealError> {
             .map_err(|e| SealError::Io(e.to_string()))?;
         file.write_all(bytes)
             .map_err(|e| SealError::Io(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| SealError::Io(e.to_string()))?;
+        file.sync_all().map_err(|e| SealError::Io(e.to_string()))?;
     }
     fs::rename(&tmp, path).map_err(|e| SealError::Io(e.to_string()))?;
     if let Some(parent) = path.parent() {
@@ -294,20 +300,22 @@ fn write_bytes_exclusive(path: &Path, bytes: &[u8]) -> Result<(), SealError> {
 }
 
 fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn emit_seal_report(result: &SealResult) {
     println!("{SEAL_HEADER}");
     println!("schema={SEAL_SCHEMA}");
-    println!("sealed_scriptlet_path={}", result.sealed_scriptlet_path.display());
+    println!(
+        "sealed_scriptlet_path={}",
+        result.sealed_scriptlet_path.display()
+    );
     println!("scriptlet_sha256={}", result.scriptlet_sha256);
     println!("storage_contract={}", result.storage_contract);
-    println!("bound_scriptlet_path={}", result.bound_scriptlet_path.display());
+    println!(
+        "bound_scriptlet_path={}",
+        result.bound_scriptlet_path.display()
+    );
     println!("authorization_revalidated=true");
     println!("promotion_authorized=false");
 }

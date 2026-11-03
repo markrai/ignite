@@ -2252,10 +2252,7 @@ struct UpdateDownloadJob {
     rx: std::sync::mpsc::Receiver<UpdateDownloadJobMessage>,
 }
 
-fn start_software_update_check(
-    x: &mut UiExec<'_>,
-    ctrl: &mut KindleCtrl,
-) -> Result<(), String> {
+fn start_software_update_check(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
     if x.update_check.is_some() || x.ui.software_update.busy() {
         println!("software_update=check_ignored reason=already_checking");
         return present_ui(x, ctrl, None);
@@ -2270,8 +2267,7 @@ fn start_software_update_check(
         .name("ignite-update-check".into())
         .spawn(move || {
             let transport = crate::software_update::CurlMetadataTransport::default();
-            let result =
-                crate::software_update::discover_latest_stable(&transport, &installed);
+            let result = crate::software_update::discover_latest_stable(&transport, &installed);
             let _ = tx.send(result);
         }) {
         Ok(_) => {
@@ -2292,10 +2288,7 @@ fn start_software_update_check(
     }
 }
 
-fn poll_software_update_check(
-    x: &mut UiExec<'_>,
-    ctrl: &mut KindleCtrl,
-) -> Result<bool, String> {
+fn poll_software_update_check(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<bool, String> {
     let Some(job) = x.update_check.as_mut() else {
         return Ok(false);
     };
@@ -2350,13 +2343,13 @@ fn start_download_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<()
         return present_ui(x, ctrl, None);
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let staging_root = std::path::PathBuf::from(
-        crate::verified_update_staging::DEFAULT_STAGING_ROOT,
-    );
+    let staging_root =
+        std::path::PathBuf::from(crate::verified_update_staging::DEFAULT_STAGING_ROOT);
     match std::thread::Builder::new()
         .name("ignite-update-download".into())
         .spawn(move || {
-            let device = crate::installation_authorization::DeviceFacts::kindle_defaults_from_host();
+            let device =
+                crate::installation_authorization::DeviceFacts::kindle_defaults_from_host();
             let source = crate::release_acquisition::AssetSource::GithubHttps {
                 origin: crate::release_acquisition::GithubReleaseOrigin {
                     owner: "markrai".into(),
@@ -2392,9 +2385,9 @@ fn start_download_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<()
         Err(e) => {
             let _ = x.ui.software_update.apply_download_result(
                 generation,
-                Err(crate::software_update::UpdateInstallError::IoError(format!(
-                    "spawn failed: {e}"
-                ))),
+                Err(crate::software_update::UpdateInstallError::IoError(
+                    format!("spawn failed: {e}"),
+                )),
             );
             eprintln!("software_update=download_spawn_failed detail={e}");
             present_ui(x, ctrl, None)
@@ -2409,13 +2402,11 @@ fn poll_download_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<boo
     let msg = match job.rx.try_recv() {
         Ok(m) => m,
         Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            UpdateDownloadJobMessage::Done(Err(
-                crate::software_update::UpdateInstallError::IoError(
-                    "download worker ended without a result".into(),
-                ),
-            ))
-        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => UpdateDownloadJobMessage::Done(Err(
+            crate::software_update::UpdateInstallError::IoError(
+                "download worker ended without a result".into(),
+            ),
+        )),
     };
     let generation = job.generation;
     match msg {
@@ -2433,7 +2424,9 @@ fn poll_download_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<boo
         }
         UpdateDownloadJobMessage::Done(result) => {
             *x.download_job = None;
-            let applied = x.ui.software_update.apply_download_result(generation, result);
+            let applied =
+                x.ui.software_update
+                    .apply_download_result(generation, result);
             if applied {
                 println!(
                     "software_update=download_result generation={generation} phase={:?}",
@@ -2464,7 +2457,11 @@ fn execute_install_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(
             scriptlet_sha256,
             staging_root,
             ..
-        } => (scriptlet_path.clone(), scriptlet_sha256.clone(), staging_root.clone()),
+        } => (
+            scriptlet_path.clone(),
+            scriptlet_sha256.clone(),
+            staging_root.clone(),
+        ),
         _ => {
             println!("software_update=install_ignored reason=not_ready");
             return present_ui(x, ctrl, None);
@@ -3551,9 +3548,7 @@ fn execute_ui_command(
             }
             present_ui(x, ctrl, None)
         }
-        UiCommand::CheckForUpdates => {
-            start_software_update_check(x, ctrl)
-        }
+        UiCommand::CheckForUpdates => start_software_update_check(x, ctrl),
         UiCommand::DownloadUpdate => start_download_update(x, ctrl),
         UiCommand::ConfirmInstallUpdate => execute_install_update(x, ctrl),
         UiCommand::CancelReadyInstall => cancel_ready_install(x, ctrl),

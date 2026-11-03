@@ -45,7 +45,10 @@ impl StorageContract {
     }
 
     pub fn scriptlet_claim_line(&self) -> String {
-        format!("{SCRIPTLET_CONTRACT_CLAIM_PREFIX}'{}'", self.storage_contract)
+        format!(
+            "{SCRIPTLET_CONTRACT_CLAIM_PREFIX}'{}'",
+            self.storage_contract
+        )
     }
 }
 
@@ -56,7 +59,10 @@ pub enum ContractError {
     NotFile,
     Io(String),
     Malformed(String),
-    Mismatch { expected: String, actual: String },
+    Mismatch {
+        expected: String,
+        actual: String,
+    },
     /// Staged contract file is not attested by the authenticated Scriptlet claim.
     UnauthenticatedClaim(String),
 }
@@ -86,8 +92,8 @@ pub fn contract_path(dir: &Path) -> PathBuf {
 }
 
 pub fn parse_contract_bytes(bytes: &[u8]) -> Result<StorageContract, ContractError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| ContractError::Malformed("not utf-8".into()))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| ContractError::Malformed("not utf-8".into()))?;
     if text.contains('\r') || text.contains('\0') {
         return Err(ContractError::Malformed("CR/NUL refused".into()));
     }
@@ -148,7 +154,10 @@ pub fn load_contract_file(path: &Path) -> Result<StorageContract, ContractError>
     parse_contract_bytes(&bytes)
 }
 
-pub fn write_contract_file_atomic(dir: &Path, contract: &StorageContract) -> Result<(), ContractError> {
+pub fn write_contract_file_atomic(
+    dir: &Path,
+    contract: &StorageContract,
+) -> Result<(), ContractError> {
     fs::create_dir_all(dir).map_err(|e| ContractError::Io(e.to_string()))?;
     let final_path = contract_path(dir);
     let tmp = dir.join(format!(".storage-contract.{}.tmp", std::process::id()));
@@ -179,7 +188,9 @@ pub fn write_contract_file_atomic(dir: &Path, contract: &StorageContract) -> Res
 }
 
 /// Require staged contract to match the running binary's compiled contract.
-pub fn require_same_storage_contract(staged_contract_dir: &Path) -> Result<StorageContract, ContractError> {
+pub fn require_same_storage_contract(
+    staged_contract_dir: &Path,
+) -> Result<StorageContract, ContractError> {
     let staged = load_contract_file(&contract_path(staged_contract_dir))?;
     let current = StorageContract::current();
     if staged.storage_contract != current.storage_contract {
@@ -329,11 +340,7 @@ pub fn require_release_bound_storage_contract(
 }
 
 fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -394,11 +401,9 @@ mod tests {
     fn matching_contract_file_without_scriptlet_claim_is_refused() {
         let dir = temp_dir("unauth");
         write_contract_file_atomic(&dir, &StorageContract::current()).unwrap();
-        let err = require_release_bound_storage_contract(
-            &dir,
-            b"#!/bin/sh\necho no-contract-claim\n",
-        )
-        .unwrap_err();
+        let err =
+            require_release_bound_storage_contract(&dir, b"#!/bin/sh\necho no-contract-claim\n")
+                .unwrap_err();
         assert!(matches!(err, ContractError::UnauthenticatedClaim(_)));
         let _ = fs::remove_dir_all(dir);
     }
@@ -408,10 +413,7 @@ mod tests {
         let dir = temp_dir("bound");
         let contract = StorageContract::current();
         write_contract_file_atomic(&dir, &contract).unwrap();
-        let scriptlet = format!(
-            "#!/bin/sh\n{}\necho ok\n",
-            contract.scriptlet_claim_line()
-        );
+        let scriptlet = format!("#!/bin/sh\n{}\necho ok\n", contract.scriptlet_claim_line());
         require_release_bound_storage_contract(&dir, scriptlet.as_bytes()).unwrap();
         let _ = fs::remove_dir_all(dir);
     }
@@ -422,10 +424,9 @@ mod tests {
         let claim = contract.scriptlet_claim_line();
         let work = temp_dir("large-sfx");
         let path = work.join("Install-Ignite-v9.9.9.sh");
-        let mut prefix = format!(
-            "#!/bin/sh\nIGNITE_ARCHIVE_OFFSET=0000000128\n{claim}\necho prefix\n"
-        )
-        .into_bytes();
+        let mut prefix =
+            format!("#!/bin/sh\nIGNITE_ARCHIVE_OFFSET=0000000128\n{claim}\necho prefix\n")
+                .into_bytes();
         while prefix.len() < 128 {
             prefix.push(b'\n');
         }
@@ -460,10 +461,9 @@ mod tests {
         let contract = StorageContract::current();
         let claim = contract.scriptlet_claim_line();
         // Simulate stamped SFX: UTF-8 prefix + gzip magic / binary tail.
-        let mut scriptlet = format!(
-            "#!/bin/sh\nIGNITE_ARCHIVE_OFFSET=0000000096\n{claim}\necho prefix\n"
-        )
-        .into_bytes();
+        let mut scriptlet =
+            format!("#!/bin/sh\nIGNITE_ARCHIVE_OFFSET=0000000096\n{claim}\necho prefix\n")
+                .into_bytes();
         while scriptlet.len() < 96 {
             scriptlet.push(b'\n');
         }
@@ -479,8 +479,7 @@ mod tests {
 
     #[test]
     fn build_sfx_py_generated_installer_binds_contract_claim() {
-        let deploy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../deployment/kindle");
+        let deploy = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../deployment/kindle");
         let build_sfx = deploy.join("sfx/build_sfx.py");
         let template = deploy.join("sfx/Install-Ignite.sfx.sh");
         if !build_sfx.is_file() || !template.is_file() {

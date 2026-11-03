@@ -343,11 +343,7 @@ pub fn commit_qualification(
 }
 
 fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

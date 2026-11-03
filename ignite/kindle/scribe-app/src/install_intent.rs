@@ -70,7 +70,8 @@ impl InstallIntent {
 }
 
 pub fn parse_intent_bytes(bytes: &[u8]) -> Result<InstallIntent, IntentError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| IntentError::Malformed("not utf-8".into()))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| IntentError::Malformed("not utf-8".into()))?;
     if text.contains('\r') || text.contains('\0') {
         return Err(IntentError::Malformed("CR/NUL refused".into()));
     }
@@ -104,7 +105,9 @@ pub fn parse_intent_bytes(bytes: &[u8]) -> Result<InstallIntent, IntentError> {
         return Err(IntentError::Malformed("missing reauth note".into()));
     }
     if !staging_root.is_absolute() {
-        return Err(IntentError::Malformed("staging_root must be absolute".into()));
+        return Err(IntentError::Malformed(
+            "staging_root must be absolute".into(),
+        ));
     }
     Ok(InstallIntent {
         expected_tag: expected_tag.to_string(),

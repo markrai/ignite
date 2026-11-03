@@ -10,18 +10,16 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::installation_authorization::{
-    evaluate_installation_authorization, revalidate_execution_binding, AuthorizeRequest,
-    AuthorizationDecision, DeviceFacts,
+    evaluate_installation_authorization, revalidate_execution_binding, AuthorizationDecision,
+    AuthorizeRequest, DeviceFacts,
 };
 use crate::release_acquisition::{
     parse_https_url, AcquisitionError, AssetSource, GithubReleaseOrigin,
 };
 use crate::release_manifest::valid_release_version;
 use crate::settings_ui::product_version_digits;
-use crate::verified_update_staging::{
-    stage_verified_update, StageRequest, TrustMode,
-};
 use crate::verified_update_staging::StagingRootKind;
+use crate::verified_update_staging::{stage_verified_update, StageRequest, TrustMode};
 
 pub const OFFICIAL_ORIGIN_SPEC: &str = "markrai/ignite";
 pub const MAX_METADATA_BYTES: u64 = 256 * 1024;
@@ -168,7 +166,10 @@ impl SoftwareUpdateState {
         }
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        self.phase = UpdateCheckPhase::Downloading { generation, handoff };
+        self.phase = UpdateCheckPhase::Downloading {
+            generation,
+            handoff,
+        };
         Some(generation)
     }
 
@@ -178,9 +179,12 @@ impl SoftwareUpdateState {
         result: Result<ReadyInstallCandidate, UpdateInstallError>,
     ) -> bool {
         match &self.phase {
-            UpdateCheckPhase::Downloading { generation: active, .. }
-            | UpdateCheckPhase::Verifying { generation: active, .. }
-                if *active == generation => {}
+            UpdateCheckPhase::Downloading {
+                generation: active, ..
+            }
+            | UpdateCheckPhase::Verifying {
+                generation: active, ..
+            } if *active == generation => {}
             _ => return false,
         }
         self.phase = match result {
@@ -209,11 +213,15 @@ impl SoftwareUpdateState {
 
     pub fn mark_verifying(&mut self, generation: u64) -> bool {
         match &self.phase {
-            UpdateCheckPhase::Downloading { generation: active, handoff }
-                if *active == generation =>
-            {
+            UpdateCheckPhase::Downloading {
+                generation: active,
+                handoff,
+            } if *active == generation => {
                 let handoff = handoff.clone();
-                self.phase = UpdateCheckPhase::Verifying { generation, handoff };
+                self.phase = UpdateCheckPhase::Verifying {
+                    generation,
+                    handoff,
+                };
                 true
             }
             _ => false,
@@ -289,7 +297,9 @@ impl SoftwareUpdateState {
             | UpdateCheckPhase::Verifying { handoff, .. }
             | UpdateCheckPhase::Installing { handoff, .. } => Some(handoff),
             UpdateCheckPhase::ReadyToInstall { handoff, .. } => Some(handoff),
-            UpdateCheckPhase::InstallFailed { handoff: Some(h), .. } => Some(h),
+            UpdateCheckPhase::InstallFailed {
+                handoff: Some(h), ..
+            } => Some(h),
             _ => None,
         }
     }
@@ -399,10 +409,8 @@ impl ReleaseMetadataTransport for CurlMetadataTransport {
     ) -> Result<Vec<u8>, UpdateDiscoveryError> {
         let url = latest_release_api_url(origin)?;
         validate_github_api_url(&url)?;
-        let tmp = std::env::temp_dir().join(format!(
-            "ignite-update-meta-{}.json",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ignite-update-meta-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let output = Command::new("curl")
             .arg("--silent")
@@ -437,11 +445,13 @@ impl ReleaseMetadataTransport for CurlMetadataTransport {
             if lower.contains("maximum file size") {
                 return Err(UpdateDiscoveryError::Oversized);
             }
-            return Err(UpdateDiscoveryError::Transport(if stderr.trim().is_empty() {
-                format!("curl failed ({code_txt})")
-            } else {
-                stderr.trim().to_string()
-            }));
+            return Err(UpdateDiscoveryError::Transport(
+                if stderr.trim().is_empty() {
+                    format!("curl failed ({code_txt})")
+                } else {
+                    stderr.trim().to_string()
+                },
+            ));
         }
         let code: u32 = code_txt
             .parse()
@@ -450,7 +460,8 @@ impl ReleaseMetadataTransport for CurlMetadataTransport {
             let _ = std::fs::remove_file(&tmp);
             return Err(UpdateDiscoveryError::HttpStatus(code));
         }
-        let bytes = std::fs::read(&tmp).map_err(|e| UpdateDiscoveryError::Transport(e.to_string()))?;
+        let bytes =
+            std::fs::read(&tmp).map_err(|e| UpdateDiscoveryError::Transport(e.to_string()))?;
         let _ = std::fs::remove_file(&tmp);
         if bytes.len() as u64 > self.size_limit {
             return Err(UpdateDiscoveryError::Oversized);
@@ -460,11 +471,12 @@ impl ReleaseMetadataTransport for CurlMetadataTransport {
 }
 
 pub fn official_origin() -> Result<GithubReleaseOrigin, UpdateDiscoveryError> {
-    GithubReleaseOrigin::parse(OFFICIAL_ORIGIN_SPEC)
-        .map_err(UpdateDiscoveryError::Acquisition)
+    GithubReleaseOrigin::parse(OFFICIAL_ORIGIN_SPEC).map_err(UpdateDiscoveryError::Acquisition)
 }
 
-pub fn latest_release_api_url(origin: &GithubReleaseOrigin) -> Result<String, UpdateDiscoveryError> {
+pub fn latest_release_api_url(
+    origin: &GithubReleaseOrigin,
+) -> Result<String, UpdateDiscoveryError> {
     if origin.owner != "markrai" || origin.repo != "ignite" {
         return Err(UpdateDiscoveryError::UntrustedOrigin(format!(
             "{}/{}",
@@ -532,14 +544,16 @@ fn interpret_latest_release(
     }
     let candidate = &tag[1..];
     if !is_stable_release_version(candidate) {
-        return Err(UpdateDiscoveryError::MalformedVersion(candidate.to_string()));
+        return Err(UpdateDiscoveryError::MalformedVersion(
+            candidate.to_string(),
+        ));
     }
     match compare_stable_versions(candidate, installed_version) {
         None => Err(UpdateDiscoveryError::MalformedVersion(format!(
             "{candidate} vs {installed_version}"
         ))),
-        Some(std::cmp::Ordering::Greater) => Ok(UpdateCheckOutcome::Available(
-            UpdateDiscoveryHandoff {
+        Some(std::cmp::Ordering::Greater) => {
+            Ok(UpdateCheckOutcome::Available(UpdateDiscoveryHandoff {
                 installed_version: installed_version.to_string(),
                 candidate_version: candidate.to_string(),
                 candidate_tag: tag.to_string(),
@@ -555,8 +569,8 @@ fn interpret_latest_release(
                     .as_ref()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
-            },
-        )),
+            }))
+        }
         Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Less) => {
             Ok(UpdateCheckOutcome::UpToDate {
                 installed: installed_version.to_string(),
@@ -655,7 +669,8 @@ pub fn download_and_stage_official_with_progress(
         trust,
         root_kind,
     };
-    let result = stage_verified_update(&req).map_err(|e| UpdateInstallError::StagingFailed(e.to_string()))?;
+    let result = stage_verified_update(&req)
+        .map_err(|e| UpdateInstallError::StagingFailed(e.to_string()))?;
     on_progress(UpdateDownloadProgress::Verifying);
     let auth_req = AuthorizeRequest {
         expected_tag: handoff.candidate_tag.clone(),
@@ -680,7 +695,9 @@ pub fn download_and_stage_official_with_progress(
         let reason = decision
             .refusal_reasons
             .iter()
-            .find(|r| !r.contains("installation_policy") && !r.contains("user installation approval"))
+            .find(|r| {
+                !r.contains("installation_policy") && !r.contains("user installation approval")
+            })
             .cloned()
             .unwrap_or_else(|| "authentication or device gate refused".into());
         return Err(UpdateInstallError::AuthorizationFailed(reason));
@@ -689,10 +706,9 @@ pub fn download_and_stage_official_with_progress(
         .bound_scriptlet_path
         .clone()
         .ok_or_else(|| UpdateInstallError::AuthorizationFailed("no bound scriptlet path".into()))?;
-    let scriptlet_sha256 = decision
-        .bound_scriptlet_sha256
-        .clone()
-        .ok_or_else(|| UpdateInstallError::AuthorizationFailed("no bound scriptlet sha256".into()))?;
+    let scriptlet_sha256 = decision.bound_scriptlet_sha256.clone().ok_or_else(|| {
+        UpdateInstallError::AuthorizationFailed("no bound scriptlet sha256".into())
+    })?;
     let _ = result;
     Ok(ReadyInstallCandidate {
         handoff: handoff.clone(),
@@ -728,7 +744,9 @@ pub fn prepare_install_execution(
     }
     // Always prefer freshly authorized decision bounds over the ReadyInstallCandidate hint.
     let scriptlet_path = decision.bound_scriptlet_path.clone().ok_or_else(|| {
-        UpdateInstallError::AuthorizationFailed("authorized decision missing bound scriptlet path".into())
+        UpdateInstallError::AuthorizationFailed(
+            "authorized decision missing bound scriptlet path".into(),
+        )
     })?;
     let scriptlet_sha256 = decision.bound_scriptlet_sha256.clone().ok_or_else(|| {
         UpdateInstallError::AuthorizationFailed(
@@ -772,13 +790,16 @@ pub fn stage_and_prepare_ready_for_tests(
         expected_tag: handoff.candidate_tag.clone(),
         version: handoff.candidate_version.clone(),
         staging_root: staging_root.to_path_buf(),
-        source: AssetSource::LocalDirectory { root: src.to_path_buf() },
+        source: AssetSource::LocalDirectory {
+            root: src.to_path_buf(),
+        },
         trust: TrustMode::Fixture {
             public_key: key.verifying_key().to_bytes(),
         },
         root_kind: StagingRootKind::HostTest,
     };
-    let _result = stage_verified_update(&req).map_err(|e| UpdateInstallError::StagingFailed(e.to_string()))?;
+    let _result = stage_verified_update(&req)
+        .map_err(|e| UpdateInstallError::StagingFailed(e.to_string()))?;
     let auth_req = AuthorizeRequest {
         expected_tag: handoff.candidate_tag.clone(),
         version: handoff.candidate_version.clone(),
@@ -788,11 +809,9 @@ pub fn stage_and_prepare_ready_for_tests(
         installed_version: handoff.installed_version.clone(),
         user_approved: false,
     };
-    let decision = evaluate_installation_authorization_fixture(
-        &auth_req,
-        &key.verifying_key().to_bytes(),
-    )
-    .map_err(|e| UpdateInstallError::AuthorizationFailed(e.to_string()))?;
+    let decision =
+        evaluate_installation_authorization_fixture(&auth_req, &key.verifying_key().to_bytes())
+            .map_err(|e| UpdateInstallError::AuthorizationFailed(e.to_string()))?;
     let scriptlet_path = decision
         .bound_scriptlet_path
         .clone()
@@ -1211,7 +1230,9 @@ mod tests {
 
     fn write_install_fixture(dir: &std::path::Path, key: &ed25519_dalek::SigningKey) {
         use crate::publication_evidence::build_minimal_production_evidence;
-        use crate::publication_trust_boundary::{BINDING_HEADER, BINDING_SCHEMA, BINDING_SCOPE, BINDING_SIGNATURE_SCHEMA};
+        use crate::publication_trust_boundary::{
+            BINDING_HEADER, BINDING_SCHEMA, BINDING_SCOPE, BINDING_SIGNATURE_SCHEMA,
+        };
         use crate::release_manifest::{encode_hex, MANIFEST_SCHEMA, SIGNATURE_SCHEMA};
         use ed25519_dalek::Signer;
         use sha2::{Digest, Sha256};
@@ -1238,19 +1259,56 @@ mod tests {
         .into_bytes();
         let sign = |msg: &[u8], schema: &str| -> Vec<u8> {
             let sig = key.sign(msg);
-            format!("schema={schema}\nsignature={}\n", encode_hex(sig.to_bytes().as_ref())).into_bytes()
+            format!(
+                "schema={schema}\nsignature={}\n",
+                encode_hex(sig.to_bytes().as_ref())
+            )
+            .into_bytes()
         };
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join(format!("Install Ignite v{INSTALL_VERSION}.sh")), INSTALL_SCRIPTLET).unwrap();
-        std::fs::write(dir.join(format!("ignite-kindle-v{INSTALL_VERSION}.manifest")), &release).unwrap();
-        std::fs::write(dir.join(format!("ignite-kindle-v{INSTALL_VERSION}.manifest.sig")), sign(&release, SIGNATURE_SCHEMA)).unwrap();
-        std::fs::write(dir.join(format!("ignite-kindle-v{INSTALL_VERSION}.publication-evidence")), &evidence).unwrap();
-        std::fs::write(dir.join(format!("ignite-kindle-v{INSTALL_VERSION}.publication-binding")), &binding).unwrap();
-        std::fs::write(dir.join(format!("ignite-kindle-v{INSTALL_VERSION}.publication-binding.sig")), sign(&binding, BINDING_SIGNATURE_SCHEMA)).unwrap();
+        std::fs::write(
+            dir.join(format!("Install Ignite v{INSTALL_VERSION}.sh")),
+            INSTALL_SCRIPTLET,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("ignite-kindle-v{INSTALL_VERSION}.manifest")),
+            &release,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("ignite-kindle-v{INSTALL_VERSION}.manifest.sig")),
+            sign(&release, SIGNATURE_SCHEMA),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "ignite-kindle-v{INSTALL_VERSION}.publication-evidence"
+            )),
+            &evidence,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "ignite-kindle-v{INSTALL_VERSION}.publication-binding"
+            )),
+            &binding,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "ignite-kindle-v{INSTALL_VERSION}.publication-binding.sig"
+            )),
+            sign(&binding, BINDING_SIGNATURE_SCHEMA),
+        )
+        .unwrap();
     }
 
     fn temp_install_pair(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let base = std::env::temp_dir().join(format!("ignite-1b-{label}-{stamp}"));
         std::fs::remove_dir_all(&base).ok();
         let src = base.join("src");
@@ -1279,14 +1337,8 @@ mod tests {
         write_install_fixture(&src, &key);
         let device = install_device(src.parent().unwrap());
         let handoff = install_handoff("0.9.14");
-        let candidate = stage_and_prepare_ready_for_tests(
-            &handoff,
-            &staging,
-            &src,
-            &key,
-            device,
-        )
-        .expect("fixture stage must succeed");
+        let candidate = stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &key, device)
+            .expect("fixture stage must succeed");
         assert_eq!(candidate.handoff.candidate_version, INSTALL_VERSION);
         assert!(candidate.scriptlet_path.exists());
         assert!(!candidate.scriptlet_sha256.is_empty());
@@ -1329,7 +1381,9 @@ mod tests {
         write_install_fixture(&src, &key);
         let device = install_device(src.parent().unwrap());
         let handoff = install_handoff("0.9.14");
-        let candidate = stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &key, device.clone()).expect("stage ok");
+        let candidate =
+            stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &key, device.clone())
+                .expect("stage ok");
         assert!(
             !candidate.authorize_preview.installation_authorized,
             "fixture provenance + user_approved=false must not authorize"
@@ -1351,7 +1405,8 @@ mod tests {
         write_install_fixture(&src, &key);
         let device = install_device(src.parent().unwrap());
         let handoff = install_handoff("0.9.14");
-        let candidate = stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &key, device).expect("stage ok");
+        let candidate = stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &key, device)
+            .expect("stage ok");
         let sha256 = &candidate.scriptlet_sha256;
         let path = &candidate.scriptlet_path;
         assert!(
@@ -1373,10 +1428,15 @@ mod tests {
         let handoff = install_handoff("0.9.14");
         assert!(state.apply_result(gen, Ok(UpdateCheckOutcome::Available(handoff.clone()))));
         assert!(matches!(state.phase, UpdateCheckPhase::Available(_)));
-        let _dl_gen = state.begin_download(handoff.clone()).expect("begin_download from Available");
+        let _dl_gen = state
+            .begin_download(handoff.clone())
+            .expect("begin_download from Available");
         assert!(matches!(state.phase, UpdateCheckPhase::Downloading { .. }));
         assert!(state.busy());
-        assert!(state.begin_download(handoff).is_none(), "duplicate download must be ignored");
+        assert!(
+            state.begin_download(handoff).is_none(),
+            "duplicate download must be ignored"
+        );
     }
 
     #[test]
@@ -1407,7 +1467,9 @@ mod tests {
         );
         let t = ScriptedTransport::new(vec![Ok(body)]);
         let out = discover_latest_stable(&t, "0.9.14").unwrap();
-        let UpdateCheckOutcome::Available(h) = out else { panic!("expected Available") };
+        let UpdateCheckOutcome::Available(h) = out else {
+            panic!("expected Available")
+        };
         assert_eq!(h.eligibility, UpdateEligibility::NewerStableAvailable);
         let state = SoftwareUpdateState {
             phase: UpdateCheckPhase::Available(h),
@@ -1426,7 +1488,10 @@ mod tests {
         let handoff = install_handoff("0.9.14");
         let tmp = std::env::temp_dir().join(format!(
             "ignite-data-check-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let data_dir = tmp.join("scribe-data");
@@ -1436,7 +1501,10 @@ mod tests {
         let content_before = std::fs::read(notebook_dir.join("important.nbk")).unwrap();
         assert_eq!(handoff.installed_version, "0.9.14");
         assert_eq!(handoff.candidate_version, INSTALL_VERSION);
-        assert_eq!(std::fs::read(notebook_dir.join("important.nbk")).unwrap(), content_before);
+        assert_eq!(
+            std::fs::read(notebook_dir.join("important.nbk")).unwrap(),
+            content_before
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1448,7 +1516,8 @@ mod tests {
         let mut device = install_device(src.parent().unwrap());
         device.firmware = Some("9.9.9".into());
         let handoff = install_handoff("0.9.14");
-        let candidate = stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &key, device).expect("stage ok");
+        let candidate = stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &key, device)
+            .expect("stage ok");
         assert!(
             matches!(
                 candidate.authorize_preview.device_compatible,
@@ -1468,9 +1537,14 @@ mod tests {
         write_install_fixture(&src, &key);
         let device = install_device(src.parent().unwrap());
         let handoff = install_handoff("0.9.14");
-        let result = stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &wrong_key, device);
+        let result =
+            stage_and_prepare_ready_for_tests(&handoff, &staging, &src, &wrong_key, device);
         assert!(
-            matches!(result, Err(UpdateInstallError::StagingFailed(_) | UpdateInstallError::AuthorizationFailed(_))),
+            matches!(
+                result,
+                Err(UpdateInstallError::StagingFailed(_)
+                    | UpdateInstallError::AuthorizationFailed(_))
+            ),
             "wrong key must refuse: got {result:?}"
         );
         std::fs::remove_dir_all(src.parent().unwrap()).ok();
@@ -1510,7 +1584,10 @@ mod tests {
             authorize_preview: candidate.authorize_preview.clone(),
         };
         assert!(state.apply_download_result(dl_gen, Ok(ready)));
-        assert!(matches!(state.phase, UpdateCheckPhase::ReadyToInstall { .. }));
+        assert!(matches!(
+            state.phase,
+            UpdateCheckPhase::ReadyToInstall { .. }
+        ));
         state.begin_install();
         state.phase = UpdateCheckPhase::InstallFailed {
             message: "spawn failed: permission denied".into(),
@@ -1523,7 +1600,13 @@ mod tests {
             }),
         };
         assert!(
-            matches!(state.phase, UpdateCheckPhase::InstallFailed { retryable: true, .. }),
+            matches!(
+                state.phase,
+                UpdateCheckPhase::InstallFailed {
+                    retryable: true,
+                    ..
+                }
+            ),
             "spawn failure must be retryable"
         );
         let label = primary_action_label(&state);
@@ -1541,7 +1624,10 @@ mod tests {
             "post-stage residual must not begin a download retry"
         );
         assert!(state.restore_ready_from_failed());
-        assert!(matches!(state.phase, UpdateCheckPhase::ReadyToInstall { .. }));
+        assert!(matches!(
+            state.phase,
+            UpdateCheckPhase::ReadyToInstall { .. }
+        ));
         std::fs::remove_dir_all(src.parent().unwrap()).ok();
     }
 
@@ -1602,11 +1688,9 @@ mod tests {
             installed_version: handoff.installed_version.clone(),
             user_approved: true,
         };
-        let decision = evaluate_installation_authorization_fixture(
-            &auth_req,
-            &key.verifying_key().to_bytes(),
-        )
-        .unwrap();
+        let decision =
+            evaluate_installation_authorization_fixture(&auth_req, &key.verifying_key().to_bytes())
+                .unwrap();
         let bound_path = decision.bound_scriptlet_path.clone().unwrap();
         let bound_sha = decision.bound_scriptlet_sha256.clone().unwrap();
         assert_ne!(bound_path, candidate.scriptlet_path);
@@ -1663,14 +1747,18 @@ mod tests {
             "Installing status must not claim success: {blob}"
         );
         assert!(
-            !blob.contains("will restart") && !headline.to_lowercase().contains("installing ignite"),
+            !blob.contains("will restart")
+                && !headline.to_lowercase().contains("installing ignite"),
             "must not imply restart-into-success or mutation underway: {blob}"
         );
         assert!(
             blob.contains("preparing to leave") || blob.contains("exit is required"),
             "Installing copy must be truthful about exit/handoff: {blob}"
         );
-        assert!(primary_action_label(&state).is_none(), "busy Installing must have no action");
+        assert!(
+            primary_action_label(&state).is_none(),
+            "busy Installing must have no action"
+        );
     }
 
     #[test]

@@ -20,8 +20,8 @@ use crate::publication_trust_boundary::{
     authenticate_official_publication_chain, AuthenticatedPublicationChain, EvidenceClaimStatus,
     ProductionTrustError, VerificationProvenance,
 };
-use crate::software_update::{compare_stable_versions, is_stable_release_version};
 use crate::release_acquisition::{ReleaseAssetNames, MAX_METADATA_ASSET_BYTES};
+use crate::software_update::{compare_stable_versions, is_stable_release_version};
 #[cfg(test)]
 use crate::verified_update_staging::RECORD_NAME;
 use crate::verified_update_staging::{
@@ -507,7 +507,10 @@ fn refused_all(
         publication_claims_validated: blocked.clone(),
         artifact_identity_bound: blocked,
         device_compatible: evaluate_device_compatibility(&request.device),
-        upgrade_compatible: evaluate_upgrade_compatible(&request.version, &request.installed_version),
+        upgrade_compatible: evaluate_upgrade_compatible(
+            &request.version,
+            &request.installed_version,
+        ),
         recovery_ready: evaluate_recovery_readiness(&request.device),
         data_compatibility_verified: evaluate_data_compatibility_verified(
             &request.device.data_root,
@@ -760,7 +763,10 @@ fn evaluate_device_compatibility(device: &DeviceFacts) -> PrerequisiteStatus {
     }
 }
 
-fn evaluate_upgrade_compatible(candidate_version: &str, installed_version: &str) -> PrerequisiteStatus {
+fn evaluate_upgrade_compatible(
+    candidate_version: &str,
+    installed_version: &str,
+) -> PrerequisiteStatus {
     if !is_stable_release_version(candidate_version) {
         return PrerequisiteStatus::Refused(format!(
             "candidate version '{candidate_version}' is not a stable release version"
@@ -801,17 +807,13 @@ fn evaluate_data_compatibility_verified(
         return PrerequisiteStatus::Refused("data_root must not be a symlink".into());
     }
     if !meta.is_dir() {
-        return PrerequisiteStatus::Refused(
-            "data_root exists but is not a real directory".into(),
-        );
+        return PrerequisiteStatus::Refused("data_root exists but is not a real directory".into());
     }
     // Fail-closed: existing data_root must resolve; never silently proceed on canonicalize failure.
     let canon_data = match data_root.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot resolve data_root path: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot resolve data_root path: {e}"));
         }
     };
     let canon_app = match app_root.canonicalize() {
@@ -831,9 +833,7 @@ fn evaluate_data_compatibility_verified(
         }
     };
     if canon_data.starts_with(&canon_app) || canon_data.starts_with(&canon_staging) {
-        return PrerequisiteStatus::Refused(
-            "data_root overlaps app_root or staging_root".into(),
-        );
+        return PrerequisiteStatus::Refused("data_root overlaps app_root or staging_root".into());
     }
     let library_meta = data_root.join("library.meta");
     let library_meta_verified = match fs::symlink_metadata(&library_meta) {
@@ -841,9 +841,7 @@ fn evaluate_data_compatibility_verified(
             let bytes = match fs::read(&library_meta) {
                 Ok(b) => b,
                 Err(e) => {
-                    return PrerequisiteStatus::Refused(format!(
-                        "cannot read library.meta: {e}"
-                    ));
+                    return PrerequisiteStatus::Refused(format!("cannot read library.meta: {e}"));
                 }
             };
             let v: serde_json::Value = match serde_json::from_slice(&bytes) {
@@ -895,9 +893,7 @@ fn evaluate_data_compatibility_verified(
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot stat data_root/notebooks: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot stat data_root/notebooks: {e}"));
         }
     }
     PrerequisiteStatus::Satisfied
@@ -950,9 +946,7 @@ fn evaluate_pending_health_preflight(app_root: &Path) -> PrerequisiteStatus {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot stat pending-health.v1: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot stat pending-health.v1: {e}"));
         }
     }
 
@@ -963,18 +957,14 @@ fn evaluate_pending_health_preflight(app_root: &Path) -> PrerequisiteStatus {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot stat LKG inventory: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot stat LKG inventory: {e}"));
         }
     };
     let lkg_handler_present = match fs::symlink_metadata(&lkg_handler) {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot stat LKG handler: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot stat LKG handler: {e}"));
         }
     };
     if lkg_inventory_present || lkg_handler_present {
@@ -1002,9 +992,7 @@ fn evaluate_pending_health_preflight(app_root: &Path) -> PrerequisiteStatus {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot read update state directory: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot read update state directory: {e}"));
         }
     }
     PrerequisiteStatus::Satisfied
@@ -1038,9 +1026,7 @@ fn evaluate_recovery_readiness(device: &DeviceFacts) -> PrerequisiteStatus {
             ));
         }
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot stat app_root: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot stat app_root: {e}"));
         }
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -1073,21 +1059,21 @@ fn evaluate_recovery_readiness(device: &DeviceFacts) -> PrerequisiteStatus {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot stat previous-release: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot stat previous-release: {e}"));
         }
     }
 
     // Match installer spirit: refuse unresolved previous-release.staging / .prev leftovers.
-    if let status @ PrerequisiteStatus::Refused(_) =
-        refuse_unresolved_recovery_leftover(&app_root.join("previous-release.staging"), "previous-release.staging")
-    {
+    if let status @ PrerequisiteStatus::Refused(_) = refuse_unresolved_recovery_leftover(
+        &app_root.join("previous-release.staging"),
+        "previous-release.staging",
+    ) {
         return status;
     }
-    if let status @ PrerequisiteStatus::Refused(_) =
-        refuse_unresolved_recovery_leftover(&app_root.join("previous-release.prev"), "previous-release.prev")
-    {
+    if let status @ PrerequisiteStatus::Refused(_) = refuse_unresolved_recovery_leftover(
+        &app_root.join("previous-release.prev"),
+        "previous-release.prev",
+    ) {
         return status;
     }
 
@@ -1116,9 +1102,7 @@ fn evaluate_recovery_readiness(device: &DeviceFacts) -> PrerequisiteStatus {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return PrerequisiteStatus::Refused(format!(
-                "cannot stat activate journal: {e}"
-            ));
+            return PrerequisiteStatus::Refused(format!("cannot stat activate journal: {e}"));
         }
     }
     PrerequisiteStatus::Satisfied
@@ -1134,7 +1118,9 @@ fn evaluate_execution_binding(
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return (
-                PrerequisiteStatus::Refused("staged Scriptlet missing for execution binding".into()),
+                PrerequisiteStatus::Refused(
+                    "staged Scriptlet missing for execution binding".into(),
+                ),
                 None,
                 None,
             );
@@ -1183,7 +1169,11 @@ fn evaluate_execution_binding(
                 Ok(p) => p,
                 Err(_) => scriptlet.clone(),
             };
-            (PrerequisiteStatus::Satisfied, Some(abs_path), Some(sha256_hex))
+            (
+                PrerequisiteStatus::Satisfied,
+                Some(abs_path),
+                Some(sha256_hex),
+            )
         }
         Err(e) => (
             PrerequisiteStatus::Refused(format!(
@@ -1648,16 +1638,13 @@ mod tests {
             PrerequisiteStatus::Refused(_)
         ));
         assert!(
-            decision
-                .refusal_reasons
-                .iter()
-                .any(|r| {
-                    r.contains("UNPROVISIONED")
-                        || r.contains("not provisioned")
-                        || r.contains("signature is invalid")
-                        || r.contains("authentication failed")
-                        || r.contains("provenance unavailable")
-                }),
+            decision.refusal_reasons.iter().any(|r| {
+                r.contains("UNPROVISIONED")
+                    || r.contains("not provisioned")
+                    || r.contains("signature is invalid")
+                    || r.contains("authentication failed")
+                    || r.contains("provenance unavailable")
+            }),
             "{:?}",
             decision.refusal_reasons
         );
@@ -2024,7 +2011,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(decision.installation_policy_satisfied, PrerequisiteStatus::Refused(_)),
+            matches!(
+                decision.installation_policy_satisfied,
+                PrerequisiteStatus::Refused(_)
+            ),
             "policy must be Refused when user_approved=false"
         );
         assert!(!decision.installation_authorized);
@@ -2064,7 +2054,10 @@ mod tests {
             evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
                 .unwrap();
         assert!(
-            matches!(decision.installation_policy_satisfied, PrerequisiteStatus::Satisfied),
+            matches!(
+                decision.installation_policy_satisfied,
+                PrerequisiteStatus::Satisfied
+            ),
             "policy must be Satisfied with user_approved=true"
         );
         assert!(
@@ -2076,7 +2069,10 @@ mod tests {
             "recovery_ready must be Satisfied with real app_root"
         );
         assert!(
-            matches!(decision.data_compatibility_verified, PrerequisiteStatus::Satisfied),
+            matches!(
+                decision.data_compatibility_verified,
+                PrerequisiteStatus::Satisfied
+            ),
             "data_compatibility_verified must be Satisfied with absent data_root"
         );
         assert!(
@@ -2107,8 +2103,12 @@ mod tests {
         let decision =
             evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
                 .unwrap();
-        let path = decision.bound_scriptlet_path.expect("binding must produce path");
-        let sha256 = decision.bound_scriptlet_sha256.expect("binding must produce sha256");
+        let path = decision
+            .bound_scriptlet_path
+            .expect("binding must produce path");
+        let sha256 = decision
+            .bound_scriptlet_sha256
+            .expect("binding must produce sha256");
         assert!(
             revalidate_execution_binding(&path, &sha256),
             "revalidation must succeed on untampered file"
@@ -2452,7 +2452,10 @@ mod tests {
             evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
                 .unwrap();
         assert!(
-            matches!(decision.data_compatibility_verified, PrerequisiteStatus::Satisfied),
+            matches!(
+                decision.data_compatibility_verified,
+                PrerequisiteStatus::Satisfied
+            ),
             "absent data_root must be Satisfied (fresh install): got {:?}",
             decision.data_compatibility_verified
         );
@@ -2474,7 +2477,10 @@ mod tests {
             evaluate_installation_authorization_fixture(&req, &key.verifying_key().to_bytes())
                 .unwrap();
         assert!(
-            matches!(decision.data_compatibility_verified, PrerequisiteStatus::Refused(_)),
+            matches!(
+                decision.data_compatibility_verified,
+                PrerequisiteStatus::Refused(_)
+            ),
             "data_root that is a file must be Refused: got {:?}",
             decision.data_compatibility_verified
         );
@@ -2535,9 +2541,16 @@ mod tests {
         )
         .unwrap();
         assert!(decision.installation_authorized);
-        let path = decision.bound_scriptlet_path.expect("bound_scriptlet_path must be set");
-        let sha256 = decision.bound_scriptlet_sha256.expect("bound_scriptlet_sha256 must be set");
-        assert!(path.exists(), "bound_scriptlet_path must point to an existing file");
+        let path = decision
+            .bound_scriptlet_path
+            .expect("bound_scriptlet_path must be set");
+        let sha256 = decision
+            .bound_scriptlet_sha256
+            .expect("bound_scriptlet_sha256 must be set");
+        assert!(
+            path.exists(),
+            "bound_scriptlet_path must point to an existing file"
+        );
         assert_eq!(sha256.len(), 64, "sha256 hex must be 64 characters");
         assert!(
             revalidate_execution_binding(&path, &sha256),
@@ -2707,10 +2720,7 @@ mod tests {
         stage_fixture(&src, &staging, &key);
         let device = kindle_like_device(src.parent().unwrap());
         fs::create_dir_all(&device.app_root).unwrap();
-        let nested = device
-            .app_root
-            .join("previous-release")
-            .join("bin");
+        let nested = device.app_root.join("previous-release").join("bin");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("scribe-app"), b"#!/bin/sh\n").unwrap();
         let run = device.app_root.join("run");

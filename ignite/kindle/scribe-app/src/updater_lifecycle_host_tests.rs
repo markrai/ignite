@@ -41,11 +41,7 @@ fn write_scriptlet(path: &Path, body: &[u8]) -> String {
 }
 
 fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn authorized_decision(path: &Path, sha: &str) -> AuthorizationDecision {

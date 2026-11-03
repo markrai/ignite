@@ -60,10 +60,14 @@ pub fn load_intent(update_dir: &Path) -> Result<InstallIntent, DeferredError> {
         Ok(m) => m,
     };
     if meta.file_type().is_symlink() {
-        return Err(DeferredError::Malformed("intent must not be a symlink".into()));
+        return Err(DeferredError::Malformed(
+            "intent must not be a symlink".into(),
+        ));
     }
     if !meta.is_file() {
-        return Err(DeferredError::Malformed("intent is not a regular file".into()));
+        return Err(DeferredError::Malformed(
+            "intent is not a regular file".into(),
+        ));
     }
     let mut file = File::open(&path).map_err(|e| DeferredError::Io(e.to_string()))?;
     let mut bytes = Vec::new();
@@ -80,7 +84,9 @@ fn parse_intent(bytes: &[u8]) -> Result<InstallIntent, DeferredError> {
     }
     let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
     if lines.len() != 9 || lines[0] != "IGNITE_INSTALL_INTENT_V1" {
-        return Err(DeferredError::Malformed("intent header/shape refused".into()));
+        return Err(DeferredError::Malformed(
+            "intent header/shape refused".into(),
+        ));
     }
     if lines[1] != "schema=1" || lines[7] != "trust_anchor=false" {
         return Err(DeferredError::Malformed(
@@ -88,7 +94,9 @@ fn parse_intent(bytes: &[u8]) -> Result<InstallIntent, DeferredError> {
         ));
     }
     if lines[8] != "note=reauthenticate-before-exec" {
-        return Err(DeferredError::Malformed("intent missing reauth note".into()));
+        return Err(DeferredError::Malformed(
+            "intent missing reauth note".into(),
+        ));
     }
     let expected_tag = field(lines[2], "expected_tag=")?;
     let version = field(lines[3], "version=")?;
@@ -178,13 +186,14 @@ pub fn run_deferred_install(update_dir: &Path) -> Result<(), DeferredError> {
             "--version",
             &intent.version,
             "--staging-root",
-            intent.staging_root.to_str().ok_or_else(|| {
-                DeferredError::Malformed("staging_root not utf-8".into())
-            })?,
+            intent
+                .staging_root
+                .to_str()
+                .ok_or_else(|| DeferredError::Malformed("staging_root not utf-8".into()))?,
             "--sealed-out",
-            sealed.to_str().ok_or_else(|| {
-                DeferredError::Malformed("sealed path not utf-8".into())
-            })?,
+            sealed
+                .to_str()
+                .ok_or_else(|| DeferredError::Malformed("sealed path not utf-8".into()))?,
             "--receipt-out",
             receipt
                 .to_str()

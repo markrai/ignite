@@ -184,7 +184,10 @@ impl PreferencesLayout {
             None
         };
         let cancel_install = if matches!(update.phase, UpdateCheckPhase::ReadyToInstall { .. }) {
-            let cancel_x = geo.xres.saturating_sub(MARGIN).saturating_sub(UPDATE_CANCEL_W);
+            let cancel_x = geo
+                .xres
+                .saturating_sub(MARGIN)
+                .saturating_sub(UPDATE_CANCEL_W);
             Some(Rect::new(
                 cancel_x,
                 UPDATE_BUTTON_Y + UPDATE_BUTTON_H + UPDATE_CANCEL_GAP,
@@ -266,13 +269,7 @@ pub fn render_preferences(
     );
     c.text(MARGIN, UPDATE_SECTION_Y, 9, "SOFTWARE UPDATE", BLACK);
     let (headline, details) = software_update::status_copy(update);
-    c.text(
-        MARGIN,
-        UPDATE_BODY_Y,
-        6,
-        &fit_text(&headline, 6, w),
-        BLACK,
-    );
+    c.text(MARGIN, UPDATE_BODY_Y, 6, &fit_text(&headline, 6, w), BLACK);
     for (i, line) in details.iter().enumerate().take(3) {
         c.text(
             MARGIN,

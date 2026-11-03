@@ -2086,7 +2086,10 @@ mod tests {
             .arg(&helper)
             .status()
             .expect("spawn mkfifo");
-        assert!(fifo_status.success(), "mkfifo failed for special-file fixture");
+        assert!(
+            fifo_status.success(),
+            "mkfifo failed for special-file fixture"
+        );
         assert_eq!(fixture.inspect().result, "UNSAFE_INPUT");
 
         let fixture = Fixture::new(ReleaseRole::CandidateB, 30);

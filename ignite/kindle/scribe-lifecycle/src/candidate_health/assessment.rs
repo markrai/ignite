@@ -1376,8 +1376,13 @@ mod tests {
     #[test]
     fn scoped_qualification_refuses_when_data_compat_passes_but_health_fails() {
         let tree = AssessmentTree::new();
-        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
-        fs::write(tree.paths.app.parent().unwrap().join("storage-contract.v1"), contract).unwrap();
+        let contract =
+            b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        fs::write(
+            tree.paths.app.parent().unwrap().join("storage-contract.v1"),
+            contract,
+        )
+        .unwrap();
         fs::write(
             tree.paths.previous_dir.join("storage-contract.v1"),
             contract,
@@ -1390,8 +1395,7 @@ mod tests {
         fs::write(&evidence_path, evidence).unwrap();
 
         let pending_before = fs::read(tree.paths.update_dir.join(PENDING_NAME)).unwrap();
-        let inventory_before =
-            fs::read(tree.paths.previous_dir.join(INVENTORY_NAME)).unwrap();
+        let inventory_before = fs::read(tree.paths.previous_dir.join(INVENTORY_NAME)).unwrap();
         let report = tree
             .assess_under_boundary(LAUNCH)
             .record_boundary_confirmation(LAUNCH, Ok(()));
@@ -1420,7 +1424,8 @@ mod tests {
     #[test]
     fn retained_tree_accepts_valid_storage_contract_outside_inventory() {
         let tree = AssessmentTree::new();
-        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        let contract =
+            b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
         fs::write(
             tree.paths.previous_dir.join(STORAGE_CONTRACT_NAME),
             contract,
@@ -1453,14 +1458,14 @@ mod tests {
     #[test]
     fn legacy_absent_retained_contract_passes_data_compat_without_backfill() {
         let tree = AssessmentTree::new();
-        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
-        fs::write(tree.paths.app.parent().unwrap().join(STORAGE_CONTRACT_NAME), contract)
-            .unwrap();
-        assert!(!tree
-            .paths
-            .previous_dir
-            .join(STORAGE_CONTRACT_NAME)
-            .exists());
+        let contract =
+            b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        fs::write(
+            tree.paths.app.parent().unwrap().join(STORAGE_CONTRACT_NAME),
+            contract,
+        )
+        .unwrap();
+        assert!(!tree.paths.previous_dir.join(STORAGE_CONTRACT_NAME).exists());
         let check = evaluate_scoped_storage_contract(&tree.paths);
         assert_eq!(check.status, CheckStatus::Pass);
         assert!(
@@ -1477,9 +1482,13 @@ mod tests {
     #[test]
     fn invalid_retained_contract_fails_data_compat() {
         let tree = AssessmentTree::new();
-        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
-        fs::write(tree.paths.app.parent().unwrap().join(STORAGE_CONTRACT_NAME), contract)
-            .unwrap();
+        let contract =
+            b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        fs::write(
+            tree.paths.app.parent().unwrap().join(STORAGE_CONTRACT_NAME),
+            contract,
+        )
+        .unwrap();
         fs::write(
             tree.paths.previous_dir.join(STORAGE_CONTRACT_NAME),
             b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=other-v2\n",
@@ -1846,7 +1855,10 @@ exec /mnt/us/scribe-app/bin/scribe-lifecycle --host \\\n\
   --sync-dir /mnt/us/scribe-app/state/sync \\\n\
   --device-dir /mnt/us/scribe-app/state/device\n",
             );
-            write_file(&pkg.join("launcher/Scribe.sh"), "#!/bin/sh\n# Name: Ignite\n");
+            write_file(
+                &pkg.join("launcher/Scribe.sh"),
+                "#!/bin/sh\n# Name: Ignite\n",
+            );
             write_file(
                 &pkg.join("Uninstall-Ignite.sh"),
                 "#!/bin/sh\n# Name: Uninstall Ignite\nok\n",
@@ -2028,9 +2040,7 @@ exec \"$@\"\n",
             run_install(&payload_a, &kindle);
             // Simulate a pre-contract Ignite A installation: strip the live contract
             // before upgrading so the snapshot cannot copy an authenticated A claim.
-            let live_contract = kindle
-                .join("scribe-app/bin")
-                .join(STORAGE_CONTRACT_NAME);
+            let live_contract = kindle.join("scribe-app/bin").join(STORAGE_CONTRACT_NAME);
             assert!(live_contract.is_file());
             fs::remove_file(&live_contract).unwrap();
             run_install(&payload_b, &kindle);
