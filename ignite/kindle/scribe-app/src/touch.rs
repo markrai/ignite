@@ -12,7 +12,8 @@
 //! touching, every finger action is suppressed, and any touch contact that overlapped that
 //! state at any point stays suppressed until *all* contacts lift ([`TouchArbiter`]).
 
-use kindle_platform::{FbGeometry, StylusEventKind, TouchContact};
+use kindle_platform::{rotate_reverses_input_axes, FbGeometry, StylusEventKind, TouchContact};
+use notebook_core::Orientation;
 
 use crate::app_ui::UiState;
 use crate::ui_gfx::{Rect, UiPoint};
@@ -46,10 +47,40 @@ pub struct TouchMapping {
     y: (i32, i32),
     panel_w: u32,
     panel_h: u32,
+    reverse_axes: bool,
 }
 
 impl TouchMapping {
     pub fn new(x: (i32, i32), y: (i32, i32), geo: &FbGeometry) -> Result<Self, String> {
+        Self::with_axis_reversal(x, y, geo, false)
+    }
+
+    /// Build a mapping for the framebuffer's reported rotation. The Scribe reports
+    /// `EXPECTED_ROTATE` (3) on the established orientation and `ACCEPTED_ROTATE_CW` (1) on the
+    /// reported 5.19.6 orientation; those differ by 180 degrees.
+    pub fn for_rotation(
+        x: (i32, i32),
+        y: (i32, i32),
+        geo: &FbGeometry,
+        rotate: u32,
+    ) -> Result<Self, String> {
+        let reverse_axes = match rotate_reverses_input_axes(rotate) {
+            Some(reverse) => reverse,
+            None => {
+                return Err(format!(
+                    "REFUSE TOUCH: unsupported framebuffer rotate={rotate}"
+                ))
+            }
+        };
+        Self::with_axis_reversal(x, y, geo, reverse_axes)
+    }
+
+    fn with_axis_reversal(
+        x: (i32, i32),
+        y: (i32, i32),
+        geo: &FbGeometry,
+        reverse_axes: bool,
+    ) -> Result<Self, String> {
         if x.1 <= x.0 || y.1 <= y.0 || geo.xres == 0 || geo.yres == 0 {
             return Err(format!(
                 "REFUSE TOUCH: degenerate mapping x={x:?} y={y:?} panel={}x{}",
@@ -61,6 +92,7 @@ impl TouchMapping {
             y,
             panel_w: geo.xres,
             panel_h: geo.yres,
+            reverse_axes,
         })
     }
 
@@ -74,10 +106,134 @@ impl TouchMapping {
 
     /// `None` for a coordinate outside the device-reported range (malformed report).
     pub fn map(&self, x: i32, y: i32) -> Option<UiPoint> {
-        Some(UiPoint {
-            x: Self::axis(x, self.x, self.panel_w)?,
-            y: Self::axis(y, self.y, self.panel_h)?,
-        })
+        let mut x = Self::axis(x, self.x, self.panel_w)?;
+        let mut y = Self::axis(y, self.y, self.panel_h)?;
+        if self.reverse_axes {
+            x = self.panel_w - 1 - x;
+            y = self.panel_h - 1 - y;
+        }
+        Some(UiPoint { x, y })
+    }
+}
+
+/// Stylus / Wacom orientation selected from the live framebuffer rotate value.
+///
+/// Proven rotate=3 → [`Orientation::Portrait0`]. Reported rotate=1 →
+/// [`Orientation::Portrait180`]. Unsupported rotate values return `Err` (same fail-closed
+/// policy as [`TouchMapping::for_rotation`]); Gate B also refuses them before mmap.
+pub fn stylus_orientation_for_fb_rotate(rotate: u32) -> Result<Orientation, String> {
+    match rotate_reverses_input_axes(rotate) {
+        Some(true) => Ok(Orientation::Portrait180),
+        Some(false) => Ok(Orientation::Portrait0),
+        None => Err(format!(
+            "REFUSE STYLUS: unsupported framebuffer rotate={rotate}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod rotate_selection_tests {
+    use super::*;
+    use crate::ui_gfx::panel_geo;
+    use kindle_platform::{ACCEPTED_ROTATE_CW, EXPECTED_ROTATE};
+
+    #[test]
+    fn for_rotation_proven_matches_identity_corners() {
+        let g = panel_geo();
+        let identity = TouchMapping::new((0, 4095), (0, 4095), &g).unwrap();
+        let proven = TouchMapping::for_rotation((0, 4095), (0, 4095), &g, EXPECTED_ROTATE).unwrap();
+        for &(x, y) in &[(0, 0), (4095, 0), (0, 4095), (4095, 4095), (2048, 2048)] {
+            assert_eq!(proven.map(x, y), identity.map(x, y), "device=({x},{y})");
+        }
+    }
+
+    #[test]
+    fn for_rotation_cw_flips_all_four_corners() {
+        let g = panel_geo();
+        let m = TouchMapping::for_rotation((0, 4095), (0, 4095), &g, ACCEPTED_ROTATE_CW).unwrap();
+        assert_eq!(m.map(0, 0), Some(UiPoint { x: 1859, y: 2479 }));
+        assert_eq!(m.map(4095, 0), Some(UiPoint { x: 0, y: 2479 }));
+        assert_eq!(m.map(0, 4095), Some(UiPoint { x: 1859, y: 0 }));
+        assert_eq!(m.map(4095, 4095), Some(UiPoint { x: 0, y: 0 }));
+        // Integer mid-map is (929,1239); 180° of that discrete point is (930,1240).
+        assert_eq!(m.map(2048, 2048), Some(UiPoint { x: 930, y: 1240 }));
+    }
+
+    #[test]
+    fn for_rotation_bounds_and_unsupported() {
+        let g = panel_geo();
+        let m = TouchMapping::for_rotation((0, 4095), (0, 4095), &g, ACCEPTED_ROTATE_CW).unwrap();
+        assert_eq!(m.map(-1, 10), None);
+        assert_eq!(m.map(10, 4096), None);
+        assert!(TouchMapping::for_rotation((5, 5), (0, 10), &g, EXPECTED_ROTATE).is_err());
+        let err = TouchMapping::for_rotation((0, 10), (0, 10), &g, 0).unwrap_err();
+        assert!(err.contains("REFUSE TOUCH"));
+        assert!(err.contains("rotate=0"));
+        assert!(TouchMapping::for_rotation((0, 10), (0, 10), &g, 2).is_err());
+    }
+
+    #[test]
+    fn stylus_orientation_follows_accepted_rotate() {
+        assert_eq!(
+            stylus_orientation_for_fb_rotate(EXPECTED_ROTATE).unwrap(),
+            Orientation::Portrait0
+        );
+        assert_eq!(
+            stylus_orientation_for_fb_rotate(ACCEPTED_ROTATE_CW).unwrap(),
+            Orientation::Portrait180
+        );
+        for bad in [0_u32, 2] {
+            let err = stylus_orientation_for_fb_rotate(bad).unwrap_err();
+            assert!(err.contains("REFUSE STYLUS"), "{err}");
+            assert!(err.contains(&format!("rotate={bad}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn touch_and_stylus_180_agree_on_normalized_corners() {
+        use notebook_core::{portrait_wacom_calibration, DevicePoint};
+
+        let g = panel_geo();
+        let touch =
+            TouchMapping::for_rotation((0, 4095), (0, 4095), &g, ACCEPTED_ROTATE_CW).unwrap();
+        let mut cal = portrait_wacom_calibration();
+        cal.orientation = stylus_orientation_for_fb_rotate(ACCEPTED_ROTATE_CW).unwrap();
+
+        // Device-space corners → opposite panel / page corners under the shared 180° policy.
+        let cases = [
+            (
+                (0, 0),
+                (1859_u32, 2479_u32),
+                (cal.device_min_x, cal.device_min_y),
+            ),
+            ((4095, 4095), (0, 0), (cal.device_max_x, cal.device_max_y)),
+            ((0, 4095), (1859, 0), (cal.device_min_x, cal.device_max_y)),
+            ((4095, 0), (0, 2479), (cal.device_max_x, cal.device_min_y)),
+        ];
+        for (touch_dev, panel, wacom_dev) in cases {
+            let mapped = touch.map(touch_dev.0, touch_dev.1).unwrap();
+            assert_eq!((mapped.x, mapped.y), panel, "touch device={touch_dev:?}");
+            let page = cal.to_page(DevicePoint::new(wacom_dev.0, wacom_dev.1));
+            let expect_x = if panel.0 == 0 { 0.0 } else { cal.page.width };
+            let expect_y = if panel.1 == 0 { 0.0 } else { cal.page.height };
+            assert!(
+                (page.x - expect_x).abs() < 1e-6 && (page.y - expect_y).abs() < 1e-6,
+                "stylus device={wacom_dev:?} page=({}, {}) expect=({}, {})",
+                page.x,
+                page.y,
+                expect_x,
+                expect_y
+            );
+        }
+
+        assert_eq!(
+            stylus_orientation_for_fb_rotate(EXPECTED_ROTATE).unwrap(),
+            Orientation::Portrait0
+        );
+        let identity =
+            TouchMapping::for_rotation((0, 4095), (0, 4095), &g, EXPECTED_ROTATE).unwrap();
+        assert_eq!(identity.map(0, 0), Some(UiPoint { x: 0, y: 0 }));
+        assert_eq!(identity.map(4095, 4095), Some(UiPoint { x: 1859, y: 2479 }));
     }
 }
 

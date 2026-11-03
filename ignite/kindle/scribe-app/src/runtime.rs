@@ -82,7 +82,8 @@ use crate::profile::RenderProfile;
 use crate::store::{page_dir, resolve_data_dir, PageStore, RuntimeStore, DEFAULT_PAGE_ID};
 use crate::text_paint::TextOverlay;
 use crate::touch::{
-    CoalesceDecision, FingerAction, MovePreviewCoalesce, TouchArbiter, TouchMapping,
+    stylus_orientation_for_fb_rotate, CoalesceDecision, FingerAction, MovePreviewCoalesce,
+    TouchArbiter, TouchMapping,
 };
 use crate::ui_gfx::{paper_background, Rect, UiPoint, BLACK};
 
@@ -4043,6 +4044,7 @@ pub fn run_page_session(
         }
     };
     let g = fb.geometry;
+    let fb_rotate = fb.var.rotate;
     crate::launch_clock::mark("framebuffer_ready");
 
     crate::launch_clock::mark("loading_paint_submit");
@@ -4089,11 +4091,16 @@ pub fn run_page_session(
         match LinuxEvdevTouch::open_observer(path) {
             Ok(t) => {
                 let axes = t.axes();
-                match TouchMapping::new((axes.x.min, axes.x.max), (axes.y.min, axes.y.max), &g) {
+                match TouchMapping::for_rotation(
+                    (axes.x.min, axes.x.max),
+                    (axes.y.min, axes.y.max),
+                    &g,
+                    fb_rotate,
+                ) {
                     Ok(mapping) => {
                         println!(
-                            "touch=observer path={path} grab=never x={}..{} y={}..{} slot_max={}",
-                            axes.x.min, axes.x.max, axes.y.min, axes.y.max, axes.slot_max
+                            "touch=observer path={path} grab=never rotate={} x={}..{} y={}..{} slot_max={}",
+                            fb_rotate, axes.x.min, axes.x.max, axes.y.min, axes.y.max, axes.slot_max
                         );
                         touch = Some((TouchPump::start(t), mapping));
                     }
@@ -4336,7 +4343,16 @@ pub fn run_page_session(
         RuntimeStore::Unbound,
     );
 
-    let cal = portrait_wacom_calibration();
+    let mut cal = portrait_wacom_calibration();
+    // Proven rotate=3 → Portrait0; reported rotate=1 → Portrait180 (same 180° policy as touch).
+    // Unsupported rotate is Err; Gate B already refused those before mmap.
+    cal.orientation = match stylus_orientation_for_fb_rotate(fb_rotate) {
+        Ok(orientation) => orientation,
+        Err(e) => {
+            eprintln!("{e}");
+            return abort_after_loading(e);
+        }
+    };
     let mut nav = NavGestureState::Idle;
     let mut eraser = EraserGestureState::Idle;
     let mut router = PenRouter::default();

@@ -30,7 +30,29 @@ pub const EXPECTED_GRAYSCALE: u32 = 2;
 /// Linux `fb.h` grayscale flag / Lab126 `GRAYSCALE_8BIT`. Same 8-bit packed layout.
 pub const ACCEPTED_GRAYSCALE_LINUX_GRAY: u32 = 1;
 pub const EXPECTED_NONSTD: u32 = 1;
+/// Rotation from the proven 5.18.6 snapshot. A 5.19.6 diagnostic reports 1
+/// with the same portrait geometry; screen orientation still needs hardware confirmation.
 pub const EXPECTED_ROTATE: u32 = 3;
+/// Alternate 5.19.6 diagnostic value; runtime reverses both touch and stylus axes for it.
+pub const ACCEPTED_ROTATE_CW: u32 = 1;
+
+/// True when Gate B accepts this framebuffer rotate value.
+pub fn rotate_is_accepted(rotate: u32) -> bool {
+    rotate == EXPECTED_ROTATE || rotate == ACCEPTED_ROTATE_CW
+}
+
+/// Whether accepted rotate values require a 180° dual-axis input reverse.
+///
+/// - `EXPECTED_ROTATE` (3): identity mapping (`Some(false)`)
+/// - `ACCEPTED_ROTATE_CW` (1): reverse both axes (`Some(true)`)
+/// - anything else: `None` (Gate B and touch refuse)
+pub fn rotate_reverses_input_axes(rotate: u32) -> Option<bool> {
+    match rotate {
+        EXPECTED_ROTATE => Some(false),
+        ACCEPTED_ROTATE_CW => Some(true),
+        _ => None,
+    }
+}
 
 /// Probe-reported hardware black/white observation (`ink-probe` Gate B).
 /// Compositor polarity lives in `fb_polarity` (`LOGICAL_BLACK` / `LOGICAL_WHITE`).
@@ -91,7 +113,12 @@ pub fn check_preconditions(
         ));
     }
     check_u32("nonstd", var.nonstd, EXPECTED_NONSTD, &mut mismatches);
-    check_u32("rotate", var.rotate, EXPECTED_ROTATE, &mut mismatches);
+    if !rotate_is_accepted(var.rotate) {
+        mismatches.push(format!(
+            "rotate: got {}, expected {} (or {} observed in the 5.19.6 diagnostic)",
+            var.rotate, EXPECTED_ROTATE, ACCEPTED_ROTATE_CW
+        ));
+    }
 
     if mismatches.is_empty() {
         Ok(())
@@ -307,5 +334,47 @@ mod tests {
     fn check_preconditions_is_info_only_no_buffer_required() {
         let (fix, var) = matching_pair();
         let _ = check_preconditions(&fix, &var);
+    }
+
+    #[test]
+    fn proven_rotate_3_still_passes() {
+        let (fix, var) = matching_pair();
+        assert_eq!(var.rotate, EXPECTED_ROTATE);
+        assert!(rotate_is_accepted(var.rotate));
+        assert_eq!(rotate_reverses_input_axes(var.rotate), Some(false));
+        assert!(check_preconditions(&fix, &var).is_ok());
+    }
+
+    #[test]
+    fn reported_rotate_1_same_geometry_passes() {
+        let (fix, mut var) = matching_pair();
+        var.rotate = ACCEPTED_ROTATE_CW;
+        assert!(rotate_is_accepted(var.rotate));
+        assert_eq!(rotate_reverses_input_axes(var.rotate), Some(true));
+        assert!(check_preconditions(&fix, &var).is_ok());
+    }
+
+    #[test]
+    fn reported_grayscale_1_and_rotate_1_pass_together() {
+        let (fix, mut var) = matching_pair();
+        var.grayscale = ACCEPTED_GRAYSCALE_LINUX_GRAY;
+        var.rotate = ACCEPTED_ROTATE_CW;
+        assert!(check_preconditions(&fix, &var).is_ok());
+    }
+
+    #[test]
+    fn unsupported_rotate_0_and_2_are_rejected() {
+        let (fix, mut var) = matching_pair();
+        var.rotate = 0;
+        let err0 = check_preconditions(&fix, &var).unwrap_err();
+        assert!(err0.iter().any(|m| m.starts_with("rotate:")));
+        assert!(!rotate_is_accepted(0));
+        assert_eq!(rotate_reverses_input_axes(0), None);
+
+        var.rotate = 2;
+        let err2 = check_preconditions(&fix, &var).unwrap_err();
+        assert!(err2.iter().any(|m| m.starts_with("rotate:")));
+        assert!(!rotate_is_accepted(2));
+        assert_eq!(rotate_reverses_input_axes(2), None);
     }
 }
