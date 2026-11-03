@@ -12,6 +12,9 @@ set -eu
 # Stamped at packaging time. Fixed-width numeric fields so OFFSET can be patched
 # in place without changing the prefix length.
 IGNITE_PACKAGE_VERSION='@@IGNITE_PACKAGE_VERSION@@'
+# Authenticated storage-contract claim (must match assets/storage-contract.v1 and the
+# running binary's ignite-storage-v1). Digested as part of the signed Scriptlet.
+IGNITE_STORAGE_CONTRACT='ignite-storage-v1'
 IGNITE_ARCHIVE_OFFSET=0000000000
 IGNITE_ARCHIVE_BYTES=0000000000
 IGNITE_ARCHIVE_SHA256=0000000000000000000000000000000000000000000000000000000000000000
@@ -19,7 +22,9 @@ IGNITE_ARCHIVE_MD5=00000000000000000000000000000000
 
 LOG_DIR="${IGNITE_LOG_DIR:-/mnt/us/scribe-app/logs}"
 LOG="$LOG_DIR/install.log"
-STAGE="${IGNITE_STAGE:-/mnt/us/scribe-app/run/ignite-extract-${IGNITE_PACKAGE_VERSION}}"
+# A per-process extraction tree prevents an installer waiting for the transaction lock from
+# deleting or replacing the package tree used by the current lock holder.
+STAGE="${IGNITE_STAGE:-/mnt/us/scribe-app/run/ignite-extract-${IGNITE_PACKAGE_VERSION}-$$}"
 PACKAGE_ROOT="${STAGE}/root/Ignite-Kindle-${IGNITE_PACKAGE_VERSION}"
 DOCS="${IGNITE_DOCS:-/mnt/us/documents}"
 STATUS=1
@@ -144,15 +149,10 @@ set +e
   tar -xzf "$ARCHIVE" -C "$STAGE/root" || die "FAILED: could not unpack Ignite."
   [ -f "$PACKAGE_ROOT/lib/install-runtime.sh" ] || die "FAILED: installer payload is incomplete."
 
-  # Diagnose Ignite is installed only after successful payload extraction.
-  mkdir -p "$DOCS" 2>/dev/null || true
-  if [ -f "$PACKAGE_ROOT/Diagnose-Ignite.sh" ]; then
-    cp -f "$PACKAGE_ROOT/Diagnose-Ignite.sh" "$DOCS/Diagnose Ignite.sh" || true
-    chmod 0755 "$DOCS/Diagnose Ignite.sh" 2>/dev/null || true
-    sed -i 's/\r$//' "$DOCS/Diagnose Ignite.sh" 2>/dev/null || true
-  fi
-
-  sh "$PACKAGE_ROOT/lib/install-runtime.sh" "$PACKAGE_ROOT"
+  # install-runtime publishes Diagnose after it has acquired the updater transaction lock. The
+  # package extraction itself is not installed state and remains outside that boundary.
+  IGNITE_INSTALL_DIAGNOSE_EARLY=1 \
+    sh "$PACKAGE_ROOT/lib/install-runtime.sh" "$PACKAGE_ROOT"
 
   cleanup_stage
   sync

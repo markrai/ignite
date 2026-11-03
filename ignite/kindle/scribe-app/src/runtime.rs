@@ -318,10 +318,16 @@ impl KindleTransport {
     fn render_preferences(
         &mut self,
         action: SideButtonAction,
+        update: &crate::software_update::SoftwareUpdateState,
         dialog: Option<&DialogSpec>,
     ) -> Result<(), String> {
         self.chrome_on_panel = false;
-        crate::settings_ui::render_preferences(self.fb.as_slice_mut(), &self.geometry, action)?;
+        crate::settings_ui::render_preferences(
+            self.fb.as_slice_mut(),
+            &self.geometry,
+            action,
+            update,
+        )?;
         if let Some(spec) = dialog {
             render_dialog(self.fb.as_slice_mut(), &self.geometry, spec)?;
         }
@@ -2197,6 +2203,10 @@ struct UiExec<'a> {
     stop: &'a Arc<AtomicBool>,
     /// NBK import in progress (Tools screen); one source per idle loop pass.
     import_run: &'a mut Option<ImportRun>,
+    /// Software Update discovery job (Preferences); completes off the UI thread.
+    update_check: &'a mut Option<UpdateCheckJob>,
+    /// Software Update download+stage job; completes off the UI thread.
+    download_job: &'a mut Option<UpdateDownloadJob>,
     /// Replica-local preferences.json (outside the library).
     prefs_path: &'a Path,
     /// `--sync-dir` (Restore from Server replaces it with the library).
@@ -2214,6 +2224,416 @@ struct ImportRun {
     imported: usize,
     skipped: usize,
     failures: Vec<crate::tools_ui::ImportFailureLine>,
+}
+
+/// Background GitHub release discovery. Never installs; results are advisory.
+struct UpdateCheckJob {
+    generation: u64,
+    rx: std::sync::mpsc::Receiver<
+        Result<
+            crate::software_update::UpdateCheckOutcome,
+            crate::software_update::UpdateDiscoveryError,
+        >,
+    >,
+}
+
+enum UpdateDownloadJobMessage {
+    Progress(crate::software_update::UpdateDownloadProgress),
+    Done(
+        Result<
+            crate::software_update::ReadyInstallCandidate,
+            crate::software_update::UpdateInstallError,
+        >,
+    ),
+}
+
+struct UpdateDownloadJob {
+    generation: u64,
+    rx: std::sync::mpsc::Receiver<UpdateDownloadJobMessage>,
+}
+
+fn start_software_update_check(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    if x.update_check.is_some() || x.ui.software_update.busy() {
+        println!("software_update=check_ignored reason=already_checking");
+        return present_ui(x, ctrl, None);
+    }
+    let Some(generation) = x.ui.software_update.begin_check() else {
+        println!("software_update=check_ignored reason=already_checking");
+        return present_ui(x, ctrl, None);
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let installed = crate::software_update::installed_version().to_string();
+    match std::thread::Builder::new()
+        .name("ignite-update-check".into())
+        .spawn(move || {
+            let transport = crate::software_update::CurlMetadataTransport::default();
+            let result = crate::software_update::discover_latest_stable(&transport, &installed);
+            let _ = tx.send(result);
+        }) {
+        Ok(_) => {
+            *x.update_check = Some(UpdateCheckJob { generation, rx });
+            println!("software_update=checking generation={generation}");
+            present_ui(x, ctrl, None)
+        }
+        Err(e) => {
+            let _ = x.ui.software_update.apply_result(
+                generation,
+                Err(crate::software_update::UpdateDiscoveryError::Transport(
+                    format!("spawn failed: {e}"),
+                )),
+            );
+            eprintln!("software_update=spawn_failed detail={e}");
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
+fn poll_software_update_check(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<bool, String> {
+    let Some(job) = x.update_check.as_mut() else {
+        return Ok(false);
+    };
+    let result = match job.rx.try_recv() {
+        Ok(r) => r,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(crate::software_update::UpdateDiscoveryError::Transport(
+                "update check worker ended without a result".into(),
+            ))
+        }
+    };
+    let generation = job.generation;
+    *x.update_check = None;
+    let applied = x.ui.software_update.apply_result(generation, result);
+    if applied {
+        println!(
+            "software_update=result generation={generation} phase={:?}",
+            std::mem::discriminant(&x.ui.software_update.phase)
+        );
+    } else {
+        println!("software_update=stale_result generation={generation}");
+    }
+    if applied && x.ui.view == AppView::Preferences && !x.ui.modal_open() {
+        present_ui(x, ctrl, None)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn start_download_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    use crate::software_update::{UpdateCheckPhase, UpdateDiscoveryHandoff};
+    if x.download_job.is_some() || x.ui.software_update.busy() {
+        println!("software_update=download_ignored reason=already_busy");
+        return present_ui(x, ctrl, None);
+    }
+    let handoff: UpdateDiscoveryHandoff = match &x.ui.software_update.phase {
+        UpdateCheckPhase::Available(h) => h.clone(),
+        UpdateCheckPhase::InstallFailed {
+            retryable: true,
+            handoff: Some(h),
+            ready_residual: None,
+            ..
+        } => h.clone(),
+        _ => {
+            println!("software_update=download_ignored reason=not_available");
+            return present_ui(x, ctrl, None);
+        }
+    };
+    let Some(generation) = x.ui.software_update.begin_download(handoff.clone()) else {
+        println!("software_update=download_ignored reason=state_refused");
+        return present_ui(x, ctrl, None);
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let staging_root =
+        std::path::PathBuf::from(crate::verified_update_staging::DEFAULT_STAGING_ROOT);
+    match std::thread::Builder::new()
+        .name("ignite-update-download".into())
+        .spawn(move || {
+            let device =
+                crate::installation_authorization::DeviceFacts::kindle_defaults_from_host();
+            let source = crate::release_acquisition::AssetSource::GithubHttps {
+                origin: crate::release_acquisition::GithubReleaseOrigin {
+                    owner: "markrai".into(),
+                    repo: "ignite".into(),
+                },
+                tag: handoff.candidate_tag.clone(),
+                connect_timeout: std::time::Duration::from_secs(
+                    crate::release_acquisition::DEFAULT_CONNECT_TIMEOUT_SECS,
+                ),
+                transfer_timeout: std::time::Duration::from_secs(
+                    crate::release_acquisition::DEFAULT_TRANSFER_TIMEOUT_SECS,
+                ),
+            };
+            let progress_tx = tx.clone();
+            let result = crate::software_update::download_and_stage_official_with_progress(
+                &handoff,
+                &staging_root,
+                crate::verified_update_staging::StagingRootKind::Production,
+                source,
+                crate::verified_update_staging::TrustMode::Production,
+                device,
+                |progress| {
+                    let _ = progress_tx.send(UpdateDownloadJobMessage::Progress(progress));
+                },
+            );
+            let _ = tx.send(UpdateDownloadJobMessage::Done(result));
+        }) {
+        Ok(_) => {
+            *x.download_job = Some(UpdateDownloadJob { generation, rx });
+            println!("software_update=downloading generation={generation}");
+            present_ui(x, ctrl, None)
+        }
+        Err(e) => {
+            let _ = x.ui.software_update.apply_download_result(
+                generation,
+                Err(crate::software_update::UpdateInstallError::IoError(
+                    format!("spawn failed: {e}"),
+                )),
+            );
+            eprintln!("software_update=download_spawn_failed detail={e}");
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
+fn poll_download_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<bool, String> {
+    let Some(job) = x.download_job.as_mut() else {
+        return Ok(false);
+    };
+    let msg = match job.rx.try_recv() {
+        Ok(m) => m,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => UpdateDownloadJobMessage::Done(Err(
+            crate::software_update::UpdateInstallError::IoError(
+                "download worker ended without a result".into(),
+            ),
+        )),
+    };
+    let generation = job.generation;
+    match msg {
+        UpdateDownloadJobMessage::Progress(
+            crate::software_update::UpdateDownloadProgress::Verifying,
+        ) => {
+            if x.ui.software_update.mark_verifying(generation) {
+                println!("software_update=verifying generation={generation}");
+                if x.ui.view == AppView::Preferences && !x.ui.modal_open() {
+                    present_ui(x, ctrl, None)?;
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        UpdateDownloadJobMessage::Done(result) => {
+            *x.download_job = None;
+            let applied =
+                x.ui.software_update
+                    .apply_download_result(generation, result);
+            if applied {
+                println!(
+                    "software_update=download_result generation={generation} phase={:?}",
+                    std::mem::discriminant(&x.ui.software_update.phase)
+                );
+            } else {
+                println!("software_update=download_stale_result generation={generation}");
+            }
+            if applied && x.ui.view == AppView::Preferences && !x.ui.modal_open() {
+                present_ui(x, ctrl, None)?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn execute_install_update(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    use crate::installation_authorization::{
+        evaluate_installation_authorization, AuthorizeRequest, DeviceFacts,
+    };
+    use crate::software_update::{installed_version, ReadyInstallResidual, UpdateCheckPhase};
+    // RETRY after post-stage failure restores ReadyToInstall without re-download.
+    let _ = x.ui.software_update.restore_ready_from_failed();
+    let (scriptlet_path, scriptlet_sha256, staging_root) = match &x.ui.software_update.phase {
+        UpdateCheckPhase::ReadyToInstall {
+            scriptlet_path,
+            scriptlet_sha256,
+            staging_root,
+            ..
+        } => (
+            scriptlet_path.clone(),
+            scriptlet_sha256.clone(),
+            staging_root.clone(),
+        ),
+        _ => {
+            println!("software_update=install_ignored reason=not_ready");
+            return present_ui(x, ctrl, None);
+        }
+    };
+    let residual = ReadyInstallResidual {
+        staging_root: staging_root.clone(),
+        scriptlet_path: scriptlet_path.clone(),
+        scriptlet_sha256: scriptlet_sha256.clone(),
+    };
+    let Some(handoff) = x.ui.software_update.begin_install() else {
+        println!("software_update=install_ignored reason=state_refused");
+        return present_ui(x, ctrl, None);
+    };
+    present_ui(x, ctrl, None)?;
+    if !crate::installation_authorization::revalidate_execution_binding(
+        &scriptlet_path,
+        &scriptlet_sha256,
+    ) {
+        let msg = "scriptlet revalidation failed; file may have changed".to_string();
+        eprintln!("software_update=install_revalidation_failed");
+        x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+            message: msg,
+            handoff: Some(handoff),
+            retryable: false,
+            ready_residual: None,
+        };
+        return present_ui(x, ctrl, None);
+    }
+    let device = DeviceFacts::kindle_defaults_from_host();
+    let auth_req = AuthorizeRequest {
+        expected_tag: handoff.candidate_tag.clone(),
+        version: handoff.candidate_version.clone(),
+        staging_root: staging_root.clone(),
+        root_kind: crate::verified_update_staging::StagingRootKind::Production,
+        device,
+        installed_version: installed_version().to_string(),
+        user_approved: true,
+    };
+    let decision = match evaluate_installation_authorization(&auth_req) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("authorization error: {e}");
+            eprintln!("software_update=install_auth_error detail={msg}");
+            x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+                message: msg,
+                handoff: Some(handoff),
+                retryable: false,
+                ready_residual: None,
+            };
+            return present_ui(x, ctrl, None);
+        }
+    };
+    if !decision.installation_authorized {
+        let reason = decision
+            .refusal_reasons
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "authorization refused".into());
+        eprintln!("software_update=install_refused reason={reason}");
+        x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+            message: reason,
+            handoff: Some(handoff),
+            retryable: false,
+            ready_residual: None,
+        };
+        return present_ui(x, ctrl, None);
+    }
+    let effective_path = match decision.bound_scriptlet_path {
+        Some(p) => p,
+        None => {
+            let msg = "authorization did not record a bound scriptlet path".to_string();
+            eprintln!("software_update=install_no_bound_path");
+            x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+                message: msg,
+                handoff: Some(handoff),
+                retryable: false,
+                ready_residual: None,
+            };
+            return present_ui(x, ctrl, None);
+        }
+    };
+    let effective_sha256 = match decision.bound_scriptlet_sha256 {
+        Some(s) => s,
+        None => {
+            let msg = "authorization did not record a bound scriptlet sha256".to_string();
+            eprintln!("software_update=install_no_bound_sha256");
+            x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+                message: msg,
+                handoff: Some(handoff),
+                retryable: false,
+                ready_residual: None,
+            };
+            return present_ui(x, ctrl, None);
+        }
+    };
+    if !crate::installation_authorization::revalidate_execution_binding(
+        &effective_path,
+        &effective_sha256,
+    ) {
+        let msg = "scriptlet revalidation failed after authorization".to_string();
+        eprintln!("software_update=install_post_auth_revalidation_failed");
+        x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+            message: msg,
+            handoff: Some(handoff),
+            retryable: false,
+            ready_residual: None,
+        };
+        return present_ui(x, ctrl, None);
+    }
+    // Bound decision identity supersedes the ReadyToInstall hint for residual + spawn.
+    let residual = ReadyInstallResidual {
+        staging_root: residual.staging_root,
+        scriptlet_path: effective_path.clone(),
+        scriptlet_sha256: effective_sha256.clone(),
+    };
+    if ctrl.session.is_wet_active() || ctrl.is_armed() {
+        let msg = "stylus active; lift pen and retry".to_string();
+        eprintln!("software_update=install_refused reason=stylus_active");
+        x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+            message: msg,
+            handoff: Some(handoff),
+            retryable: true,
+            ready_residual: Some(residual),
+        };
+        return present_ui(x, ctrl, None);
+    }
+    // Persist install intent (instruction only), then exit. Lifecycle post-shutdown
+    // reauthenticates the signed release, seals bytes, and execs under the updater lock.
+    // Never spawn the installer while scribe-app is still running.
+    let update_dir = auth_req.device.app_root.join("state").join("update");
+    let intent_txn = format!("{}-{}", chrono_like_txn(), std::process::id());
+    let intent = crate::install_intent::InstallIntent {
+        expected_tag: handoff.candidate_tag.clone(),
+        version: handoff.candidate_version.clone(),
+        staging_root: staging_root.clone(),
+        storage_contract: crate::storage_contract::STORAGE_CONTRACT_ID.to_string(),
+        intent_txn,
+    };
+    if let Err(err) = crate::install_intent::write_intent_atomic(&update_dir, &intent) {
+        let msg = format!("failed to persist install intent: {err}");
+        eprintln!("software_update=install_intent_write_failed detail={msg}");
+        x.ui.software_update.phase = UpdateCheckPhase::InstallFailed {
+            message: msg,
+            handoff: Some(handoff),
+            retryable: true,
+            ready_residual: Some(residual),
+        };
+        return present_ui(x, ctrl, None);
+    }
+    println!(
+        "software_update=install_intent_persisted path={} staging={} bound_sha256_prefix={} note=lifecycle_will_reauthenticate_after_exit",
+        update_dir.join("install-intent.v1").display(),
+        staging_root.display(),
+        &effective_sha256[..8.min(effective_sha256.len())]
+    );
+    let _ = effective_path;
+    request_app_exit(x, ctrl)
+}
+
+fn chrono_like_txn() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs:x}")
+}
+
+fn cancel_ready_install(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    x.ui.software_update.cancel_ready();
+    present_ui(x, ctrl, None)
 }
 
 fn tools_scan_phase(
@@ -2520,8 +2940,11 @@ fn present_ui(
         AppView::Tools => ctrl.transport_mut().render_tools(&x.ui.tools),
         AppView::Preferences => {
             let dialog = x.ui.modal.as_ref().and_then(dialog_spec);
-            ctrl.transport_mut()
-                .render_preferences(x.ui.side_button, dialog.as_ref())
+            ctrl.transport_mut().render_preferences(
+                x.ui.side_button,
+                &x.ui.software_update,
+                dialog.as_ref(),
+            )
         }
         AppView::LinkTargetPicker => {
             let dialog = x.ui.modal.as_ref().and_then(dialog_spec);
@@ -3125,6 +3548,10 @@ fn execute_ui_command(
             }
             present_ui(x, ctrl, None)
         }
+        UiCommand::CheckForUpdates => start_software_update_check(x, ctrl),
+        UiCommand::DownloadUpdate => start_download_update(x, ctrl),
+        UiCommand::ConfirmInstallUpdate => execute_install_update(x, ctrl),
+        UiCommand::CancelReadyInstall => cancel_ready_install(x, ctrl),
         UiCommand::BeginCreateLink { x: px, y: py } => begin_create_link(x, ctrl, px, py),
         UiCommand::LinkPickerCancel => leave_link_picker(x, ctrl),
         UiCommand::LinkPickerOpenNotebook(id) => open_picker_notebook(x, ctrl, &id),
@@ -3544,7 +3971,11 @@ fn execute_ui_command(
 
 /// Live framebuffer session. The process singleton must already be held; this
 /// function mmaps `/dev/fb0` and opens input.
-pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
+pub fn run_page_session(
+    cfg: RuntimeConfig,
+    stop: Arc<AtomicBool>,
+    launch_health: &mut crate::launch_health::Reporter,
+) -> i32 {
     crate::launch_clock::mark("runtime_entry");
     println!(
         "# SCRIBE APP GATE F11: V1 usable notebook UX (Home, modals, keyboard, chrome) + F0–F10"
@@ -3938,11 +4369,14 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut stylus_mode_disarm_failed = false;
     let mut sleep_guard: Option<crate::sleep_ui::SleepGuard> = None;
     let mut import_run: Option<ImportRun> = None;
+    let mut update_check: Option<UpdateCheckJob> = None;
+    let mut download_job: Option<UpdateDownloadJob> = None;
     let mut input_lag = crate::input_lag::InputLag::default();
     let mut last_stylus_us = 0u64;
     let mut sync_capture_max_us = 0u64;
     let mut inbound_apply_count = 0u64;
     let mut inbound_apply_max_us = 0u64;
+    let mut initial_iteration_gate = crate::launch_health::InitialIterationGate::default();
     let code = loop {
         crate::launch_diag::live().maybe_emit_stats();
         if stop.load(Ordering::SeqCst) {
@@ -3951,6 +4385,13 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             shutdown_safe = safe;
             stylus_mode_disarm_failed = disarm_fail;
             break c;
+        }
+
+        // Reaching the loop a second time proves that one complete iteration returned normally
+        // (including a handled `continue`). Home was constructed and GC16-rendered above. An
+        // initialization error, loop error, or immediate stop breaks before this acknowledgment.
+        if initial_iteration_gate.entering_iteration() {
+            launch_health.acknowledge_ready();
         }
 
         // F11.1: Kindle screensaver/suspend. The process and UiState survive, but the panel
@@ -4055,6 +4496,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     hosted: cfg.display_events_stdin,
                     stop: &stop,
                     import_run: &mut import_run,
+                    update_check: &mut update_check,
+                    download_job: &mut download_job,
                     prefs_path: &prefs_path,
                     sync_dir: cfg.sync_dir.as_deref(),
                     lasso: &mut lasso,
@@ -4190,6 +4633,34 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             RESTART_REQUESTED.store(true, Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
             continue;
+        }
+
+        if structure_eligible && pending_ui.is_none() && update_check.is_some() {
+            match poll_software_update_check(&mut ui_exec!(), &mut ctrl) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("error: software update present: {e}");
+                    let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                    shutdown_safe = safe;
+                    stylus_mode_disarm_failed = disarm_fail;
+                    break 1;
+                }
+            }
+        }
+
+        if structure_eligible && pending_ui.is_none() && download_job.is_some() {
+            match poll_download_update(&mut ui_exec!(), &mut ctrl) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("error: software update download present: {e}");
+                    let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                    shutdown_safe = safe;
+                    stylus_mode_disarm_failed = disarm_fail;
+                    break 1;
+                }
+            }
         }
 
         // S2C inbound materialization: only at the same safe point as structural work, never

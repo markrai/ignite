@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -39,6 +42,28 @@ OPTIONAL_ACTIVATION_BOUNDARIES = ["description"]
 ALL_ACTIVATION_BOUNDARIES = REQUIRED_ACTIVATION_BOUNDARIES + OPTIONAL_ACTIVATION_BOUNDARIES
 
 
+def _write_passthrough_lock_helper(kindle: Path) -> Path:
+    """Host-only stand-in; kernel lock behavior has separate Unix regression coverage."""
+    helper = kindle / ".test-bin" / "updater-lock-helper.sh"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_text(
+        "#!/bin/sh\n"
+        'if test "$1" = "--verify-updater-transaction-lock"; then exit 0; fi\n'
+        'test "$1" = "--with-updater-transaction-lock" || exit 64\n'
+        "shift\n"
+        'test "$1" = "--" || exit 64\n'
+        "shift\n"
+        "IGNITE_UPDATER_LOCK_HELD=1\n"
+        "IGNITE_UPDATER_LOCK_FD=0\n"
+        "export IGNITE_UPDATER_LOCK_HELD IGNITE_UPDATER_LOCK_FD\n"
+        'exec "$@"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    helper.chmod(helper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return helper
+
+
 def _env_for(kindle: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     sh = _require_sh()
     env = _posix_env(sh)
@@ -60,6 +85,9 @@ def _env_for(kindle: Path, extra: dict[str, str] | None = None) -> dict[str, str
             "IGNITE_RECOVERY_ALLOW_NONROOT": "1",
             "IGNITE_RECOVERY_SKIP_CHOWN": "1",
             "IGNITE_RECOVERY_ROOT": _to_posix_path(kindle / "var" / "local" / "ignite-recovery"),
+            "IGNITE_UPDATER_LOCK_HELPER": _to_posix_path(
+                _write_passthrough_lock_helper(kindle)
+            ),
         }
     )
     if extra:
@@ -67,15 +95,167 @@ def _env_for(kindle: Path, extra: dict[str, str] | None = None) -> dict[str, str
     return env
 
 
-def _run_install(payload: Path, kindle: Path, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run_install(
+    payload: Path,
+    kindle: Path,
+    extra: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     sh = _require_sh()
     script = _HERE / "lib" / "install-runtime.sh"
-    return subprocess.run(
+    options: dict[str, object] = {}
+    if pass_fds:
+        options["pass_fds"] = pass_fds
+    return subprocess.run(  # type: ignore[arg-type]
         [sh, _to_posix_path(script), _to_posix_path(payload)],
         capture_output=True,
         text=True,
         env=_env_for(kindle, extra),
+        **options,
     )
+
+
+@pytest.fixture(scope="session")
+def compiled_rust_lock_helper(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("compiled updater-lock integration requires Linux")
+    cargo = shutil.which("cargo")
+    assert cargo is not None, "Linux updater-lock integration requires cargo"
+    target_dir = tmp_path_factory.mktemp("rust-updater-lock-target")
+    built = subprocess.run(
+        [cargo, "build", "-p", "scribe-lifecycle", "--target-dir", str(target_dir)],
+        cwd=_HERE.parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert built.returncode == 0, built.stdout + built.stderr
+    helper = target_dir / "debug" / "scribe-lifecycle"
+    assert helper.is_file()
+    return helper
+
+
+def _start_rust_lock_holder(helper: Path, lock_path: Path, ready: Path) -> subprocess.Popen[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+            "IGNITE_TEST_LOCK_READY": str(ready),
+        }
+    )
+    code = (
+        "import os,time; "
+        "open(os.environ['IGNITE_TEST_LOCK_READY'],'w',encoding='ascii').write('ready\\n'); "
+        "time.sleep(60)"
+    )
+    return subprocess.Popen(
+        [
+            str(helper),
+            "--with-updater-transaction-lock",
+            "--",
+            sys.executable,
+            "-c",
+            code,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=env,
+    )
+
+
+def _run_uninstall_runtime(
+    kindle: Path,
+    extra: dict[str, str],
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    sh = _require_sh()
+    options: dict[str, object] = {}
+    if pass_fds:
+        options["pass_fds"] = pass_fds
+    return subprocess.run(  # type: ignore[arg-type]
+        [sh, _to_posix_path(_HERE / "lib" / "uninstall-runtime.sh")],
+        capture_output=True,
+        text=True,
+        env=_env_for(kindle, extra),
+        **options,
+    )
+
+
+def _wait_for_file(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        assert process.poll() is None, "lock holder exited before readiness"
+        assert time.monotonic() < deadline, "lock holder readiness timed out"
+        time.sleep(0.01)
+
+
+def _pending_path(kindle: Path) -> Path:
+    return kindle / "scribe-app" / "state" / "update" / "pending-health.v1"
+
+
+def _inventory_path(kindle: Path) -> Path:
+    return kindle / "scribe-app" / "previous-release" / "ignite-lkg-inventory.v1"
+
+
+def _read_record(path: Path) -> dict[str, str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return dict(line.split("=", 1) for line in lines[1:] if "=" in line)
+
+
+def _path_with_command_stub(tmp_path: Path, command: str, script: str) -> str:
+    test_bin = tmp_path / f"fail-{command}"
+    test_bin.mkdir(exist_ok=True)
+    stub = test_bin / command
+    stub.write_text(f"#!/bin/sh\n{script}\n", encoding="utf-8", newline="\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    sh_dir = str(Path(_require_sh()).resolve().parent)
+    return os.pathsep.join((str(test_bin), sh_dir, os.environ.get("PATH", "")))
+
+
+def _seed_persistent_state(kindle: Path) -> dict[Path, bytes]:
+    files = {
+        kindle / "scribe-data" / "notebooks" / "n" / "page" / "strokes.jsonl": b"stroke\x00bytes\n",
+        kindle / "scribe-app" / "state" / "sync" / "outbox.jsonl": b'{"sync":"keep"}\n',
+        kindle / "scribe-app" / "state" / "device" / "identity.json": b'{"device":"keep"}\n',
+        kindle / "scribe-app" / "state" / "settings.json": b'{"settings":"keep"}\n',
+    }
+    for path, content in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return files
+
+
+def _assert_persistent_state(files: dict[Path, bytes]) -> None:
+    for path, content in files.items():
+        assert path.read_bytes() == content
+
+
+def _install_pending_candidate(tmp_path: Path) -> tuple[Path, Path]:
+    payload_a = make_payload(tmp_path / "src-a", "7.8.0")
+    payload_b = make_payload(tmp_path / "src-b", "7.8.1")
+    app_b = payload_b / "bin" / "scribe-app"
+    app_b.write_bytes(app_b.read_bytes() + b"candidate-B")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    installed = _run_install(payload_a, kindle)
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    upgraded = _run_install(payload_b, kindle)
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    return payload_b, kindle
+
+
+def _seed_legacy_previous_release(kindle: Path) -> Path:
+    app = kindle / "scribe-app"
+    previous = app / "previous-release"
+    previous.mkdir(parents=True, exist_ok=True)
+    for source, name in (
+        (app / "bin" / "scribe-app", "scribe-app"),
+        (app / "bin" / "scribe-lifecycle", "scribe-lifecycle"),
+        (app / "bin" / "scribe-lifecycle-host.sh", "scribe-lifecycle-host.sh"),
+    ):
+        shutil.copyfile(source, previous / name)
+    return previous
 
 
 def test_missing_su_fails_closed(tmp_path: Path) -> None:
@@ -109,6 +289,7 @@ def test_first_install_then_repeat(tmp_path: Path) -> None:
     assert (kindle / "documents" / "Diagnose Ignite.sh").is_file()
     second = _run_install(payload, kindle)
     assert second.returncode == 0, second.stdout + second.stderr
+    assert _pending_path(kindle).is_file()
     assert (kindle / "scribe-data" / "n" / "page.meta").read_text(encoding="utf-8") == "keep\n"
 
 
@@ -348,6 +529,10 @@ def test_real_helpers_never_restore_whole_appreg() -> None:
     assert "ignite-activate.committed" in install
     assert "had_previous" in install
     assert "phase=pending" in install
+    assert "IGNITE_PENDING_HEALTH_V1" in install
+    assert "IGNITE_LKG_INVENTORY_V1" in install
+    assert "data_compatibility=unknown" in install
+    assert "update blocked:" in install
     assert "IGNITE_FAIL_RESTORE_SQL" in helpers
     assert ".bail on" in helpers
     assert "BEGIN IMMEDIATE" in helpers
@@ -404,6 +589,45 @@ def test_failed_register_restores_only_ignite_handler(tmp_path: Path) -> None:
     snaps = list((kindle / "scribe-app" / "appreg-backups").glob("handler-com.markrai.ignite.*.sql"))
     assert snaps
     assert any("IGNITE_APPREG_SNAP v1" in p.read_text(encoding="utf-8") for p in snaps)
+
+
+def test_lkg_inventory_retains_pre_upgrade_ignite_handler_only(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "3.0.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.0.1")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        (payload_b / "bin" / "scribe-app").read_bytes() + b"B"
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    appreg = kindle / "var" / "local" / "appreg.db"
+    _seed_appreg(appreg, ignite_command="/old/host")
+    stub = tmp_path / "ok-register.sh"
+    _write_register_stub(stub, succeed=True)
+    env_a = _register_env(
+        tmp_path,
+        kindle,
+        {"IGNITE_REGISTER_STUB": _to_posix_path(stub), "IGNITE_REG_MARK": "A"},
+    )
+    env_b = _register_env(
+        tmp_path,
+        kindle,
+        {"IGNITE_REGISTER_STUB": _to_posix_path(stub), "IGNITE_REG_MARK": "B"},
+    )
+    assert _run_install(payload_a, kindle, env_a).returncode == 0
+    upgraded = _run_install(payload_b, kindle, env_b)
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+
+    handler = kindle / "scribe-app" / "previous-release" / "appreg-handler.sql"
+    text = handler.read_text(encoding="utf-8")
+    assert "IGNITE_APPREG_SNAP v1" in text
+    assert "com.markrai.ignite" in text
+    assert "igniteMark" in text
+    assert "'A'" in text
+    assert "system.other" not in text
+    digest = hashlib.sha256(handler.read_bytes()).hexdigest()
+    assert f"entry=appreg-handler.sql|file|{handler.stat().st_size}|{digest}\n" in _inventory_path(
+        kindle
+    ).read_text(encoding="utf-8")
 
 
 def test_appreg_restore_does_not_expand_shell_in_values(tmp_path: Path) -> None:
@@ -579,7 +803,6 @@ def test_restore_cp_failure_reports_incomplete_and_keeps_journal(tmp_path: Path)
     first = _run_install(payload, kindle)
     assert first.returncode == 0, first.stdout + first.stderr
     old_app = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
-    prev = (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes()
     (payload / "bin" / "scribe-app").write_bytes(old_app + b"NEW")
     failed = _run_install(
         payload,
@@ -591,7 +814,7 @@ def test_restore_cp_failure_reports_incomplete_and_keeps_journal(tmp_path: Path)
     journal = kindle / "scribe-app" / "run" / "ignite-activate.journal"
     assert journal.is_file()
     assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == old_app + b"NEW"
-    assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == prev
+    assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == old_app
 
 
 def test_restore_sql_failure_reports_incomplete_and_keeps_journal(tmp_path: Path) -> None:
@@ -670,6 +893,7 @@ def test_partial_previous_release_staging_does_not_replace_recovery_base(tmp_pat
     first = _run_install(payload, kindle)
     assert first.returncode == 0, first.stdout + first.stderr
     old_app = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
+    _seed_legacy_previous_release(kindle)
     staging = kindle / "scribe-app" / "previous-release.staging"
     staging.mkdir(parents=True)
     (staging / "scribe-app").write_bytes(b"PARTIAL")
@@ -692,7 +916,7 @@ def test_interrupted_prev_publish_reuses_prev_dir(tmp_path: Path) -> None:
     first = _run_install(payload, kindle)
     assert first.returncode == 0, first.stdout + first.stderr
     old_app = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
-    prev = kindle / "scribe-app" / "previous-release"
+    prev = _seed_legacy_previous_release(kindle)
     prev_old = kindle / "scribe-app" / "previous-release.prev"
     prev.rename(prev_old)
     live = kindle / "scribe-app" / "bin" / "scribe-app"
@@ -742,11 +966,18 @@ def test_handler_snapshot_sql_failure_does_not_publish(tmp_path: Path) -> None:
     assert not any(p.suffix == ".sql" and p.is_file() for p in snaps)
 
 
-PUBLISH_PENDING = (
+SNAPSHOT_PRE_JOURNAL = (
     "before-prev-move",
     "after-prev-move",
     "before-staging-publish",
     "after-staging-publish",
+)
+PUBLISH_PENDING = (
+    "after-static-verification",
+    "before-lkg-inventory-publish",
+    "after-lkg-inventory-publish",
+    "before-pending-health-publish",
+    "after-pending-health-publish",
     "before-commit",
 )
 PUBLISH_COMMITTED = (
@@ -774,7 +1005,7 @@ def _unrelated_ok(kindle: Path) -> None:
     assert _appreg_query(appreg, "SELECT value FROM properties WHERE handlerId='system.other'") == "/usr/bin/other"
 
 
-@pytest.mark.parametrize("point", PUBLISH_PENDING + PUBLISH_COMMITTED)
+@pytest.mark.parametrize("point", SNAPSHOT_PRE_JOURNAL + PUBLISH_PENDING + PUBLISH_COMMITTED)
 def test_publish_crash_boundaries_keep_one_complete_version(tmp_path: Path, point: str) -> None:
     payload = make_payload(tmp_path / "src")
     kindle = tmp_path / "kindle"
@@ -814,7 +1045,10 @@ def test_publish_crash_boundaries_keep_one_complete_version(tmp_path: Path, poin
     _unrelated_ok(kindle)
     journal = kindle / "scribe-app" / "run" / "ignite-activate.journal"
     committed = kindle / "scribe-app" / "run" / "ignite-activate.committed"
-    if point in PUBLISH_PENDING:
+    if point in SNAPSHOT_PRE_JOURNAL:
+        assert not committed.exists()
+        assert not journal.exists()
+    elif point in PUBLISH_PENDING:
         assert not committed.exists()
         assert journal.is_file()
     else:
@@ -832,7 +1066,7 @@ def test_publish_crash_boundaries_keep_one_complete_version(tmp_path: Path, poin
     assert probe.returncode == 1, probe.stdout + probe.stderr
     assert "rollback incomplete" not in (probe.stdout + probe.stderr)
     live = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
-    if point in PUBLISH_PENDING:
+    if point in SNAPSHOT_PRE_JOURNAL + PUBLISH_PENDING:
         assert live == bytes_a
         assert _mark(kindle) == "A"
     else:
@@ -841,20 +1075,23 @@ def test_publish_crash_boundaries_keep_one_complete_version(tmp_path: Path, poin
     _data_ok(kindle)
     _unrelated_ok(kindle)
 
-    finished = _run_install(
-        payload,
-        kindle,
-        _register_env(tmp_path, kindle, {
-            "IGNITE_REGISTER_STUB": _to_posix_path(stub),
-            "IGNITE_REG_MARK": "B",
-        }),
-    )
-    assert finished.returncode == 0, finished.stdout + finished.stderr
+    if point in SNAPSHOT_PRE_JOURNAL + PUBLISH_PENDING:
+        finished = _run_install(
+            payload,
+            kindle,
+            _register_env(tmp_path, kindle, {
+                "IGNITE_REGISTER_STUB": _to_posix_path(stub),
+                "IGNITE_REG_MARK": "B",
+            }),
+        )
+        assert finished.returncode == 0, finished.stdout + finished.stderr
     assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == bytes_b
     assert _mark(kindle) == "B"
     assert not journal.exists()
     assert not committed.exists()
     assert not (kindle / "scribe-app" / "previous-release.prev").exists()
+    assert _pending_path(kindle).is_file()
+    assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == bytes_a
     _data_ok(kindle)
     _unrelated_ok(kindle)
     again = _run_install(
@@ -865,7 +1102,8 @@ def test_publish_crash_boundaries_keep_one_complete_version(tmp_path: Path, poin
             "IGNITE_REG_MARK": "B",
         }),
     )
-    assert again.returncode == 0, again.stdout + again.stderr
+    assert again.returncode != 0, again.stdout + again.stderr
+    assert "update blocked" in (again.stdout + again.stderr)
     assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == bytes_b
     assert _mark(kindle) == "B"
 
@@ -896,7 +1134,7 @@ def test_recovery_failure_stays_pending_and_retryable(tmp_path: Path) -> None:
         _register_env(tmp_path, kindle, {
             "IGNITE_REGISTER_STUB": _to_posix_path(stub),
             "IGNITE_REG_MARK": "B",
-            "IGNITE_FAIL_PUBLISH": "after-staging-publish",
+            "IGNITE_FAIL_PUBLISH": "after-pending-health-publish",
         }),
     )
     assert crashed.returncode == 99
@@ -912,7 +1150,8 @@ def test_recovery_failure_stays_pending_and_retryable(tmp_path: Path) -> None:
     assert failed.returncode != 0
     assert "install_ok" not in (failed.stdout + failed.stderr)
     assert (kindle / "scribe-app" / "run" / "ignite-activate.journal").is_file()
-    assert (kindle / "scribe-app" / "previous-release.prev" / "scribe-app").is_file()
+    assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == bytes_a
+    assert _pending_path(kindle).is_file()
     _data_ok(kindle)
     finished = _run_install(
         payload,
@@ -925,6 +1164,7 @@ def test_recovery_failure_stays_pending_and_retryable(tmp_path: Path) -> None:
     assert finished.returncode == 0, finished.stdout + finished.stderr
     assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == bytes_a + b"VERSION-B"
     assert _mark(kindle) == "B"
+    assert _pending_path(kindle).is_file()
     _data_ok(kindle)
     _unrelated_ok(kindle)
 
@@ -1001,6 +1241,8 @@ def test_scenario_a_clean_compatible_device(tmp_path: Path) -> None:
     assert (kindle / "scribe-app" / "bin" / "scribe-app").is_file()
     assert (kindle / "documents" / "Scribe.sh").is_file()
     assert not (kindle / "scribe-data").exists()
+    assert not (kindle / "scribe-app" / "previous-release").exists()
+    assert not _pending_path(kindle).exists()
 
 
 def test_scenario_b_upgrade_preserves_notebooks(tmp_path: Path) -> None:
@@ -1012,6 +1254,7 @@ def test_scenario_b_upgrade_preserves_notebooks(tmp_path: Path) -> None:
     note.write_text("stroke-keep\n", encoding="utf-8")
     first = _run_install(payload, kindle)
     assert first.returncode == 0, first.stdout + first.stderr
+    bytes_a = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
     (payload / "bin" / "scribe-app").write_bytes(
         (payload / "bin" / "scribe-app").read_bytes() + b"UPGRADED"
     )
@@ -1019,7 +1262,454 @@ def test_scenario_b_upgrade_preserves_notebooks(tmp_path: Path) -> None:
     assert second.returncode == 0, second.stdout + second.stderr
     assert note.read_text(encoding="utf-8") == "stroke-keep\n"
     assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes().endswith(b"UPGRADED")
-    assert (kindle / "scribe-app" / "previous-release" / "scribe-app").is_file()
+    assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == bytes_a
+    assert _pending_path(kindle).is_file()
+    assert _inventory_path(kindle).is_file()
+
+
+def test_upgrade_retains_a_and_publishes_strict_pending_health(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "1.2.3")
+    payload_b = make_payload(tmp_path / "src-b", "1.2.4")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        (payload_b / "bin" / "scribe-app").read_bytes() + b"candidate-B"
+    )
+    (payload_b / "bin" / "scribe-lifecycle").write_bytes(
+        (payload_b / "bin" / "scribe-lifecycle").read_bytes() + b"candidate-B"
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    persistent = _seed_persistent_state(kindle)
+
+    installed_a = _run_install(payload_a, kindle)
+    assert installed_a.returncode == 0, installed_a.stdout + installed_a.stderr
+    app_a = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
+    life_a = (kindle / "scribe-app" / "bin" / "scribe-lifecycle").read_bytes()
+    upgraded = _run_install(payload_b, kindle)
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+
+    live_app = kindle / "scribe-app" / "bin" / "scribe-app"
+    live_life = kindle / "scribe-app" / "bin" / "scribe-lifecycle"
+    retained = kindle / "scribe-app" / "previous-release"
+    assert live_app.read_bytes().endswith(b"candidate-B")
+    assert live_life.read_bytes().endswith(b"candidate-B")
+    assert (retained / "scribe-app").read_bytes() == app_a
+    assert (retained / "scribe-lifecycle").read_bytes() == life_a
+    for required in (
+        "scribe-lifecycle-host.sh",
+        "Scribe.sh",
+        "scribe-icon.png",
+        "install-runtime.sh",
+        "uninstall-runtime.sh",
+        "backup-runtime.sh",
+        "register-helpers.sh",
+        "install-recovery.sh",
+        "Uninstall Ignite.sh",
+        "Backup Ignite Data.sh",
+        "Diagnose Ignite.sh",
+    ):
+        assert (retained / required).is_file(), required
+
+    pending = _pending_path(kindle)
+    inventory = _inventory_path(kindle)
+    assert pending.read_bytes().endswith(b"\n")
+    assert len(pending.read_bytes()) <= 4096
+    assert len(pending.read_text(encoding="utf-8").splitlines()) == 14
+    record = _read_record(pending)
+    assert record["schema"] == "1"
+    assert record["status"] == "pending-health"
+    assert record["candidate_version"] == "1.2.4"
+    assert record["retained_version"] == "unknown"
+    assert record["data_compatibility"] == "unknown"
+    assert record["candidate_app_sha256"] == hashlib.sha256(live_app.read_bytes()).hexdigest()
+    assert record["candidate_lifecycle_sha256"] == hashlib.sha256(live_life.read_bytes()).hexdigest()
+    inventory_bytes = inventory.read_bytes()
+    inventory_sha = hashlib.sha256(inventory_bytes).hexdigest()
+    assert record["lkg_inventory_bytes"] == str(len(inventory_bytes))
+    assert record["lkg_inventory_sha256"] == inventory_sha
+    assert record["retained_release_identity"] == f"sha256:{inventory_sha}"
+    inventory_text = inventory.read_text(encoding="utf-8")
+    assert inventory_text.startswith(
+        "IGNITE_LKG_INVENTORY_V1\nschema=1\nkind=ignite-application-release\nentry_count=18\n"
+    )
+    assert "entry=appreg-handler.sql|absent|0|-\n" in inventory_text
+    _assert_persistent_state(persistent)
+
+
+def test_legacy_previous_release_is_completed_before_upgrade(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "1.3.0")
+    payload_b = make_payload(tmp_path / "src-b", "1.3.1")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        (payload_b / "bin" / "scribe-app").read_bytes() + b"candidate-B"
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    legacy = _seed_legacy_previous_release(kindle)
+    live_helper = kindle / "scribe-app" / "tools" / "ignite-release" / "lib" / "install-recovery.sh"
+    helper_a = live_helper.read_bytes()
+    assert not (legacy / "install-recovery.sh").exists()
+
+    upgraded = _run_install(payload_b, kindle)
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert (legacy / "install-recovery.sh").read_bytes() == helper_a
+    helper_digest = hashlib.sha256(helper_a).hexdigest()
+    assert (
+        f"entry=install-recovery.sh|file|{len(helper_a)}|{helper_digest}\n"
+        in _inventory_path(kindle).read_text(encoding="utf-8")
+    )
+
+
+def test_mismatched_existing_recovery_base_fails_before_activation(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "1.4.0")
+    payload_b = make_payload(tmp_path / "src-b", "1.4.1")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    live_a = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
+    legacy = _seed_legacy_previous_release(kindle)
+    (legacy / "scribe-app").write_bytes(b"different-release")
+
+    refused = _run_install(payload_b, kindle)
+    assert refused.returncode != 0
+    assert "does not exactly match live release A" in (refused.stdout + refused.stderr)
+    assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == live_a
+    assert (legacy / "scribe-app").read_bytes() == b"different-release"
+    assert not _pending_path(kindle).exists()
+
+
+def test_pending_health_blocks_reinstall_and_stacked_upgrade(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "2.0.0")
+    payload_b = make_payload(tmp_path / "src-b", "2.0.1")
+    payload_c = make_payload(tmp_path / "src-c", "2.0.2")
+    (payload_b / "bin" / "scribe-app").write_bytes(b"B" + (payload_b / "bin" / "scribe-app").read_bytes())
+    (payload_c / "bin" / "scribe-app").write_bytes(b"C" + (payload_c / "bin" / "scribe-app").read_bytes())
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    live_b = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
+    retained_a = (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes()
+    pending = _pending_path(kindle).read_bytes()
+    inventory = _inventory_path(kindle).read_bytes()
+    pending_fields = _read_record(_pending_path(kindle))
+    evidence_path = kindle / "scribe-app" / "state" / "update" / "launch-health-evidence.v1"
+    evidence = (
+        "IGNITE_LAUNCH_HEALTH_EVIDENCE_V1\n"
+        "schema=1\n"
+        f"candidate_version={pending_fields['candidate_version']}\n"
+        f"candidate_txn={pending_fields['candidate_txn']}\n"
+        f"pending_sha256={hashlib.sha256(pending).hexdigest()}\n"
+        f"candidate_app_bytes={pending_fields['candidate_app_bytes']}\n"
+        f"candidate_app_sha256={pending_fields['candidate_app_sha256']}\n"
+        f"candidate_lifecycle_bytes={pending_fields['candidate_lifecycle_bytes']}\n"
+        f"candidate_lifecycle_sha256={pending_fields['candidate_lifecycle_sha256']}\n"
+        "launch_uuid=00112233445566778899aabbccddeeff\n"
+        "outcome=ready_running\n"
+        "ready=true\n"
+        "readiness=ready\n"
+        "process=running\n"
+        "observation_complete=false\n"
+        "ready_elapsed_ms=250\n"
+        "post_ready_observed_ms=60000\n"
+        "qualification=unqualified\n"
+        "data_compatibility=unknown\n"
+    ).encode("ascii")
+    evidence_path.write_bytes(evidence)
+
+    for attempted in (payload_b, payload_c):
+        refused = _run_install(attempted, kindle)
+        assert refused.returncode != 0
+        assert "update blocked" in (refused.stdout + refused.stderr)
+        assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == live_b
+        assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == retained_a
+        assert _pending_path(kindle).read_bytes() == pending
+        assert _inventory_path(kindle).read_bytes() == inventory
+        assert evidence_path.read_bytes() == evidence
+
+
+def test_pending_health_record_damage_fails_closed(tmp_path: Path) -> None:
+    payload = make_payload(tmp_path / "src")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload, kindle).returncode == 0
+    (payload / "bin" / "scribe-app").write_bytes(
+        (payload / "bin" / "scribe-app").read_bytes() + b"B"
+    )
+    assert _run_install(payload, kindle).returncode == 0
+    pending = _pending_path(kindle)
+    retained = (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes()
+    original = pending.read_text(encoding="utf-8")
+
+    for damaged in (
+        original.replace("schema=1", "schema=2"),
+        original.replace("status=pending-health", "status=ready"),
+        original.replace("candidate_app_sha256=", "candidate_app_sha256=xyz", 1),
+        original + "unexpected=field\n",
+    ):
+        pending.write_text(damaged, encoding="utf-8", newline="\n")
+        refused = _run_install(payload, kindle)
+        assert refused.returncode != 0
+        assert "malformed, damaged, or inconsistent" in (refused.stdout + refused.stderr)
+        assert pending.read_text(encoding="utf-8") == damaged
+        assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == retained
+    pending.write_text(original, encoding="utf-8", newline="\n")
+
+    live = kindle / "scribe-app" / "bin" / "scribe-app"
+    live_bytes = live.read_bytes()
+    live.write_bytes(live_bytes + b"stale-or-modified")
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    assert "installed candidate application does not match record" in (refused.stdout + refused.stderr)
+    live.write_bytes(live_bytes)
+
+    pending.unlink()
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    assert "pending health state is missing" in (refused.stdout + refused.stderr)
+    assert _inventory_path(kindle).is_file()
+
+
+def test_pending_health_record_requires_exact_canonical_bytes(tmp_path: Path) -> None:
+    payload, kindle = _install_pending_candidate(tmp_path)
+    pending = _pending_path(kindle)
+    original = pending.read_bytes()
+    retained = (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes()
+
+    valid = _run_install(payload, kindle)
+    assert valid.returncode != 0
+    assert "update blocked" in (valid.stdout + valid.stderr)
+
+    damaged_records = (
+        original + b"unterminated-trailing-data",
+        original.replace(b"schema=1", b"schema=1\x00", 1),
+        original + b"unexpected=field\n",
+        original[:-1],
+        original.replace(b"\n", b"\r\n"),
+    )
+    for damaged in damaged_records:
+        pending.write_bytes(damaged)
+        refused = _run_install(payload, kindle)
+        assert refused.returncode != 0
+        assert "malformed, damaged, or inconsistent" in (refused.stdout + refused.stderr)
+        assert pending.read_bytes() == damaged
+        assert (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes() == retained
+    pending.write_bytes(original)
+
+
+def test_pending_health_rejects_noncanonical_versions(tmp_path: Path) -> None:
+    payload, kindle = _install_pending_candidate(tmp_path)
+    pending = _pending_path(kindle)
+    original = pending.read_bytes()
+    version_line = next(line for line in original.splitlines(keepends=True) if line.startswith(b"candidate_version="))
+
+    invalid_versions = (
+        b"01.2.3",
+        b"1.02.3",
+        b"1.2.03",
+        b"1.2.3-01",
+        b"1.2.3-alpha..1",
+        b"1.2.3-.rc",
+        b"1.2.3-rc.",
+        b"1.2.3-alpha_1",
+        b"1.2.3+build.1",
+        b"1.2.3-rc+build",
+        b"1.2.3-rc/1",
+        b"1.2",
+        b"1.2.3-",
+        b"1.2.3-" + b"a" * 59,
+    )
+    for version in invalid_versions:
+        damaged = original.replace(version_line, b"candidate_version=" + version + b"\n", 1)
+        pending.write_bytes(damaged)
+        refused = _run_install(payload, kindle)
+        assert refused.returncode != 0
+        assert "candidate version malformed or noncanonical" in (refused.stdout + refused.stderr)
+        assert pending.read_bytes() == damaged
+    pending.write_bytes(original)
+
+
+def test_integrity_command_failures_and_invalid_outputs_fail_closed(tmp_path: Path) -> None:
+    payload, kindle = _install_pending_candidate(tmp_path)
+    pending = _pending_path(kindle)
+    original_pending = pending.read_bytes()
+    inventory = _inventory_path(kindle)
+    original_inventory = inventory.read_bytes()
+    cases = (
+        ("sha256sum", "exit 23"),
+        ("sha256sum", "printf '%s\\n' not-a-digest; exit 0"),
+        ("sha256sum", f"printf '%s\\n' {'0' * 64}; exit 0"),
+        ("wc", "exit 23"),
+        ("wc", "printf '%s\\n' not-a-count; exit 0"),
+        ("wc", "printf '%s\\n' '1 2'; exit 0"),
+    )
+    for command, script in cases:
+        path = _path_with_command_stub(tmp_path, command, script)
+        refused = _run_install(payload, kindle, {"PATH": path})
+        assert refused.returncode != 0
+        assert "malformed, damaged, or inconsistent" in (refused.stdout + refused.stderr)
+        assert pending.read_bytes() == original_pending
+        assert inventory.read_bytes() == original_inventory
+
+
+def test_v2_committed_marker_requires_exact_canonical_bytes(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "8.0.0")
+    payload_b = make_payload(tmp_path / "src-b", "8.0.1")
+    app_b = payload_b / "bin" / "scribe-app"
+    app_b.write_bytes(app_b.read_bytes() + b"candidate-B")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    crashed = _run_install(payload_b, kindle, {"IGNITE_FAIL_PUBLISH": "after-commit"})
+    assert crashed.returncode == 99
+
+    committed = kindle / "scribe-app" / "run" / "ignite-activate.committed"
+    original = committed.read_bytes()
+    malformed_markers = (
+        original + b"unterminated-trailing-data",
+        original.replace(b" pending_health=1", b"\x00 pending_health=1", 1),
+        original + b"unexpected=field\n",
+        original[:-1],
+        original.replace(b"\n", b"\r\n"),
+        original.replace(b"pending_health=1", b"pending_health=01", 1),
+        original.replace(b"txn=", b"txn=not-a-transaction-", 1),
+    )
+    for malformed in malformed_markers:
+        committed.write_bytes(malformed)
+        refused = _run_install(payload_b, kindle)
+        assert refused.returncode != 0
+        assert "install_ok" not in (refused.stdout + refused.stderr)
+        assert committed.read_bytes() == malformed
+
+    committed.write_bytes(original)
+    valid = _run_install(payload_b, kindle)
+    assert valid.returncode != 0
+    assert "update blocked" in (valid.stdout + valid.stderr)
+    assert not committed.exists()
+
+
+def test_legacy_committed_marker_recovery_remains_supported(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "8.1.0")
+    payload_b = make_payload(tmp_path / "src-b", "8.1.1")
+    app_b = payload_b / "bin" / "scribe-app"
+    app_b.write_bytes(app_b.read_bytes() + b"candidate-B")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    committed = kindle / "scribe-app" / "run" / "ignite-activate.committed"
+    committed.write_bytes(b"committed txn=legacy-v1\n")
+
+    upgraded = _run_install(payload_b, kindle)
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert not committed.exists()
+    assert _pending_path(kindle).is_file()
+
+
+def test_lkg_inventory_damage_and_unexpected_paths_fail_closed(tmp_path: Path) -> None:
+    payload = make_payload(tmp_path / "src")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload, kindle).returncode == 0
+    (payload / "bin" / "scribe-app").write_bytes(
+        (payload / "bin" / "scribe-app").read_bytes() + b"B"
+    )
+    assert _run_install(payload, kindle).returncode == 0
+    retained = kindle / "scribe-app" / "previous-release"
+    app = retained / "scribe-app"
+    app_bytes = app.read_bytes()
+
+    app.write_bytes(app_bytes + b"modified")
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    assert "lkg_invalid" in (refused.stdout + refused.stderr)
+    app.write_bytes(app_bytes)
+
+    life = retained / "scribe-lifecycle"
+    life_bytes = life.read_bytes()
+    life.unlink()
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    assert "lkg_invalid" in (refused.stdout + refused.stderr)
+    life.write_bytes(life_bytes)
+
+    unexpected = retained / "unexpected-file"
+    unexpected.write_bytes(b"not release inventory")
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    assert "unexpected retained path" in (refused.stdout + refused.stderr)
+    unexpected.unlink()
+
+    inventory = _inventory_path(kindle)
+    inventory_bytes = inventory.read_bytes()
+    inventory.write_bytes(inventory_bytes.replace(b"entry_count=18", b"entry_count=17"))
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    assert "inventory digest mismatch" in (refused.stdout + refused.stderr)
+    inventory.write_bytes(inventory_bytes)
+
+    scriptlet = retained / "Scribe.sh"
+    scriptlet_bytes = scriptlet.read_bytes()
+    scriptlet.unlink()
+    try:
+        os.symlink(app, scriptlet)
+    except OSError:
+        scriptlet.write_bytes(scriptlet_bytes)
+        return
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    assert "retained path Scribe.sh is a symlink" in (refused.stdout + refused.stderr)
+    assert scriptlet.is_symlink()
+
+
+@pytest.mark.parametrize(
+    "version",
+    (
+        "",
+        "v1.2.3",
+        "1.2.3.4",
+        "01.2.3",
+        "1.02.3",
+        "1.2.03",
+        "1.2.3-01",
+        "1.2.3-.rc",
+        "1.2.3-rc.",
+        "1.2.3-alpha..1",
+        "1.2.3-alpha_1",
+        "1.2.3+build.1",
+        "1.2.3-rc+build",
+        "1.2.3-rc/1",
+        "1.2",
+        "1.2.3-",
+        "1.2.3-" + "a" * 59,
+    ),
+)
+def test_noncanonical_package_version_fails_closed(tmp_path: Path, version: str) -> None:
+    payload = make_payload(tmp_path / "src", version)
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+
+    refused = _run_install(payload, kindle)
+    assert refused.returncode != 0
+    output = refused.stdout + refused.stderr
+    if version in ("1.2.3-rc.", "1.2.3-rc/1"):
+        assert (
+            "package directory" in output
+            or "package version is malformed or noncanonical" in output
+        )
+    else:
+        assert "package version is malformed or noncanonical" in output
+    assert not (kindle / "scribe-app" / "bin" / "scribe-app").exists()
+
+
+@pytest.mark.parametrize(
+    "version", ("0.0.0", "1.2.3", "10.20.30-rc.1", "1.2.3-alpha-beta.0")
+)
+def test_canonical_package_versions_remain_supported(tmp_path: Path, version: str) -> None:
+    payload = make_payload(tmp_path / "src", version)
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+
+    installed = _run_install(payload, kindle)
+    assert installed.returncode == 0, installed.stdout + installed.stderr
 
 
 def test_scenario_c_wrong_elf_leaves_runtime_and_data(tmp_path: Path) -> None:
@@ -1077,3 +1767,384 @@ def test_arm32le_elf_stub_is_accepted(tmp_path: Path) -> None:
     (kindle / "documents").mkdir(parents=True)
     result = _run_install(payload, kindle, {"IGNITE_SKIP_ELF_CHECK": "0"})
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_missing_transaction_lock_helper_refuses_before_mutation(tmp_path: Path) -> None:
+    payload = make_payload(tmp_path / "src")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+
+    refused = _run_install(
+        payload,
+        kindle,
+        {"IGNITE_UPDATER_LOCK_HELPER": _to_posix_path(tmp_path / "missing-helper")},
+    )
+
+    assert refused.returncode != 0
+    assert "coordination: updater transaction lock helper is unavailable" in refused.stderr
+    assert not (kindle / "scribe-app").exists()
+
+
+def test_transaction_lock_precedes_install_recovery_and_uninstall_mutation() -> None:
+    install = (_HERE / "lib" / "install-runtime.sh").read_text(encoding="utf-8")
+    uninstall = (_HERE / "lib" / "uninstall-runtime.sh").read_text(encoding="utf-8")
+
+    install_lock = install.index("--with-updater-transaction-lock")
+    install_verify = install.index("--verify-updater-transaction-lock")
+    assert install_lock < install.index("recover_install_transaction")
+    assert install_verify < install.index("recover_install_transaction")
+    assert install_lock < install.index('mkdir -p "$APP_ROOT/bin"')
+    assert install_lock < install.index("guard_pending_health")
+
+    uninstall_lock = uninstall.index("--with-updater-transaction-lock")
+    uninstall_verify = uninstall.index("--verify-updater-transaction-lock")
+    assert uninstall_lock < uninstall.index("# Refuse while running")
+    assert uninstall_verify < uninstall.index("# Refuse while running")
+    assert uninstall_lock < uninstall.index('rm -f "$APP_ROOT/bin/scribe-app"')
+    assert uninstall_lock < uninstall.index("ignite_recovery_uninstall")
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux flock semantics"
+)
+def test_compiled_rust_handoff_rejects_forgery_and_releases_after_holder_death(
+    tmp_path: Path, compiled_rust_lock_helper: Path
+) -> None:
+    payload = make_payload(tmp_path / "src")
+    packaged_helper = payload / "bin" / "scribe-lifecycle"
+    shutil.copyfile(compiled_rust_lock_helper, packaged_helper)
+    packaged_helper.chmod(
+        packaged_helper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    lock_path = tmp_path / "updater.lock"
+    rust_env = {
+        "IGNITE_UPDATER_LOCK_HELPER": str(packaged_helper),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+    }
+
+    installed = _run_install(payload, kindle, rust_env)
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    live = kindle / "scribe-app" / "bin" / "scribe-app"
+    installed_helper = kindle / "scribe-app" / "bin" / "scribe-lifecycle"
+    uninstall_env = {
+        "IGNITE_UPDATER_LOCK_HELPER": str(installed_helper),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+    }
+    live_before = live.read_bytes()
+    stale = kindle / "scribe-app" / "bin" / "scribe-app.new"
+    stale.write_bytes(b"recovery-must-not-run")
+
+    forged_fd = os.open(lock_path, os.O_RDWR)
+    ready = tmp_path / "holder.ready"
+    holder = _start_rust_lock_holder(
+        compiled_rust_lock_helper,
+        lock_path,
+        ready,
+    )
+    try:
+        _wait_for_file(ready, holder)
+        forged_install_env = {
+            **rust_env,
+            "IGNITE_UPDATER_LOCK_HELD": "1",
+            "IGNITE_UPDATER_LOCK_FD": str(forged_fd),
+        }
+        forged_install = _run_install(
+            payload,
+            kindle,
+            forged_install_env,
+            pass_fds=(forged_fd,),
+        )
+        assert forged_install.returncode == 75
+        assert "already in progress" in forged_install.stderr
+        assert stale.read_bytes() == b"recovery-must-not-run"
+        assert live.read_bytes() == live_before
+
+        forged_uninstall_env = {
+            **uninstall_env,
+            "IGNITE_UPDATER_LOCK_HELD": "1",
+            "IGNITE_UPDATER_LOCK_FD": str(forged_fd),
+        }
+        forged_uninstall = _run_uninstall_runtime(
+            kindle,
+            forged_uninstall_env,
+            pass_fds=(forged_fd,),
+        )
+        assert forged_uninstall.returncode == 75
+        assert "already in progress" in forged_uninstall.stderr
+        assert stale.read_bytes() == b"recovery-must-not-run"
+        assert live.read_bytes() == live_before
+    finally:
+        os.close(forged_fd)
+        holder.kill()
+        holder.wait(timeout=5)
+
+    recovered = _run_install(
+        payload,
+        kindle,
+        rust_env,
+    )
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not stale.exists()
+
+    uninstalled = _run_uninstall_runtime(kindle, uninstall_env)
+    assert uninstalled.returncode == 0, uninstalled.stdout + uninstalled.stderr
+    assert not live.exists()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux flock semantics"
+)
+def test_compiled_rust_lock_contention_preserves_pending_b_and_retained_a(
+    tmp_path: Path, compiled_rust_lock_helper: Path
+) -> None:
+    payload_b, kindle = _install_pending_candidate(tmp_path)
+    app = kindle / "scribe-app"
+    protected_roots = [
+        app / "bin",
+        app / "previous-release",
+        app / "state" / "update",
+        app / "run",
+    ]
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(path.relative_to(app)): path.read_bytes()
+            for root in protected_roots
+            if root.exists()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    lock_path = tmp_path / "updater.lock"
+    rust_env = {
+        "IGNITE_UPDATER_LOCK_HELPER": str(compiled_rust_lock_helper),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(lock_path),
+    }
+    ready = tmp_path / "holder.ready"
+    holder = _start_rust_lock_holder(
+        compiled_rust_lock_helper,
+        lock_path,
+        ready,
+    )
+    try:
+        _wait_for_file(ready, holder)
+        install = _run_install(payload_b, kindle, rust_env)
+        assert install.returncode == 75
+        assert "already in progress" in install.stderr
+        uninstall = _run_uninstall_runtime(kindle, rust_env)
+        assert uninstall.returncode == 75
+        assert "already in progress" in uninstall.stderr
+        assert snapshot() == before
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux flock semantics"
+)
+def test_promotion_decision_boundary_excludes_actual_installer(
+    tmp_path: Path, compiled_rust_lock_helper: Path
+) -> None:
+    payload = make_payload(tmp_path / "src")
+    kindle = tmp_path / "kindle"
+    update = kindle / "scribe-app" / "state" / "update"
+    update.mkdir(parents=True)
+    (update / ".launch-health-evidence.v1.lock").touch()
+    coordination_env = {
+        "IGNITE_TEST_LAUNCH_GATE_PATH": str(tmp_path / "launch-gate.lock"),
+        "IGNITE_TEST_LAUNCH_HOST_PATH": str(tmp_path / "host.lock"),
+        "IGNITE_TEST_LAUNCH_CHILD_PATH": str(tmp_path / "child.lock"),
+        "IGNITE_TEST_EVIDENCE_WORKER_PATH": str(tmp_path / "worker.lock"),
+        "IGNITE_TEST_LAUNCH_CONTROL_PATH": str(tmp_path / "control.sock"),
+        "IGNITE_TEST_UPDATE_DIR": str(update),
+        "IGNITE_TEST_UPDATER_LOCK_PATH": str(tmp_path / "updater.lock"),
+        "IGNITE_TEST_DECISION_TIMEOUT_MS": "500",
+    }
+    process_env = os.environ.copy()
+    process_env.update(coordination_env)
+    host_ready = tmp_path / "host.ready"
+    host = subprocess.Popen(
+        [
+            str(compiled_rust_lock_helper),
+            "--test-launch-coordination-host",
+            "ready",
+            str(host_ready),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=process_env,
+    )
+    decision_ready = tmp_path / "decision.ready"
+    decision: subprocess.Popen[str] | None = None
+    try:
+        _wait_for_file(host_ready, host)
+        decision = subprocess.Popen(
+            [
+                str(compiled_rust_lock_helper),
+                "--test-hold-promotion-decision-boundary",
+                str(decision_ready),
+                "60000",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=process_env,
+        )
+        _wait_for_file(decision_ready, decision)
+
+        refused = _run_install(
+            payload,
+            kindle,
+            {
+                **coordination_env,
+                "IGNITE_UPDATER_LOCK_HELPER": str(compiled_rust_lock_helper),
+            },
+        )
+        assert refused.returncode == 75
+        assert "already in progress" in refused.stderr
+        assert not (kindle / "scribe-app" / "bin").exists()
+    finally:
+        if decision is not None:
+            decision.kill()
+            decision.wait(timeout=5)
+        host.kill()
+        host.wait(timeout=5)
+
+def _qualify_journal_path(kindle: Path) -> Path:
+    return kindle / "scribe-app" / "state" / "update" / "ignite-qualify.journal"
+
+
+def _write_qualify_journal(kindle: Path, *, phase: str, txn: str = "txn-test") -> None:
+    path = _qualify_journal_path(kindle)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "IGNITE_QUALIFY_JOURNAL_V1\n"
+        "schema=1\n"
+        f"pending_txn={txn}\n"
+        f"pending_sha256={'ab' * 32}\n"
+        "storage_contract=ignite-storage-v1\n"
+        f"phase={phase}\n",
+        encoding="ascii",
+        newline="\n",
+    )
+
+
+def test_install_writes_live_and_retained_storage_contract(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "3.0.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.0.1")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    live_contract = kindle / "scribe-app" / "bin" / "storage-contract.v1"
+    assert live_contract.is_file()
+    assert "storage_contract=ignite-storage-v1\n" in live_contract.read_text(encoding="ascii")
+    assert _run_install(payload_b, kindle).returncode == 0
+    retained = kindle / "scribe-app" / "previous-release" / "storage-contract.v1"
+    assert retained.is_file()
+    assert retained.read_text(encoding="ascii") == live_contract.read_text(encoding="ascii")
+
+
+def test_legacy_a_rollback_removes_b_storage_contract(tmp_path: Path) -> None:
+    """Pre-contract retained A must not leave B's live contract after rollback."""
+    payload_a = make_payload(tmp_path / "src-a", "3.3.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.3.1")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    live_contract = kindle / "scribe-app" / "bin" / "storage-contract.v1"
+    assert live_contract.is_file()
+    # Simulate pre-contract Ignite A: strip live contract before upgrading.
+    live_contract.unlink()
+    assert not live_contract.exists()
+    bytes_a = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
+    failed = _run_install(payload_b, kindle, {"IGNITE_FAIL_AT": "icon"})
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == bytes_a
+    assert not live_contract.exists(), "rollback to pre-contract A must remove B's contract"
+    assert not (kindle / "scribe-app" / "previous-release" / "storage-contract.v1").exists()
+
+
+def test_first_install_fault_after_contract_removes_incomplete_contract(tmp_path: Path) -> None:
+    payload = make_payload(tmp_path / "src", "3.4.0")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    (kindle / "scribe-data" / "n").mkdir(parents=True)
+    (kindle / "scribe-data" / "n" / "page.meta").write_text("keep\n", encoding="utf-8")
+    failed = _run_install(payload, kindle, {"IGNITE_FAIL_AT": "icon"})
+    assert failed.returncode == 1
+    assert not (kindle / "scribe-app" / "bin" / "scribe-app").exists()
+    assert not (kindle / "scribe-app" / "bin" / "storage-contract.v1").exists()
+    assert (kindle / "scribe-data" / "n" / "page.meta").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_qualify_journal_prepared_pending_absent_recovers_before_guard(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "3.1.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.1.1")
+    payload_c = make_payload(tmp_path / "src-c", "3.1.2")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    (payload_c / "bin" / "scribe-app").write_bytes(
+        b"C" + (payload_c / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    assert _pending_path(kindle).is_file()
+    assert _inventory_path(kindle).is_file()
+    _pending_path(kindle).unlink()
+    _write_qualify_journal(kindle, phase="prepared")
+    # Notebook data must remain untouched across recovery + next install.
+    notebook = kindle / "scribe-data" / "library.meta"
+    notebook.parent.mkdir(parents=True, exist_ok=True)
+    notebook.write_text('{"v":1}\n', encoding="ascii")
+    recovered = _run_install(payload_c, kindle)
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not _qualify_journal_path(kindle).exists()
+    # Recovery retired A's LKG tree; C then retained qualified B and published new pending.
+    assert _pending_path(kindle).is_file()
+    assert _inventory_path(kindle).is_file()
+    retained = (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes()
+    assert retained.startswith(b"B")
+    assert notebook.read_text(encoding="ascii") == '{"v":1}\n'
+
+
+def test_qualify_journal_contradiction_refuses_without_deleting_evidence(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "3.2.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.2.1")
+    payload_c = make_payload(tmp_path / "src-c", "3.2.2")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    (payload_c / "bin" / "scribe-app").write_bytes(
+        b"C" + (payload_c / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    pending = _pending_path(kindle).read_bytes()
+    inventory = _inventory_path(kindle).read_bytes()
+    _write_qualify_journal(kindle, phase="pending_removed")
+    refused = _run_install(payload_c, kindle)
+    assert refused.returncode != 0
+    assert "qualify_journal_contradiction" in (refused.stdout + refused.stderr) or (
+        "interrupted" in (refused.stdout + refused.stderr)
+    )
+    assert _pending_path(kindle).read_bytes() == pending
+    assert _inventory_path(kindle).read_bytes() == inventory
+    assert _qualify_journal_path(kindle).is_file()

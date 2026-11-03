@@ -1,0 +1,25 @@
+IGNITE_PUBLICATION_COMPONENT_CONTRACT_V1
+schema=1
+role_count=22
+role=scribe-app|direct-copy|0755|APP/bin/scribe-app|bin/scribe-app|required
+role=scribe-lifecycle|direct-copy|0755|APP/bin/scribe-lifecycle|bin/scribe-lifecycle|required
+role=scribe-lifecycle-host|direct-copy|0755|APP/bin/scribe-lifecycle-host.sh|host/scribe-lifecycle-host.sh|required
+role=launcher|direct-copy|0755|DOCS/Scribe.sh|launcher/Scribe.sh|required
+role=registration-source|direct-copy|0644|-|registration/ignite.json|required
+role=icon|direct-copy|0644|APP/assets/scribe-icon.png|assets/scribe-icon.png|required
+role=license-noto-emoji|direct-copy|0644|APP/assets/licenses/noto-emoji/OFL.txt|assets/licenses/noto-emoji/OFL.txt|required
+role=license-noto-emoji-description|optional|0644|APP/assets/licenses/noto-emoji/DESCRIPTION.en_us.html|assets/licenses/noto-emoji/DESCRIPTION.en_us.html|optional
+role=license-noto-emoji-upstream-info|optional|0644|APP/assets/licenses/noto-emoji/upstream_info.md|assets/licenses/noto-emoji/upstream_info.md|optional
+role=license-source-sans-3|direct-copy|0644|APP/assets/licenses/source-sans-3/OFL.txt|assets/licenses/source-sans-3/OFL.txt|required
+role=install-runtime|direct-copy|0755|APP/tools/ignite-release/lib/install-runtime.sh|lib/install-runtime.sh|required
+role=uninstall-runtime|direct-copy|0755|APP/tools/ignite-release/lib/uninstall-runtime.sh|lib/uninstall-runtime.sh|required
+role=backup-runtime|direct-copy|0755|APP/tools/ignite-release/lib/backup-runtime.sh|lib/backup-runtime.sh|required
+role=register-helpers|direct-copy|0755|APP/tools/ignite-release/lib/register-helpers.sh|lib/register-helpers.sh|required
+role=install-recovery|direct-copy|0755|APP/tools/ignite-release/lib/install-recovery.sh|lib/install-recovery.sh|required
+role=uninstall-entry|direct-copy|0755|DOCS/Uninstall Ignite.sh|Uninstall-Ignite.sh|required
+role=backup-entry|direct-copy|0755|DOCS/Backup Ignite Data.sh|Backup-Ignite-Data.sh|required
+role=diagnose-entry|direct-copy|0755|DOCS/Diagnose Ignite.sh|Diagnose-Ignite.sh|required
+role=recovery-dropbear|direct-copy|0644|REC/bin/dropbearmulti|recovery/bin/dropbearmulti|required
+role=recovery-elf-sha256|direct-copy|0644|REC/manifest/elf.sha256|recovery/manifest/elf.sha256|required
+role=recovery-provenance|direct-copy|0644|REC/manifest/provenance.txt|recovery/manifest/provenance.txt|required
+role=recovery-version|generated|-|REC/manifest/version|-|absent-only

@@ -87,12 +87,36 @@ else {
     Write-Step "SkipBuild: using existing release binaries (NOT provenance-safe; forbidden for official releases)"
 }
 
-$bash = Get-Command bash -ErrorAction SilentlyContinue
-if (-not $bash) {
-    throw "bash not found (needed to run tools/dropbear/docker_build.sh)"
+# Prefer Git Bash. WindowsApps/WSL `bash.exe` mangles Windows paths and cannot
+# run tools/dropbear/docker_build.sh from this wrapper.
+# ProgramFiles is unset on Linux pwsh CI hosts — skip those candidates there.
+$bashExe = $null
+$gitBashCandidates = @()
+if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles})) {
+    $gitBashCandidates += @(
+        (Join-Path ${env:ProgramFiles} "Git\bin\bash.exe"),
+        (Join-Path ${env:ProgramFiles} "Git\usr\bin\bash.exe")
+    )
+}
+foreach ($candidate in $gitBashCandidates) {
+    if (Test-Path -LiteralPath $candidate) {
+        $bashExe = $candidate
+        break
+    }
+}
+if (-not $bashExe) {
+    $bashCmd = Get-Command bash -ErrorAction SilentlyContinue
+    if ($bashCmd) {
+        $bashExe = $bashCmd.Source
+    }
+}
+if (-not $bashExe) {
+    throw "bash not found (needed to run tools/dropbear/docker_build.sh); install Git for Windows"
 }
 Write-Step "Dropbear ARMv7hf client"
-& bash (Join-Path $RepoRoot "tools\dropbear\docker_build.sh")
+$dropbearScript = Join-Path $RepoRoot "tools\dropbear\docker_build.sh"
+$dropbearUnix = ConvertTo-DockerUnixPath $dropbearScript
+& $bashExe -lc ("bash '" + ($dropbearUnix -replace "'", "'\''") + "'")
 if ($LASTEXITCODE -ne 0) {
     throw "Dropbear docker_build.sh failed with exit $LASTEXITCODE"
 }
