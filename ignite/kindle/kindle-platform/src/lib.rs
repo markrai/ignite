@@ -69,7 +69,8 @@ pub use fbdev_abi::{
 };
 pub use gate_b::{
     check_preconditions as check_gate_b_preconditions, format_fb_diagnose,
-    grayscale_is_accepted_8bpp_gray, BLACK_BYTE, WHITE_BYTE,
+    grayscale_is_accepted_8bpp_gray, rotate_is_accepted, rotate_reverses_input_axes,
+    ACCEPTED_ROTATE_CW, BLACK_BYTE, EXPECTED_ROTATE, WHITE_BYTE,
 };
 pub use hwtcon_abi::{
     stylus_mode, MxcfbRect, MxcfbUpdateDataMtk, MxcfbUpdateMarkerData, MXCFB_SEND_UPDATE_MTK,
