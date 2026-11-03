@@ -29,6 +29,7 @@ from ship_lib.publish import (  # noqa: E402
     build_publish_env,
     canonical_nine_file_names,
     inspect_existing_release,
+    promote_publish_workspace,
     publish_release,
     seed_promote_work_from_acquired,
 )
@@ -416,6 +417,59 @@ class PublishRecoveryAndShellBoundaryTests(unittest.TestCase):
             seed_promote_work_from_acquired(
                 acquired=acquired, work_dir=self.tmp / "work"
             )
+
+    def test_promote_workspace_is_version_specific(self) -> None:
+        root = self.tmp / "ship-work"
+        v15 = promote_publish_workspace(root, "v0.9.15")
+        v16 = promote_publish_workspace(root, "v0.9.16")
+        self.assertEqual(v15, root / "promote-publish-v0.9.15")
+        self.assertEqual(v16, root / "promote-publish-v0.9.16")
+        self.assertNotEqual(v15, v16)
+        with self.assertRaises(ShipError):
+            promote_publish_workspace(root, "0.9.16")
+        with self.assertRaises(ShipError):
+            promote_publish_workspace(root, "v0.9.16/../other")
+
+    def test_seed_refuses_cross_version_kindle_contamination(self) -> None:
+        _state, acquired, _root, _pub, _signed = _load_acquire_fixtures(self.tmp)
+        work = self.tmp / "promote-publish-shared"
+        seed_promote_work_from_acquired(acquired=acquired, work_dir=work)
+        # Simulate leftover assets from a prior release in the same workspace.
+        foreign = work / "kindle" / "Install Ignite v0.9.15.sh"
+        foreign.write_bytes(b"foreign-prior-version-bytes")
+        (work / "kindle" / "Install Ignite v0.9.15.sha256").write_text(
+            "deadbeef  Install Ignite v0.9.15.sh\n", encoding="utf-8"
+        )
+        with self.assertRaises(ShipError) as ctx:
+            seed_promote_work_from_acquired(acquired=acquired, work_dir=work)
+        self.assertIn("contamination", str(ctx.exception))
+        self.assertIn("Install Ignite v0.9.15.sh", str(ctx.exception))
+        # Authenticated current-version artifacts must remain untouched.
+        version = acquired.identity.version
+        current = work / "kindle" / f"Install Ignite v{version}.sh"
+        self.assertTrue(current.is_file())
+        self.assertTrue(foreign.is_file())
+
+    def test_seed_same_version_retry_preserves_matching_bytes(self) -> None:
+        _state, acquired, _root, _pub, _signed = _load_acquire_fixtures(self.tmp)
+        work = promote_publish_workspace(self.tmp / "ship-work", f"v{acquired.identity.version}")
+        seed_promote_work_from_acquired(acquired=acquired, work_dir=work)
+        version = acquired.identity.version
+        scriptlet = work / "kindle" / f"Install Ignite v{version}.sh"
+        before = scriptlet.read_bytes()
+        before_digest = hashlib.sha256(before).hexdigest()
+        # Retry must reuse matching bytes without deleting the seeded tree.
+        seed_promote_work_from_acquired(acquired=acquired, work_dir=work)
+        self.assertEqual(before, scriptlet.read_bytes())
+        self.assertEqual(before_digest, hashlib.sha256(scriptlet.read_bytes()).hexdigest())
+        kindle_files = sorted(p.name for p in (work / "kindle").iterdir() if p.is_file())
+        self.assertEqual(
+            [
+                f"Install Ignite v{version}.sh",
+                f"Install Ignite v{version}.sha256",
+            ],
+            kindle_files,
+        )
 
 
 class FixtureKeyCannotAuthorizeTests(unittest.TestCase):

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .authority import authority_present, initialize_authority, load_authority
-from .ci_coord import wait_for_ci_success
+from .ci_coord import bind_existing_ci_run, wait_for_ci_success
 from .config import OWNED_RELEASE_PATHS, ShipConfig
 from .errors import ShipBlockedError, ShipConfigError, ShipError
 from .git_coord import (
@@ -58,6 +58,7 @@ from .pin_provision import provision_public_pin
 from .publish import (
     assemble_nine_file_inventory,
     build_publish_env,
+    promote_publish_workspace,
     publish_release,
     seed_promote_work_from_acquired,
     verify_published_release,
@@ -357,6 +358,297 @@ class ShipOrchestrator:
     def plan(self, version: str) -> ShipReport:
         """Explicit read-only rehearsal — never mutates authority, pin, versions, or Git."""
         return self.ship(version, resume=False, plan_only=True)
+
+    def prepare_from_ci(
+        self,
+        version: str,
+        *,
+        run_id: int,
+        commit: str,
+        acquired_dir: Path | None = None,
+        plan_only: bool = False,
+    ) -> ShipReport:
+        """Bind an already-green main CI run and prepare through hardware (never publish).
+
+        Reuses production acquisition, signing, dry-run verify, and Kindle hardware
+        acceptance. Does not bump versions, open PRs, rebuild artifacts, or publish.
+        """
+        validate_version_string(version)
+        tag = tag_for_version(version)
+        report = ShipReport(outcome=ShipOutcome.PARTIAL, version=version, tag=tag)
+        report.emit("schema=ignite-ship-prepare-from-ci-v1")
+        report.emit(f"version={version}")
+        report.emit(f"tag={tag}")
+        report.emit(f"plan_only={str(plan_only).lower()}")
+        report.emit(
+            f"execute_live_mutations={str(self.hooks.execute_live_mutations).lower()}"
+        )
+        report.emit(f"production_mode={str(self.production_mode).lower()}")
+        report.emit("publish=forbidden-in-prepare-from-ci")
+
+        mutate = self.may_mutate_workspace and not plan_only
+        try:
+            # Authority + pin must already exist for this path (no key generation).
+            if not authority_present(self.config):
+                raise ShipConfigError(
+                    "prepare-from-ci requires initialized production authority"
+                )
+            if self.config.pin_path.read_bytes() == b"UNPROVISIONED\n":
+                raise ShipBlockedError(
+                    "prepare-from-ci refuses UNPROVISIONED repository pin"
+                )
+
+            gh = self.hooks.gh or SubprocessGitHub()
+            bound = bind_existing_ci_run(
+                repo_root=self.config.repo_root,
+                version=version,
+                run_id=run_id,
+                commit=commit,
+                gh=gh,
+                repository=self.config.repository,
+            )
+            report.emit(f"ci_run_id={bound.run_id}")
+            report.emit(f"main_sha={bound.head_sha}")
+            report.emit(f"ci_workflow={bound.workflow_path}")
+            report.emit(f"ci_workflow_id={bound.workflow_id}")
+
+            if not mutate:
+                # Non-live / plan mode: validate only. Never create or rewrite a journal.
+                report.emit("journal=unmodified-non-live")
+                report.emit("prepared_for_publish=false")
+                report.emit("published=false")
+                report.outcome = ShipOutcome.PLANNED
+                return report
+
+            self.config.ship_home.mkdir(parents=True, exist_ok=True)
+            self.config.journal_dir.mkdir(parents=True, exist_ok=True)
+            self.config.work_dir.mkdir(parents=True, exist_ok=True)
+            journal = ShipJournal.open_for_version(self.config.journal_dir, version)
+            if journal.published() or journal.is_complete(PHASE_PUBLISH):
+                raise ShipBlockedError(
+                    "journal already published; refuse prepare-from-ci for this version"
+                )
+
+            self._phase_authority(journal, report, mutate=True)
+            self._phase_pin(journal, report, mutate=True)
+            self._bind_existing_ci_train(
+                journal,
+                report,
+                version=version,
+                tag=tag,
+                run_id=bound.run_id,
+                commit=bound.head_sha,
+            )
+            self._phase_acquire(
+                journal,
+                report,
+                tag,
+                mutate=True,
+                reuse_acquired=acquired_dir,
+            )
+            self._phase_sign(journal, report, version, tag, mutate=True)
+            self._phase_verify(journal, report, tag, mutate=True)
+            self._phase_hardware(journal, report, version, mutate=True)
+            # Never publish from prepare.
+            if not journal.is_complete(PHASE_PUBLISH):
+                journal.mark_deferred(
+                    PHASE_PUBLISH,
+                    reason="prepare-from-ci stops before publication; use publish-prepared",
+                )
+                report.emit("phase=publish:deferred-awaiting-publish-prepared")
+
+            hw = journal.phases.get(PHASE_HARDWARE)
+            prepared = (
+                journal.is_complete(PHASE_ACQUIRE)
+                and journal.is_complete(PHASE_SIGN)
+                and journal.is_complete(PHASE_VERIFY)
+                and journal.is_complete(PHASE_HARDWARE)
+                and bool(hw and hw.fields.get("production_evidence"))
+            )
+            report.emit(f"prepared_for_publish={str(prepared).lower()}")
+            report.emit("published=false")
+            if prepared:
+                report.outcome = ShipOutcome.READY
+            elif any(
+                journal.state_of(p) == PhaseState.BLOCKED for p in journal.phases
+            ):
+                report.outcome = ShipOutcome.BLOCKED_POLICY
+            elif any(
+                journal.state_of(p) == PhaseState.DEFERRED
+                for p in (
+                    PHASE_ACQUIRE,
+                    PHASE_SIGN,
+                    PHASE_VERIFY,
+                    PHASE_HARDWARE,
+                )
+            ):
+                report.outcome = ShipOutcome.NOT_PERFORMED
+            else:
+                report.outcome = ShipOutcome.PARTIAL
+            return report
+        except ShipConfigError as exc:
+            report.outcome = ShipOutcome.BLOCKED_CONFIG
+            report.emit(f"error={exc}")
+            report.emit("published=false")
+            return report
+        except ShipBlockedError as exc:
+            msg = str(exc)
+            if "hardware" in msg:
+                report.outcome = ShipOutcome.BLOCKED_HARDWARE
+            elif "ci" in msg.lower() or "CI" in msg or "VERSION" in msg or "ahead_by" in msg:
+                report.outcome = ShipOutcome.BLOCKED_CI
+            elif "verif" in msg or "dry_run" in msg or "dry-run" in msg:
+                report.outcome = ShipOutcome.BLOCKED_VERIFY
+            else:
+                report.outcome = ShipOutcome.BLOCKED_POLICY
+            report.emit(f"error={exc}")
+            report.emit("published=false")
+            return report
+        except ShipError as exc:
+            report.outcome = ShipOutcome.FAILED
+            report.emit(f"error={exc}")
+            report.emit("published=false")
+            return report
+
+    def publish_prepared(self, version: str, *, plan_only: bool = False) -> ShipReport:
+        """Publish a version previously prepared by prepare-from-ci (or equivalent journal)."""
+        validate_version_string(version)
+        tag = tag_for_version(version)
+        self.config.ship_home.mkdir(parents=True, exist_ok=True)
+        self.config.journal_dir.mkdir(parents=True, exist_ok=True)
+        if self.may_mutate_workspace and not plan_only:
+            self.config.work_dir.mkdir(parents=True, exist_ok=True)
+        journal = ShipJournal.open_for_version(self.config.journal_dir, version)
+        report = ShipReport(outcome=ShipOutcome.PARTIAL, version=version, tag=tag)
+        report.emit("schema=ignite-ship-publish-prepared-v1")
+        report.emit(f"version={version}")
+        report.emit(f"tag={tag}")
+        report.emit(f"plan_only={str(plan_only).lower()}")
+        report.emit(
+            f"execute_live_mutations={str(self.hooks.execute_live_mutations).lower()}"
+        )
+        report.emit(f"production_mode={str(self.production_mode).lower()}")
+
+        mutate = self.may_mutate_workspace and not plan_only
+        try:
+            for phase in (
+                PHASE_ACQUIRE,
+                PHASE_SIGN,
+                PHASE_VERIFY,
+                PHASE_HARDWARE,
+            ):
+                if not journal.is_complete(phase):
+                    raise ShipBlockedError(
+                        f"publish-prepared requires completed {phase}; "
+                        "run prepare-from-ci first"
+                    )
+            hw = journal.phases[PHASE_HARDWARE]
+            if not hw.fields.get("production_evidence"):
+                raise ShipBlockedError(
+                    "release-blocked: hardware-acceptance-unavailable "
+                    "(prepare lacked production evidence; doctor connectivity "
+                    "is not acceptance)"
+                )
+            if int(journal.fields.get("ci_run_id") or 0) <= 0:
+                raise ShipBlockedError("publish-prepared requires bound ci_run_id")
+            if len(str(journal.fields.get("main_sha") or "")) != 40:
+                raise ShipBlockedError("publish-prepared requires bound main_sha")
+
+            self._phase_publish(journal, report, mutate=mutate)
+
+            if journal.published() and journal.is_complete(PHASE_PUBLISH):
+                if not journal.is_complete(PHASE_DONE):
+                    journal.mark_completed(
+                        PHASE_DONE,
+                        identity=self._identity_binding(journal, version, tag),
+                        published=True,
+                    )
+                report.emit("phase=done")
+                report.outcome = ShipOutcome.SUCCESS
+                report.emit("published=true")
+            else:
+                report.emit("phase=done:not-published")
+                report.emit("published=false")
+                if plan_only or not mutate:
+                    report.outcome = ShipOutcome.PLANNED
+                elif journal.state_of(PHASE_PUBLISH) == PhaseState.DEFERRED:
+                    report.outcome = ShipOutcome.NOT_PERFORMED
+                else:
+                    report.outcome = ShipOutcome.PARTIAL
+            return report
+        except ShipConfigError as exc:
+            report.outcome = ShipOutcome.BLOCKED_CONFIG
+            report.emit(f"error={exc}")
+            report.emit("published=false")
+            return report
+        except ShipBlockedError as exc:
+            msg = str(exc)
+            if "hardware" in msg:
+                report.outcome = ShipOutcome.BLOCKED_HARDWARE
+            else:
+                report.outcome = ShipOutcome.BLOCKED_POLICY
+            report.emit(f"error={exc}")
+            report.emit("published=false")
+            return report
+        except ShipError as exc:
+            report.outcome = ShipOutcome.FAILED
+            report.emit(f"error={exc}")
+            report.emit("published=false")
+            return report
+
+    def _bind_existing_ci_train(
+        self,
+        journal: ShipJournal,
+        report: ShipReport,
+        *,
+        version: str,
+        tag: str,
+        run_id: int,
+        commit: str,
+    ) -> None:
+        """Mark version/git/ci-wait complete for an already-merged green CI run."""
+        auth_fp = load_authority(self.config).fingerprint_sha256
+        identity = {
+            "repository": self.config.repository,
+            "version": version,
+            "tag": tag,
+            "fingerprint_sha256": auth_fp,
+            "main_sha": commit,
+            "source_revision": commit,
+            "ci_run_id": run_id,
+            "bound_from_existing_ci": True,
+        }
+        for phase in (
+            PHASE_VERSION,
+            PHASE_GIT_PREPARE,
+            PHASE_GIT_PUSH,
+            PHASE_GIT_MERGE,
+            PHASE_CI_WAIT,
+        ):
+            if journal.is_complete(phase):
+                existing_sha = str(journal.fields.get("main_sha") or "")
+                existing_run = int(journal.fields.get("ci_run_id") or 0)
+                if existing_sha and existing_sha != commit:
+                    raise ShipError(
+                        f"journal main_sha {existing_sha} disagrees with bound commit {commit}"
+                    )
+                if existing_run and existing_run != run_id:
+                    raise ShipError(
+                        f"journal ci_run_id {existing_run} disagrees with bound run {run_id}"
+                    )
+                report.emit(f"phase={phase}:skipped-complete")
+                continue
+            journal.mark_completed(
+                phase,
+                identity=identity,
+                note="bound-from-existing-ci",
+                fingerprint_sha256=auth_fp,
+                main_sha=commit,
+                source_revision=commit,
+                ci_run_id=run_id,
+                bound_from_existing_ci=True,
+            )
+            report.emit(f"phase={phase}:bound-from-existing-ci")
 
     def ship(
         self,
@@ -921,6 +1213,56 @@ class ShipOrchestrator:
         )
         report.emit(f"phase=ci-wait:ok run_id={run.run_id}")
 
+    def _complete_acquire_from_bundle(
+        self,
+        journal: ShipJournal,
+        report: ShipReport,
+        *,
+        tag: str,
+        run_id: int,
+        bundle: Any,
+        reused: bool,
+    ) -> None:
+        main_sha = str(journal.fields.get("main_sha") or "")
+        identity = getattr(bundle, "identity", None)
+        source = getattr(identity, "ci_head_sha", "") or str(
+            journal.fields.get("source_revision") or ""
+        )
+        bundle_run = int(getattr(identity, "ci_run_id", 0) or 0)
+        if main_sha and source and main_sha != source:
+            raise ShipError("acquired CI SHA does not match bound main SHA")
+        if run_id and bundle_run and bundle_run != run_id:
+            raise ShipError(
+                f"acquired ci_run_id {bundle_run} disagrees with bound run {run_id}"
+            )
+        expected_tag = getattr(identity, "tag", tag)
+        if expected_tag and expected_tag != tag:
+            raise ShipError(
+                f"acquired tag {expected_tag!r} disagrees with bound tag {tag!r}"
+            )
+        root = getattr(bundle, "root", None)
+        journal.mark_completed(
+            PHASE_ACQUIRE,
+            identity={
+                "repository": self.config.repository,
+                "version": journal.version,
+                "tag": tag,
+                "main_sha": main_sha,
+                "source_revision": source,
+                "ci_run_id": run_id or bundle_run,
+                "scriptlet_sha256": getattr(identity, "scriptlet_sha256", ""),
+                "scriptlet_bytes": getattr(identity, "scriptlet_bytes", 0),
+            },
+            acquired_dir=str(root),
+            scriptlet_sha256=getattr(identity, "scriptlet_sha256", ""),
+            scriptlet_bytes=getattr(identity, "scriptlet_bytes", 0),
+            source_revision=source,
+            reused_acquired=reused,
+        )
+        report.emit(
+            f"phase=acquire:{'reused' if reused else 'ok'} run_id={run_id or bundle_run}"
+        )
+
     def _phase_acquire(
         self,
         journal: ShipJournal,
@@ -928,49 +1270,51 @@ class ShipOrchestrator:
         tag: str,
         *,
         mutate: bool,
+        reuse_acquired: Path | None = None,
     ) -> None:
         if journal.is_complete(PHASE_ACQUIRE):
             report.emit("phase=acquire:skipped-complete")
             return
         run_id = int(journal.fields.get("ci_run_id") or 0)
         out = self.config.work_dir / f"acquired-{tag}"
+        if reuse_acquired is not None:
+            if not mutate:
+                journal.mark_deferred(
+                    PHASE_ACQUIRE, reason="non-live acquire reuse deferred"
+                )
+                report.emit("phase=acquire:deferred-non-live")
+                return
+            kindle = self.config.repo_root / "deployment" / "kindle"
+            if str(kindle) not in sys.path:
+                sys.path.insert(0, str(kindle))
+            from release_acquire import load_acquired_bundle
+
+            if run_id <= 0:
+                raise ShipBlockedError("ci_run_id missing; refuse acquire reuse")
+            if self.config.pin_path.read_bytes() == b"UNPROVISIONED\n":
+                raise ShipError("refuse acquire while repository pin is UNPROVISIONED")
+            journal.mark_in_progress(PHASE_ACQUIRE)
+            bundle = load_acquired_bundle(Path(reuse_acquired))
+            self._complete_acquire_from_bundle(
+                journal,
+                report,
+                tag=tag,
+                run_id=run_id,
+                bundle=bundle,
+                reused=True,
+            )
+            return
         if self.hooks.acquire_fn is not None and mutate:
             journal.mark_in_progress(PHASE_ACQUIRE)
             bundle = self.hooks.acquire_fn(tag=tag, output_dir=out, run_id=run_id)
-            main_sha = str(journal.fields.get("main_sha") or "")
-            source = getattr(
-                getattr(bundle, "identity", None), "ci_head_sha", ""
-            ) or str(journal.fields.get("source_revision") or "")
-            if main_sha and source and main_sha != source:
-                raise ShipError("acquired CI SHA does not match merged main SHA")
-            journal.mark_completed(
-                PHASE_ACQUIRE,
-                identity={
-                    "repository": self.config.repository,
-                    "version": journal.version,
-                    "tag": tag,
-                    "main_sha": main_sha,
-                    "source_revision": source,
-                    "ci_run_id": run_id,
-                    "scriptlet_sha256": getattr(
-                        getattr(bundle, "identity", None), "scriptlet_sha256", ""
-                    ),
-                    "scriptlet_bytes": getattr(
-                        getattr(bundle, "identity", None), "scriptlet_bytes", 0
-                    ),
-                },
-                acquired_dir=str(
-                    bundle.root if hasattr(bundle, "root") else out
-                ),
-                scriptlet_sha256=getattr(
-                    getattr(bundle, "identity", None), "scriptlet_sha256", ""
-                ),
-                scriptlet_bytes=getattr(
-                    getattr(bundle, "identity", None), "scriptlet_bytes", 0
-                ),
-                source_revision=source,
+            self._complete_acquire_from_bundle(
+                journal,
+                report,
+                tag=tag,
+                run_id=run_id,
+                bundle=bundle,
+                reused=False,
             )
-            report.emit("phase=acquire:ok")
             return
         if not mutate or not self.production_mode:
             journal.mark_deferred(PHASE_ACQUIRE, reason="non-live acquire deferred")
@@ -994,27 +1338,14 @@ class ShipOrchestrator:
             run_id=run_id,
             repository=self.config.repository,
         )
-        main_sha = str(journal.fields.get("main_sha") or "")
-        if main_sha and bundle.identity.ci_head_sha != main_sha:
-            raise ShipError("acquired CI SHA does not match merged main SHA")
-        journal.mark_completed(
-            PHASE_ACQUIRE,
-            identity={
-                "repository": self.config.repository,
-                "version": journal.version,
-                "tag": tag,
-                "main_sha": main_sha,
-                "source_revision": bundle.identity.ci_head_sha,
-                "ci_run_id": run_id,
-                "scriptlet_sha256": bundle.identity.scriptlet_sha256,
-                "scriptlet_bytes": bundle.identity.scriptlet_bytes,
-            },
-            acquired_dir=str(bundle.root),
-            scriptlet_sha256=bundle.identity.scriptlet_sha256,
-            scriptlet_bytes=bundle.identity.scriptlet_bytes,
-            source_revision=bundle.identity.ci_head_sha,
+        self._complete_acquire_from_bundle(
+            journal,
+            report,
+            tag=tag,
+            run_id=run_id,
+            bundle=bundle,
+            reused=False,
         )
-        report.emit(f"phase=acquire:ok run_id={run_id}")
 
     def _phase_sign(
         self,
@@ -1330,8 +1661,11 @@ class ShipOrchestrator:
                     "acquired CI SHA does not match merged main before publish"
                 )
 
-            work_dir = self.config.work_dir / "promote-publish"
+            # Version-scoped workspace: prior-version Kindle/Linux seeds must not
+            # share a directory with the current candidate (cross-version contamination).
+            work_dir = promote_publish_workspace(self.config.work_dir, journal.tag)
             work_dir.mkdir(parents=True, exist_ok=True)
+            report.emit(f"promote_work_dir={work_dir}")
             nine_dest = work_dir / "nine-file-candidate"
             inventory = assemble_nine_file_inventory(
                 acquired=acquired,
@@ -1344,6 +1678,7 @@ class ShipOrchestrator:
                 expected_asset_names=list(inventory.asset_names),
                 expected_asset_digests=dict(inventory.asset_digests),
                 nine_file_candidate=str(inventory.root),
+                publish_work_dir=str(work_dir),
                 publish_commit=inventory.commit,
                 publish_run_id=inventory.run_id,
             )
@@ -1358,6 +1693,7 @@ class ShipOrchestrator:
             )
             # Seed exact acquired CI bytes into the promote work directory so a
             # fresh WORK is valid for ``publish`` (guard→resolve→verify→create).
+            # Same-tag retries reuse matching bytes; foreign files refuse closed.
             seed_promote_work_from_acquired(acquired=acquired, work_dir=work_dir)
 
             from .publish import PublishResult
@@ -1400,16 +1736,21 @@ class ShipOrchestrator:
                         promote_command="recover-existing",
                     )
                     report.emit(f"publish_recover_after_error={exc}")
-                except ShipError:
+                except ShipError as recover_exc:
                     journal.mark_failed(
                         PHASE_PUBLISH,
                         executed=False,
                         independently_verified=False,
                         error=str(exc),
+                        recover_error=str(recover_exc),
                         expected_asset_names=list(inventory.asset_names),
                         expected_asset_digests=dict(inventory.asset_digests),
                     )
-                    raise
+                    # Preserve the original promote-release.sh failure; do not
+                    # let a subsequent recovery-verify error replace it.
+                    raise ShipError(
+                        f"{exc} (recovery verification also failed: {recover_exc})"
+                    ) from exc
 
             verified = bool(result.independently_verified)
             if not verified:

@@ -153,6 +153,41 @@ def assemble_nine_file_inventory(
     )
 
 
+def promote_publish_workspace(ship_work_dir: Path, tag: str) -> Path:
+    """Return the version-scoped promote work directory for a release tag.
+
+    Isolates Kindle/Linux seed trees per tag so prior-version assets cannot
+    contaminate the current release candidate. Same-tag retries reuse this path.
+    """
+    if not tag.startswith("v") or "/" in tag or "\\" in tag or ".." in tag:
+        raise ShipError(f"refuse invalid promote workspace tag: {tag!r}")
+    return ship_work_dir / f"promote-publish-{tag}"
+
+
+def _relative_files(directory: Path) -> set[str]:
+    if not directory.is_dir():
+        return set()
+    found: set[str] = set()
+    for path in directory.rglob("*"):
+        if path.is_file():
+            found.add(path.relative_to(directory).as_posix())
+    return found
+
+
+def _refuse_seed_contamination(
+    directory: Path, expected: set[str], *, label: str
+) -> None:
+    """Fail closed when foreign version artifacts are present; never delete them."""
+    have = _relative_files(directory)
+    foreign = sorted(have - expected)
+    if foreign:
+        raise ShipError(
+            f"promote work {label} contamination: unexpected {foreign!r}; "
+            f"expected only {sorted(expected)!r} "
+            "(refusing to mix cross-version release artifacts)"
+        )
+
+
 def seed_promote_work_from_acquired(*, acquired, work_dir: Path) -> None:
     """Place exact acquired CI bytes where ``promote-release.sh verify`` expects them.
 
@@ -161,7 +196,9 @@ def seed_promote_work_from_acquired(*, acquired, work_dir: Path) -> None:
       $WORK/linux/<linux bundle> + .sha256
 
     Does not rebuild artifacts. Refuses to overwrite an existing seeded tree with
-    different bytes.
+    different bytes. Refuses when unexpected (cross-version) files are already
+    present — callers must use a version-scoped workspace rather than deleting
+    authenticated artifacts.
     """
     identity = acquired.identity
     kindle_dir = work_dir / "kindle"
@@ -170,6 +207,11 @@ def seed_promote_work_from_acquired(*, acquired, work_dir: Path) -> None:
     scriptlet_sum = f"Install Ignite v{identity.version}.sha256"
     linux_name = identity.linux_bundle_name
     linux_sum = f"{linux_name}.sha256"
+    expected_kindle = {scriptlet_name, scriptlet_sum}
+    expected_linux = {linux_name, linux_sum}
+
+    _refuse_seed_contamination(kindle_dir, expected_kindle, label="kindle")
+    _refuse_seed_contamination(linux_dir, expected_linux, label="linux")
 
     src_scriptlet = acquired.ci_artifacts / scriptlet_name
     if not src_scriptlet.is_file():
@@ -206,6 +248,21 @@ def seed_promote_work_from_acquired(*, acquired, work_dir: Path) -> None:
                 )
             continue
         shutil.copy2(src, dest)
+
+    _refuse_seed_contamination(kindle_dir, expected_kindle, label="kindle")
+    _refuse_seed_contamination(linux_dir, expected_linux, label="linux")
+    have_kindle = _relative_files(kindle_dir)
+    have_linux = _relative_files(linux_dir)
+    if have_kindle != expected_kindle:
+        raise ShipError(
+            f"promote work kindle seed incomplete: got={sorted(have_kindle)!r} "
+            f"expected={sorted(expected_kindle)!r}"
+        )
+    if have_linux != expected_linux:
+        raise ShipError(
+            f"promote work linux seed incomplete: got={sorted(have_linux)!r} "
+            f"expected={sorted(expected_linux)!r}"
+        )
 
 
 def build_publish_env(

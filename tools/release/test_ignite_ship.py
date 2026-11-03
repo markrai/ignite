@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,7 @@ from ship_lib.hardware import (  # noqa: E402
     ScriptedHardwareProbe,
 )
 from ship_lib.journal import ShipJournal  # noqa: E402
-from ship_lib.orchestrator import ShipHooks, ShipOrchestrator  # noqa: E402
+from ship_lib.orchestrator import ShipHooks, ShipOrchestrator, ShipReport  # noqa: E402
 from ship_lib.outcomes import (  # noqa: E402
     PHASE_AUTHORITY,
     PHASE_DONE,
@@ -1312,3 +1312,716 @@ class FinalGateCorrectionTests(unittest.TestCase):
             self.assertIn("merged state", str(ctx.exception).lower())
         finally:
             gc.confirm_pr_merged = original  # type: ignore[assignment]
+
+
+
+class PrepareFromCiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ignite-prepare-ci-"))
+        self.repo = self.tmp / "repo"
+        self.home = self.tmp / "ship-home"
+        self.recovery = self.tmp / "recovery"
+        self.key_dir = self.tmp / "recovery-key"
+        _init_mini_repo(self.repo, version="0.9.16")
+        # Pin validation loads trust-boundary + release sign helpers from the mini tree.
+        shutil.copy(
+            _REPO / "deployment" / "kindle" / "production_trust_boundary.py",
+            self.repo / "deployment" / "kindle" / "production_trust_boundary.py",
+        )
+        shutil.copy(
+            _REPO / "tools" / "release" / "kindle_release_sign.py",
+            self.repo / "tools" / "release" / "kindle_release_sign.py",
+        )
+        self.store = InsecureFileStore(self.home / "secrets")
+        self.cfg = ShipConfig(
+            repo_root=self.repo,
+            ship_home=self.home,
+            recovery_dir=self.recovery,
+            recovery_key_dir=self.key_dir,
+            allow_insecure_store=True,
+            allow_live=True,
+            require_hardware=True,
+            hardware_device_id="qa-kindle-1",
+        )
+        self.home.mkdir(parents=True)
+        self.recovery.mkdir(parents=True)
+        self.key_dir.mkdir(parents=True)
+        initialize_authority(self.cfg, store=self.store)
+        provision_public_pin(self.cfg)
+        self.commit = "5c01d29b41f86c94e10f5b43eef222c7f17d30b6"
+        self.run_id = 41705371651
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    DESIGNATED_WORKFLOW_ID = 424242
+
+    def _gh_for_bind(
+        self,
+        *,
+        head_sha: str | None = None,
+        conclusion: str = "success",
+        path: str = ".github/workflows/ci.yml",
+        workflow_id: int | None = None,
+        designated_workflow_id: int | None = None,
+        ahead_by: int = 0,
+        version_at_commit: str = "0.9.16",
+    ):
+        sha = head_sha or self.commit
+        run_id = self.run_id
+        run_workflow_id = (
+            self.DESIGNATED_WORKFLOW_ID if workflow_id is None else workflow_id
+        )
+        want_workflow_id = (
+            self.DESIGNATED_WORKFLOW_ID
+            if designated_workflow_id is None
+            else designated_workflow_id
+        )
+
+        class FakeGH:
+            def run(self, args: list[str], *, cwd: Path):
+                del cwd
+                joined = " ".join(args)
+                if args[:1] == ["api"] and "actions/workflows/ci.yml" in joined:
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        json.dumps({"id": want_workflow_id, "path": "ci.yml"}),
+                        "",
+                    )
+                if args[:1] == ["api"] and f"actions/runs/{run_id}" in joined:
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        json.dumps(
+                            {
+                                "id": run_id,
+                                "status": "completed",
+                                "conclusion": conclusion,
+                                "head_sha": sha,
+                                "head_branch": "main",
+                                "event": "push",
+                                "path": path,
+                                "workflow_id": run_workflow_id,
+                                "html_url": "https://example.test/run",
+                            }
+                        ),
+                        "",
+                    )
+                if args[:1] == ["api"] and "compare/main..." in joined:
+                    if "--jq" in args and args[args.index("--jq") + 1] == ".ahead_by":
+                        return subprocess.CompletedProcess(
+                            args, 0, f"{ahead_by}\n", ""
+                        )
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps({"ahead_by": ahead_by}), ""
+                    )
+                if "contents/ignite/VERSION" in joined:
+                    if "application/vnd.github.raw" in joined:
+                        return subprocess.CompletedProcess(
+                            args, 0, version_at_commit + "\n", ""
+                        )
+                    import base64
+
+                    body = base64.b64encode(
+                        (version_at_commit + "\n").encode("utf-8")
+                    ).decode("ascii")
+                    return subprocess.CompletedProcess(args, 0, body + "\n", "")
+                return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+        return FakeGH()
+
+    def test_bind_existing_ci_run_accepts_matching_success(self) -> None:
+        from ship_lib.ci_coord import bind_existing_ci_run
+
+        bound = bind_existing_ci_run(
+            repo_root=self.repo,
+            version="0.9.16",
+            run_id=self.run_id,
+            commit=self.commit,
+            gh=self._gh_for_bind(),
+            repository=self.cfg.repository,
+        )
+        self.assertEqual(bound.run_id, self.run_id)
+        self.assertEqual(bound.head_sha, self.commit)
+        self.assertEqual(bound.workflow_id, self.DESIGNATED_WORKFLOW_ID)
+        self.assertEqual(bound.workflow_path, ".github/workflows/ci.yml")
+
+    def test_bind_existing_ci_run_rejects_sha_mismatch(self) -> None:
+        from ship_lib.ci_coord import bind_existing_ci_run
+
+        with self.assertRaises(ShipBlockedError) as ctx:
+            bind_existing_ci_run(
+                repo_root=self.repo,
+                version="0.9.16",
+                run_id=self.run_id,
+                commit=self.commit,
+                gh=self._gh_for_bind(head_sha="a" * 40),
+                repository=self.cfg.repository,
+            )
+        self.assertIn("does not match commit", str(ctx.exception))
+
+    def test_bind_existing_ci_run_rejects_wrong_workflow_path(self) -> None:
+        from ship_lib.ci_coord import bind_existing_ci_run
+
+        with self.assertRaises(ShipBlockedError) as ctx:
+            bind_existing_ci_run(
+                repo_root=self.repo,
+                version="0.9.16",
+                run_id=self.run_id,
+                commit=self.commit,
+                gh=self._gh_for_bind(path="tools/release/ci.yml"),
+                repository=self.cfg.repository,
+            )
+        self.assertIn("not the designated CI workflow", str(ctx.exception))
+        self.assertIn("path", str(ctx.exception))
+
+    def test_bind_existing_ci_run_rejects_wrong_workflow_id(self) -> None:
+        from ship_lib.ci_coord import bind_existing_ci_run
+
+        with self.assertRaises(ShipBlockedError) as ctx:
+            bind_existing_ci_run(
+                repo_root=self.repo,
+                version="0.9.16",
+                run_id=self.run_id,
+                commit=self.commit,
+                gh=self._gh_for_bind(workflow_id=999001),
+                repository=self.cfg.repository,
+            )
+        self.assertIn("not the designated CI workflow", str(ctx.exception))
+        self.assertIn("workflow_id", str(ctx.exception))
+
+    def test_bind_existing_ci_run_rejects_commit_not_on_main(self) -> None:
+        from ship_lib.ci_coord import bind_existing_ci_run
+
+        with self.assertRaises(ShipBlockedError) as ctx:
+            bind_existing_ci_run(
+                repo_root=self.repo,
+                version="0.9.16",
+                run_id=self.run_id,
+                commit=self.commit,
+                gh=self._gh_for_bind(ahead_by=1),
+                repository=self.cfg.repository,
+            )
+        self.assertIn("not on main", str(ctx.exception))
+        self.assertIn("ahead_by", str(ctx.exception))
+
+    def test_prepare_from_ci_never_publishes_without_execute_live(self) -> None:
+        hooks = ShipHooks(
+            secret_store=self.store,
+            execute_live_mutations=False,
+            gh=self._gh_for_bind(),
+            publish_fn=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("publish must not run during prepare")
+            ),
+        )
+        orch = ShipOrchestrator(self.cfg, hooks=hooks)
+        report = orch.prepare_from_ci(
+            "0.9.16",
+            run_id=self.run_id,
+            commit=self.commit,
+            plan_only=True,
+        )
+        self.assertEqual(report.outcome, ShipOutcome.PLANNED)
+        self.assertIn("published=false", report.lines)
+        self.assertIn("publish=forbidden-in-prepare-from-ci", report.lines)
+        self.assertIn("journal=unmodified-non-live", report.lines)
+        journal_path = self.cfg.journal_dir / "ship-0.9.16.journal.v2.json"
+        self.assertFalse(
+            journal_path.exists(),
+            "plan/non-live prepare-from-ci must not create a journal",
+        )
+
+    def test_prepare_from_ci_plan_mode_does_not_alter_existing_journal(self) -> None:
+        journal = ShipJournal.open_for_version(self.cfg.journal_dir, "0.9.16")
+        journal.mark_completed(
+            "authority-init",
+            note="pre-existing-snapshot",
+            fingerprint_sha256="ab" * 32,
+        )
+        journal_path = journal.path
+        before = journal_path.read_bytes()
+        before_mtime = journal_path.stat().st_mtime_ns
+
+        hooks = ShipHooks(
+            secret_store=self.store,
+            execute_live_mutations=False,
+            gh=self._gh_for_bind(),
+            publish_fn=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("publish must not run during prepare")
+            ),
+        )
+        orch = ShipOrchestrator(self.cfg, hooks=hooks)
+        report = orch.prepare_from_ci(
+            "0.9.16",
+            run_id=self.run_id,
+            commit=self.commit,
+            plan_only=True,
+        )
+        self.assertEqual(report.outcome, ShipOutcome.PLANNED)
+        self.assertIn("journal=unmodified-non-live", report.lines)
+        after = journal_path.read_bytes()
+        self.assertEqual(before, after)
+        self.assertEqual(before_mtime, journal_path.stat().st_mtime_ns)
+        reloaded = ShipJournal.load(journal_path)
+        self.assertTrue(reloaded.is_complete("authority-init"))
+        self.assertFalse(reloaded.is_complete("ci-wait"))
+        self.assertFalse(reloaded.is_complete("version-sync"))
+        self.assertFalse(reloaded.published())
+
+    def test_prepare_then_publish_prepared_uses_hardware_evidence(self) -> None:
+        @dataclass
+        class _Ident:
+            ci_head_sha: str
+            scriptlet_sha256: str
+            scriptlet_bytes: int
+            ci_run_id: int
+            tag: str
+
+        @dataclass
+        class _Bundle:
+            root: Path
+            identity: _Ident
+
+        def fake_acquire(*, tag: str, output_dir: Path, run_id: int) -> _Bundle:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return _Bundle(
+                root=output_dir,
+                identity=_Ident(
+                    ci_head_sha=self.commit,
+                    scriptlet_sha256="cd" * 32,
+                    scriptlet_bytes=12,
+                    ci_run_id=run_id,
+                    tag=tag,
+                ),
+            )
+
+        class _Dry:
+            outcome = type("O", (), {"value": "complete-verification-pass"})()
+
+        publish_calls: list[str] = []
+
+        def fake_publish(*, journal: ShipJournal, gh: Any) -> dict[str, Any]:
+            del gh
+            publish_calls.append(journal.version)
+            names = [f"asset-{i}.bin" for i in range(9)]
+            return {
+                "executed": True,
+                "independently_verified": True,
+                "release_url": "https://github.com/markrai/ignite/releases/tag/v0.9.16",
+                "asset_digests": {n: "ab" * 32 for n in names},
+                "asset_names": names,
+            }
+
+        # Sign without RestrictedSigningService: complete sign after acquire via hook seam.
+        hooks = ShipHooks(
+            secret_store=self.store,
+            execute_live_mutations=True,
+            allow_local_mutations_for_tests=True,
+            gh=self._gh_for_bind(),
+            hardware_probe=ScriptedHardwareProbe(
+                pass_all=True, production_evidence=True
+            ),
+            acquire_fn=fake_acquire,
+            dry_run_fn=lambda **kwargs: _Dry(),
+            publish_fn=fake_publish,
+        )
+        orch = ShipOrchestrator(self.cfg, hooks=hooks)
+
+        # Monkeypatch sign to complete without openssl ceremony.
+        original_sign = ShipOrchestrator._phase_sign
+
+        commit = self.commit
+        run_id = self.run_id
+
+        def stub_sign(orch_self, journal, report, version, tag, *, mutate):
+            if journal.is_complete("sign"):
+                report.emit("phase=sign:skipped-complete")
+                return
+            if not mutate:
+                journal.mark_deferred("sign", reason="non-live")
+                report.emit("phase=sign:deferred-non-live")
+                return
+            signed = orch_self.config.work_dir / f"signed-{tag}"
+            signed.mkdir(parents=True, exist_ok=True)
+            journal.mark_completed(
+                "sign",
+                identity={
+                    "repository": orch_self.config.repository,
+                    "version": version,
+                    "tag": tag,
+                    "main_sha": commit,
+                    "source_revision": commit,
+                    "ci_run_id": run_id,
+                },
+                signed_dir=str(signed),
+                fingerprint_sha256=load_authority(orch_self.config).fingerprint_sha256,
+                signed_scriptlet_sha256="cd" * 32,
+            )
+            report.emit("phase=sign:ok")
+
+        ShipOrchestrator._phase_sign = stub_sign  # type: ignore[method-assign]
+        try:
+            prep = orch.prepare_from_ci(
+                "0.9.16",
+                run_id=self.run_id,
+                commit=self.commit,
+                plan_only=False,
+            )
+            self.assertEqual(prep.outcome, ShipOutcome.READY)
+            self.assertIn("prepared_for_publish=true", prep.lines)
+            self.assertIn("published=false", prep.lines)
+            self.assertEqual(publish_calls, [])
+
+            journal = ShipJournal.open_for_version(self.cfg.journal_dir, "0.9.16")
+            self.assertTrue(journal.is_complete("hardware-acceptance"))
+            self.assertTrue(
+                journal.phases["hardware-acceptance"].fields.get("production_evidence")
+            )
+
+            pub = orch.publish_prepared("0.9.16", plan_only=False)
+            self.assertEqual(pub.outcome, ShipOutcome.SUCCESS)
+            self.assertIn("published=true", pub.lines)
+            self.assertEqual(publish_calls, ["0.9.16"])
+        finally:
+            ShipOrchestrator._phase_sign = original_sign  # type: ignore[method-assign]
+
+    def test_publish_prepared_refuses_without_hardware_evidence(self) -> None:
+        journal = ShipJournal.open_for_version(self.cfg.journal_dir, "0.9.16")
+        for phase in (
+            "authority-init",
+            "public-pin-provision",
+            "version-sync",
+            "git-prepare",
+            "git-push-pr",
+            "git-merge",
+            "ci-wait",
+            "acquire",
+            "sign",
+            "verify-dry-run",
+            "hardware-acceptance",
+        ):
+            fields = {
+                "main_sha": self.commit,
+                "source_revision": self.commit,
+                "ci_run_id": self.run_id,
+                "acquired_dir": str(self.tmp / "acq"),
+                "signed_dir": str(self.tmp / "sig"),
+                "scriptlet_sha256": "cd" * 32,
+                "scriptlet_bytes": 12,
+            }
+            if phase == "hardware-acceptance":
+                fields["production_evidence"] = False
+            journal.mark_completed(phase, **fields)
+        hooks = ShipHooks(
+            secret_store=self.store,
+            execute_live_mutations=True,
+            publish_fn=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("must not publish")
+            ),
+        )
+        orch = ShipOrchestrator(self.cfg, hooks=hooks)
+        report = orch.publish_prepared("0.9.16", plan_only=False)
+        self.assertEqual(report.outcome, ShipOutcome.BLOCKED_HARDWARE)
+        self.assertIn("published=false", report.lines)
+        self.assertIn("hardware-acceptance-unavailable", "\n".join(report.lines))
+
+
+class PublishWorkspaceIsolationTests(unittest.TestCase):
+    """Regression: version-scoped promote work + original publish error preservation."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ignite-publish-iso-"))
+        self.repo = self.tmp / "repo"
+        self.home = self.tmp / "ship-home"
+        self.recovery = self.tmp / "recovery"
+        self.key_dir = self.tmp / "recovery-key"
+        _init_mini_repo(self.repo, version="0.9.16")
+        shutil.copy(
+            _REPO / "deployment" / "kindle" / "production_trust_boundary.py",
+            self.repo / "deployment" / "kindle" / "production_trust_boundary.py",
+        )
+        shutil.copy(
+            _REPO / "tools" / "release" / "kindle_release_sign.py",
+            self.repo / "tools" / "release" / "kindle_release_sign.py",
+        )
+        # Real promote shell path needs promote-release.sh under the mini repo.
+        shutil.copy(
+            _REPO / "tools" / "release" / "promote-release.sh",
+            self.repo / "tools" / "release" / "promote-release.sh",
+        )
+        self.store = InsecureFileStore(self.home / "secrets")
+        self.cfg = ShipConfig(
+            repo_root=self.repo,
+            ship_home=self.home,
+            recovery_dir=self.recovery,
+            recovery_key_dir=self.key_dir,
+            allow_insecure_store=True,
+            allow_live=True,
+            require_hardware=True,
+            hardware_device_id="qa-kindle-1",
+        )
+        self.home.mkdir(parents=True)
+        self.recovery.mkdir(parents=True)
+        self.key_dir.mkdir(parents=True)
+        initialize_authority(self.cfg, store=self.store)
+        provision_public_pin(self.cfg)
+        self.commit = "5c01d29b41f86c94e10f5b43eef222c7f17d30b6"
+        self.run_id = 41705371651
+
+        import importlib.util
+
+        helper = _REPO / "deployment" / "kindle" / "test_release_acquire.py"
+        spec = importlib.util.spec_from_file_location(
+            "ignite_test_release_acquire_iso", helper
+        )
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        bundles = self.tmp / "bundles"
+        bundles.mkdir(parents=True, exist_ok=True)
+        _state, self.acquired, _root, _pub, self.signed = mod._signed_bundle_for_shell(
+            bundles
+        )
+        self.commit = str(self.acquired.identity.ci_head_sha)
+        self.run_id = int(self.acquired.identity.ci_run_id)
+        self.version = str(self.acquired.identity.version)
+        self.tag = f"v{self.version}"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _prepare_journal(self) -> ShipJournal:
+        journal = ShipJournal.open_for_version(self.cfg.journal_dir, self.version)
+        for phase in (
+            "authority-init",
+            "public-pin-provision",
+            "version-sync",
+            "git-prepare",
+            "git-push-pr",
+            "git-merge",
+            "ci-wait",
+            "acquire",
+            "sign",
+            "verify-dry-run",
+            "hardware-acceptance",
+        ):
+            fields: dict[str, Any] = {
+                "main_sha": self.commit,
+                "source_revision": self.commit,
+                "ci_run_id": self.run_id,
+                "acquired_dir": str(self.acquired.root),
+                "signed_dir": str(self.signed.root),
+                "scriptlet_sha256": "cd" * 32,
+                "scriptlet_bytes": 12,
+            }
+            if phase == "hardware-acceptance":
+                fields["production_evidence"] = True
+            journal.mark_completed(phase, **fields)
+        return journal
+
+    def test_phase_publish_uses_version_specific_workspace(self) -> None:
+        import ship_lib.orchestrator as orch_mod
+        from ship_lib.publish import promote_publish_workspace
+
+        journal = self._prepare_journal()
+        captured: dict[str, Path] = {}
+
+        def capture_seed(*, acquired: Any, work_dir: Path) -> None:
+            del acquired
+            captured["work_dir"] = work_dir
+
+        def fake_publish(**kwargs: Any) -> Any:
+            del kwargs
+
+            @dataclass
+            class _Result:
+                independently_verified: bool = True
+                release_url: str = "https://example.test/release"
+                asset_digests: dict[str, str] = field(default_factory=dict)
+                asset_names: tuple[str, ...] = ()
+                recovered_existing: bool = False
+                executed: bool = True
+
+            digests = {
+                n: "ab" * 32
+                for n in (
+                    f"Install Ignite v{self.version}.sh",
+                    f"Install Ignite v{self.version}.sha256",
+                )
+            }
+            return _Result(
+                asset_digests=digests,
+                asset_names=tuple(digests),
+            )
+
+        original_seed = orch_mod.seed_promote_work_from_acquired
+        original_publish = orch_mod.publish_release
+        original_assemble = orch_mod.assemble_nine_file_inventory
+        original_env = orch_mod.build_publish_env
+        try:
+            orch_mod.seed_promote_work_from_acquired = capture_seed  # type: ignore[assignment]
+
+            def fake_assemble(*, acquired: Any, signed: Any, dest: Path):
+                del signed
+                dest.mkdir(parents=True, exist_ok=True)
+                names = (
+                    f"Install Ignite v{acquired.identity.version}.sh",
+                    f"Install Ignite v{acquired.identity.version}.sha256",
+                    f"ignite-kindle-v{acquired.identity.version}.manifest",
+                    f"ignite-kindle-v{acquired.identity.version}.manifest.sig",
+                    f"ignite-kindle-v{acquired.identity.version}.publication-binding",
+                    f"ignite-kindle-v{acquired.identity.version}.publication-binding.sig",
+                    f"ignite-kindle-v{acquired.identity.version}.publication-evidence",
+                    acquired.identity.linux_bundle_name,
+                    f"{acquired.identity.linux_bundle_name}.sha256",
+                )
+                digests = {}
+                for name in names:
+                    path = dest / name
+                    path.write_bytes(b"x")
+                    digests[name] = "ab" * 32
+                from ship_lib.publish import NineFileInventory
+
+                return NineFileInventory(
+                    root=dest,
+                    version=acquired.identity.version,
+                    tag=f"v{acquired.identity.version}",
+                    commit=self.commit,
+                    run_id=self.run_id,
+                    asset_names=tuple(sorted(names)),
+                    asset_digests=digests,
+                    linux_bundle_name=acquired.identity.linux_bundle_name,
+                )
+
+            orch_mod.assemble_nine_file_inventory = fake_assemble  # type: ignore[assignment]
+            orch_mod.publish_release = fake_publish  # type: ignore[assignment]
+            orch_mod.build_publish_env = lambda **kwargs: {  # type: ignore[assignment]
+                "IGNITE_PROMOTE_TAG": self.tag,
+                "IGNITE_PROMOTE_RUN_ID": str(self.run_id),
+                "IGNITE_PROMOTE_COMMIT": self.commit,
+            }
+
+            hooks = ShipHooks(
+                secret_store=self.store,
+                execute_live_mutations=True,
+                allow_local_mutations_for_tests=True,
+                gh=type("GH", (), {"run": lambda *a, **k: None})(),
+            )
+            orch = ShipOrchestrator(self.cfg, hooks=hooks)
+            report = ShipReport(
+                outcome=ShipOutcome.PARTIAL, version=self.version, tag=self.tag
+            )
+            orch._phase_publish(journal, report, mutate=True)
+            expected = promote_publish_workspace(self.cfg.work_dir, self.tag)
+            self.assertEqual(captured.get("work_dir"), expected)
+            self.assertIn(f"promote_work_dir={expected}", report.lines)
+            self.assertNotEqual(
+                captured["work_dir"], self.cfg.work_dir / "promote-publish"
+            )
+            # Prior shared workspace contamination must not be the publish target.
+            shared = self.cfg.work_dir / "promote-publish"
+            shared.mkdir(parents=True, exist_ok=True)
+            (shared / "kindle").mkdir(exist_ok=True)
+            (shared / "kindle" / "Install Ignite v0.9.15.sh").write_bytes(b"old")
+            self.assertNotEqual(captured["work_dir"], shared)
+        finally:
+            orch_mod.seed_promote_work_from_acquired = original_seed  # type: ignore[assignment]
+            orch_mod.publish_release = original_publish  # type: ignore[assignment]
+            orch_mod.assemble_nine_file_inventory = original_assemble  # type: ignore[assignment]
+            orch_mod.build_publish_env = original_env  # type: ignore[assignment]
+
+    def test_phase_publish_preserves_original_promote_error(self) -> None:
+        import ship_lib.orchestrator as orch_mod
+
+        journal = self._prepare_journal()
+        promote_msg = (
+            "promote-release.sh publish failed: Kindle artifact file set mismatch: "
+            "Install Ignite v0.9.15.sh"
+        )
+        recover_msg = "unable to view published release for verification: not found"
+
+        def boom_publish(**kwargs: Any) -> Any:
+            del kwargs
+            raise ShipError(promote_msg)
+
+        def boom_verify(**kwargs: Any) -> Any:
+            del kwargs
+            raise ShipError(recover_msg)
+
+        def fake_assemble(*, acquired: Any, signed: Any, dest: Path):
+            del signed
+            dest.mkdir(parents=True, exist_ok=True)
+            from ship_lib.publish import NineFileInventory
+
+            names = (
+                f"Install Ignite v{self.version}.sh",
+                f"Install Ignite v{self.version}.sha256",
+                f"ignite-kindle-v{self.version}.manifest",
+                f"ignite-kindle-v{self.version}.manifest.sig",
+                f"ignite-kindle-v{self.version}.publication-binding",
+                f"ignite-kindle-v{self.version}.publication-binding.sig",
+                f"ignite-kindle-v{self.version}.publication-evidence",
+                acquired.identity.linux_bundle_name,
+                f"{acquired.identity.linux_bundle_name}.sha256",
+            )
+            for name in names:
+                (dest / name).write_bytes(b"x")
+            return NineFileInventory(
+                root=dest,
+                version=self.version,
+                tag=self.tag,
+                commit=self.commit,
+                run_id=self.run_id,
+                asset_names=names,
+                asset_digests={n: "ab" * 32 for n in names},
+                linux_bundle_name=acquired.identity.linux_bundle_name,
+            )
+
+        original_publish = orch_mod.publish_release
+        original_verify = orch_mod.verify_published_release
+        original_assemble = orch_mod.assemble_nine_file_inventory
+        original_seed = orch_mod.seed_promote_work_from_acquired
+        original_env = orch_mod.build_publish_env
+        try:
+            orch_mod.publish_release = boom_publish  # type: ignore[assignment]
+            orch_mod.verify_published_release = boom_verify  # type: ignore[assignment]
+            orch_mod.assemble_nine_file_inventory = fake_assemble  # type: ignore[assignment]
+            orch_mod.seed_promote_work_from_acquired = lambda **kwargs: None  # type: ignore[assignment]
+            orch_mod.build_publish_env = lambda **kwargs: {  # type: ignore[assignment]
+                "IGNITE_PROMOTE_TAG": self.tag,
+                "IGNITE_PROMOTE_RUN_ID": str(self.run_id),
+                "IGNITE_PROMOTE_COMMIT": self.commit,
+            }
+            hooks = ShipHooks(
+                secret_store=self.store,
+                execute_live_mutations=True,
+                allow_local_mutations_for_tests=True,
+                gh=type("GH", (), {"run": lambda *a, **k: None})(),
+            )
+            orch = ShipOrchestrator(self.cfg, hooks=hooks)
+            report = ShipReport(
+                outcome=ShipOutcome.PARTIAL, version=self.version, tag=self.tag
+            )
+            with self.assertRaises(ShipError) as ctx:
+                orch._phase_publish(journal, report, mutate=True)
+            msg = str(ctx.exception)
+            self.assertIn("Kindle artifact file set mismatch", msg)
+            self.assertIn("Install Ignite v0.9.15.sh", msg)
+            self.assertIn("recovery verification also failed", msg)
+            self.assertIn("unable to view published release", msg)
+            phase = journal.phases[PHASE_PUBLISH]
+            self.assertEqual(phase.state, PhaseState.FAILED)
+            self.assertIn(
+                "Kindle artifact file set mismatch", str(phase.fields.get("error"))
+            )
+        finally:
+            orch_mod.publish_release = original_publish  # type: ignore[assignment]
+            orch_mod.verify_published_release = original_verify  # type: ignore[assignment]
+            orch_mod.assemble_nine_file_inventory = original_assemble  # type: ignore[assignment]
+            orch_mod.seed_promote_work_from_acquired = original_seed  # type: ignore[assignment]
+            orch_mod.build_publish_env = original_env  # type: ignore[assignment]
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -64,6 +64,9 @@ dist/
 /target/dropbear-kindle/
 **/Ignite-Diagnose*.txt
 
+# Local CI artifact acquisition trees (binaries + build evidence; never commit)
+/acquired-v*/
+
 # Editor / agent local state
 *.orig
 *.rej

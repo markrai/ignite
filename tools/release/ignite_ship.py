@@ -8,6 +8,8 @@ Commands:
   init-authority  One-time production publisher identity + recovery (no Git/CI/release)
   provision-pin   Write the authority public key into the repository pin (unstaged)
   plan            Read-only release rehearsal (never mutates authority/pin/versions/Git)
+  prepare-from-ci Bind an already-green main CI run; prepare through hardware (never publish)
+  publish-prepared Publish a version previously prepared by prepare-from-ci
   ship            Run the phased release workflow for a version
   resume          Resume an interrupted ship journal for a version
 
@@ -107,6 +109,57 @@ def main(argv: list[str] | None = None) -> int:
     )
     plan.add_argument("--version", required=True, help="release version e.g. 0.9.15")
 
+    prepare = sub.add_parser(
+        "prepare-from-ci",
+        help=(
+            "bind an already-successful main ci.yml run and prepare through "
+            "acquire/sign/verify/hardware (never publishes)"
+        ),
+    )
+    prepare.add_argument("--version", required=True, help="release version e.g. 0.9.16")
+    prepare.add_argument(
+        "--run-id",
+        type=int,
+        required=True,
+        help="successful GitHub Actions ci.yml run id on main",
+    )
+    prepare.add_argument(
+        "--commit",
+        required=True,
+        help="40-character commit SHA expected for that CI run",
+    )
+    prepare.add_argument(
+        "--acquired",
+        type=Path,
+        default=None,
+        help=(
+            "reuse an existing acquired-vX.Y.Z directory instead of re-downloading "
+            "(must match --run-id/--commit/--version)"
+        ),
+    )
+    prepare.add_argument(
+        "--execute-live",
+        action="store_true",
+        help=(
+            "execute acquire/sign/verify/hardware using production authority. "
+            "Requires --allow-live. Never publishes."
+        ),
+    )
+
+    publish_prepared = sub.add_parser(
+        "publish-prepared",
+        help="publish a version previously prepared by prepare-from-ci",
+    )
+    publish_prepared.add_argument("--version", required=True)
+    publish_prepared.add_argument(
+        "--execute-live",
+        action="store_true",
+        help=(
+            "execute GitHub Release publication for the prepared journal. "
+            "Requires --allow-live and completed hardware production evidence."
+        ),
+    )
+
     ship = sub.add_parser("ship", help="autonomous release workflow for a version")
     ship.add_argument("--version", required=True, help="release version e.g. 0.9.15")
     ship.add_argument(
@@ -146,6 +199,19 @@ def main(argv: list[str] | None = None) -> int:
         report = orch.provision_pin()
     elif args.command == "plan":
         report = orch.plan(args.version)
+    elif args.command == "prepare-from-ci":
+        report = orch.prepare_from_ci(
+            args.version,
+            run_id=int(args.run_id),
+            commit=str(args.commit),
+            acquired_dir=args.acquired,
+            plan_only=not hooks.execute_live_mutations,
+        )
+    elif args.command == "publish-prepared":
+        report = orch.publish_prepared(
+            args.version,
+            plan_only=not hooks.execute_live_mutations,
+        )
     elif args.command == "ship":
         report = orch.ship(args.version, resume=False)
     elif args.command == "resume":
