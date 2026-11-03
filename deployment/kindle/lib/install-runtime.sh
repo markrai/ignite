@@ -57,6 +57,7 @@ fi
 STABLE_APP=$APP_ROOT/bin/scribe-app
 STABLE_LIFE=$APP_ROOT/bin/scribe-lifecycle
 STABLE_HOST=$APP_ROOT/bin/scribe-lifecycle-host.sh
+STABLE_STORAGE_CONTRACT=$APP_ROOT/bin/storage-contract.v1
 SCRIPTLET=$DOCS/Scribe.sh
 # Canonical appreg identity (sourced helpers also set HANDLER / LEGACY_HANDLER).
 HANDLER=com.markrai.ignite
@@ -110,6 +111,7 @@ ignite_require_free_kb() {
 
 cleanup_staged_new() {
   rm -f "$STABLE_APP.new" "$STABLE_LIFE.new" "$STABLE_HOST.new" "$SCRIPTLET.new" \
+    "$STABLE_STORAGE_CONTRACT.new" \
     "$APP_ROOT/assets/scribe-icon.png.new" \
     "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt.new" \
     "$APP_ROOT/assets/licenses/noto-emoji/DESCRIPTION.en_us.html.new" \
@@ -141,6 +143,21 @@ restore_cp_optional() {
     return 0
   fi
   restore_cp "$src" "$dest" "$name"
+}
+
+# Optional retained artifact: restore when present; otherwise remove the live copy so a
+# contract-aware B cannot leave identity behind after rolling back to pre-contract A.
+restore_cp_optional_or_remove() {
+  src=$1
+  dest=$2
+  name=$3
+  if [ -f "$src" ]; then
+    restore_cp "$src" "$dest" "$name"
+    return $?
+  fi
+  refuse_symlink "$dest" "rollback remove target $name" || return 1
+  rm -f "$dest" || return 1
+  return 0
 }
 
 publish_crash() {
@@ -246,6 +263,7 @@ snapshot_name_allowed() {
     OFL.txt|DESCRIPTION.en_us.html|upstream_info.md|source-sans-3-OFL.txt|\
     install-runtime.sh|uninstall-runtime.sh|backup-runtime.sh|register-helpers.sh|\
     install-recovery.sh|Uninstall\ Ignite.sh|Backup\ Ignite\ Data.sh|Diagnose\ Ignite.sh|\
+    storage-contract.v1|\
     "$LKG_HANDLER_NAME"|"$LKG_INVENTORY_NAME")
       return 0
       ;;
@@ -479,8 +497,29 @@ validate_pending_health() {
   return 0
 }
 
+# After pending-health is retired, LKG metadata and the retained A tree are no longer
+# the guarded rollback base. Remove them so the next install snapshots live B instead of
+# treating stale A as a same-generation recovery base.
+finish_qualified_lkg_retirement() {
+  rm -f "$LKG_INVENTORY" "$LKG_HANDLER" || return 1
+  if [ -e "$PREV_DIR" ] || [ -L "$PREV_DIR" ]; then
+    refuse_symlink "$PREV_DIR" "previous-release directory" || return 1
+    rm -rf "$PREV_DIR" || return 1
+  fi
+  if [ -e "$PREV_OLD" ] || [ -L "$PREV_OLD" ]; then
+    refuse_symlink "$PREV_OLD" "previous-release.prev" || return 1
+    rm -rf "$PREV_OLD" || return 1
+  fi
+  if [ -e "$PREV_STAGING" ] || [ -L "$PREV_STAGING" ]; then
+    refuse_symlink "$PREV_STAGING" "previous-release.staging" || return 1
+    rm -rf "$PREV_STAGING" || return 1
+  fi
+  return 0
+}
+
 # Recover crash windows from ignite-qualify.journal without deleting rollback evidence
-# while pending-health still exists (phase=prepared).
+# while pending-health still exists (phase=prepared). Contradictory journal/pending
+# combinations refuse without deleting retained evidence.
 reconcile_qualification_journal() {
   ensure_update_dir || return 1
   QUALIFY_JOURNAL=$UPDATE_DIR/ignite-qualify.journal
@@ -490,15 +529,31 @@ reconcile_qualification_journal() {
   refuse_symlink "$QUALIFY_JOURNAL" "qualification journal" || return 1
   [ -f "$QUALIFY_JOURNAL" ] || return 1
   q_phase=$(grep '^phase=' "$QUALIFY_JOURNAL" 2>/dev/null | tail -n 1 | sed 's/^phase=//') || true
+  pending_present=0
+  if [ -e "$PENDING_HEALTH" ] || [ -L "$PENDING_HEALTH" ]; then
+    pending_present=1
+  fi
   case "$q_phase" in
     prepared)
-      # pending-health should still be present; leave for a later successful qualify.
+      if [ "$pending_present" -eq 0 ]; then
+        # Crash window: prepared journal but pending already removed before
+        # pending_removed could be recorded. Finish LKG cleanup and retire the
+        # retained A tree so the next install can snapshot live B.
+        finish_qualified_lkg_retirement || return 1
+        rm -f "$QUALIFY_JOURNAL" || return 1
+        sync
+        return 0
+      fi
+      # pending-health still present; leave for a later successful qualify.
       return 0
       ;;
     pending_removed|complete)
-      # Pending already retired; finish LKG metadata cleanup so the next install is not
-      # stuck on ambiguous LKG-without-pending, then drop the journal.
-      rm -f "$LKG_INVENTORY" "$LKG_HANDLER" || return 1
+      if [ "$pending_present" -eq 1 ]; then
+        log "qualify_journal_contradiction: phase=$q_phase but pending-health still present; refusing without deleting evidence"
+        return 1
+      fi
+      # Pending already retired; finish LKG cleanup / retire retained A, then drop journal.
+      finish_qualified_lkg_retirement || return 1
       rm -f "$QUALIFY_JOURNAL" || return 1
       sync
       return 0
@@ -740,6 +795,10 @@ snapshot_previous_release() {
   snapshot_copy_required "$STABLE_APP" "$PREV_STAGING/scribe-app" || return 1
   snapshot_copy_required "$STABLE_LIFE" "$PREV_STAGING/scribe-lifecycle" || return 1
   snapshot_copy_required "$STABLE_HOST" "$PREV_STAGING/scribe-lifecycle-host.sh" || return 1
+  # Scoped storage-contract identity for no-migration qualification (not inventory entry).
+  if [ -f "$STABLE_STORAGE_CONTRACT" ]; then
+    snapshot_copy_required "$STABLE_STORAGE_CONTRACT" "$PREV_STAGING/storage-contract.v1" || return 1
+  fi
   snapshot_copy_optional "$SCRIPTLET" "$PREV_STAGING/Scribe.sh" || return 1
   snapshot_copy_optional "$APP_ROOT/assets/scribe-icon.png" "$PREV_STAGING/scribe-icon.png" || return 1
   snapshot_copy_optional "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt" "$PREV_STAGING/OFL.txt" || return 1
@@ -824,6 +883,7 @@ prepare_existing_snapshot() {
   verify_or_complete_snapshot_entry scribe-app "$STABLE_APP" || return 1
   verify_or_complete_snapshot_entry scribe-lifecycle "$STABLE_LIFE" || return 1
   verify_or_complete_snapshot_entry scribe-lifecycle-host.sh "$STABLE_HOST" || return 1
+  verify_or_complete_snapshot_entry storage-contract.v1 "$STABLE_STORAGE_CONTRACT" || return 1
   verify_or_complete_snapshot_entry Scribe.sh "$SCRIPTLET" || return 1
   verify_or_complete_snapshot_entry scribe-icon.png "$APP_ROOT/assets/scribe-icon.png" || return 1
   verify_or_complete_snapshot_entry OFL.txt "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt" || return 1
@@ -949,6 +1009,7 @@ rollback_runtime() {
     restore_cp "$PREV_DIR/scribe-app" "$STABLE_APP" scribe-app || return 1
     restore_cp "$PREV_DIR/scribe-lifecycle" "$STABLE_LIFE" scribe-lifecycle || return 1
     restore_cp "$PREV_DIR/scribe-lifecycle-host.sh" "$STABLE_HOST" host || return 1
+    restore_cp_optional_or_remove "$PREV_DIR/storage-contract.v1" "$STABLE_STORAGE_CONTRACT" storage-contract || return 1
     restore_cp_optional "$PREV_DIR/Scribe.sh" "$SCRIPTLET" scriptlet || return 1
     restore_cp_optional "$PREV_DIR/scribe-icon.png" "$APP_ROOT/assets/scribe-icon.png" icon || return 1
     restore_cp_optional "$PREV_DIR/OFL.txt" "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt" ofl || return 1
@@ -966,7 +1027,8 @@ rollback_runtime() {
     restore_cp_optional "$PREV_DIR/Diagnose Ignite.sh" "$DOCS/Diagnose Ignite.sh" diagnose-docs || return 1
   else
     log "install_rollback: no previous snapshot; removing incomplete first install"
-    rm -f "$STABLE_APP" "$STABLE_LIFE" "$STABLE_HOST" "$SCRIPTLET" || return 1
+    rm -f "$STABLE_APP" "$STABLE_LIFE" "$STABLE_HOST" "$SCRIPTLET" \
+      "$STABLE_STORAGE_CONTRACT" || return 1
     rm -f "$DOCS/Uninstall Ignite.sh" "$DOCS/Backup Ignite Data.sh" || return 1
     # Diagnose Ignite.sh is installed after successful payload extraction (SFX).
     # Keep it so USB diagnose remains available after a failed first runtime install.
@@ -1145,6 +1207,8 @@ guard_pending_health
 cleanup_staged_new
 
 # Snapshot last successful live files only if previous-release is empty.
+# Successful qualification retires previous-release (see reconcile_qualification_journal),
+# so B→C snapshots live B. A mismatched existing base still fails closed below.
 if [ ! -f "$PREV_DIR/scribe-app" ] && [ -f "$STABLE_APP" ]; then
   snapshot_previous_release || die "could not snapshot current release for rollback"
 fi
@@ -1223,6 +1287,15 @@ fi
 activate_mv scribe-app "$STABLE_APP.new" "$STABLE_APP"
 activate_mv scribe-lifecycle "$STABLE_LIFE.new" "$STABLE_LIFE"
 activate_mv host "$STABLE_HOST.new" "$STABLE_HOST"
+# Live storage-contract identity derived from the authenticated release claim
+# (Install-Ignite.sfx.sh IGNITE_STORAGE_CONTRACT). Not an independent trust anchor.
+{
+  printf '%s\n' 'IGNITE_STORAGE_CONTRACT_V1'
+  printf '%s\n' 'schema=1'
+  printf '%s\n' 'storage_contract=ignite-storage-v1'
+} >"$STABLE_STORAGE_CONTRACT.new" || die "could not stage storage-contract.v1"
+chmod 0644 "$STABLE_STORAGE_CONTRACT.new"
+activate_mv storage-contract "$STABLE_STORAGE_CONTRACT.new" "$STABLE_STORAGE_CONTRACT"
 activate_mv icon "$APP_ROOT/assets/scribe-icon.png.new" "$APP_ROOT/assets/scribe-icon.png"
 activate_mv scriptlet "$SCRIPTLET.new" "$SCRIPTLET"
 activate_mv ofl "$APP_ROOT/assets/licenses/noto-emoji/OFL.txt.new" \

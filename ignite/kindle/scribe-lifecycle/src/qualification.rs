@@ -232,12 +232,13 @@ pub fn reconcile_interrupted_qualification(
     let Some(journal) = load_journal(update_dir)? else {
         return Ok(());
     };
+    let pending_present = update_dir.join(PENDING_NAME).exists();
     match journal.phase {
         QualifyPhase::Prepared => {
             // Crash window: journal says prepared but pending was already unlinked before
             // pending_removed could be written. Finish LKG cleanup so guard_pending_health
             // cannot stay stuck on ambiguous LKG-without-pending.
-            if !update_dir.join(PENDING_NAME).exists() {
+            if !pending_present {
                 finish_lkg_cleanup(previous_release_dir)?;
                 remove_if_present(&journal_path(update_dir))?;
                 if let Ok(dir) = File::open(update_dir) {
@@ -248,6 +249,12 @@ pub fn reconcile_interrupted_qualification(
             Ok(())
         }
         QualifyPhase::PendingRemoved | QualifyPhase::Complete => {
+            if pending_present {
+                return Err(QualifyError::Unsafe(format!(
+                    "contradictory qualify journal phase={} with pending-health still present; refusing without deleting evidence",
+                    journal.phase.as_str()
+                )));
+            }
             finish_lkg_cleanup(previous_release_dir)?;
             remove_if_present(&journal_path(update_dir))?;
             if let Ok(dir) = File::open(update_dir) {
@@ -261,7 +268,36 @@ pub fn reconcile_interrupted_qualification(
 fn finish_lkg_cleanup(previous_release_dir: &Path) -> Result<(), QualifyError> {
     remove_if_present(&previous_release_dir.join(LKG_INVENTORY_NAME))?;
     remove_if_present(&previous_release_dir.join(LKG_HANDLER_NAME))?;
+    // Retire the retained A tree so the next install snapshots live B instead of
+    // treating stale A as a same-generation recovery base.
+    remove_dir_if_present(previous_release_dir)?;
+    if let Some(parent) = previous_release_dir.parent() {
+        remove_dir_if_present(&parent.join("previous-release.prev"))?;
+        remove_dir_if_present(&parent.join("previous-release.staging"))?;
+    }
     Ok(())
+}
+
+fn remove_dir_if_present(path: &Path) -> Result<(), QualifyError> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(QualifyError::Io(e.to_string())),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(QualifyError::Unsafe(format!(
+                    "refusing to remove symlink {}",
+                    path.display()
+                )));
+            }
+            if !meta.is_dir() {
+                return Err(QualifyError::Unsafe(format!(
+                    "refusing to remove non-directory {}",
+                    path.display()
+                )));
+            }
+            fs::remove_dir_all(path).map_err(|e| QualifyError::Io(e.to_string()))
+        }
+    }
 }
 
 /// Commit qualification after caller has verified runtime + contract eligibility.
@@ -485,6 +521,31 @@ mod tests {
         commit_qualification(&update, &prev, "ignite-storage-v1").unwrap();
         let err = commit_qualification(&update, &prev, "ignite-storage-v1").unwrap_err();
         assert!(matches!(err, QualifyError::NotEligible(_)));
+        let _ = fs::remove_dir_all(update.parent().unwrap());
+    }
+
+    #[test]
+    fn contradictory_pending_removed_with_pending_present_refuses_without_deleting() {
+        let (update, prev) = temp_tree();
+        write_pending(&update, "txn-contradict");
+        fs::write(prev.join(LKG_INVENTORY_NAME), b"inventory\n").unwrap();
+        fs::write(prev.join(LKG_HANDLER_NAME), b"handler\n").unwrap();
+        write_journal(
+            &update,
+            &QualifyJournal {
+                pending_txn: "txn-contradict".into(),
+                pending_sha256: "ab".repeat(32),
+                storage_contract: "ignite-storage-v1".into(),
+                phase: QualifyPhase::PendingRemoved,
+            },
+        )
+        .unwrap();
+        let err = reconcile_interrupted_qualification(&update, &prev).unwrap_err();
+        assert!(matches!(err, QualifyError::Unsafe(_)), "{err}");
+        assert!(update.join(PENDING_NAME).exists());
+        assert!(prev.join(LKG_INVENTORY_NAME).exists());
+        assert!(prev.join(LKG_HANDLER_NAME).exists());
+        assert!(journal_path(&update).exists());
         let _ = fs::remove_dir_all(update.parent().unwrap());
     }
 }

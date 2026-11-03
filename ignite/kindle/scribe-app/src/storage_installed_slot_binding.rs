@@ -55,6 +55,12 @@ const INVENTORY_NAMES: [&str; 18] = [
     "appreg-handler.sql",
 ];
 
+/// Scoped identity retained beside the canonical 18-entry LKG inventory; never an inventory row.
+const STORAGE_CONTRACT_NAME: &str = "storage-contract.v1";
+const STORAGE_CONTRACT_ID: &str = "ignite-storage-v1";
+const STORAGE_CONTRACT_BYTES: &[u8] =
+    b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseRole {
     RetainedA,
@@ -845,7 +851,10 @@ fn verify_inventory_files(
 ) -> Result<(), SlotError> {
     let mut allowed = INVENTORY_NAMES.to_vec();
     allowed.push("ignite-lkg-inventory.v1");
+    // Optional scoped identity — content-verified when present; not part of entry_count=18.
+    allowed.push(STORAGE_CONTRACT_NAME);
     verify_closed_directory(retained_root, &allowed, "retained-release-directory")?;
+    verify_optional_storage_contract(retained_root, "retained-storage-contract")?;
     for name in INVENTORY_NAMES {
         let path = retained_root.join(name);
         match inventory.entries.get(name) {
@@ -864,12 +873,49 @@ fn verify_inventory_files(
     Ok(())
 }
 
+fn verify_optional_storage_contract(dir: &Path, label: &'static str) -> Result<(), SlotError> {
+    let path = dir.join(STORAGE_CONTRACT_NAME);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SlotError::Io(label)),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(SlotError::Unsafe(label));
+            }
+            let bytes = fs::read(&path).map_err(|_| SlotError::Io(label))?;
+            if bytes != STORAGE_CONTRACT_BYTES {
+                return Err(SlotError::Mismatch("storage-contract-invalid"));
+            }
+            // Reject non-canonical encodings even if bytes otherwise look similar.
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| SlotError::Invalid("storage-contract-noncanonical"))?;
+            if !text.ends_with('\n') || text.contains('\r') {
+                return Err(SlotError::Invalid("storage-contract-noncanonical"));
+            }
+            let id = text
+                .lines()
+                .find_map(|line| line.strip_prefix("storage_contract="))
+                .ok_or(SlotError::Invalid("storage-contract-noncanonical"))?;
+            if id != STORAGE_CONTRACT_ID {
+                return Err(SlotError::Mismatch("storage-contract-mismatch"));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn verify_candidate_closed_directories(config: &SlotBindingConfig) -> Result<(), SlotError> {
     verify_closed_directory(
         &config.app_root.join("bin"),
-        &["scribe-app", "scribe-lifecycle", "scribe-lifecycle-host.sh"],
+        &[
+            "scribe-app",
+            "scribe-lifecycle",
+            "scribe-lifecycle-host.sh",
+            STORAGE_CONTRACT_NAME,
+        ],
         "candidate-bin-directory",
     )?;
+    verify_optional_storage_contract(&config.app_root.join("bin"), "candidate-storage-contract")?;
     verify_closed_directory(
         &config.app_root.join("tools/ignite-release/lib"),
         &[
@@ -1849,6 +1895,26 @@ mod tests {
     }
 
     #[test]
+    fn retained_and_candidate_storage_contract_are_content_verified() {
+        let fixture = Fixture::new(ReleaseRole::CandidateB, 71);
+        let retained = fixture.config.app_root.join("previous-release");
+        let live_bin = fixture.config.app_root.join("bin");
+        fs::write(retained.join(STORAGE_CONTRACT_NAME), STORAGE_CONTRACT_BYTES).unwrap();
+        fs::write(live_bin.join(STORAGE_CONTRACT_NAME), STORAGE_CONTRACT_BYTES).unwrap();
+        assert_eq!(fixture.inspect().retained_inventory, "observed-match");
+
+        let fixture = Fixture::new(ReleaseRole::CandidateB, 72);
+        let retained = fixture.config.app_root.join("previous-release");
+        fs::write(retained.join(STORAGE_CONTRACT_NAME), b"forged-contract\n").unwrap();
+        assert_eq!(fixture.inspect().failure, "storage-contract-invalid");
+
+        let fixture = Fixture::new(ReleaseRole::CandidateB, 73);
+        let live_bin = fixture.config.app_root.join("bin");
+        fs::write(live_bin.join(STORAGE_CONTRACT_NAME), b"forged-contract\n").unwrap();
+        assert_eq!(fixture.inspect().failure, "storage-contract-invalid");
+    }
+
+    #[test]
     fn extra_duplicate_wrong_transaction_and_wrong_inventory_fail_closed() {
         let fixture = Fixture::new(ReleaseRole::CandidateB, 17);
         fs::write(fixture.config.app_root.join("bin/unregistered"), b"extra").unwrap();
@@ -1990,7 +2056,6 @@ mod tests {
     #[test]
     fn symlink_hardlink_special_file_and_parent_substitution_are_refused() {
         use std::os::unix::fs::symlink;
-        use std::os::unix::net::UnixListener;
 
         let fixture = Fixture::new(ReleaseRole::CandidateB, 26);
         let app = fixture.component("scribe-app");
@@ -2016,7 +2081,12 @@ mod tests {
         let fixture = Fixture::new(ReleaseRole::CandidateB, 29);
         let helper = fixture.component("backup-runtime");
         fs::remove_file(&helper).unwrap();
-        let _listener = UnixListener::bind(&helper).unwrap();
+        // Prefer a FIFO over AF_UNIX here: Docker temp roots can exceed SUN_LEN.
+        let fifo_status = std::process::Command::new("mkfifo")
+            .arg(&helper)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(fifo_status.success(), "mkfifo failed for special-file fixture");
         assert_eq!(fixture.inspect().result, "UNSAFE_INPUT");
 
         let fixture = Fixture::new(ReleaseRole::CandidateB, 30);

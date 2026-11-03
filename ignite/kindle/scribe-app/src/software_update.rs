@@ -1190,7 +1190,8 @@ mod tests {
 
     const INSTALL_VERSION: &str = "3.3.1";
     const INSTALL_TAG: &str = "v3.3.1";
-    const INSTALL_SCRIPTLET: &[u8] = b"#!/bin/sh\necho fixture-install\n";
+    const INSTALL_SCRIPTLET: &[u8] =
+        b"#!/bin/sh\nIGNITE_STORAGE_CONTRACT='ignite-storage-v1'\necho fixture-install\n";
 
     fn install_signing_key() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&[42_u8; 32])

@@ -188,22 +188,22 @@ fn two_update_qualify_journal_allows_second_install_preflight() {
     fs::write(prev.join("appreg-handler.sql"), b"handler\n").unwrap();
     fs::write(root.join("library.meta"), b"{\"v\":1,\"notebooks\":[]}\n").unwrap();
 
-    // Qualify B.
+    // Qualify B — retires pending, LKG metadata, and the retained A tree.
     update_qualification::commit_qualification(&update, &prev, STORAGE_CONTRACT_ID).unwrap();
     assert!(!update.join("pending-health.v1").exists());
-    assert!(!prev.join("ignite-lkg-inventory.v1").exists());
-    assert!(!prev.join("appreg-handler.sql").exists());
+    assert!(!prev.exists());
     // Notebook data untouched.
     assert_eq!(
         fs::read_to_string(root.join("library.meta")).unwrap(),
         "{\"v\":1,\"notebooks\":[]}\n"
     );
 
-    // Second install preflight: no pending, no ambiguous LKG.
+    // Second install preflight: no pending, no ambiguous LKG / retained A.
     assert!(!update.join("pending-health.v1").exists());
-    assert!(!prev.join("ignite-lkg-inventory.v1").exists());
+    assert!(!prev.exists());
 
-    // Simulate B→C pending again then crash after pending removal; reconcile must unblock.
+    // Simulate B→C retaining B, then crash after pending removal; reconcile must unblock.
+    fs::create_dir_all(&prev).unwrap();
     fs::write(update.join("pending-health.v1"), b"IGNITE_PENDING_HEALTH_V1\nschema=1\nstatus=pending-health\ncandidate_version=0.9.16\ncandidate_txn=txn-c\ncandidate_app_bytes=1\ncandidate_app_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncandidate_lifecycle_bytes=1\ncandidate_lifecycle_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nretained_release_identity=previous-release\nlkg_inventory_bytes=1\nlkg_inventory_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\ndata_compatibility=unknown\n").unwrap();
     fs::write(prev.join("ignite-lkg-inventory.v1"), b"inventory2\n").unwrap();
     fs::write(prev.join("appreg-handler.sql"), b"handler2\n").unwrap();
@@ -221,8 +221,7 @@ fn two_update_qualify_journal_allows_second_install_preflight() {
     fs::remove_file(update.join("pending-health.v1")).unwrap();
     // Exact crash window: journal still `prepared` while pending is already gone.
     update_qualification::reconcile_interrupted_qualification(&update, &prev).unwrap();
-    assert!(!prev.join("ignite-lkg-inventory.v1").exists());
-    assert!(!prev.join("appreg-handler.sql").exists());
+    assert!(!prev.exists());
     assert!(!update.join("ignite-qualify.journal").exists());
     assert_eq!(
         fs::read_to_string(root.join("library.meta")).unwrap(),
@@ -230,6 +229,7 @@ fn two_update_qualify_journal_allows_second_install_preflight() {
     );
 
     // Partial LKG cleanup safety: only inventory remains under pending_removed.
+    fs::create_dir_all(&prev).unwrap();
     fs::write(prev.join("ignite-lkg-inventory.v1"), b"leftover\n").unwrap();
     update_qualification::write_journal_for_test(
         &update,
@@ -242,7 +242,7 @@ fn two_update_qualify_journal_allows_second_install_preflight() {
     )
     .unwrap();
     update_qualification::reconcile_interrupted_qualification(&update, &prev).unwrap();
-    assert!(!prev.join("ignite-lkg-inventory.v1").exists());
+    assert!(!prev.exists());
     assert!(!update.join("ignite-qualify.journal").exists());
 
     let _ = fs::remove_dir_all(root);

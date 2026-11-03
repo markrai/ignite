@@ -2016,3 +2016,135 @@ def test_promotion_decision_boundary_excludes_actual_installer(
             decision.wait(timeout=5)
         host.kill()
         host.wait(timeout=5)
+
+def _qualify_journal_path(kindle: Path) -> Path:
+    return kindle / "scribe-app" / "state" / "update" / "ignite-qualify.journal"
+
+
+def _write_qualify_journal(kindle: Path, *, phase: str, txn: str = "txn-test") -> None:
+    path = _qualify_journal_path(kindle)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "IGNITE_QUALIFY_JOURNAL_V1\n"
+        "schema=1\n"
+        f"pending_txn={txn}\n"
+        f"pending_sha256={'ab' * 32}\n"
+        "storage_contract=ignite-storage-v1\n"
+        f"phase={phase}\n",
+        encoding="ascii",
+        newline="\n",
+    )
+
+
+def test_install_writes_live_and_retained_storage_contract(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "3.0.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.0.1")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    live_contract = kindle / "scribe-app" / "bin" / "storage-contract.v1"
+    assert live_contract.is_file()
+    assert "storage_contract=ignite-storage-v1\n" in live_contract.read_text(encoding="ascii")
+    assert _run_install(payload_b, kindle).returncode == 0
+    retained = kindle / "scribe-app" / "previous-release" / "storage-contract.v1"
+    assert retained.is_file()
+    assert retained.read_text(encoding="ascii") == live_contract.read_text(encoding="ascii")
+
+
+def test_legacy_a_rollback_removes_b_storage_contract(tmp_path: Path) -> None:
+    """Pre-contract retained A must not leave B's live contract after rollback."""
+    payload_a = make_payload(tmp_path / "src-a", "3.3.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.3.1")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    live_contract = kindle / "scribe-app" / "bin" / "storage-contract.v1"
+    assert live_contract.is_file()
+    # Simulate pre-contract Ignite A: strip live contract before upgrading.
+    live_contract.unlink()
+    assert not live_contract.exists()
+    bytes_a = (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes()
+    failed = _run_install(payload_b, kindle, {"IGNITE_FAIL_AT": "icon"})
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert (kindle / "scribe-app" / "bin" / "scribe-app").read_bytes() == bytes_a
+    assert not live_contract.exists(), "rollback to pre-contract A must remove B's contract"
+    assert not (kindle / "scribe-app" / "previous-release" / "storage-contract.v1").exists()
+
+
+def test_first_install_fault_after_contract_removes_incomplete_contract(tmp_path: Path) -> None:
+    payload = make_payload(tmp_path / "src", "3.4.0")
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    (kindle / "scribe-data" / "n").mkdir(parents=True)
+    (kindle / "scribe-data" / "n" / "page.meta").write_text("keep\n", encoding="utf-8")
+    failed = _run_install(payload, kindle, {"IGNITE_FAIL_AT": "icon"})
+    assert failed.returncode == 1
+    assert not (kindle / "scribe-app" / "bin" / "scribe-app").exists()
+    assert not (kindle / "scribe-app" / "bin" / "storage-contract.v1").exists()
+    assert (kindle / "scribe-data" / "n" / "page.meta").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_qualify_journal_prepared_pending_absent_recovers_before_guard(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "3.1.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.1.1")
+    payload_c = make_payload(tmp_path / "src-c", "3.1.2")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    (payload_c / "bin" / "scribe-app").write_bytes(
+        b"C" + (payload_c / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    assert _pending_path(kindle).is_file()
+    assert _inventory_path(kindle).is_file()
+    _pending_path(kindle).unlink()
+    _write_qualify_journal(kindle, phase="prepared")
+    # Notebook data must remain untouched across recovery + next install.
+    notebook = kindle / "scribe-data" / "library.meta"
+    notebook.parent.mkdir(parents=True, exist_ok=True)
+    notebook.write_text('{"v":1}\n', encoding="ascii")
+    recovered = _run_install(payload_c, kindle)
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not _qualify_journal_path(kindle).exists()
+    # Recovery retired A's LKG tree; C then retained qualified B and published new pending.
+    assert _pending_path(kindle).is_file()
+    assert _inventory_path(kindle).is_file()
+    retained = (kindle / "scribe-app" / "previous-release" / "scribe-app").read_bytes()
+    assert retained.startswith(b"B")
+    assert notebook.read_text(encoding="ascii") == '{"v":1}\n'
+
+
+def test_qualify_journal_contradiction_refuses_without_deleting_evidence(tmp_path: Path) -> None:
+    payload_a = make_payload(tmp_path / "src-a", "3.2.0")
+    payload_b = make_payload(tmp_path / "src-b", "3.2.1")
+    payload_c = make_payload(tmp_path / "src-c", "3.2.2")
+    (payload_b / "bin" / "scribe-app").write_bytes(
+        b"B" + (payload_b / "bin" / "scribe-app").read_bytes()
+    )
+    (payload_c / "bin" / "scribe-app").write_bytes(
+        b"C" + (payload_c / "bin" / "scribe-app").read_bytes()
+    )
+    kindle = tmp_path / "kindle"
+    (kindle / "documents").mkdir(parents=True)
+    assert _run_install(payload_a, kindle).returncode == 0
+    assert _run_install(payload_b, kindle).returncode == 0
+    pending = _pending_path(kindle).read_bytes()
+    inventory = _inventory_path(kindle).read_bytes()
+    _write_qualify_journal(kindle, phase="pending_removed")
+    refused = _run_install(payload_c, kindle)
+    assert refused.returncode != 0
+    assert "qualify_journal_contradiction" in (refused.stdout + refused.stderr) or (
+        "interrupted" in (refused.stdout + refused.stderr)
+    )
+    assert _pending_path(kindle).read_bytes() == pending
+    assert _inventory_path(kindle).read_bytes() == inventory
+    assert _qualify_journal_path(kindle).is_file()

@@ -900,6 +900,7 @@ mod unix_main {
             pause_seen: AtomicBool::new(false),
             go_seen: AtomicBool::new(false),
             load_seen: AtomicBool::new(false),
+            child_shutdown_confirmed: AtomicBool::new(false),
             launch_coordination: Some(coordination),
             degraded_decision_blocker: None,
             launch_coordination_failed: false,
@@ -959,6 +960,13 @@ mod unix_main {
         let code = acknowledge(lipc, prop, &payload);
         if !ok {
             state().log("unload_child_shutdown_budget_exceeded FAIL");
+            state()
+                .child_shutdown_confirmed
+                .store(false, Ordering::SeqCst);
+        } else {
+            state()
+                .child_shutdown_confirmed
+                .store(true, Ordering::SeqCst);
         }
         state().done.store(true, Ordering::SeqCst);
         state().log("lifecycle_done unload_ack_sent exiting");
@@ -1075,6 +1083,7 @@ mod unix_main {
             pause_seen: AtomicBool::new(false),
             go_seen: AtomicBool::new(false),
             load_seen: AtomicBool::new(false),
+            child_shutdown_confirmed: AtomicBool::new(false),
             launch_coordination,
             launch_coordination_failed: coordination_error.is_some(),
             degraded_decision_blocker,
@@ -1189,10 +1198,18 @@ mod unix_main {
 
         // 2) Deferred install intent takes precedence (reauth + sealed exec).
         match crate::deferred_install::load_intent(&update_dir) {
-            Ok(_) => match crate::deferred_install::run_deferred_install(&update_dir) {
-                Ok(()) => {}
-                Err(err) => state().log(&format!("deferred_install_failed detail={err}")),
-            },
+            Ok(_) => {
+                if !state().child_shutdown_confirmed.load(Ordering::SeqCst) {
+                    state().log(
+                        "deferred_install_skipped reason=child_shutdown_unconfirmed intent_preserved",
+                    );
+                    return;
+                }
+                match crate::deferred_install::run_deferred_install(&update_dir) {
+                    Ok(()) => {}
+                    Err(err) => state().log(&format!("deferred_install_failed detail={err}")),
+                }
+            }
             Err(crate::deferred_install::DeferredError::MissingIntent) => {
                 // 3) Otherwise attempt scoped qualification while host generation is live.
                 if let Err(err) = attempt_scoped_qualification(&update_dir, &previous) {
@@ -1219,17 +1236,7 @@ mod unix_main {
             "qualify_assessment overall_exit={}",
             report.exit_code()
         ));
-        // Scoped policy: require data_compatibility PASS in the report text.
-        let text = report.to_string();
-        if !text.contains("check.data_compatibility=PASS") {
-            return Err(
-                "data_compatibility not PASS under scoped storage-contract policy".into(),
-            );
-        }
-        // Keep promotion_authorized=false in assessment output; qualification only clears pending.
-        if !text.contains("promotion_authorized=false") {
-            return Err("assessment must remain promotion_authorized=false".into());
-        }
+        report.scoped_qualification_eligible()?;
         crate::qualification::commit_qualification(update_dir, previous, "ignite-storage-v1")
             .map_err(|e| e.to_string())?;
         state().log("qualify_committed pending_health_retired");

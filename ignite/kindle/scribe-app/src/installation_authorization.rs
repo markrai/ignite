@@ -2491,7 +2491,8 @@ mod tests {
         stage_fixture(&src, &staging, &key);
         let mut device = kindle_like_device(src.parent().unwrap());
         fs::create_dir_all(&device.app_root).unwrap();
-        let blocker = device.data_root.parent().unwrap().to_path_buf();
+        // File used as a directory prefix → symlink_metadata on the child returns ENOTDIR.
+        let blocker = device.data_root.parent().unwrap().join("block-file");
         fs::write(&blocker, b"blocking-file").unwrap();
         let inner = blocker.join("child");
         device.data_root = inner;

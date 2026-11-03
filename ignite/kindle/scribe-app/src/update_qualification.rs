@@ -243,12 +243,13 @@ pub fn reconcile_interrupted_qualification(
     let Some(journal) = load_journal(update_dir)? else {
         return Ok(());
     };
+    let pending_present = update_dir.join(PENDING_NAME).exists();
     match journal.phase {
         QualifyPhase::Prepared => {
             // Crash window: prepared journal but pending already removed before
             // pending_removed could be recorded. Finish LKG cleanup so install
             // preflight cannot stay stuck on ambiguous LKG-without-pending.
-            if !update_dir.join(PENDING_NAME).exists() {
+            if !pending_present {
                 finish_lkg_cleanup(previous_release_dir)?;
                 remove_if_present(&journal_path(update_dir))?;
                 if let Ok(dir) = File::open(update_dir) {
@@ -258,6 +259,12 @@ pub fn reconcile_interrupted_qualification(
             Ok(())
         }
         QualifyPhase::PendingRemoved | QualifyPhase::Complete => {
+            if pending_present {
+                return Err(QualifyError::Unsafe(format!(
+                    "contradictory qualify journal phase={} with pending-health still present; refusing without deleting evidence",
+                    journal.phase.as_str()
+                )));
+            }
             finish_lkg_cleanup(previous_release_dir)?;
             remove_if_present(&journal_path(update_dir))?;
             if let Ok(dir) = File::open(update_dir) {
@@ -271,7 +278,36 @@ pub fn reconcile_interrupted_qualification(
 fn finish_lkg_cleanup(previous_release_dir: &Path) -> Result<(), QualifyError> {
     remove_if_present(&previous_release_dir.join(LKG_INVENTORY_NAME))?;
     remove_if_present(&previous_release_dir.join(LKG_HANDLER_NAME))?;
+    // Retire the retained A tree so the next install snapshots live B instead of
+    // treating stale A as a same-generation recovery base.
+    remove_dir_if_present(previous_release_dir)?;
+    if let Some(parent) = previous_release_dir.parent() {
+        remove_dir_if_present(&parent.join("previous-release.prev"))?;
+        remove_dir_if_present(&parent.join("previous-release.staging"))?;
+    }
     Ok(())
+}
+
+fn remove_dir_if_present(path: &Path) -> Result<(), QualifyError> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(QualifyError::Io(e.to_string())),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(QualifyError::Unsafe(format!(
+                    "refusing to remove symlink {}",
+                    path.display()
+                )));
+            }
+            if !meta.is_dir() {
+                return Err(QualifyError::Unsafe(format!(
+                    "refusing to remove non-directory {}",
+                    path.display()
+                )));
+            }
+            fs::remove_dir_all(path).map_err(|e| QualifyError::Io(e.to_string()))
+        }
+    }
 }
 
 /// Commit qualification after caller has verified runtime + contract eligibility.

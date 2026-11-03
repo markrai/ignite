@@ -195,6 +195,9 @@ pub struct LifecycleState {
     pub pause_seen: AtomicBool,
     pub go_seen: AtomicBool,
     pub load_seen: AtomicBool,
+    /// Set after unload confirms the child has exited (or no child was running).
+    /// Deferred install must not begin while this is false.
+    pub child_shutdown_confirmed: AtomicBool,
     /// Present only when the host established all cross-process coordination primitives. If setup
     /// fails, ordinary launches remain available but every future decision boundary refuses.
     pub launch_coordination: Option<Arc<crate::launch_gate::HostLaunchCoordination>>,

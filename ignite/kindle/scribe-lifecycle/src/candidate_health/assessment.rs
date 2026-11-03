@@ -17,6 +17,9 @@ const INVENTORY_NAME: &str = "ignite-lkg-inventory.v1";
 const INVENTORY_HEADER: &str = "IGNITE_LKG_INVENTORY_V1";
 const INVENTORY_MAX_BYTES: u64 = 32 * 1024;
 const RETAINED_FILE_MAX_BYTES: u64 = EXECUTABLE_MAX_BYTES;
+/// Scoped identity file retained beside the 18-entry LKG inventory; never an inventory row.
+const STORAGE_CONTRACT_NAME: &str = "storage-contract.v1";
+const STORAGE_CONTRACT_ID: &str = "ignite-storage-v1";
 const REQUIRED_RETAINED: [&str; 3] = ["scribe-app", "scribe-lifecycle", "scribe-lifecycle-host.sh"];
 const RETAINED_ENTRIES: [&str; 18] = [
     "scribe-app",
@@ -140,6 +143,23 @@ pub struct PromotionAssessmentReport {
     mode: AssessmentMode,
 }
 
+/// Mandatory checks for scoped pending-health qualification (not capability certification).
+const SCOPED_QUALIFY_REQUIRED: &[&str] = &[
+    "decision_boundary",
+    "assessment_lock",
+    "pending_and_live_candidate",
+    "retained_release",
+    "ownership_record",
+    "evidence_identity",
+    "launch_ownership",
+    "lifecycle_generation",
+    "intentional_stop",
+    "readiness",
+    "post_ready_observation",
+    "data_compatibility",
+    "state_stability",
+];
+
 impl PromotionAssessmentReport {
     #[cfg(test)]
     fn overall(&self) -> PromotionAssessment {
@@ -167,6 +187,32 @@ impl PromotionAssessmentReport {
         self.checks.insert(0, check);
         self.overall = overall_for(&self.checks);
         self
+    }
+
+    /// Typed eligibility for scoped no-migration qualification.
+    ///
+    /// Requires every mandatory runtime / ownership / identity / boundary /
+    /// observation / retained-release / stability / storage-contract check to
+    /// PASS. Any FAIL or UNKNOWN on a required check refuses. Does not require
+    /// capability `coverage=complete`.
+    pub fn scoped_qualification_eligible(&self) -> Result<(), String> {
+        if !self.to_string().contains("promotion_authorized=false") {
+            return Err("assessment must remain promotion_authorized=false".into());
+        }
+        for name in SCOPED_QUALIFY_REQUIRED {
+            let Some(check) = self.checks.iter().find(|c| c.name == *name) else {
+                return Err(format!("required check {name} missing from assessment"));
+            };
+            if check.status != CheckStatus::Pass {
+                return Err(format!(
+                    "required check {name}={} class={} detail={}",
+                    check.status.as_str(),
+                    check.class,
+                    check.detail
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -579,16 +625,22 @@ fn compatibility_unknown() -> Check {
     )
 }
 
-/// Scoped no-migration updater policy: matching `storage-contract.v1` between the live
-/// candidate tree and retained previous-release. Does not claim capability coverage=complete.
+/// Scoped no-migration updater policy for `storage-contract.v1`.
+///
+/// - Matching live+retained contracts → PASS.
+/// - Retained contract **absent** (pre-contract Ignite A) with live `ignite-storage-v1` → PASS
+///   under the explicit legacy baseline. This does **not** claim A carried a contract and does
+///   **not** backfill a retained contract file.
+/// - Malformed/mismatched retained contract → FAIL (bootstrap/reinstall required).
+/// - Live contract missing/invalid → UNKNOWN.
+///
+/// Does not claim capability coverage=complete.
 fn evaluate_scoped_storage_contract(paths: &AssessmentPaths) -> Check {
-    const CONTRACT_NAME: &str = "storage-contract.v1";
-    const EXPECTED: &str = "ignite-storage-v1";
     let live = paths
         .app
         .parent()
-        .map(|bin| bin.join(CONTRACT_NAME))
-        .unwrap_or_else(|| PathBuf::from(CONTRACT_NAME));
+        .map(|bin| bin.join(STORAGE_CONTRACT_NAME))
+        .unwrap_or_else(|| PathBuf::from(STORAGE_CONTRACT_NAME));
     // Prefer contract beside binaries under app root / previous-release.
     let live_contract = if live.is_file() {
         live
@@ -596,13 +648,16 @@ fn evaluate_scoped_storage_contract(paths: &AssessmentPaths) -> Check {
         paths
             .previous_dir
             .parent()
-            .map(|app| app.join("bin").join(CONTRACT_NAME))
+            .map(|app| app.join("bin").join(STORAGE_CONTRACT_NAME))
             .unwrap_or(live)
     };
-    let retained = paths.previous_dir.join(CONTRACT_NAME);
-    match (read_contract_id(&live_contract), read_contract_id(&retained)) {
-        (Ok(live_id), Ok(retained_id))
-            if live_id == retained_id && live_id == EXPECTED =>
+    let retained = paths.previous_dir.join(STORAGE_CONTRACT_NAME);
+    match (
+        read_contract_presence(&live_contract),
+        read_contract_presence(&retained),
+    ) {
+        (ContractPresence::Present(live_id), ContractPresence::Present(retained_id))
+            if live_id == retained_id && live_id == STORAGE_CONTRACT_ID =>
         {
             Check::pass(
                 "data_compatibility",
@@ -611,34 +666,81 @@ fn evaluate_scoped_storage_contract(paths: &AssessmentPaths) -> Check {
                 ),
             )
         }
-        (Ok(live_id), Ok(retained_id)) => Check::fail(
+        (ContractPresence::Present(live_id), ContractPresence::Present(retained_id)) => {
+            Check::fail(
+                "data_compatibility",
+                "storage_contract_mismatch",
+                format!("live={live_id} retained={retained_id}; migrations unsupported"),
+            )
+        }
+        (ContractPresence::Present(live_id), ContractPresence::Absent) => {
+            if live_id == STORAGE_CONTRACT_ID {
+                // Narrow legacy baseline: pre-contract retained A never declared a contract.
+                // Accept once when live B carries the authenticated ignite-storage-v1 identity.
+                Check::pass(
+                    "data_compatibility",
+                    format!(
+                        "legacy_pre_contract_retained_a: live storage_contract={live_id}; retained {STORAGE_CONTRACT_NAME} absent (not backfilled); no-migration baseline accepted for first post-contract candidate"
+                    ),
+                )
+            } else {
+                Check::fail(
+                    "data_compatibility",
+                    "storage_contract_mismatch",
+                    format!(
+                        "live={live_id} retained=absent; unsupported live contract for legacy baseline"
+                    ),
+                )
+            }
+        }
+        (ContractPresence::Present(_), ContractPresence::Invalid(detail)) => Check::fail(
             "data_compatibility",
-            "storage_contract_mismatch",
-            format!("live={live_id} retained={retained_id}; migrations unsupported"),
+            "storage_contract_invalid",
+            format!(
+                "retained {STORAGE_CONTRACT_NAME} is present but invalid ({detail}); refusing without backfill — USB reinstall of a contract-aware release is required"
+            ),
         ),
-        (Err(live_err), Err(retained_err)) => Check::unknown(
+        (ContractPresence::Absent, ContractPresence::Absent) => Check::unknown(
             "data_compatibility",
             "policy_blocker",
             format!(
-                "scoped storage-contract unavailable live={live_err} retained={retained_err}; pending evidence still records data_compatibility=unknown"
+                "scoped storage-contract unavailable live and retained; pending evidence still records data_compatibility=unknown"
             ),
         ),
-        (Err(err), _) | (_, Err(err)) => Check::unknown(
+        (ContractPresence::Absent, _) | (ContractPresence::Invalid(_), _) => Check::unknown(
             "data_compatibility",
             "policy_blocker",
-            format!("scoped storage-contract incomplete: {err}"),
+            "scoped storage-contract incomplete on live candidate",
         ),
     }
 }
 
-fn read_contract_id(path: &Path) -> Result<String, String> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+#[derive(Debug)]
+enum ContractPresence {
+    Present(String),
+    Absent,
+    Invalid(String),
+}
+
+fn read_contract_presence(path: &Path) -> ContractPresence {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return ContractPresence::Absent,
+        Err(error) => return ContractPresence::Invalid(error.to_string()),
+    };
     if meta.file_type().is_symlink() {
-        return Err("symlink refused".into());
+        return ContractPresence::Invalid("symlink refused".into());
     }
     if !meta.is_file() {
-        return Err("not a regular file".into());
+        return ContractPresence::Invalid("not a regular file".into());
     }
+    match read_contract_id_from_file(path) {
+        Ok(id) => ContractPresence::Present(id),
+        Err(detail) => ContractPresence::Invalid(detail),
+    }
+}
+
+fn read_contract_id_from_file(path: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     if !text.ends_with('\n') || text.contains('\r') {
         return Err("non-canonical encoding".into());
@@ -652,6 +754,21 @@ fn read_contract_id(path: &Path) -> Result<String, String> {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "missing storage_contract".into())
+}
+
+fn verify_retained_storage_contract_file(path: &Path) -> Result<(), EvidenceError> {
+    match read_contract_presence(path) {
+        ContractPresence::Present(id) if id == STORAGE_CONTRACT_ID => Ok(()),
+        ContractPresence::Present(id) => Err(invalid(format!(
+            "retained {STORAGE_CONTRACT_NAME} has unsupported storage_contract={id}"
+        ))),
+        ContractPresence::Absent => Err(invalid(format!(
+            "retained {STORAGE_CONTRACT_NAME} vanished during validation"
+        ))),
+        ContractPresence::Invalid(detail) => Err(invalid(format!(
+            "retained {STORAGE_CONTRACT_NAME} invalid: {detail}"
+        ))),
+    }
 }
 
 fn load_pending(paths: &AssessmentPaths) -> Result<PendingAssessment, EvidenceError> {
@@ -886,6 +1003,8 @@ fn validate_retained(
 fn validate_retained_tree(previous_dir: &Path) -> Result<(), EvidenceError> {
     let mut allowed: BTreeSet<&str> = RETAINED_ENTRIES.into_iter().collect();
     allowed.insert(INVENTORY_NAME);
+    // Optional scoped identity — verified when present; never an LKG inventory entry.
+    allowed.insert(STORAGE_CONTRACT_NAME);
     let mut seen = BTreeSet::new();
     for entry in fs::read_dir(previous_dir)? {
         let entry = entry?;
@@ -903,6 +1022,9 @@ fn validate_retained_tree(previous_dir: &Path) -> Result<(), EvidenceError> {
             return Err(invalid(format!(
                 "retained release path {name:?} is not a regular file"
             )));
+        }
+        if name == STORAGE_CONTRACT_NAME {
+            verify_retained_storage_contract_file(&entry.path())?;
         }
         seen.insert(name);
     }
@@ -1252,6 +1374,123 @@ mod tests {
     }
 
     #[test]
+    fn scoped_qualification_refuses_when_data_compat_passes_but_health_fails() {
+        let tree = AssessmentTree::new();
+        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        fs::write(tree.paths.app.parent().unwrap().join("storage-contract.v1"), contract).unwrap();
+        fs::write(
+            tree.paths.previous_dir.join("storage-contract.v1"),
+            contract,
+        )
+        .unwrap();
+        // Corrupt durable evidence so a required health check fails while data_compat PASSes.
+        let evidence_path = tree.paths.update_dir.join(EVIDENCE_NAME);
+        let mut evidence = fs::read_to_string(&evidence_path).unwrap();
+        evidence = evidence.replacen("ready=true", "ready=false", 1);
+        fs::write(&evidence_path, evidence).unwrap();
+
+        let pending_before = fs::read(tree.paths.update_dir.join(PENDING_NAME)).unwrap();
+        let inventory_before =
+            fs::read(tree.paths.previous_dir.join(INVENTORY_NAME)).unwrap();
+        let report = tree
+            .assess_under_boundary(LAUNCH)
+            .record_boundary_confirmation(LAUNCH, Ok(()));
+        assert_eq!(
+            report.check("data_compatibility").status,
+            CheckStatus::Pass,
+            "fixture must keep data_compatibility PASS"
+        );
+        let err = report.scoped_qualification_eligible().unwrap_err();
+        assert!(
+            err.contains("required check"),
+            "expected required-check refusal, got {err}"
+        );
+        assert_eq!(
+            fs::read(tree.paths.update_dir.join(PENDING_NAME)).unwrap(),
+            pending_before,
+            "pending-health must remain untouched"
+        );
+        assert_eq!(
+            fs::read(tree.paths.previous_dir.join(INVENTORY_NAME)).unwrap(),
+            inventory_before,
+            "LKG inventory must remain untouched"
+        );
+    }
+
+    #[test]
+    fn retained_tree_accepts_valid_storage_contract_outside_inventory() {
+        let tree = AssessmentTree::new();
+        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        fs::write(
+            tree.paths.previous_dir.join(STORAGE_CONTRACT_NAME),
+            contract,
+        )
+        .unwrap();
+        validate_retained_tree(&tree.paths.previous_dir).expect("valid contract must be allowed");
+        // Inventory stays the canonical 18-entry format.
+        let inventory = fs::read(tree.paths.previous_dir.join(INVENTORY_NAME)).unwrap();
+        validate_inventory_bytes(&tree.paths.previous_dir, &inventory).unwrap();
+        assert!(!std::str::from_utf8(&inventory)
+            .unwrap()
+            .contains(STORAGE_CONTRACT_NAME));
+    }
+
+    #[test]
+    fn retained_tree_rejects_malformed_storage_contract() {
+        let tree = AssessmentTree::new();
+        fs::write(
+            tree.paths.previous_dir.join(STORAGE_CONTRACT_NAME),
+            b"not-a-contract\n",
+        )
+        .unwrap();
+        let err = validate_retained_tree(&tree.paths.previous_dir).unwrap_err();
+        assert!(
+            err.to_string().contains(STORAGE_CONTRACT_NAME),
+            "expected contract validation failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_absent_retained_contract_passes_data_compat_without_backfill() {
+        let tree = AssessmentTree::new();
+        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        fs::write(tree.paths.app.parent().unwrap().join(STORAGE_CONTRACT_NAME), contract)
+            .unwrap();
+        assert!(!tree
+            .paths
+            .previous_dir
+            .join(STORAGE_CONTRACT_NAME)
+            .exists());
+        let check = evaluate_scoped_storage_contract(&tree.paths);
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(
+            check.detail.contains("legacy_pre_contract_retained_a"),
+            "expected explicit legacy baseline detail, got {}",
+            check.detail
+        );
+        assert!(
+            !tree.paths.previous_dir.join(STORAGE_CONTRACT_NAME).exists(),
+            "must not backfill an unauthenticated retained contract"
+        );
+    }
+
+    #[test]
+    fn invalid_retained_contract_fails_data_compat() {
+        let tree = AssessmentTree::new();
+        let contract = b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=ignite-storage-v1\n";
+        fs::write(tree.paths.app.parent().unwrap().join(STORAGE_CONTRACT_NAME), contract)
+            .unwrap();
+        fs::write(
+            tree.paths.previous_dir.join(STORAGE_CONTRACT_NAME),
+            b"IGNITE_STORAGE_CONTRACT_V1\nschema=1\nstorage_contract=other-v2\n",
+        )
+        .unwrap();
+        let check = evaluate_scoped_storage_contract(&tree.paths);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.class, "storage_contract_mismatch");
+    }
+
+    #[test]
     fn valid_runtime_evidence_requires_explicit_compatibility_review() {
         let tree = AssessmentTree::new();
         let report = tree.assess();
@@ -1554,5 +1793,279 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             before_retained_names
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod installer_retained_assessment {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        fn repo_root() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .canonicalize()
+                .expect("repo root")
+        }
+
+        fn install_runtime_sh() -> PathBuf {
+            repo_root().join("deployment/kindle/lib/install-runtime.sh")
+        }
+
+        fn write_file(path: &Path, body: &str) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, body.as_bytes()).unwrap();
+        }
+
+        fn write_exec(path: &Path, body: &[u8]) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, body).unwrap();
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        fn make_payload(root: &Path, version: &str, app_marker: &[u8]) -> PathBuf {
+            let pkg = root.join(format!("Ignite-Kindle-{version}"));
+            write_exec(pkg.join("bin/scribe-app").as_path(), app_marker);
+            write_exec(
+                pkg.join("bin/scribe-lifecycle").as_path(),
+                format!("lifecycle-{version}\n").as_bytes(),
+            );
+            write_file(
+                &pkg.join("host/scribe-lifecycle-host.sh"),
+                "#!/bin/sh\n\
+exec /mnt/us/scribe-app/bin/scribe-lifecycle --host \\\n\
+  --service com.markrai.ignite \\\n\
+  --child /mnt/us/scribe-app/bin/scribe-app -- \\\n\
+  --confirm-write --data-dir /mnt/us/scribe-data \\\n\
+  --sync-dir /mnt/us/scribe-app/state/sync \\\n\
+  --device-dir /mnt/us/scribe-app/state/device\n",
+            );
+            write_file(&pkg.join("launcher/Scribe.sh"), "#!/bin/sh\n# Name: Ignite\n");
+            write_file(
+                &pkg.join("Uninstall-Ignite.sh"),
+                "#!/bin/sh\n# Name: Uninstall Ignite\nok\n",
+            );
+            write_file(
+                &pkg.join("Backup-Ignite-Data.sh"),
+                "#!/bin/sh\n# Name: Backup Ignite Data\nok\n",
+            );
+            write_file(
+                &pkg.join("Diagnose-Ignite.sh"),
+                "#!/bin/sh\n# Name: Diagnose Ignite\nok\n",
+            );
+            write_file(
+                &pkg.join("registration/ignite.json"),
+                "{ \"def\": \"interface\", \"assoc\": { \"interface\": \"application\" } },\n\
+{\n\
+  \"def\": \"handlerId\",\n\
+  \"assoc\": {\n\
+    \"handlerId\": \"com.markrai.ignite\",\n\
+    \"props\": {\n\
+      \"lipcId\": \"com.markrai.ignite\",\n\
+      \"command\": \"/mnt/us/scribe-app/bin/scribe-lifecycle-host.sh\"\n\
+    }\n\
+  }\n\
+}\n",
+            );
+            for name in [
+                "assets/licenses/noto-emoji/OFL.txt",
+                "assets/licenses/source-sans-3/OFL.txt",
+                "lib/install-runtime.sh",
+                "lib/uninstall-runtime.sh",
+                "lib/backup-runtime.sh",
+                "lib/register-helpers.sh",
+                "lib/install-recovery.sh",
+                "assets/licenses/noto-emoji/DESCRIPTION.en_us.html",
+                "assets/licenses/noto-emoji/upstream_info.md",
+            ] {
+                write_file(&pkg.join(name), &format!("# {name}\nok\n"));
+            }
+            // Recovery binary presence is required; ELF class checks are skipped in this fixture.
+            let dropbear = b"dropbear-stub";
+            write_exec(pkg.join("recovery/bin/dropbearmulti").as_path(), dropbear);
+            write_file(
+                &pkg.join("recovery/manifest/elf.sha256"),
+                &format!("{}\n", sha256_bytes(dropbear)),
+            );
+            write_file(
+                &pkg.join("recovery/manifest/provenance.txt"),
+                "name=dropbearmulti\nrole=test-stub\n",
+            );
+            write_file(&pkg.join("recovery/manifest/version"), "test\n");
+            write_exec(pkg.join("assets/scribe-icon.png").as_path(), b"PNG");
+            pkg
+        }
+
+        fn write_lock_helper(kindle: &Path) -> PathBuf {
+            let helper = kindle.join(".test-bin/updater-lock-helper.sh");
+            write_file(
+                &helper,
+                "#!/bin/sh\n\
+if test \"$1\" = \"--verify-updater-transaction-lock\"; then exit 0; fi\n\
+test \"$1\" = \"--with-updater-transaction-lock\" || exit 64\n\
+shift\n\
+test \"$1\" = \"--\" || exit 64\n\
+shift\n\
+IGNITE_UPDATER_LOCK_HELD=1\n\
+IGNITE_UPDATER_LOCK_FD=0\n\
+export IGNITE_UPDATER_LOCK_HELD IGNITE_UPDATER_LOCK_FD\n\
+exec \"$@\"\n",
+            );
+            let mut perms = fs::metadata(&helper).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&helper, perms).unwrap();
+            helper
+        }
+
+        fn run_install(payload: &Path, kindle: &Path) {
+            fs::create_dir_all(kindle.join("documents")).unwrap();
+            let helper = write_lock_helper(kindle);
+            let app = kindle.join("scribe-app");
+            let status = Command::new("sh")
+                .arg(install_runtime_sh())
+                .arg(payload)
+                .env("IGNITE_APP_ROOT", &app)
+                .env("IGNITE_DATA_DIR", kindle.join("scribe-data"))
+                .env("IGNITE_DOCS", kindle.join("documents"))
+                .env("IGNITE_US_ROOT", kindle)
+                .env("IGNITE_SKIP_SH_CHECK", "1")
+                .env("IGNITE_SKIP_PROC_CHECK", "1")
+                .env("IGNITE_SKIP_BIN_SMOKE", "1")
+                .env("IGNITE_SKIP_SU_CHECK", "1")
+                .env("IGNITE_SKIP_REGISTER", "1")
+                .env("IGNITE_SKIP_APPREG_BACKUP", "1")
+                .env("IGNITE_SKIP_ELF_CHECK", "1")
+                .env("IGNITE_SKIP_SPACE_CHECK", "1")
+                .env("IGNITE_RECOVERY_ALLOW_NONROOT", "1")
+                .env("IGNITE_RECOVERY_SKIP_CHOWN", "1")
+                .env(
+                    "IGNITE_RECOVERY_ROOT",
+                    kindle.join("var/local/ignite-recovery"),
+                )
+                .env("IGNITE_UPDATER_LOCK_HELPER", &helper)
+                .output()
+                .expect("spawn install-runtime");
+            assert!(
+                status.status.success(),
+                "install failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+
+        #[test]
+        fn contract_aware_upgrade_retained_tree_passes_assessment() {
+            let root = std::env::temp_dir().join(format!(
+                "ignite-installer-assess-{}-{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let payload_a = make_payload(&root.join("src-a"), "9.0.0", b"AAAA");
+            let payload_b = make_payload(&root.join("src-b"), "9.0.1", b"BBBB");
+            let kindle = root.join("kindle");
+            run_install(&payload_a, &kindle);
+            run_install(&payload_b, &kindle);
+
+            let app_root = kindle.join("scribe-app");
+            let previous = app_root.join("previous-release");
+            let live_contract = app_root.join("bin").join(STORAGE_CONTRACT_NAME);
+            let retained_contract = previous.join(STORAGE_CONTRACT_NAME);
+            assert!(live_contract.is_file(), "live contract missing");
+            assert!(retained_contract.is_file(), "retained contract missing");
+            assert_eq!(
+                fs::read(&live_contract).unwrap(),
+                fs::read(&retained_contract).unwrap()
+            );
+
+            validate_retained_tree(&previous)
+                .expect("real installer retained tree must pass assessment allowlist");
+            let inventory = fs::read(previous.join(INVENTORY_NAME)).unwrap();
+            validate_inventory_bytes(&previous, &inventory)
+                .expect("canonical 18-entry inventory must still validate");
+            assert!(
+                !std::str::from_utf8(&inventory)
+                    .unwrap()
+                    .contains(STORAGE_CONTRACT_NAME),
+                "contract must remain outside entry_count=18 inventory"
+            );
+
+            let paths = AssessmentPaths {
+                update_dir: app_root.join("state/update"),
+                app: app_root.join("bin/scribe-app"),
+                lifecycle: app_root.join("bin/scribe-lifecycle"),
+                previous_dir: previous,
+            };
+            let check = evaluate_scoped_storage_contract(&paths);
+            assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+            assert!(
+                check.detail.contains("matches live and retained"),
+                "expected matching-contract PASS, got {}",
+                check.detail
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn pre_contract_a_upgrade_uses_legacy_baseline_without_backfill() {
+            let root = std::env::temp_dir().join(format!(
+                "ignite-installer-legacy-{}-{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let payload_a = make_payload(&root.join("src-a"), "9.1.0", b"AAAA");
+            let payload_b = make_payload(&root.join("src-b"), "9.1.1", b"BBBB");
+            let kindle = root.join("kindle");
+            run_install(&payload_a, &kindle);
+            // Simulate a pre-contract Ignite A installation: strip the live contract
+            // before upgrading so the snapshot cannot copy an authenticated A claim.
+            let live_contract = kindle
+                .join("scribe-app/bin")
+                .join(STORAGE_CONTRACT_NAME);
+            assert!(live_contract.is_file());
+            fs::remove_file(&live_contract).unwrap();
+            run_install(&payload_b, &kindle);
+
+            let app_root = kindle.join("scribe-app");
+            let previous = app_root.join("previous-release");
+            assert!(
+                !previous.join(STORAGE_CONTRACT_NAME).exists(),
+                "pre-contract A must not gain a backfilled retained contract"
+            );
+            assert!(app_root.join("bin").join(STORAGE_CONTRACT_NAME).is_file());
+
+            validate_retained_tree(&previous)
+                .expect("legacy retained tree without contract must still validate");
+            let inventory = fs::read(previous.join(INVENTORY_NAME)).unwrap();
+            validate_inventory_bytes(&previous, &inventory).unwrap();
+
+            let paths = AssessmentPaths {
+                update_dir: app_root.join("state/update"),
+                app: app_root.join("bin/scribe-app"),
+                lifecycle: app_root.join("bin/scribe-lifecycle"),
+                previous_dir: previous.clone(),
+            };
+            let check = evaluate_scoped_storage_contract(&paths);
+            assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+            assert!(
+                check.detail.contains("legacy_pre_contract_retained_a"),
+                "expected legacy baseline PASS, got {}",
+                check.detail
+            );
+            assert!(
+                !previous.join(STORAGE_CONTRACT_NAME).exists(),
+                "assessment must not invent a retained contract file"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }

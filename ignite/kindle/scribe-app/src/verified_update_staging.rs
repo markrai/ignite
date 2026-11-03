@@ -809,12 +809,7 @@ pub fn stage_verified_update(request: &StageRequest) -> Result<StageResult, Stag
     let (auth, mut observations) = authenticate_assets_dir(&assets, &names, request, observations)?;
 
     let scriptlet_path = assets.join(&names.scriptlet);
-    {
-        let mut file = File::open(&scriptlet_path)?;
-        auth.release()
-            .verify_installer(auth.release().installer_filename(), &mut file)
-            .map_err(|e| StagingError::ScriptletVerify(e.to_string()))?;
-    }
+    verify_scriptlet_stream_and_materialize_contract(&auth, &assets, &scriptlet_path)?;
     observations.scriptlet_verified = true;
 
     if !observations.publication_claims_validated {
@@ -889,12 +884,7 @@ fn revalidate_published_assets(
     }
 
     let scriptlet_path = assets.join(&names.scriptlet);
-    {
-        let mut file = File::open(&scriptlet_path)?;
-        auth.release()
-            .verify_installer(auth.release().installer_filename(), &mut file)
-            .map_err(|e| StagingError::ScriptletVerify(e.to_string()))?;
-    }
+    verify_scriptlet_stream_and_materialize_contract(&auth, &assets, &scriptlet_path)?;
     observations.scriptlet_verified = true;
     if !observations.publication_claims_validated {
         return Err(StagingError::ClaimsNotValidated);
@@ -967,6 +957,24 @@ fn read_bounded_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>
         ));
     }
     Ok(buf)
+}
+
+/// Stream-verify the full installer digest, then materialize the storage contract
+/// from a bounded SFX shell-prefix read (never `fs::read` of the complete Scriptlet).
+fn verify_scriptlet_stream_and_materialize_contract(
+    auth: &AuthenticatedPublicationChain,
+    assets: &Path,
+    scriptlet_path: &Path,
+) -> Result<(), StagingError> {
+    let mut file = File::open(scriptlet_path)?;
+    auth.release()
+        .verify_installer(auth.release().installer_filename(), &mut file)
+        .map_err(|e| StagingError::ScriptletVerify(e.to_string()))?;
+    let prefix = crate::storage_contract::read_sfx_shell_prefix_from_path(scriptlet_path)
+        .map_err(|e| StagingError::ScriptletVerify(format!("storage-contract prefix read: {e}")))?;
+    crate::storage_contract::materialize_contract_from_authenticated_scriptlet(assets, &prefix)
+        .map_err(|e| StagingError::ScriptletVerify(format!("storage-contract materialize: {e}")))?;
+    Ok(())
 }
 
 fn authenticate_assets_dir(
@@ -1513,7 +1521,8 @@ mod tests {
 
     const VERSION: &str = "3.3.1";
     const TAG: &str = "v3.3.1";
-    const INSTALLER: &[u8] = b"#!/bin/sh\necho fixture-scriptlet\n";
+    const INSTALLER: &[u8] =
+        b"#!/bin/sh\nIGNITE_STORAGE_CONTRACT='ignite-storage-v1'\necho fixture-scriptlet\n";
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[11_u8; 32])
