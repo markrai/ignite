@@ -25,7 +25,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "backup-archive"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "backup-export",
  "crc32fast",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "backup-export"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "portable-backup",
  "scribe-sync-server",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "backup-restore"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "backup-archive",
  "backup-export",
@@ -134,7 +134,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "control-protocol"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "ink-probe"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "kindle-platform",
  "notebook-core",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "kindle-platform"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "libc",
  "notebook-core",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "nbk-reader"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "notebook-core"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "uuid",
 ]
@@ -845,7 +845,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "portable-backup"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "scribe-sync-server",
  "serde",
@@ -931,7 +931,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scribe-app"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "control-protocol",
  "ctrlc",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "scribe-lifecycle"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "libc",
  "libloading",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "scribe-server"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "backup-archive",
  "backup-export",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "scribe-sync-server"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "getrandom 0.3.4",
  "http-body-util",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "scribe-sync-tool"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "kindle-platform",
  "notebook-core",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "scribe-web-wasm"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "notebook-core",
  "serde",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "sync-engine"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "notebook-core",
  "serde",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "sync-protocol"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "serde",
  "serde_json",
