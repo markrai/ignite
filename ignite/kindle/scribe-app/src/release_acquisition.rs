@@ -191,10 +191,11 @@ impl GithubReleaseOrigin {
         if asset_name.contains('/') || asset_name.contains('\\') || asset_name.contains("..") {
             return Err(AcquisitionError::UnsafePath(asset_name.to_string()));
         }
-        // Percent-encode spaces in Scriptlet names.
-        let encoded = asset_name.replace(' ', "%20");
+        // GitHub Releases substitutes '.' for spaces in uploaded asset names.
+        // Keep the logical Scriptlet contract name locally; rewrite only the URL.
+        let github_name = asset_name.replace(' ', ".");
         Ok(format!(
-            "https://github.com/{}/{}/releases/download/{tag}/{encoded}",
+            "https://github.com/{}/{}/releases/download/{tag}/{github_name}",
             self.owner, self.repo
         ))
     }
@@ -851,7 +852,8 @@ mod tests {
             .asset_url("v3.3.1", "Install Ignite v3.3.1.sh")
             .expect("url");
         assert!(url.starts_with("https://github.com/acme/ignite/releases/download/v3.3.1/"));
-        assert!(url.contains("Install%20Ignite%20v3.3.1.sh"));
+        assert!(url.ends_with("/Install.Ignite.v3.3.1.sh"));
+        assert!(!url.contains("%20"));
         assert!(origin.asset_url("v3.3.1", "../x").is_err());
     }
 

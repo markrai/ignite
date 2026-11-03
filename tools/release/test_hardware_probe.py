@@ -40,6 +40,7 @@ def _inventory_block(
     updater_cli: str = "absent",
     unprov: int = 0,
     schema: int = 0,
+    pin_match: int = 0,
     notebooks: int = 437,
     lib_hash: str = "3b78114bd3cb70447eba9fd2372802bad8710429fc69c94e9880a7018cb65f3d",
 ) -> str:
@@ -52,6 +53,7 @@ def _inventory_block(
         f"UNPROVISIONED_count={unprov}\n"
         "stage_cli_count=0\n"
         f"manifest_schema_count={schema}\n"
+        f"official_pin_hex_count={pin_match}\n"
         "notebook_dirs=26\n"
         f"notebook_files={notebooks}\n"
         f"library_meta_sha256={lib_hash}\n"
@@ -178,6 +180,52 @@ class HardwareProbeUnitTests(unittest.TestCase):
             self.assertTrue(
                 any("NOT_RUN_SAFETY_BOUNDARY" in c for c in report.case_results)
             )
+
+    def test_pin_provisioned_device_authorizes_first_publish(self) -> None:
+        def runner(script: str) -> str:
+            if "scribe_app_present" in script:
+                # Help text may still contain UNPROVISIONED; pin hex match wins.
+                return _inventory_block(
+                    updater_cli="present", unprov=4, schema=1, pin_match=1
+                )
+            return _identity_block()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = KindleSshHardwareProbe(
+                ssh_host="kindle",
+                evidence_dir=Path(tmp),
+                repo_pin_hex="0a0bb4e13814b5faf7656143cddcda6bdfc68092a490c91af64cbff157407dc8",
+                run_script=runner,
+            )
+            report = probe.evaluate(device_id=_DEVICE, public_key_hex="ab" * 32)
+            self.assertTrue(report.pre_release_ready)
+            self.assertTrue(report.arm_package_embeds_pin)
+            self.assertTrue(report.production_evidence)
+            self.assertTrue(report.authorizes_publication)
+            self.assertEqual("PIN_PROVISIONED_MATCHED", report.embedded_pin_state)
+            self.assertTrue(
+                any(c.startswith("T14|PASS|") for c in report.case_results)
+            )
+
+    def test_unprovisioned_binary_never_authorizes_even_with_repo_pin(self) -> None:
+        def runner(script: str) -> str:
+            if "scribe_app_present" in script:
+                return _inventory_block(
+                    updater_cli="present", unprov=3, schema=2, pin_match=0
+                )
+            return _identity_block()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = KindleSshHardwareProbe(
+                ssh_host="kindle",
+                evidence_dir=Path(tmp),
+                repo_pin_hex="0a0bb4e13814b5faf7656143cddcda6bdfc68092a490c91af64cbff157407dc8",
+                run_script=runner,
+            )
+            report = probe.evaluate(device_id=_DEVICE, public_key_hex="ab" * 32)
+            self.assertFalse(report.production_evidence)
+            self.assertFalse(report.authorizes_publication)
+            self.assertEqual("UNPROVISIONED", report.embedded_pin_state)
 
     def test_doctor_connectivity_mismatch(self) -> None:
         def runner(_script: str) -> str:
