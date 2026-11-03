@@ -54,7 +54,9 @@ die() { echo "promote-release.sh: $*" >&2; exit 1; }
 _linux_server_version() {
   local bin="$1"
   local got=""
-  if got="$("$bin" --version 2>/dev/null | tr -d '[:space:]')" && [ -n "$got" ]; then
+  # Native probe first. Keep stderr visible so a failed ELF exec (e.g. Windows
+  # Git Bash) diagnoses why we fall through; do not swallow API/tool errors.
+  if got="$("$bin" --version | tr -d '[:space:]')" && [ -n "$got" ]; then
     printf '%s\n' "$got"
     return 0
   fi
@@ -73,9 +75,11 @@ if ":" in rest:
 print("/mnt/" + drive + rest)
 ' "$bin"
     )" || return 1
+    # WSL stderr stays visible for mapping/exec failures; pipefail + empty
+    # stdout still fail closed before the caller accepts a version string.
     got="$(
       wsl.exe -e bash -lc "chmod +x $(printf '%q' "$wsl_bin") && $(printf '%q' "$wsl_bin") --version" \
-        2>/dev/null | tr -d '[:space:]'
+        | tr -d '[:space:]'
     )" || return 1
     [ -n "$got" ] || return 1
     printf '%s\n' "$got"
