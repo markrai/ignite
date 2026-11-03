@@ -425,7 +425,9 @@ mkdir -p "$NOTMO"
 for f in /usr/bin/* /bin/*; do
   b="$(basename "$f")"
   case "$b" in timeout|gtimeout) continue ;; esac
-  [ -e "$NOTMO/$b" ] || ln -s "$f" "$NOTMO/$b"
+  # /usr/bin and /bin often share basenames; force-replace to avoid
+  # "ln: ... Already exists" races on busy runners.
+  ln -sfn "$f" "$NOTMO/$b"
 done
 make_timeout_shim() { # make_timeout_shim <name> → $CASE/tmo/<name> logs its argv, then bounds for real
   mkdir -p "$CASE/tmo"

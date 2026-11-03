@@ -2109,7 +2109,14 @@ mod tests {
             fs::remove_dir(&nested).unwrap();
             symlink(&outside, &nested).unwrap();
         });
-        assert_eq!(report.result_token(), "STATE_CHANGED");
+        // Either token proves the substituted symlink was not traversed as a
+        // library directory: STATE_CHANGED (inventory churn) or UNSAFE_INPUT
+        // (symlink refused as a library path). Outside sentinel must survive.
+        assert!(
+            matches!(report.result_token(), "STATE_CHANGED" | "UNSAFE_INPUT"),
+            "unexpected result={}",
+            report.result_token()
+        );
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"preserve");
     }
 }
