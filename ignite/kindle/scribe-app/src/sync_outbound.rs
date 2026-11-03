@@ -199,7 +199,7 @@ struct BaseStateV2 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum RecordKind {
+pub(crate) enum RecordKind {
     Op,
     Prep,
     Commit,
@@ -208,13 +208,13 @@ enum RecordKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutboxRecordV1 {
-    v: u32,
-    kind: RecordKind,
-    seq: u64,
+pub(crate) struct OutboxRecordV1 {
+    pub(crate) v: u32,
+    pub(crate) kind: RecordKind,
+    pub(crate) seq: u64,
     /// Exact canonical envelope bytes (UTF-8 JSON text) for `op` / `prep`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    envelope: Option<String>,
+    pub(crate) envelope: Option<String>,
 }
 
 /// A committed, not yet acknowledged operation.
@@ -277,60 +277,41 @@ pub(crate) struct ParsedJournal {
     pub torn_tail: bool,
 }
 
-pub(crate) fn parse_journal(raw: &[u8]) -> Result<ParsedJournal, String> {
-    parse_journal_from(raw)
+/// Pure transaction-state core shared by the production journal reader and the bounded,
+/// read-only storage inspector. It owns no file descriptor and performs no persistence work.
+#[derive(Debug, Default)]
+pub(crate) struct JournalParser {
+    out: ParsedJournal,
+    open_prep: Option<PendingOp>,
 }
 
-/// Streamed [`parse_journal`]: one record in memory at a time (a large backlog is never held
-/// twice, as raw bytes and parsed).
-fn parse_journal_from(mut r: impl std::io::BufRead) -> Result<ParsedJournal, String> {
-    let mut out = ParsedJournal::default();
-    let mut open_prep: Option<PendingOp> = None;
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let n = r
-            .read_until(b'\n', &mut line)
-            .map_err(|e| format!("read outbox: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        if line.last() != Some(&b'\n') {
-            // Last line without its newline: never acknowledged as durable.
-            out.torn_tail = true;
-            break;
-        }
-        line.pop();
-        if line.is_empty() {
-            continue;
-        }
-        let rec: OutboxRecordV1 =
-            serde_json::from_slice(&line).map_err(|e| format!("corrupt outbox record: {e}"))?;
+impl JournalParser {
+    pub(crate) fn push(&mut self, rec: OutboxRecordV1) -> Result<(), String> {
         if rec.v != 1 {
             return Err(format!("unsupported outbox record version {}", rec.v));
         }
         match rec.kind {
             RecordKind::Op | RecordKind::Prep => {
-                if let Some(p) = &open_prep {
+                if let Some(p) = &self.open_prep {
                     return Err(format!(
                         "outbox: seq {} follows unresolved prep {}",
                         rec.seq, p.seq
                     ));
                 }
                 let op = PendingOp::from_record(&rec)?;
-                if let Some(last) = out.committed.last() {
+                if let Some(last) = self.out.committed.last() {
                     if op.seq != last.seq + 1 {
                         return Err(format!("outbox: seq {} after {}", op.seq, last.seq));
                     }
                 }
                 if rec.kind == RecordKind::Op {
-                    out.committed.push(op);
+                    self.out.committed.push(op);
                 } else {
-                    open_prep = Some(op);
+                    self.open_prep = Some(op);
                 }
             }
             RecordKind::Commit | RecordKind::Abort => {
-                let Some(p) = open_prep.take() else {
+                let Some(p) = self.open_prep.take() else {
                     return Err(format!(
                         "outbox: {:?} without prep (seq {})",
                         rec.kind, rec.seq
@@ -343,13 +324,52 @@ fn parse_journal_from(mut r: impl std::io::BufRead) -> Result<ParsedJournal, Str
                     ));
                 }
                 if rec.kind == RecordKind::Commit {
-                    out.committed.push(p);
+                    self.out.committed.push(p);
                 }
             }
         }
+        Ok(())
     }
-    out.trailing_prep = open_prep;
-    Ok(out)
+
+    pub(crate) fn finish(mut self, torn_tail: bool) -> ParsedJournal {
+        self.out.trailing_prep = self.open_prep;
+        self.out.torn_tail = torn_tail;
+        self.out
+    }
+}
+
+pub(crate) fn parse_journal(raw: &[u8]) -> Result<ParsedJournal, String> {
+    parse_journal_from(raw)
+}
+
+/// Streamed [`parse_journal`]: one record in memory at a time (a large backlog is never held
+/// twice, as raw bytes and parsed).
+pub(crate) fn parse_journal_from(mut r: impl std::io::BufRead) -> Result<ParsedJournal, String> {
+    let mut parser = JournalParser::default();
+    let mut torn_tail = false;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = r
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("read outbox: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            // Last line without its newline: never acknowledged as durable.
+            torn_tail = true;
+            break;
+        }
+        line.pop();
+        if line.is_empty() {
+            continue;
+        }
+        let rec: OutboxRecordV1 =
+            serde_json::from_slice(&line).map_err(|e| format!("corrupt outbox record: {e}"))?;
+        parser.push(rec)?;
+    }
+    Ok(parser.finish(torn_tail))
 }
 
 // ------------------------------------------------------------------------------------------

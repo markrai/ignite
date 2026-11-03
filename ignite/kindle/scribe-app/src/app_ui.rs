@@ -22,6 +22,7 @@ use crate::modal::{dialog_spec, ButtonId, DialogLayout, Modal, TitlePurpose, PIC
 use crate::prefs::SideButtonAction;
 use crate::server_link::LinkView;
 use crate::settings_ui::{PreferencesHit, PreferencesLayout, SettingsChromeHit};
+use crate::software_update::SoftwareUpdateState;
 use crate::sync_ui::{SyncHit, SyncLayout};
 use crate::tools_ui::{ToolsHit, ToolsLayout, ToolsState};
 use crate::touch::FingerAction;
@@ -80,6 +81,14 @@ pub enum UiCommand {
     OpenPreferences,
     /// Persist and apply a side-button preference.
     SetSideButton(crate::prefs::SideButtonAction),
+    /// Preferences: advisory GitHub release discovery (never installs).
+    CheckForUpdates,
+    /// Preferences: begin downloading the staged update candidate.
+    DownloadUpdate,
+    /// Preferences: user confirms install of the ready candidate.
+    ConfirmInstallUpdate,
+    /// Preferences: user cancels the ready candidate, returning to Available.
+    CancelReadyInstall,
     /// Tools: scan the Kindle's notebooks (read-only).
     ToolsScan,
     /// Tools: import every eligible Kindle notebook (one-way copy).
@@ -168,6 +177,8 @@ pub struct UiState {
     pub tools: ToolsState,
     /// Replica-local side-button preference (durable file is outside the library).
     pub side_button: SideButtonAction,
+    /// Software Update discovery state (advisory; never installation authority).
+    pub software_update: SoftwareUpdateState,
     /// Link-target picker (only while `AppView::LinkTargetPicker`).
     pub link_picker: Option<LinkPickerState>,
     /// Kindle-local folders (live members, library order), refreshed by the runtime before each
@@ -191,6 +202,7 @@ impl UiState {
             sync_view: None,
             tools: ToolsState::default(),
             side_button: SideButtonAction::NavigationUndo,
+            software_update: SoftwareUpdateState::default(),
             link_picker: None,
             folders: Vec::new(),
             next_folder_title: crate::folders::default_folder_title(1),
@@ -572,7 +584,7 @@ impl UiState {
     }
 
     fn on_preferences_tap(&mut self, geo: &FbGeometry, p: UiPoint) -> UiCommand {
-        match PreferencesLayout::new(geo).hit(p.x, p.y) {
+        match PreferencesLayout::new(geo, &self.software_update).hit(p.x, p.y) {
             None => UiCommand::None,
             Some(PreferencesHit::Chrome(SettingsChromeHit::Back)) => UiCommand::GoHome,
             Some(PreferencesHit::Chrome(SettingsChromeHit::ToolsTab)) => UiCommand::ShowToolsTab,
@@ -583,6 +595,28 @@ impl UiState {
             Some(PreferencesHit::CreateLink) => {
                 UiCommand::SetSideButton(SideButtonAction::CreateLink)
             }
+            Some(PreferencesHit::CheckForUpdates) => {
+                if self.software_update.busy() {
+                    UiCommand::None
+                } else {
+                    UiCommand::CheckForUpdates
+                }
+            }
+            Some(PreferencesHit::DownloadUpdate) => {
+                if self.software_update.busy() {
+                    UiCommand::None
+                } else {
+                    UiCommand::DownloadUpdate
+                }
+            }
+            Some(PreferencesHit::ConfirmInstallUpdate) => {
+                if self.software_update.busy() {
+                    UiCommand::None
+                } else {
+                    UiCommand::ConfirmInstallUpdate
+                }
+            }
+            Some(PreferencesHit::CancelReadyInstall) => UiCommand::CancelReadyInstall,
         }
     }
 

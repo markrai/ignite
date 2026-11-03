@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shutil
 import stat
 import sys
@@ -28,6 +29,11 @@ for extra in (_HERE, _SFX):
         sys.path.insert(0, str(extra))
 
 from build_sfx import build_sfx, default_template  # noqa: E402
+from release_component_profiles import (  # noqa: E402
+    ProfileError,
+    verify_deterministic,
+    write_profiles,
+)
 from validate_stage import (  # noqa: E402
     installer_sfx_name,
     validate_payload,
@@ -35,6 +41,7 @@ from validate_stage import (  # noqa: E402
     validate_sfx,
     validate_zip,
 )
+from verify_sfx_payload_equivalence import verify_equivalence  # noqa: E402
 
 VERSION_RE = r"^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$"
 
@@ -169,7 +176,10 @@ def stage_payload(
         deploy / "scribe-lifecycle-host.sh",
         payload / "host" / "scribe-lifecycle-host.sh",
     )
-    copy_text_lf(repo / "tools" / "kindle_launcher" / "Scribe.sh", payload / "launcher" / "Scribe.sh")
+    copy_text_lf(
+        repo / "tools" / "kindle_launcher" / "Scribe.sh",
+        payload / "launcher" / "Scribe.sh",
+    )
     copy_text_lf(
         repo / "tools" / "kindle_app" / "registration" / "ignite.json",
         payload / "registration" / "ignite.json",
@@ -188,7 +198,10 @@ def stage_payload(
     )
     ofl_desc = repo / "ignite" / "licenses" / "noto-emoji" / "DESCRIPTION.en_us.html"
     if ofl_desc.is_file():
-        copy_text_lf(ofl_desc, payload / "assets" / "licenses" / "noto-emoji" / "DESCRIPTION.en_us.html")
+        copy_text_lf(
+            ofl_desc,
+            payload / "assets" / "licenses" / "noto-emoji" / "DESCRIPTION.en_us.html",
+        )
 
     dropbear_bin = dropbear_dir / "dropbearmulti"
     dropbear_sum = dropbear_dir / "elf.sha256"
@@ -208,7 +221,13 @@ def stage_payload(
     copy_text_lf(dropbear_sum, payload / "recovery" / "manifest" / "elf.sha256")
     copy_text_lf(dropbear_prov, payload / "recovery" / "manifest" / "provenance.txt")
     packaged = payload / "recovery" / "bin" / "dropbearmulti"
-    sidecar = (payload / "recovery" / "manifest" / "elf.sha256").read_text(encoding="utf-8").split()[0].strip().lower()
+    sidecar = (
+        (payload / "recovery" / "manifest" / "elf.sha256")
+        .read_text(encoding="utf-8")
+        .split()[0]
+        .strip()
+        .lower()
+    )
     have = sha256_file(packaged)
     if have != pin_sha or sidecar != pin_sha:
         die(f"packaged Dropbear digest {have} != PINNED/manifest {pin_sha}")
@@ -236,13 +255,17 @@ def write_sha256sum(path: Path, digest: str, filename: str) -> None:
     write_utf8_lf(path, f"{digest}  {filename}\n")
 
 
-def write_support_zip(repo: Path, support_dir: Path, zip_path: Path, sfx_path: Path, version: str) -> None:
+def write_support_zip(
+    repo: Path, support_dir: Path, zip_path: Path, sfx_path: Path, version: str
+) -> None:
     if support_dir.exists():
         shutil.rmtree(support_dir)
     support_dir.mkdir(parents=True)
     shutil.copyfile(sfx_path, support_dir / sfx_path.name)
     readme = (repo / "deployment" / "kindle" / "README.txt").read_text(encoding="utf-8")
-    readme = readme.replace("Version: see the folder name of this package", f"Version: {version}")
+    readme = readme.replace(
+        "Version: see the folder name of this package", f"Version: {version}"
+    )
     write_utf8_lf(support_dir / "README.txt", readme)
 
     errors = validate_root(support_dir, version)
@@ -271,6 +294,9 @@ def package(
     out_root: Path,
     pinned: Path,
     support_zip: bool,
+    *,
+    fixture_signing_private_key: Path | None = None,
+    fixture_signing_public_key: Path | None = None,
 ) -> dict[str, str | int]:
     app_bin = release_bin_dir / "scribe-app"
     life_bin = release_bin_dir / "scribe-lifecycle"
@@ -294,12 +320,80 @@ def package(
     if errors:
         die("payload validation failed:\n" + "\n".join(errors))
 
+    print(
+        "== Generate release-component profiles (build evidence; not customer assets)"
+    )
+    try:
+        profiles = verify_deterministic(payload, version)
+    except ProfileError as exc:
+        die(f"component profile generation failed: {exc}")
+    profile_dir = out_root / "component-profiles"
+    write_profiles(profile_dir, profiles)
+    result_profiles = {
+        "component_profile_dir": str(profile_dir),
+        "component_profile_package_sha256": sha256_file(
+            profile_dir / "ignite-kindle-component-profile-package.v1"
+        ),
+    }
+
     print(f"== Build customer {sfx_name}")
     out_root.mkdir(parents=True, exist_ok=True)
     sfx_path.write_bytes(build_sfx(payload, version, default_template()))
     errors = validate_sfx(sfx_path, version)
     if errors:
         die("SFX validation failed:\n" + "\n".join(errors))
+
+    print("== Verify SFX ↔ staged payload ↔ package profile equivalence")
+    package_profile_path = profile_dir / "ignite-kindle-component-profile-package.v1"
+    package_profile_bytes = package_profile_path.read_bytes()
+    eq_ok, eq_report = verify_equivalence(
+        sfx_path=sfx_path,
+        payload_path=payload,
+        version=version,
+        package_profile=package_profile_bytes,
+    )
+    eq_report_path = profile_dir / "sfx-payload-equivalence.v1"
+    eq_report_path.write_bytes(eq_report)
+    if not eq_ok:
+        die(
+            "SFX payload equivalence failed:\n"
+            + eq_report.decode("ascii", errors="replace")
+        )
+
+    print("== Emit CI packaging measurement (build evidence; not a Release asset)")
+    from ci_packaging_measurement import (  # local import keeps ordinary packaging lean
+        MEASUREMENT_BASENAME,
+        MEASUREMENTS_SUBDIR,
+        MeasurementError,
+        build_ci_packaging_measurement,
+        write_packaging_measurements,
+    )
+
+    source_revision = os.environ.get("GITHUB_SHA") or None
+    workflow_run_id = os.environ.get("GITHUB_RUN_ID") or None
+    if source_revision is not None and len(source_revision) != 40:
+        # Local/dev wrappers may set a short SHA; omit rather than emit noncanonical.
+        source_revision = None
+    if workflow_run_id is not None and not workflow_run_id.isdigit():
+        workflow_run_id = None
+    try:
+        measurement = build_ci_packaging_measurement(
+            version=version,
+            scriptlet=sfx_path,
+            payload=payload,
+            package_profile=package_profile_bytes,
+            source_revision=source_revision,
+            workflow_run_id=workflow_run_id,
+        )
+        measurement_dir = out_root / MEASUREMENTS_SUBDIR
+        write_packaging_measurements(
+            out_dir=measurement_dir,
+            measurement=measurement,
+            package_profile=package_profile_bytes,
+            equivalence_report=eq_report,
+        )
+    except MeasurementError as exc:
+        die(f"CI packaging measurement failed: {exc}")
 
     sfx_hash = sha256_file(sfx_path)
     write_sha256sum(sfx_sha_path, sfx_hash, sfx_name)
@@ -310,6 +404,10 @@ def package(
         "sfx_sha256": sfx_hash,
         "sfx_bytes": sfx_path.stat().st_size,
         "sfx_checksum": str(sfx_sha_path),
+        "packaging_measurement_dir": str(measurement_dir),
+        "packaging_measurement_sha256": hashlib.sha256(measurement).hexdigest(),
+        "packaging_measurement": str(measurement_dir / MEASUREMENT_BASENAME),
+        **result_profiles,
     }
 
     if support_zip:
@@ -327,15 +425,64 @@ def package(
     print("")
     print("======== Ignite Kindle release ========")
     print(f"version:              {version}")
-    print("profile:              full-feature (sync-dir + device-dir enabled; optional to use)")
+    print(
+        "profile:              full-feature (sync-dir + device-dir enabled; optional to use)"
+    )
     print(f"CUSTOMER ARTIFACT:    {sfx_path}")
     print(f"customer_size_bytes:  {result['sfx_bytes']}")
     print(f"customer_sha256:      {sfx_hash}")
     print(f"customer_checksum:    {sfx_sha_path}")
+    print(
+        f"component_profiles:   {result['component_profile_dir']} (build evidence only)"
+    )
+    print(f"package_profile_sha256: {result['component_profile_package_sha256']}")
+    print(
+        f"packaging_measurement: {result['packaging_measurement']} (CI build evidence)"
+    )
+    print(f"packaging_measurement_sha256: {result['packaging_measurement_sha256']}")
     if support_zip:
         print(f"support ZIP (optional, not for end users): {result['support_zip']}")
         print(f"support_size_bytes:   {result['support_bytes']}")
         print(f"support_sha256:       {result['support_sha256']}")
+
+    # Explicit fixture-only authenticated assets. Never the default packaging path.
+    # Requires both disposable key paths; refuses the production pin.
+    if (
+        fixture_signing_private_key is not None
+        or fixture_signing_public_key is not None
+    ):
+        if fixture_signing_private_key is None or fixture_signing_public_key is None:
+            die(
+                "fixture authenticated assets require both "
+                "--fixture-signing-private-key and --fixture-signing-public-key"
+            )
+        print(
+            "== Emit fixture-only authenticated release assets (not customer release assets)"
+        )
+        from authenticated_release_assets import (  # local import keeps ordinary packaging lean
+            AuthenticatedAssetError,
+            FIXTURE_AUTH_SUBDIR,
+            emit_fixture_authenticated_assets_from_package_output,
+        )
+
+        try:
+            assets = emit_fixture_authenticated_assets_from_package_output(
+                version=version,
+                out_root=out_root,
+                private_key_path=fixture_signing_private_key,
+                public_key_path=fixture_signing_public_key,
+            )
+        except AuthenticatedAssetError as exc:
+            die(str(exc))
+        fixture_dir = out_root / FIXTURE_AUTH_SUBDIR
+        result["fixture_authenticated_assets_dir"] = str(fixture_dir)
+        result["fixture_publication_evidence_sha256"] = hashlib.sha256(
+            assets.publication_evidence
+        ).hexdigest()
+        print(
+            f"fixture_authenticated_assets: {fixture_dir} (disposable key; not for promotion)"
+        )
+
     print("=======================================")
     return result
 
@@ -344,7 +491,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     repo_default = _HERE.parents[1]
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--repo-root", type=Path, default=repo_default)
-    p.add_argument("--version", default="", help="artifact version override (default: ignite/VERSION)")
+    p.add_argument(
+        "--version",
+        default="",
+        help="artifact version override (default: ignite/VERSION)",
+    )
     p.add_argument(
         "--release-bin-dir",
         type=Path,
@@ -354,7 +505,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dropbear-dir", type=Path, default=None)
     p.add_argument("--out-root", type=Path, default=None)
     p.add_argument("--pinned-file", type=Path, default=None)
-    p.add_argument("--no-support-zip", action="store_true", help="omit developer/support ZIP")
+    p.add_argument(
+        "--no-support-zip", action="store_true", help="omit developer/support ZIP"
+    )
+    p.add_argument(
+        "--fixture-signing-private-key",
+        type=Path,
+        default=None,
+        help=(
+            "OPTIONAL fixture-only workflow: disposable OpenSSL Ed25519 private key. "
+            "Never the production pin. Writes under fixture-authenticated-assets/ only."
+        ),
+    )
+    p.add_argument(
+        "--fixture-signing-public-key",
+        type=Path,
+        default=None,
+        help=(
+            "OPTIONAL fixture-only workflow: disposable public key (64 hex + LF). "
+            "Must not be tools/release/kindle-release-public-key.hex."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -383,6 +554,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.pinned_file
             else repo / "tools" / "dropbear" / "PINNED.txt"
         )
+        fixture_priv = (
+            args.fixture_signing_private_key.resolve()
+            if args.fixture_signing_private_key
+            else None
+        )
+        fixture_pub = (
+            args.fixture_signing_public_key.resolve()
+            if args.fixture_signing_public_key
+            else None
+        )
         package(
             repo=repo,
             version=version,
@@ -391,6 +572,8 @@ def main(argv: list[str] | None = None) -> int:
             out_root=out_root,
             pinned=pinned,
             support_zip=not args.no_support_zip,
+            fixture_signing_private_key=fixture_priv,
+            fixture_signing_public_key=fixture_pub,
         )
     except PackageError as exc:
         print(f"package_release.py: {exc}", file=sys.stderr)

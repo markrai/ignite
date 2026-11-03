@@ -133,12 +133,83 @@ jobs:
           cp "$src/Install Ignite v$v.sh" "$src/Install Ignite v$v.sha256" dist/kindle-release/
           (cd dist/kindle-release && sha256sum -c "Install Ignite v$v.sha256")
           python3 deployment/kindle/validate_stage.py --sfx "dist/kindle-release/Install Ignite v$v.sh" --version "$v"
+          # Slice 3D-B2a.4.3c: reproducible component profiles from the staged payload
+          # (build evidence only; not Release assets). SFX↔payload byte equivalence after
+          # customer extraction remains a separate blocked check (see docs).
+          payload="$(find target/package/kindle/staging -maxdepth 1 -type d -name "Ignite-Kindle-$v" | head -n 1)"
+          if [ -z "$payload" ] || [ ! -d "$payload" ]; then
+            echo "missing staged payload Ignite-Kindle-$v for component profiles" >&2
+            exit 1
+          fi
+          python3 deployment/kindle/release_component_profiles.py \
+            --payload "$payload" --version "$v" --check-deterministic \
+            --out-dir target/package/kindle/component-profiles
+          test -s target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1
+          # Slice 3D-B2a.4.3d: independent byte-equivalence of the copied customer
+          # Scriptlet against the staged payload + canonical package profile.
+          # Inspects dist/kindle-release (upload candidate), never executes the Scriptlet.
+          python3 deployment/kindle/verify_sfx_payload_equivalence.py \
+            --sfx "dist/kindle-release/Install Ignite v$v.sh" \
+            --payload "$payload" \
+            --version "$v" \
+            --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+            --report target/package/kindle/component-profiles/sfx-payload-equivalence.v1
+          # Slice 3D-B2a.4.3l: CI packaging measurement from the same build inputs.
+          # Associated artifact for offline ceremony; not a GitHub Release asset.
+          # Prefer the measurement already emitted by package_release.py when present.
+          meas_src="target/package/kindle/packaging-measurements"
+          if [ ! -f "$meas_src/ignite-kindle-ci-packaging-measurement.v1" ]; then
+            python3 deployment/kindle/ci_packaging_measurement.py build \
+              --version "$v" \
+              --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+              --payload "$payload" \
+              --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+              --equivalence-report target/package/kindle/component-profiles/sfx-payload-equivalence.v1 \
+              --out-dir "$meas_src" \
+              --source-revision "${GITHUB_SHA}" \
+              --workflow-run-id "${GITHUB_RUN_ID}"
+          fi
+          mkdir -p dist/kindle-packaging-measurements
+          cp "$meas_src/ignite-kindle-ci-packaging-measurement.v1" \
+             "$meas_src/ignite-kindle-component-profile-package.v1" \
+             dist/kindle-packaging-measurements/
+          if [ -f "$meas_src/sfx-payload-equivalence.v1" ]; then
+            cp "$meas_src/sfx-payload-equivalence.v1" dist/kindle-packaging-measurements/
+          fi
+          # Bind measurement to the exact upload-candidate Scriptlet (no execution).
+          python3 deployment/kindle/ci_packaging_measurement.py verify \
+            --measurement dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 \
+            --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+            --package-profile dist/kindle-packaging-measurements/ignite-kindle-component-profile-package.v1 \
+            --expected-version "$v" \
+            --expected-source-revision "${GITHUB_SHA}"
+          # Record association with the customer artifact set for the same run.
+          {
+            echo "IGNITE_CI_KINDLE_ARTIFACT_ASSOCIATION_V1"
+            echo "schema=1"
+            echo "customer_artifact=ignite-kindle-release"
+            echo "measurement_artifact=ignite-kindle-packaging-measurements"
+            echo "scriptlet=Install Ignite v$v.sh"
+            echo "scriptlet_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
+            echo "measurement_sha256=$(sha256sum dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 | awk '{print $1}')"
+            echo "version=$v"
+            echo "source_revision=${GITHUB_SHA}"
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "github_release_asset=false"
+          } > dist/kindle-packaging-measurements/artifact-association.v1
           echo "kindle_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
       - name: Upload Kindle release artifact
         uses: actions/upload-artifact@v4
         with:
           name: ignite-kindle-release
           path: dist/kindle-release/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Upload Kindle packaging measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-kindle-packaging-measurements
+          path: dist/kindle-packaging-measurements/
           retention-days: 30
           if-no-files-found: error
 
@@ -320,6 +391,8 @@ jobs:
         run: bash deployment/linux/docker/test-compose-static.sh
       - name: GHCR publishing guards and image references
         run: bash deployment/linux/docker/test-ghcr-publish.sh
+      - name: Offline Kindle release signing helper
+        run: python3 tools/release/test_kindle_release_sign.py
       - name: Promote-publish guards
         run: bash tools/release/test-promote-release.sh
       - name: Version file synchronization

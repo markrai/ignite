@@ -13,6 +13,7 @@ if str(_HERE) not in sys.path:
 
 from test_install_runtime import (  # noqa: E402
     _appreg_query,
+    _env_for,
     _register_env,
     _run_install,
     _seed_appreg,
@@ -239,6 +240,7 @@ def test_uninstall_after_migration_removes_both_keeps_data(tmp_path: Path) -> No
 
     sh = _require_sh()
     env = _posix_env(sh)
+    lock_env = _env_for(kindle)
     env.update(
         {
             "IGNITE_APP_ROOT": _to_posix_path(kindle / "scribe-app"),
@@ -251,6 +253,7 @@ def test_uninstall_after_migration_removes_both_keeps_data(tmp_path: Path) -> No
             "IGNITE_RECOVERY_SKIP_CHOWN": "1",
             "IGNITE_RECOVERY_ROOT": _to_posix_path(kindle / "var" / "local" / "ignite-recovery"),
             "IGNITE_SKIP_PROC_CHECK": "1",
+            "IGNITE_UPDATER_LOCK_HELPER": lock_env["IGNITE_UPDATER_LOCK_HELPER"],
         }
     )
     # install-recovery sourced by uninstall needs helpers present

@@ -12,8 +12,107 @@ use std::process::ExitCode;
 use scribe_app::cadence::parse_du_interval_us;
 
 fn main() -> ExitCode {
-    scribe_app::launch_clock::mark("process_entry");
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match scribe_app::storage_capabilities::command_requested(&args) {
+        Ok(true) => return emit_storage_capabilities(),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::storage_inspect_library::parse_command(&args) {
+        Ok(scribe_app::storage_inspect_library::InspectionCommand::Inspect(path)) => {
+            return inspect_storage_library(&path);
+        }
+        Ok(scribe_app::storage_inspect_library::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::storage_inspect_external::parse_command(&args) {
+        Ok(scribe_app::storage_inspect_external::InspectionCommand::Inspect(config)) => {
+            return inspect_storage_external(&config);
+        }
+        Ok(scribe_app::storage_inspect_external::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::storage_release_provenance::parse_command(&args) {
+        Ok(scribe_app::storage_release_provenance::InspectionCommand::Inspect(config)) => {
+            return inspect_release_provenance(&config);
+        }
+        Ok(scribe_app::storage_release_provenance::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::storage_installed_slot_binding::parse_command(&args) {
+        Ok(scribe_app::storage_installed_slot_binding::InspectionCommand::Inspect(config)) => {
+            return inspect_installed_slot_binding(&config);
+        }
+        Ok(scribe_app::storage_installed_slot_binding::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::storage_writer_exclusion::parse_command(&args) {
+        Ok(scribe_app::storage_writer_exclusion::InspectionCommand::Inspect(config)) => {
+            return inspect_writer_exclusion(&config);
+        }
+        Ok(scribe_app::storage_writer_exclusion::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::storage_compatibility_preflight::parse_command(&args) {
+        Ok(scribe_app::storage_compatibility_preflight::InspectionCommand::Inspect(config)) => {
+            return inspect_compatibility_preflight(&config);
+        }
+        Ok(scribe_app::storage_compatibility_preflight::InspectionCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::verified_update_staging::parse_command(&args) {
+        Ok(scribe_app::verified_update_staging::StageCommand::Stage(request)) => {
+            return stage_verified_update(request);
+        }
+        Ok(scribe_app::verified_update_staging::StageCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::installation_authorization::parse_command(&args) {
+        Ok(scribe_app::installation_authorization::AuthorizeCommand::Authorize(request)) => {
+            return authorize_verified_update(request);
+        }
+        Ok(scribe_app::installation_authorization::AuthorizeCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match scribe_app::seal_authorized_install::parse_command(&args) {
+        Ok(scribe_app::seal_authorized_install::SealCommand::Seal(request)) => {
+            return seal_authorized_install(request);
+        }
+        Ok(scribe_app::seal_authorized_install::SealCommand::NotRequested) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    scribe_app::launch_clock::mark("process_entry");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
         return ExitCode::SUCCESS;
@@ -36,8 +135,12 @@ fn main() -> ExitCode {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
+        use scribe_app::launch_health::Reporter;
         use scribe_app::singleton::{process_exit_code, run_with_singleton, DEFAULT_LOCK_PATH};
 
+        // Claim the lifecycle-only descriptor before initialization can launch subprocesses.
+        // A singleton loser or startup failure drops it without reporting readiness.
+        let mut launch_health = Reporter::from_environment();
         // Kernel flock before any framebuffer / input / library / sync work.
         // A second invocation leaves the live instance alone (never SIGTERM, never paint).
         match run_with_singleton(Path::new(DEFAULT_LOCK_PATH), || {
@@ -59,7 +162,7 @@ fn main() -> ExitCode {
                         return 1;
                     }
                 };
-                let code = runtime::run_page_session(cfg, Arc::clone(&stop));
+                let code = runtime::run_page_session(cfg, Arc::clone(&stop), &mut launch_health);
                 // S2B: bounded stop of background sync after the pen session is released (never
                 // delays the input/panel shutdown; the durable outbox survives for the next
                 // launch). D1: stop the server link first (closes discovery + the firewall
@@ -113,6 +216,60 @@ Usage:
              [--fb /dev/fb0] [--input /dev/input/stylus]
 
 Options:
+  --storage-capabilities
+                        Emit the compiled canonical storage declaration and exit without
+                        application initialization. Must be used alone.
+  --inspect-storage-library --data-dir PATH
+                        Inspect one existing native library read-only and emit a bounded
+                        library-only report. Does not initialize or repair the application.
+  --inspect-storage-external --data-dir LIBRARY --sync-dir SYNC
+                             --device-dir DEVICE --state-dir STATE
+                        Inspect existing external sync/device state read-only. All roots are
+                        explicit; no application, recovery, network, or hardware initialization.
+  --inspect-release-provenance --subject A|B --expected-tag vX.Y.Z
+       --record PATH --record-signature PATH --release-manifest PATH
+       --release-manifest-signature PATH --capabilities PATH
+       --component ROLE=ABSOLUTE_PATH (one for every schema-v1 role)
+                        Authenticate one caller-supplied release component set. This does not prove
+                        canonical paths, installed-slot ownership, or an atomic state snapshot. It
+                        is read-only/report-only and never establishes first-launch admission, data
+                        compatibility, or promotion authorization. Production verification remains
+                        unavailable while the compile-time public-key pin is UNPROVISIONED.
+  --inspect-installed-slot-binding --release-role retained-a|candidate-b
+       --expected-transaction TXN --app-root APP --documents-root DOCS
+       --recovery-root RECOVERY --expected-tag vX.Y.Z
+       --record PATH --record-signature PATH --release-manifest PATH
+       --release-manifest-signature PATH --capabilities PATH
+       --component ROLE=ABSOLUTE_PATH (one for every schema-v1 role)
+                        Map authenticated component observations onto the fixed live-B or retained-A
+                        installer layout and compare pending/inventory state. This bounded read-only
+                        diagnostic never establishes installation/execution binding or admission,
+                        and always exits nonzero.
+  --inspect-writer-exclusion --data-dir LIBRARY --sync-dir SYNC
+                        Attempt a bounded, read-only acquisition of pre-existing coordination
+                        locks and report coverage gaps. Never creates lock files, starts recovery,
+                        claims an atomic snapshot, or authorizes candidate execution.
+  --stage-verified-update --expected-tag vX.Y.Z
+       --github-release owner/repo | --fixture-assets-dir PATH
+       [--staging-root PATH] [--fixture-public-key HEX_PATH]
+                        Download/stage the six publication assets and authenticate them with the
+                        existing publication trust chain. Never executes the Scriptlet, never
+                        installs, activates, or promotes. Fixture mode requires an explicit
+                        --fixture-public-key and remains test-only provenance. Production mode
+                        fails closed while the pin is UNPROVISIONED. Default staging root:
+                        /mnt/us/scribe-app/state/verified-update
+  --authorize-verified-update --expected-tag vX.Y.Z [--staging-root PATH]
+                        Read-only installation authorization diagnostic over a staged candidate.
+                        Revalidates authenticity under the official production pin and reports
+                        each prerequisite as satisfied, refused, or not_implemented. Never
+                        installs, executes the Scriptlet, activates a slot, or writes an
+                        authorization token. Always exits nonzero while installation remains
+                        unauthorized (including while the pin is UNPROVISIONED).
+  --inspect-compatibility-preflight --app-root APP --data-dir LIBRARY --sync-dir SYNC
+                        --device-dir DEVICE --state-dir STATE
+                        Hash a bounded fixed-root inventory, run the existing read-only library and
+                        external-state inspectors, and compare a second inventory. Observational
+                        equality is not an atomic snapshot, A/B compatibility, or launch approval.
   --diagnose-fb         Read-only FBIOGET dump + Gate B check (no mmap write, no notebooks)
   --confirm-write       Required for physical write (fb mmap / stylus mode / SEND)
   --data-dir PATH       Library storage root (default /mnt/us/scribe-data)
@@ -172,6 +329,177 @@ Does not open /dev/stylus.
 ink-probe remains the diagnostic laboratory.
 "
     );
+}
+
+fn emit_storage_capabilities() -> ExitCode {
+    use std::io::Write as _;
+
+    let bytes = match scribe_app::storage_capabilities::canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("storage capabilities unavailable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("write storage capabilities: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn inspect_storage_library(path: &std::path::Path) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_inspect_library::inspect_library(path);
+    let bytes = match report.canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("storage library inspection unavailable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write storage library inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
+}
+
+fn inspect_storage_external(
+    config: &scribe_app::storage_inspect_external::ExternalInspectionConfig,
+) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_inspect_external::inspect_external(config);
+    let bytes = match report.canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("storage external inspection unavailable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write storage external inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
+}
+
+fn stage_verified_update(request: scribe_app::verified_update_staging::StageRequest) -> ExitCode {
+    match scribe_app::verified_update_staging::stage_verified_update(&request) {
+        Ok(result) => {
+            scribe_app::verified_update_staging::emit_stage_report(&result);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("stage-verified-update: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn authorize_verified_update(
+    request: scribe_app::installation_authorization::AuthorizeRequest,
+) -> ExitCode {
+    match scribe_app::installation_authorization::evaluate_installation_authorization(&request) {
+        Ok(decision) => {
+            scribe_app::installation_authorization::emit_authorization_report(&decision);
+            if decision.installation_authorized {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("authorize-verified-update: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn seal_authorized_install(request: scribe_app::seal_authorized_install::SealRequest) -> ExitCode {
+    match scribe_app::seal_authorized_install::seal_authorized_install(&request) {
+        Ok(result) => {
+            scribe_app::seal_authorized_install::emit_seal_report(&result);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("seal-authorized-install: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn inspect_release_provenance(
+    config: &scribe_app::storage_release_provenance::InspectionConfig,
+) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_release_provenance::inspect_official(config);
+    let bytes = report.canonical_bytes();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write installed release provenance inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
+}
+
+fn inspect_installed_slot_binding(
+    config: &scribe_app::storage_installed_slot_binding::SlotBindingConfig,
+) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_installed_slot_binding::inspect_official(config);
+    let bytes = report.canonical_bytes();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write installed slot binding inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
+}
+
+fn inspect_writer_exclusion(
+    config: &scribe_app::storage_writer_exclusion::WriterExclusionConfig,
+) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_writer_exclusion::inspect_writer_exclusion(config);
+    let bytes = report.canonical_bytes();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write data-writer exclusion inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
+}
+
+fn inspect_compatibility_preflight(
+    config: &scribe_app::storage_compatibility_preflight::PreflightConfig,
+) -> ExitCode {
+    use std::io::Write as _;
+
+    let report = scribe_app::storage_compatibility_preflight::inspect_preflight(config);
+    let bytes = match report.canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("encode compatibility preflight: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+        eprintln!("write compatibility preflight: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(report.exit_code())
 }
 
 fn diagnose_fb(args: &[String]) -> ExitCode {

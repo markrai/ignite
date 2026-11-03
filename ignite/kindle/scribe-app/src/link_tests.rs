@@ -155,7 +155,7 @@ mod tests {
         ui.enter_preferences();
         assert_eq!(ui.view, AppView::Preferences);
         assert!(!ui.allows_page_input());
-        let pl = crate::settings_ui::PreferencesLayout::new(&g);
+        let pl = crate::settings_ui::PreferencesLayout::new(&g, &ui.software_update);
         assert_eq!(
             ui.on_tap(
                 &g,
@@ -173,6 +173,31 @@ mod tests {
         assert_eq!(
             ui.on_tap(&g, create, &[], "N", None),
             UiCommand::SetSideButton(SideButtonAction::CreateLink)
+        );
+        let check = center(pl.check_updates.expect("check target"));
+        assert_eq!(
+            ui.on_tap(&g, check, &[], "N", None),
+            UiCommand::CheckForUpdates
+        );
+        assert!(ui.software_update.begin_check().is_some());
+        assert_eq!(
+            ui.on_tap(&g, check, &[], "N", None),
+            UiCommand::None,
+            "duplicate check while busy is ignored"
+        );
+        assert_eq!(
+            ui.on_tap(
+                &g,
+                UiPoint {
+                    x: pl.chrome.back.x + 10,
+                    y: pl.chrome.back.y + 10
+                },
+                &[],
+                "N",
+                None
+            ),
+            UiCommand::GoHome,
+            "navigation while checking remains available"
         );
     }
 

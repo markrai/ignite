@@ -35,12 +35,15 @@ pub mod fullscreen;
 pub mod home;
 pub mod ink;
 pub mod input_lag;
+pub mod install_intent;
+pub mod installation_authorization;
 pub mod keyboard;
 #[cfg(feature = "kindle_supervisor_harness")]
 mod kindle_supervisor_harness;
 pub mod lasso;
 pub mod launch_clock;
 pub mod launch_diag;
+pub mod launch_health;
 pub mod library;
 pub mod link_paint;
 pub mod link_picker;
@@ -59,16 +62,30 @@ pub mod prefs;
 pub mod pressure;
 pub mod pressure_curve;
 pub mod profile;
+pub mod publication_evidence;
+pub mod publication_trust_boundary;
+pub mod release_acquisition;
+pub mod release_manifest;
 pub mod render;
 #[cfg(unix)]
 pub mod runtime;
 mod s1_sync_tests;
 mod s2_erase_parity_tests;
+pub mod seal_authorized_install;
 pub mod server_link;
 pub mod session;
 pub mod settings_ui;
 pub mod singleton;
 pub mod sleep_ui;
+pub mod software_update;
+pub mod storage_capabilities;
+pub mod storage_compatibility_preflight;
+pub mod storage_contract;
+pub mod storage_inspect_external;
+pub mod storage_inspect_library;
+pub mod storage_installed_slot_binding;
+pub mod storage_release_provenance;
+pub mod storage_writer_exclusion;
 pub mod store;
 pub mod sync_adopt;
 pub mod sync_local;
@@ -88,6 +105,10 @@ mod sync_recovery_supervise;
 mod sync_recovery_tail;
 mod sync_recovery_tunnel;
 mod sync_startup_diag;
+pub mod update_qualification;
+#[cfg(test)]
+mod updater_lifecycle_host_tests;
+pub mod verified_update_staging;
 #[cfg(feature = "kindle_supervisor_harness")]
 pub use kindle_supervisor_harness::run as run_kindle_supervisor_harness;
 #[cfg(test)]
