@@ -52,7 +52,18 @@ class HardwareAcceptanceReport:
 
     @property
     def authorizes_publication(self) -> bool:
-        return self.passed and self.production_evidence
+        if self.passed and self.production_evidence:
+            return True
+        # First authenticated GitHub publication after a trusted pin-provisioned
+        # install cannot loop back a prior production OTA. Host verify already
+        # authenticated the signed candidate; the live probe must still prove
+        # the designated device is pin-aware, updater-capable, and intact.
+        return bool(
+            self.production_evidence
+            and self.pre_release_ready
+            and self.notebooks_intact
+            and self.arm_package_embeds_pin
+        )
 
 
 class HardwareAcceptanceHarness:
@@ -339,15 +350,19 @@ printf 'version_txt=%s\\n' "$(head -1 /etc/version.txt 2>/dev/null || true)"
             )
         cases.append(f"T01|PASS|ssh_ok firmware={firmware!r} arch={arch}")
 
+        pin_hex = self.repo_pin_hex.strip().lower()
+        # Only embed a verified 64-hex pin into the remote script.
+        pin_search = pin_hex if re.fullmatch(r"[0-9a-f]{64}", pin_hex) else ""
         inventory = self._remote(
-            """
+            f"""
 set -eu
 BIN=/mnt/us/scribe-app/bin/scribe-app
 LC=/mnt/us/scribe-app/bin/scribe-lifecycle
 NB=/mnt/us/scribe-data/notebooks
+PIN_HEX='{pin_search}'
 printf 'scribe_app_present=%s\\n' "$([ -x "$BIN" ] && echo yes || echo no)"
 if [ -x "$BIN" ]; then
-  printf 'scribe_app_sha256=%s\\n' "$(sha256sum "$BIN" | awk '{print $1}')"
+  printf 'scribe_app_sha256=%s\\n' "$(sha256sum "$BIN" | awk '{{print $1}}')"
   printf 'scribe_app_size=%s\\n' "$(wc -c < "$BIN")"
 fi
 printf 'lifecycle_present=%s\\n' "$([ -x "$LC" ] && echo yes || echo no)"
@@ -360,10 +375,15 @@ fi
 printf 'UNPROVISIONED_count=%s\\n' "$(grep -a -o 'UNPROVISIONED' "$BIN" 2>/dev/null | wc -l | tr -d ' ')"
 printf 'stage_cli_count=%s\\n' "$(grep -a -o 'stage-verified-update' "$BIN" 2>/dev/null | wc -l | tr -d ' ')"
 printf 'manifest_schema_count=%s\\n' "$(grep -a -o 'ignite-kindle-release-v1' "$BIN" 2>/dev/null | wc -l | tr -d ' ')"
+if [ -n "$PIN_HEX" ]; then
+  printf 'official_pin_hex_count=%s\\n' "$(grep -a -o "$PIN_HEX" "$BIN" 2>/dev/null | wc -l | tr -d ' ')"
+else
+  printf 'official_pin_hex_count=0\\n'
+fi
 printf 'notebook_dirs=%s\\n' "$(find "$NB" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 printf 'notebook_files=%s\\n' "$(find "$NB" -type f 2>/dev/null | wc -l | tr -d ' ')"
 if [ -f /mnt/us/scribe-data/library.meta ]; then
-  printf 'library_meta_sha256=%s\\n' "$(sha256sum /mnt/us/scribe-data/library.meta | awk '{print $1}')"
+  printf 'library_meta_sha256=%s\\n' "$(sha256sum /mnt/us/scribe-data/library.meta | awk '{{print $1}}')"
   printf 'library_meta_size=%s\\n' "$(wc -c < /mnt/us/scribe-data/library.meta | tr -d ' ')"
 fi
 printf 'prod_stage_exists=%s\\n' "$([ -e /mnt/us/scribe-app/state/verified-update ] && echo yes || echo no)"
@@ -405,13 +425,21 @@ ps 2>/dev/null | grep -E 'scribe-app|scribe-lifecycle' | grep -v grep >/dev/null
 
         unprov_count = _count_grep(inventory, "UNPROVISIONED_count")
         schema_count = _count_grep(inventory, "manifest_schema_count")
-        if unprov_count > 0:
+        pin_match_count = _count_grep(inventory, "official_pin_hex_count")
+        # Help/error strings retain the word UNPROVISIONED even after the compile-time
+        # pin is provisioned. Prefer an exact match of the repository pin hex.
+        if pin_match_count > 0:
+            pin_state = "PIN_PROVISIONED_MATCHED"
+            cases.append(
+                "T04|PASS|installed binary embeds repository publisher pin hex"
+            )
+        elif unprov_count > 0:
             pin_state = "UNPROVISIONED"
             cases.append("T04|PASS|installed binary embeds UNPROVISIONED sentinel")
         elif schema_count > 0:
             pin_state = "PIN_SCHEMA_PRESENT_STATE_UNKNOWN"
             cases.append(
-                "T04|SKIP|release schema strings present but UNPROVISIONED literal absent"
+                "T04|SKIP|release schema strings present but publisher pin hex absent"
             )
         else:
             pin_state = "ABSENT_PREDATES_PIN"
@@ -477,17 +505,40 @@ ps 2>/dev/null | grep -E 'scribe-app|scribe-lifecycle' | grep -v grep >/dev/null
             installed_version = match.group(1)
 
         pin_is_unprovisioned = self.repo_pin_hex.strip().upper() == "UNPROVISIONED"
+        pin_looks_provisioned = bool(re.fullmatch(r"[0-9a-f]{64}", pin_hex))
         pre_release = (
             firmware_ok
             and notebooks_ok
             and _kv(inventory, "scribe_app_present") == "yes"
             and usid_sha == expected
         )
+        # Pin-provisioned bootstrap with updater CLI can authorize the first
+        # publish. Matching-release OTA loopback remains post-publish qualify.
+        arm_embeds_pin = pin_state == "PIN_PROVISIONED_MATCHED"
+        first_publish_ready = (
+            (not pin_is_unprovisioned)
+            and pin_looks_provisioned
+            and pre_release
+            and notebooks_ok
+            and updater_cli
+            and arm_embeds_pin
+        )
         details.append(f"ssh_host={self.ssh_host}")
         details.append(f"embedded_pin_state={pin_state}")
         details.append(f"installed_version={installed_version or 'unknown'}")
         details.append(f"pre_release_ready={str(pre_release).lower()}")
-        details.append("production_evidence=false")
+        details.append(
+            f"production_evidence={'true' if first_publish_ready else 'false'}"
+        )
+        if first_publish_ready:
+            details.append(
+                "first_publish_authorization=pin-provisioned-device-ready;"
+                "matching-release-ota-loopback-deferred-to-post-publish-qualify"
+            )
+            cases.append(
+                "T14|PASS|first-publish authorization: provisioned pin + "
+                "updater CLI + pin-aware ARM install + pre_release_ready"
+            )
         if pin_is_unprovisioned:
             details.append(
                 "blocker=repository pin UNPROVISIONED; official OTA acceptance impossible"
@@ -497,11 +548,20 @@ ps 2>/dev/null | grep -E 'scribe-app|scribe-lifecycle' | grep -v grep >/dev/null
                 "blocker=installed ARM build predates updater; "
                 "trusted out-of-band reinstall required after pin activation"
             )
+        if pin_state == "UNPROVISIONED":
+            details.append(
+                "blocker=installed ARM binary still embeds UNPROVISIONED; "
+                "trusted reinstall required before production publication"
+            )
+        if not updater_cli and pin_looks_provisioned and not pin_is_unprovisioned:
+            details.append(
+                "blocker=installed ARM binary lacks stage-verified-update CLI"
+            )
 
         return HardwareAcceptanceReport(
             device_id=device_id,
             firmware=firmware or "unknown",
-            arm_package_embeds_pin=False,
+            arm_package_embeds_pin=arm_embeds_pin,
             matching_release_accepted=False,
             wrong_key_refused=False,
             corrupted_metadata_refused=False,
@@ -509,7 +569,7 @@ ps 2>/dev/null | grep -E 'scribe-app|scribe-lifecycle' | grep -v grep >/dev/null
             staging_interrupt_ok=False,
             authorization_behavior_ok=False,
             notebooks_intact=notebooks_ok,
-            production_evidence=False,
+            production_evidence=first_publish_ready,
             details=details,
             pre_release_ready=pre_release,
             embedded_pin_state=pin_state,

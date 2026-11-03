@@ -512,6 +512,7 @@ def test_acquire_mocked_success(tmp_path: Path) -> None:
     identity = parse_acquisition_receipt(bundle.receipt_path.read_bytes())
     assert identity.ci_run_id == RUN_ID
     assert identity.ci_head_sha == SOURCE_REV
+    assert identity.association_cross_checked is True
     scriptlet = next(bundle.ci_artifacts.rglob(f"Install Ignite v{VERSION}.sh"))
     assert identity.scriptlet_sha256 == _sha(scriptlet.read_bytes())
     assert "extracted-tree-sha256-not-github-archive-digest" in (
@@ -519,6 +520,31 @@ def test_acquire_mocked_success(tmp_path: Path) -> None:
     )
     reloaded = load_acquired_bundle(out)
     assert reloaded.identity.scriptlet_sha256 == identity.scriptlet_sha256
+
+
+def test_acquire_association_without_version_is_not_cross_checked(
+    tmp_path: Path,
+) -> None:
+    """CI associations that omit version must not claim a full cross-check.
+
+    Claiming association_cross_checked=true without version made sign-time
+    reload require the field and fail with a version mismatch.
+    """
+    state = _seed_mock_state(tmp_path)
+    assoc = state / "arts" / MEASUREMENTS_ARTIFACT / "artifact-association.v1"
+    lines = [
+        line
+        for line in assoc.read_bytes().decode("ascii").splitlines()
+        if not line.startswith("version=")
+    ]
+    assoc.write_bytes(("\n".join(lines) + "\n").encode("ascii"))
+    gh = MockGh(state)
+    out = tmp_path / "acquired"
+    bundle = acquire_release(tag=TAG, output_dir=out, run_id=RUN_ID, gh=gh)
+    identity = parse_acquisition_receipt(bundle.receipt_path.read_bytes())
+    assert identity.association_cross_checked is False
+    reloaded = load_acquired_bundle(out)
+    assert reloaded.identity.association_cross_checked is False
 
 
 def test_acquire_multi_page_artifacts(tmp_path: Path) -> None:

@@ -564,11 +564,18 @@ def _cross_check_association(
                 "association workflow_run_id disagrees with GitHub run id"
             )
     if require_fields or "version" in fields:
+        if "version" not in fields:
+            raise AcquireError("association missing version")
         if fields.get("version") != version:
             raise AcquireError("association version mismatch")
     if measurement_sha256 is not None and "measurement_sha256" in fields:
         if fields["measurement_sha256"] != measurement_sha256:
             raise AcquireError("association measurement_sha256 mismatch")
+    # Full cross-check requires an explicit version binding. Older CI
+    # association records omit it; present fields may still be validated above,
+    # but must not be claimed as association_cross_checked=true.
+    if "version" not in fields:
+        return False
     return True
 
 

@@ -49,6 +49,45 @@ PUBLIC_KEY_FILE="$ROOT/tools/release/kindle-release-public-key.hex"
 
 die() { echo "promote-release.sh: $*" >&2; exit 1; }
 
+# Probe scribe-server --version. Native Linux hosts exec directly; Windows Git
+# Bash cannot run Linux ELF, so fall back to wsl.exe for the same probe.
+_linux_server_version() {
+  local bin="$1"
+  local got=""
+  # Native probe first. Keep stderr visible so a failed ELF exec (e.g. Windows
+  # Git Bash) diagnoses why we fall through; do not swallow API/tool errors.
+  if got="$("$bin" --version | tr -d '[:space:]')" && [ -n "$got" ]; then
+    printf '%s\n' "$got"
+    return 0
+  fi
+  if command -v wsl.exe >/dev/null 2>&1; then
+    local wsl_bin
+    wsl_bin="$(
+      python3 -c '
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]).resolve()
+drive = p.drive.rstrip(":").lower()
+if not drive:
+    raise SystemExit("linux server path has no drive for WSL mapping")
+rest = p.as_posix()
+if ":" in rest:
+    rest = rest.split(":", 1)[1]
+print("/mnt/" + drive + rest)
+' "$bin"
+    )" || return 1
+    # WSL stderr stays visible for mapping/exec failures; pipefail + empty
+    # stdout still fail closed before the caller accepts a version string.
+    got="$(
+      wsl.exe -e bash -lc "chmod +x $(printf '%q' "$wsl_bin") && $(printf '%q' "$wsl_bin") --version" \
+        | tr -d '[:space:]'
+    )" || return 1
+    [ -n "$got" ] || return 1
+    printf '%s\n' "$got"
+    return 0
+  fi
+  return 1
+}
+
 case "${1:-}" in
   dry-run)
     if [ -n "${IGNITE_PROMOTE_PUBLIC_KEY_FILE:-}" ]; then
@@ -303,8 +342,11 @@ verify() {
     || die "bundle metadata version is not $VERSION"
   grep -qx "arch=$ARCH" "$WORK/${LINUX%.tar.gz}/.ignite-bundle" \
     || die "bundle metadata arch is not $ARCH"
-  [ "$("$WORK/${LINUX%.tar.gz}/scribe-server" --version | tr -d '[:space:]')" = "$VERSION" ] \
-    || die "bundle binary is not $VERSION"
+  server_bin="$WORK/${LINUX%.tar.gz}/scribe-server"
+  [ -f "$server_bin" ] || die "bundle missing scribe-server"
+  server_ver="$(_linux_server_version "$server_bin")" \
+    || die "cannot probe bundle scribe-server --version on this host"
+  [ "$server_ver" = "$VERSION" ] || die "bundle binary is not $VERSION"
   rm -rf "${WORK:?}/${LINUX%.tar.gz}"
 
   rm -rf "$AUTH_DIR"

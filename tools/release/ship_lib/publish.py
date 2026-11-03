@@ -37,6 +37,35 @@ def canonical_nine_file_names(
     )
 
 
+def github_release_asset_name(logical_name: str) -> str:
+    """Map logical release asset names to GitHub's on-wire asset names.
+
+    GitHub Releases substitutes ``.`` for spaces in uploaded asset filenames.
+    Local/authenticated inventory keeps the spaced Scriptlet contract names.
+    """
+    return logical_name.replace(" ", ".")
+
+
+def resolve_published_asset_name(
+    logical_name: str, remote_by_name: Mapping[str, object]
+) -> str:
+    """Resolve a logical inventory name against a published release asset map.
+
+    Accepts either the logical name (spaces preserved) or GitHub's rewritten
+    dotted form so verification works against real GitHub Releases and against
+    fixtures that keep spaced names.
+    """
+    dotted = github_release_asset_name(logical_name)
+    if logical_name in remote_by_name:
+        return logical_name
+    if dotted in remote_by_name:
+        return dotted
+    raise ShipError(
+        f"published release missing asset for {logical_name!r} "
+        f"(also looked for {dotted!r})"
+    )
+
+
 def local_asset_digests(asset_dir: Path, names: Sequence[str]) -> dict[str, str]:
     digests: dict[str, str] = {}
     for name in names:
@@ -477,17 +506,23 @@ def verify_published_release(
 
     assets = list(data.get("assets") or [])
     remote_by_name = {str(a.get("name") or ""): a for a in assets}
+    logical_to_remote = {
+        name: resolve_published_asset_name(name, remote_by_name) for name in expected
+    }
+    expected_remote = sorted(logical_to_remote.values())
     names = sorted(remote_by_name)
-    if names != expected:
+    if names != expected_remote:
         raise ShipError(
             "published asset inventory mismatch: "
-            f"got={names!r} expected={expected!r}"
+            f"got={names!r} expected={expected_remote!r} "
+            f"(logical={expected!r})"
         )
 
     if local_asset_dir is not None:
         for name in expected:
             local = local_asset_dir / name
-            remote_size = remote_by_name[name].get("size")
+            remote = remote_by_name[logical_to_remote[name]]
+            remote_size = remote.get("size") if isinstance(remote, dict) else None
             if remote_size is not None and int(remote_size) != local.stat().st_size:
                 raise ShipError(f"published asset size mismatch for {name}")
 
@@ -505,6 +540,7 @@ def verify_published_release(
             dest=work,
             gh=gh,
             remote_by_name=remote_by_name,
+            logical_to_remote=logical_to_remote,
         )
         for name in expected:
             if remote_digests[name] != expected_digests[name]:
@@ -522,7 +558,7 @@ def verify_published_release(
         "release_url": str(data.get("url") or ""),
         "tag": tag,
         "commit": tag_sha,
-        "asset_names": names,
+        "asset_names": expected,
         "asset_digests": dict(remote_digests),
         "is_prerelease": bool(data.get("isPrerelease")),
     }
@@ -536,25 +572,31 @@ def _download_and_hash_assets(
     dest: Path,
     gh: GitHubClient,
     remote_by_name: Mapping[str, object],
+    logical_to_remote: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     digests: dict[str, str] = {}
-    pattern_args: list[str] = []
+    mapping = dict(logical_to_remote or {})
     for name in names:
-        pattern_args.extend(["--pattern", name])
+        if name not in mapping:
+            mapping[name] = resolve_published_asset_name(name, remote_by_name)
+    pattern_args: list[str] = []
+    for remote_name in mapping.values():
+        pattern_args.extend(["--pattern", remote_name])
     downloaded = gh.run(
         ["release", "download", tag, "-D", str(dest), *pattern_args, "--clobber"],
         cwd=repo_root,
     )
     if downloaded.returncode != 0:
         for name in names:
-            out = dest / name
+            remote_name = mapping[name]
+            out = dest / remote_name
             api = gh.run(
                 [
                     "api",
                     "-H",
                     "Accept: application/octet-stream",
                     f"repos/{{owner}}/{{repo}}/releases/assets/"
-                    f"{_asset_id(remote_by_name[name])}",
+                    f"{_asset_id(remote_by_name[remote_name])}",
                     "--output",
                     str(out),
                 ],
@@ -566,13 +608,24 @@ def _download_and_hash_assets(
                     + (api.stderr or api.stdout or downloaded.stderr or "").strip()
                 )
     for name in names:
-        path = dest / name
+        remote_name = mapping[name]
+        path = dest / remote_name
         if not path.is_file():
-            raise ShipError(f"downloaded asset missing after retrieval: {name}")
+            # gh may write the logical name when patterns use spaces; accept either.
+            alt = dest / name
+            if alt.is_file():
+                path = alt
+            else:
+                raise ShipError(f"downloaded asset missing after retrieval: {name}")
+        logical_path = dest / name
+        if path != logical_path:
+            if logical_path.exists():
+                logical_path.unlink()
+            path.replace(logical_path)
+            path = logical_path
+        remote_meta = remote_by_name[remote_name]
         remote_size = (
-            remote_by_name[name].get("size")
-            if isinstance(remote_by_name[name], dict)
-            else None
+            remote_meta.get("size") if isinstance(remote_meta, dict) else None
         )
         if remote_size is not None and int(remote_size) != path.stat().st_size:
             raise ShipError(f"downloaded asset size mismatch for {name}")

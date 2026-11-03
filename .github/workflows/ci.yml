@@ -192,6 +192,7 @@ jobs:
             echo "scriptlet=Install Ignite v$v.sh"
             echo "scriptlet_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
             echo "measurement_sha256=$(sha256sum dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 | awk '{print $1}')"
+            echo "version=$v"
             echo "source_revision=${GITHUB_SHA}"
             echo "workflow_run_id=${GITHUB_RUN_ID}"
             echo "github_release_asset=false"
