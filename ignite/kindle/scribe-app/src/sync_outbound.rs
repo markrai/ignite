@@ -4529,6 +4529,10 @@ mod tests;
 mod offline_capture_tests;
 
 #[cfg(test)]
+#[path = "page_template_sync_tests.rs"]
+mod page_template_sync_tests;
+
+#[cfg(test)]
 #[path = "s2c_inbound_tests.rs"]
 mod s2c_tests;
 

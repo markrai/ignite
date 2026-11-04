@@ -94,3 +94,81 @@ describe("session blob cache", () => {
     expect(cache.error(ref.sha256)).toMatch(/SHA-256/);
   });
 });
+
+/**
+ * Slice 3: nonblank templates are ordinary Gray8 blobs for Web.
+ * These buffers mimic Kindle mark geometry (white paper + light gray marks, packed stride)
+ * but are TypeScript-generated — they are not the Rust `generate_page_background` bytes, so
+ * this does not claim cross-platform pixel parity with the Kindle generator.
+ */
+describe("page-template-like Gray8 blobs (Ruled / Grid / Dotted)", () => {
+  const PAPER = 0xff;
+  const MARK = 0xe0;
+  const W = 48;
+  const H = 64;
+
+  function packedWhite(): Uint8Array {
+    return new Uint8Array(W * H).fill(PAPER);
+  }
+
+  function ruled(): Uint8Array {
+    const b = packedWhite();
+    for (let y = 16; y < H - 8; y += 16) {
+      for (let x = 0; x < W; x++) b[y * W + x] = MARK;
+    }
+    return b;
+  }
+
+  function grid(): Uint8Array {
+    const b = packedWhite();
+    for (let y = 0; y < H - 8; y++) {
+      for (let x = 0; x < W; x++) {
+        if (x % 12 === 0 || y % 12 === 0) b[y * W + x] = MARK;
+      }
+    }
+    return b;
+  }
+
+  function dotted(): Uint8Array {
+    const b = packedWhite();
+    for (let y = 6; y < H - 8; y += 12) {
+      for (let x = 6; x < W; x += 12) b[y * W + x] = MARK;
+    }
+    return b;
+  }
+
+  async function asBlobRef(bytes: Uint8Array): Promise<Extract<BackgroundRef, { kind: "blob" }>> {
+    const sha256 = await sha256Hex(bytes);
+    return {
+      kind: "blob",
+      sha256,
+      byte_len: bytes.length,
+      format: { encoding: "gray8", width: W, height: H, stride: W },
+    };
+  }
+
+  it.each([
+    ["Ruled", ruled],
+    ["Grid", grid],
+    ["Dotted", dotted],
+  ] as const)("%s verifies and decodes under strokes", async (_name, gen) => {
+    const bytes = gen();
+    expect(bytes.some((v) => v === MARK)).toBe(true);
+    expect(bytes.some((v) => v === PAPER)).toBe(true);
+    const blobRef = await asBlobRef(bytes);
+    await verifyBlob(bytes, blobRef);
+    const rgba = gray8ToRgba(bytes, W, H, W);
+    expect(rgba.length).toBe(W * H * 4);
+    // Gray channel preserved; fully opaque — ready to paint beneath vector strokes.
+    for (let i = 0; i < bytes.length; i++) {
+      expect(rgba[i * 4]).toBe(bytes[i]);
+      expect(rgba[i * 4 + 3]).toBe(255);
+    }
+    const decode = vi.fn(async () => ({}) as CanvasImageSource);
+    const cache = new BlobCache(async () => bytes, decode);
+    const decoded = await cache.load(blobRef);
+    expect(decoded.width).toBe(W);
+    expect(decoded.height).toBe(H);
+    expect(decode).toHaveBeenCalledTimes(1);
+  });
+});

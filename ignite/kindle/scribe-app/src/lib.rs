@@ -58,6 +58,7 @@ pub mod orch;
 pub mod page_label;
 pub mod page_ledger;
 pub mod page_thumb;
+#[cfg(test)]
 mod page_template_durable_tests;
 pub mod paper_templates;
 pub mod prefs;
