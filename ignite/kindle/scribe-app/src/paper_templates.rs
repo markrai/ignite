@@ -20,8 +20,7 @@
 //! hardware-validated. Tune only by changing these constants; do not rewrite
 //! already-persisted page backgrounds.
 
-use crate::page_label::{chrome_band_height_px, scrub_chrome_band};
-use kindle_platform::FbGeometry;
+use crate::page_label::chrome_band_height_px;
 
 /// Paper / unmarked Gray8 white (matches `ui_gfx::WHITE` and `BackgroundIdentityV1::Blank`).
 pub const PAPER_WHITE: u8 = 0xFF;
@@ -79,8 +78,9 @@ pub fn generate_page_background(
             "REFUSE TEMPLATE: invalid dimensions {width}x{height}"
         ));
     }
-    // Prefer u64 so we can refuse products that fit in usize but cannot be allocated
-    // (e.g. u32::MAX² on 64-bit hosts ≈ 16 EiB − ε).
+    // Checked u64 product first; then try_reserve_exact so hosts where the product
+    // fits in usize but not in addressable memory (e.g. u32::MAX² on 64-bit) refuse
+    // cleanly instead of panicking inside `vec![_; len]`.
     let len_u64 = u64::from(width)
         .checked_mul(u64::from(height))
         .ok_or_else(|| format!("REFUSE TEMPLATE: dimension overflow {width}x{height}"))?;
@@ -201,33 +201,32 @@ fn reserved_region_is_white(buf: &[u8], width: u32, height: u32) -> bool {
     true
 }
 
-/// Geometry helper for scrub tests (packed layout: `line_length == width`).
-pub fn packed_geo(width: u32, height: u32) -> FbGeometry {
-    FbGeometry {
-        xres: width,
-        yres: height,
-        xres_virtual: width,
-        yres_virtual: height,
-        xoffset: 0,
-        yoffset: 0,
-        bits_per_pixel: 8,
-        line_length: width,
-        smem_len: width.saturating_mul(height),
-    }
-}
-
-/// True when the real [`scrub_chrome_band`] leaves `bg` unchanged.
-pub fn scrub_is_noop(bg: &mut [u8], width: u32, height: u32) -> Result<bool, String> {
-    let before = bg.to_vec();
-    let changed = scrub_chrome_band(bg, &packed_geo(width, height))?;
-    Ok(!changed && bg == before.as_slice())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::page_label::scrub_chrome_band;
     use crate::store::BackgroundIdentityV1;
+    use kindle_platform::FbGeometry;
+
+    fn packed_geo(width: u32, height: u32) -> FbGeometry {
+        FbGeometry {
+            xres: width,
+            yres: height,
+            xres_virtual: width,
+            yres_virtual: height,
+            xoffset: 0,
+            yoffset: 0,
+            bits_per_pixel: 8,
+            line_length: width,
+            smem_len: width.saturating_mul(height),
+        }
+    }
+
+    fn scrub_is_noop(bg: &mut [u8], width: u32, height: u32) -> Result<bool, String> {
+        let before = bg.to_vec();
+        let changed = scrub_chrome_band(bg, &packed_geo(width, height))?;
+        Ok(!changed && bg == before.as_slice())
+    }
 
     fn count_marks(buf: &[u8]) -> usize {
         buf.iter().filter(|&&b| b != PAPER_WHITE).count()
@@ -367,9 +366,15 @@ mod tests {
         assert!(generate_page_background(PageTemplate::Blank, 0, 10).is_err());
         assert!(generate_page_background(PageTemplate::Ruled, 10, 0).is_err());
         assert!(generate_page_background(PageTemplate::Grid, 0, 0).is_err());
-        // (2^32-1)^2 overflows usize on both 32- and 64-bit hosts.
+        // On 64-bit hosts u32::MAX² fits in usize but is not allocatable; refuse via
+        // try_reserve_exact (do not panic). On 32-bit the product overflows usize first.
         let err = generate_page_background(PageTemplate::Blank, u32::MAX, u32::MAX);
         assert!(err.is_err(), "u32::MAX x u32::MAX must refuse: {err:?}");
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains("cannot allocate") || msg.contains("overflow"),
+            "unexpected refusal wording: {msg}"
+        );
     }
 
     #[test]
