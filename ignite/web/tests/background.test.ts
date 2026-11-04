@@ -103,7 +103,8 @@ describe("session blob cache", () => {
  */
 describe("page-template-like Gray8 blobs (Ruled / Grid / Dotted)", () => {
   const PAPER = 0xff;
-  const MARK = 0xe0;
+  const MARK = 0x80;
+  const RULED_MARK = 0x80;
   const W = 48;
   const H = 64;
 
@@ -114,7 +115,7 @@ describe("page-template-like Gray8 blobs (Ruled / Grid / Dotted)", () => {
   function ruled(): Uint8Array {
     const b = packedWhite();
     for (let y = 16; y < H - 8; y += 16) {
-      for (let x = 0; x < W; x++) b[y * W + x] = MARK;
+      for (let x = 0; x < W; x++) b[y * W + x] = RULED_MARK;
     }
     return b;
   }
@@ -148,12 +149,12 @@ describe("page-template-like Gray8 blobs (Ruled / Grid / Dotted)", () => {
   }
 
   it.each([
-    ["Ruled", ruled],
-    ["Grid", grid],
-    ["Dotted", dotted],
-  ] as const)("%s verifies and decodes as Gray8", async (_name, gen) => {
+    ["Ruled", ruled, RULED_MARK],
+    ["Grid", grid, MARK],
+    ["Dotted", dotted, MARK],
+  ] as const)("%s verifies and decodes as Gray8", async (_name, gen, mark) => {
     const bytes = gen();
-    expect(bytes.some((v) => v === MARK)).toBe(true);
+    expect(bytes.some((v) => v === mark)).toBe(true);
     expect(bytes.some((v) => v === PAPER)).toBe(true);
     const blobRef = await asBlobRef(bytes);
     await verifyBlob(bytes, blobRef);

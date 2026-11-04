@@ -1,6 +1,15 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.18] - 2026-11-04
+
+### Added
+
+- Notebook page templates on Kindle: when creating a notebook, a **Select paper**
+  step offers Blank, Ruled, Grid, and Dotted. The choice is applied only at page
+  creation as a durable Gray8 `background.raw` (existing pages and blank notebooks
+  are unchanged). Non-blank templates sync as ordinary background blobs with no
+  protocol or schema migration. Mark spacing and E Ink–tuned intensity (including
+  3×3 dotted marks) are fixed generator constants.
 
 ## [0.9.17] - 2026-11-03
 

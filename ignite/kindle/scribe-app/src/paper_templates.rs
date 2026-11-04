@@ -25,8 +25,11 @@ use crate::page_label::chrome_band_height_px;
 /// Paper / unmarked Gray8 white (matches `ui_gfx::WHITE` and `BackgroundIdentityV1::Blank`).
 pub const PAPER_WHITE: u8 = 0xFF;
 
-/// Light gray rule/dot pigment (restrained for E Ink; subject to physical tuning).
-pub const MARK_GRAY: u8 = 0xE0;
+/// Grid/dot pigment (matched to physical E Ink tuning of ruled lines).
+pub const MARK_GRAY: u8 = 0x80;
+
+/// Ruled line pigment (same intensity as [`MARK_GRAY`] after physical E Ink tuning).
+pub const RULED_MARK_GRAY: u8 = 0x80;
 
 /// Vertical pitch between ruled horizontal lines (panel px).
 pub const RULED_SPACING_PX: u32 = 80;
@@ -36,6 +39,10 @@ pub const GRID_SPACING_PX: u32 = 40;
 
 /// Pitch for dotted lattice (panel px).
 pub const DOTTED_SPACING_PX: u32 = 40;
+
+/// Side length of each filled square at a dotted lattice point (panel px).
+/// Single-pixel marks lack enough area to register on E Ink; spacing is unchanged.
+pub const DOTTED_MARK_SIZE_PX: u32 = 3;
 
 /// Rows above the chrome band sampled by `scrub_chrome_band` (`sample_y = chrome_top - 8`).
 const CHROME_SAMPLE_MARGIN_PX: u32 = 8;
@@ -140,28 +147,28 @@ fn put(buf: &mut [u8], width: u32, x: u32, y: u32, value: u8) {
     buf[i] = value;
 }
 
-fn draw_hline(buf: &mut [u8], width: u32, y: u32, usable: u32) {
+fn draw_hline(buf: &mut [u8], width: u32, y: u32, usable: u32, gray: u8) {
     if y >= usable {
         return;
     }
     for x in 0..width {
-        put(buf, width, x, y, MARK_GRAY);
+        put(buf, width, x, y, gray);
     }
 }
 
-fn draw_vline(buf: &mut [u8], width: u32, x: u32, usable: u32) {
+fn draw_vline(buf: &mut [u8], width: u32, x: u32, usable: u32, gray: u8) {
     if x >= width {
         return;
     }
     for y in 0..usable {
-        put(buf, width, x, y, MARK_GRAY);
+        put(buf, width, x, y, gray);
     }
 }
 
 fn draw_ruled(buf: &mut [u8], width: u32, usable: u32) {
     let mut y = RULED_SPACING_PX;
     while y < usable {
-        draw_hline(buf, width, y, usable);
+        draw_hline(buf, width, y, usable, RULED_MARK_GRAY);
         match y.checked_add(RULED_SPACING_PX) {
             Some(n) => y = n,
             None => break,
@@ -172,7 +179,7 @@ fn draw_ruled(buf: &mut [u8], width: u32, usable: u32) {
 fn draw_grid(buf: &mut [u8], width: u32, usable: u32) {
     let mut y = GRID_SPACING_PX;
     while y < usable {
-        draw_hline(buf, width, y, usable);
+        draw_hline(buf, width, y, usable, MARK_GRAY);
         match y.checked_add(GRID_SPACING_PX) {
             Some(n) => y = n,
             None => break,
@@ -180,10 +187,30 @@ fn draw_grid(buf: &mut [u8], width: u32, usable: u32) {
     }
     let mut x = GRID_SPACING_PX;
     while x < width {
-        draw_vline(buf, width, x, usable);
+        draw_vline(buf, width, x, usable, MARK_GRAY);
         match x.checked_add(GRID_SPACING_PX) {
             Some(n) => x = n,
             None => break,
+        }
+    }
+}
+
+fn draw_dot(buf: &mut [u8], width: u32, usable: u32, cx: u32, cy: u32) {
+    // Odd sizes are centered on (cx, cy); even sizes bias toward +x/+y.
+    let half = DOTTED_MARK_SIZE_PX / 2;
+    let x0 = cx.saturating_sub(half);
+    let y0 = cy.saturating_sub(half);
+    for dy in 0..DOTTED_MARK_SIZE_PX {
+        let y = match y0.checked_add(dy) {
+            Some(v) if v < usable => v,
+            _ => continue,
+        };
+        for dx in 0..DOTTED_MARK_SIZE_PX {
+            let x = match x0.checked_add(dx) {
+                Some(v) if v < width => v,
+                _ => continue,
+            };
+            put(buf, width, x, y, MARK_GRAY);
         }
     }
 }
@@ -193,7 +220,7 @@ fn draw_dotted(buf: &mut [u8], width: u32, usable: u32) {
     while y < usable {
         let mut x = DOTTED_SPACING_PX;
         while x < width {
-            put(buf, width, x, y, MARK_GRAY);
+            draw_dot(buf, width, usable, x, y);
             match x.checked_add(DOTTED_SPACING_PX) {
                 Some(n) => x = n,
                 None => break,
@@ -337,10 +364,10 @@ mod tests {
         while expected_y < usable {
             assert_eq!(
                 bg[index(w, 0, expected_y)],
-                MARK_GRAY,
+                RULED_MARK_GRAY,
                 "missing rule at y={expected_y}"
             );
-            assert_eq!(bg[index(w, w - 1, expected_y)], MARK_GRAY);
+            assert_eq!(bg[index(w, w - 1, expected_y)], RULED_MARK_GRAY);
             // Midway between rules stays paper (when spacing allows).
             let mid = expected_y + RULED_SPACING_PX / 2;
             if mid < usable {
@@ -364,17 +391,17 @@ mod tests {
         );
 
         let dotted = generate_page_background(PageTemplate::Dotted, w, h).unwrap();
-        assert_eq!(
-            dotted[index(w, DOTTED_SPACING_PX, DOTTED_SPACING_PX)],
-            MARK_GRAY
-        );
+        let cx = DOTTED_SPACING_PX;
+        let cy = DOTTED_SPACING_PX;
+        assert_eq!(dotted[index(w, cx, cy)], MARK_GRAY);
+        // 3×3 footprint includes the immediate neighbors of the lattice point.
+        assert_eq!(dotted[index(w, cx + 1, cy)], MARK_GRAY);
+        assert_eq!(dotted[index(w, cx, cy + 1)], MARK_GRAY);
         assert_eq!(dotted[index(w, 0, 0)], PAPER_WHITE);
-        assert_eq!(dotted[index(w, DOTTED_SPACING_PX, 0)], PAPER_WHITE);
-        if DOTTED_SPACING_PX + 1 < usable {
-            assert_eq!(
-                dotted[index(w, DOTTED_SPACING_PX, DOTTED_SPACING_PX + 1)],
-                PAPER_WHITE
-            );
+        assert_eq!(dotted[index(w, cx, 0)], PAPER_WHITE);
+        let outside = cy + DOTTED_MARK_SIZE_PX;
+        if outside < usable {
+            assert_eq!(dotted[index(w, cx, outside)], PAPER_WHITE);
         }
     }
 
