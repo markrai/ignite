@@ -117,7 +117,8 @@ describe("stroke planning", () => {
 
 /** Records draw calls; enough to assert order, backgrounds and geometry. */
 function fakeCtx() {
-  const calls: { op: string; args: unknown[]; lineWidth?: number; fill?: unknown }[] = [];
+  const calls: { op: string; args: unknown[]; lineWidth?: number; fill?: unknown; imageSmoothingEnabled?: boolean }[] =
+    [];
   const ctx: Ctx2D & { calls: typeof calls } = {
     calls,
     fillStyle: "",
@@ -125,7 +126,7 @@ function fakeCtx() {
     lineWidth: 1,
     lineCap: "butt",
     lineJoin: "miter",
-    imageSmoothingEnabled: false,
+    imageSmoothingEnabled: true, // production ctx default; blob blit must clear this
     save: () => calls.push({ op: "save", args: [] }),
     restore: () => calls.push({ op: "restore", args: [] }),
     setTransform: (...a) => calls.push({ op: "setTransform", args: a }),
@@ -142,7 +143,9 @@ function fakeCtx() {
       calls.push({ op: "stroke", args: [], lineWidth: this.lineWidth });
     },
     fill: () => calls.push({ op: "fill", args: [] }),
-    drawImage: (...a) => calls.push({ op: "drawImage", args: a }),
+    drawImage(...a) {
+      calls.push({ op: "drawImage", args: a, imageSmoothingEnabled: this.imageSmoothingEnabled });
+    },
   };
   return ctx;
 }
@@ -166,8 +169,11 @@ describe("renderPage", () => {
     const img = {} as CanvasImageSource;
     const ctx = fakeCtx();
     renderPage(ctx, { page, pageSize: size, background: { width: 93, height: 124, image: img }, transform: t, viewport: vp });
+    const draws = ctx.calls.filter((c) => c.op === "drawImage");
+    expect(draws).toHaveLength(1);
+    expect(draws[0]!.imageSmoothingEnabled).toBe(false);
+    expect(draws[0]!.args).toEqual([img, 0, 0, 93, 124, 0, 0, size.width, size.height]);
     const di = ctx.calls.findIndex((c) => c.op === "drawImage");
-    expect(ctx.calls[di]!.args).toEqual([img, 0, 0, 93, 124, 0, 0, size.width, size.height]);
     expect(ctx.calls.findIndex((c) => c.op === "moveTo")).toBeGreaterThan(di);
   });
 

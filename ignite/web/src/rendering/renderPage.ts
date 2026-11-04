@@ -80,7 +80,8 @@ export function renderPage(ctx: Ctx2D, input: RenderInput, plans: DrawRun[][] = 
   ctx.fillRect(0, 0, pageSize.width, pageSize.height);
   if (page.background.kind === "blob") {
     if (!background) throw new Error("blob background not loaded");
-    ctx.imageSmoothingEnabled = true;
+    // Nearest-neighbor: bilinear upscales soft-fringe thin Gray8 marks into a visible “double”.
+    ctx.imageSmoothingEnabled = false;
     ctx.drawImage(background.image, 0, 0, background.width, background.height, 0, 0, pageSize.width, pageSize.height);
   }
 
