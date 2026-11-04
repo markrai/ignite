@@ -174,11 +174,7 @@ mod tests {
         assert!(matches!(paper, Modal::PaperChooser { .. }), "{paper:?}");
         let spec = crate::modal::dialog_spec(&paper).unwrap();
         let dl = crate::modal::DialogLayout::new(&g, &spec);
-        let (_, r) = dl
-            .buttons
-            .iter()
-            .find(|(b, _)| b.label == "BLANK")
-            .unwrap();
+        let (_, r) = dl.buttons.iter().find(|(b, _)| b.label == "BLANK").unwrap();
         let cmd = tap_resolve(&mut ui, center(*r), None);
         assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
         assert!(ui.modal.as_ref().unwrap().is_title_entry());

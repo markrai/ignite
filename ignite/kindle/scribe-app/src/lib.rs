@@ -57,11 +57,11 @@ pub mod open_page;
 pub mod orch;
 pub mod page_label;
 pub mod page_ledger;
-pub mod page_thumb;
 #[cfg(test)]
 mod page_template_durable_tests;
 #[cfg(test)]
 mod page_template_ui_tests;
+pub mod page_thumb;
 pub mod paper_templates;
 pub mod prefs;
 pub mod pressure;

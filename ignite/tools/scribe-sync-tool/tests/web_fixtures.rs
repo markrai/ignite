@@ -37,6 +37,10 @@ use scribe_app::library::{
 use scribe_app::notebook::{
     insert_page_after_durable, InsertPageHooks, PersistedNotebookManifestV1,
 };
+use scribe_app::paper_templates::{
+    generate_page_background, reserved_bottom_rows, PageTemplate, SCRIBE_PANEL_HEIGHT,
+    SCRIBE_PANEL_WIDTH,
+};
 use scribe_app::pressure_curve::{
     interpolate_q, quantize_pressure, PressureCurveV1, PRESSURE_Q_MAX, STYLE_LEGACY_FIXED_V1,
     STYLE_PRESSURE_WIDTH_V1,
@@ -50,10 +54,6 @@ use scribe_app::store::{
     PersistedReplacementV2,
 };
 use scribe_app::sync_local::{build_snapshot, ensure_sync_identity};
-use scribe_app::paper_templates::{
-    generate_page_background, reserved_bottom_rows, PageTemplate, SCRIBE_PANEL_HEIGHT,
-    SCRIBE_PANEL_WIDTH,
-};
 use scribe_app::ui_gfx::paper_background;
 use serde_json::{json, Value};
 use sync_engine::LibraryState;
@@ -805,7 +805,10 @@ fn paper_template_fixtures_match_rust_generator() {
     assert_eq!(m["width"], SCRIBE_PANEL_WIDTH);
     assert_eq!(m["height"], SCRIBE_PANEL_HEIGHT);
     assert_eq!(m["stride"], SCRIBE_PANEL_WIDTH);
-    assert_eq!(m["reserved_bottom_rows"], reserved_bottom_rows(SCRIBE_PANEL_HEIGHT));
+    assert_eq!(
+        m["reserved_bottom_rows"],
+        reserved_bottom_rows(SCRIBE_PANEL_HEIGHT)
+    );
 
     for t in PageTemplate::picker_choices() {
         let name = paper_template_name(t);

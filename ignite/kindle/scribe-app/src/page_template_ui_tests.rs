@@ -118,7 +118,13 @@ mod tests {
         let layout = HomeLayout::new(&g, &ui.home, 2);
         ui.on_tap(&g, center(layout.new_button), &c, "Notebook 3", None);
         let chooser = ui.modal.clone().unwrap();
-        ui.on_tap(&g, dialog_button(&g, &chooser, "NEW NOTEBOOK"), &c, "x", None);
+        ui.on_tap(
+            &g,
+            dialog_button(&g, &chooser, "NEW NOTEBOOK"),
+            &c,
+            "x",
+            None,
+        );
         let paper = ui.modal.clone().unwrap();
         assert_eq!(
             labels(&paper),
@@ -205,9 +211,13 @@ mod tests {
     fn each_template_choice_reaches_durable_create_with_matching_background() {
         for template in PageTemplate::picker_choices() {
             let root = tmp(&format!("ui-{template:?}"));
-            let opened =
-                open_or_create_library(&root, InkRequest::Default, &geo(), &paper_background(&geo()))
-                    .unwrap();
+            let opened = open_or_create_library(
+                &root,
+                InkRequest::Default,
+                &geo(),
+                &paper_background(&geo()),
+            )
+            .unwrap();
             let mut library = opened.repository;
             let before = library.manifest().notebook_ids.clone();
             let title = format!("T-{template:?}");
@@ -228,8 +238,13 @@ mod tests {
             let bg = fs::read(nb.join(DEFAULT_PAGE_ID).join("background.raw")).unwrap();
             assert_eq!(bg, expected_bg(template), "{template:?}");
 
-            let opened = open_or_create_notebook(&nb, InkRequest::Default, &geo(), &paper_background(&geo()))
-                .unwrap();
+            let opened = open_or_create_notebook(
+                &nb,
+                InkRequest::Default,
+                &geo(),
+                &paper_background(&geo()),
+            )
+            .unwrap();
             assert_eq!(opened.loaded.background, expected_bg(template));
             let _ = fs::remove_dir_all(root);
         }
@@ -279,9 +294,13 @@ mod tests {
         );
 
         let root = tmp("folder-create");
-        let opened =
-            open_or_create_library(&root, InkRequest::Default, &geo(), &paper_background(&geo()))
-                .unwrap();
+        let opened = open_or_create_library(
+            &root,
+            InkRequest::Default,
+            &geo(),
+            &paper_background(&geo()),
+        )
+        .unwrap();
         let mut library = opened.repository;
         // Seed the folder so set_folder can succeed.
         let mut folders = FolderStore::open(&root);
@@ -313,7 +332,13 @@ mod tests {
         let layout = HomeLayout::new(&g, &ui.home, 2);
         ui.on_tap(&g, center(layout.new_button), &c, "Notebook 3", None);
         let chooser = ui.modal.clone().unwrap();
-        ui.on_tap(&g, dialog_button(&g, &chooser, "NEW NOTEBOOK"), &c, "x", None);
+        ui.on_tap(
+            &g,
+            dialog_button(&g, &chooser, "NEW NOTEBOOK"),
+            &c,
+            "x",
+            None,
+        );
         let paper = ui.modal.clone().unwrap();
         let cmd = ui.on_tap(&g, dialog_button(&g, &paper, "CANCEL"), &c, "x", None);
         assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
@@ -342,9 +367,13 @@ mod tests {
     #[test]
     fn failed_create_leaves_library_unchanged() {
         let root = tmp("fail-ui");
-        let opened =
-            open_or_create_library(&root, InkRequest::Default, &geo(), &paper_background(&geo()))
-                .unwrap();
+        let opened = open_or_create_library(
+            &root,
+            InkRequest::Default,
+            &geo(),
+            &paper_background(&geo()),
+        )
+        .unwrap();
         let mut library = opened.repository;
         let before = library.manifest().notebook_ids.clone();
         let hooks = CreateNotebookHooks {
@@ -371,9 +400,13 @@ mod tests {
     #[test]
     fn blank_default_paths_without_picker_remain_blank() {
         let root = tmp("blank-default");
-        let opened =
-            open_or_create_library(&root, InkRequest::Default, &geo(), &paper_background(&geo()))
-                .unwrap();
+        let opened = open_or_create_library(
+            &root,
+            InkRequest::Default,
+            &geo(),
+            &paper_background(&geo()),
+        )
+        .unwrap();
         let mut library = opened.repository;
         // Noninteractive / paper_background path (dev Home, import, etc.).
         let commit = create_notebook_durable(

@@ -2944,14 +2944,18 @@ fn inbound_parse_tail_decodes_replace_stroke_lineages() {
 
 fn template_durable_bg(template: crate::paper_templates::PageTemplate) -> Vec<u8> {
     let g = geo();
-    let mut bg = crate::paper_templates::generate_page_background(template, g.xres, g.yres).unwrap();
+    let mut bg =
+        crate::paper_templates::generate_page_background(template, g.xres, g.yres).unwrap();
     crate::page_label::scrub_chrome_band(&mut bg, &g).unwrap();
     bg
 }
 
 fn template_background_ref(bytes: &[u8]) -> BackgroundRef {
     let g = geo();
-    if bytes.iter().all(|&b| b == crate::paper_templates::PAPER_WHITE) {
+    if bytes
+        .iter()
+        .all(|&b| b == crate::paper_templates::PAPER_WHITE)
+    {
         return BackgroundRef::Blank;
     }
     BackgroundRef::Blob {
@@ -2990,12 +2994,16 @@ fn page_templates_inbound_materialize_byte_identical_for_all_templates() {
         let bg = template_background_ref(&bytes);
         if let BackgroundRef::Blob { sha256, .. } = &bg {
             assert!(
-                srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes)).0 < 300,
+                srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes))
+                    .0
+                    < 300,
                 "{template:?} blob PUT"
             );
             // Idempotent second PUT of the same content-addressed blob.
             assert!(
-                srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes)).0 < 300,
+                srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes))
+                    .0
+                    < 300,
                 "{template:?} blob PUT dedupe"
             );
         }
@@ -3099,7 +3107,10 @@ fn page_templates_inbound_materialize_byte_identical_for_all_templates() {
         .clone();
     let dir = k.lib.join("notebooks").join(&nb_local);
     let (_store, loaded) = load_existing_page(&dir, &page_local).unwrap();
-    assert_eq!(loaded.background, *grid_bytes, "{grid_tmpl:?} bg after stroke");
+    assert_eq!(
+        loaded.background, *grid_bytes,
+        "{grid_tmpl:?} bg after stroke"
+    );
     assert_eq!(loaded.strokes.len(), 1);
 }
 
@@ -3116,7 +3127,11 @@ fn page_template_shared_background_dedupes_blob_and_preserves_refs() {
     let BackgroundRef::Blob { sha256, .. } = &bg else {
         panic!("Ruled must be Blob");
     };
-    assert!(srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes)).0 < 300);
+    assert!(
+        srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes))
+            .0
+            < 300
+    );
     let mut remote = Remote::new(lib);
     let n1 = NotebookId::from_uuid(Uuid::now_v7()).unwrap();
     let n2 = NotebookId::from_uuid(Uuid::now_v7()).unwrap();
@@ -3178,7 +3193,11 @@ fn page_template_missing_and_mismatched_blob_refs_rejected_by_server() {
     let (nb0, p0) = first_page(&srv, lib);
     let bytes = template_durable_bg(PageTemplate::Dotted);
     let real = sha256_hex(&bytes);
-    assert!(srv.call("PUT", &format!("/v1/blobs/{real}"), Some(&bytes)).0 < 300);
+    assert!(
+        srv.call("PUT", &format!("/v1/blobs/{real}"), Some(&bytes))
+            .0
+            < 300
+    );
 
     // Unknown SHA (never uploaded).
     let fake = sha256_hex(b"absent-template-blob");

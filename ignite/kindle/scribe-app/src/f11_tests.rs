@@ -398,7 +398,16 @@ mod tests {
         );
         assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
         let paper = ui.modal.clone().unwrap();
-        assert!(matches!(paper, Modal::PaperChooser { folder_id: None, .. }), "{paper:?}");
+        assert!(
+            matches!(
+                paper,
+                Modal::PaperChooser {
+                    folder_id: None,
+                    ..
+                }
+            ),
+            "{paper:?}"
+        );
         let cmd = ui.on_tap(
             &g,
             dialog_button(&g, &paper, "BLANK"),

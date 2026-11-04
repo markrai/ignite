@@ -1080,14 +1080,7 @@ pub fn create_notebook_durable_with_template(
     hooks: &CreateNotebookHooks,
 ) -> Result<CreateNotebookCommit, String> {
     let background = generate_page_background(template, geo.xres, geo.yres)?;
-    create_notebook_durable(
-        library,
-        profile,
-        geo,
-        &background,
-        explicit_title,
-        hooks,
-    )
+    create_notebook_durable(library, profile, geo, &background, explicit_title, hooks)
 }
 
 pub fn switch_notebook_durable(

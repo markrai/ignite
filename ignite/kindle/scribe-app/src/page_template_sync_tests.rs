@@ -61,7 +61,11 @@ fn create_templated(
     .unwrap();
     let nb = lib.notebook_dir(&cn.notebook_id);
     let bg = fs::read(nb.join("page-1").join("background.raw")).unwrap();
-    assert_eq!(bg, durable_bg(template), "{template:?} durable vs generator");
+    assert_eq!(
+        bg,
+        durable_bg(template),
+        "{template:?} durable vs generator"
+    );
     sync.notebook_created(&nb, &cn.notebook_id, &cn.title, after);
     (cn.notebook_id, bg)
 }
@@ -162,9 +166,10 @@ fn durable_template_create_captures_create_notebook_and_blob_identity() {
             }
         }
         // Inserted page inherits and captures CreatePage with the same background ref.
-        let mut m: crate::notebook::PersistedNotebookManifestV1 =
-            serde_json::from_slice(&fs::read(nb_dir(&e.lib, &nb_id).join("notebook.meta")).unwrap())
-                .unwrap();
+        let mut m: crate::notebook::PersistedNotebookManifestV1 = serde_json::from_slice(
+            &fs::read(nb_dir(&e.lib, &nb_id).join("notebook.meta")).unwrap(),
+        )
+        .unwrap();
         let pending1 = s.pending();
         let ins = insert_page_after_durable(
             &nb_dir(&e.lib, &nb_id),
@@ -186,7 +191,9 @@ fn durable_template_create_captures_create_notebook_and_blob_identity() {
             &ins.inserted_page_id,
             Some("page-1"),
         );
-        wait_until("create_page", Duration::from_secs(5), || s.pending() > pending1);
+        wait_until("create_page", Duration::from_secs(5), || {
+            s.pending() > pending1
+        });
         let create_page = parse_journal(&fs::read(e.sync.join(OUTBOX_FILE)).unwrap())
             .unwrap()
             .committed
@@ -211,13 +218,22 @@ fn identical_ruled_backgrounds_dedupe_to_one_content_addressed_blob() {
     let e = env("tmpl-dedupe");
     write_config(&e.sync, &srv.url(), &srv.token, false);
     let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
-    let (nb_a, bg_a) = create_templated(&s, &e.lib, PageTemplate::Ruled, "Ruled-A", Some("notebook-1"));
+    let (nb_a, bg_a) = create_templated(
+        &s,
+        &e.lib,
+        PageTemplate::Ruled,
+        "Ruled-A",
+        Some("notebook-1"),
+    );
     let (nb_b, bg_b) = create_templated(&s, &e.lib, PageTemplate::Ruled, "Ruled-B", Some(&nb_a));
     assert_eq!(bg_a, bg_b);
     let sha = sha256_hex(&bg_a);
     // Content-addressed outbox store: identical backgrounds share one blob file.
     assert_eq!(
-        blob_files(&e.sync).iter().filter(|n| *n == sha.as_str()).count(),
+        blob_files(&e.sync)
+            .iter()
+            .filter(|n| *n == sha.as_str())
+            .count(),
         1
     );
 
@@ -257,7 +273,13 @@ fn blank_template_uploads_without_background_blob() {
     write_config(&e.sync, &srv.url(), &srv.token, false);
     let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
     let before = blob_files(&e.sync);
-    create_templated(&s, &e.lib, PageTemplate::Blank, "Blank-T", Some("notebook-1"));
+    create_templated(
+        &s,
+        &e.lib,
+        PageTemplate::Blank,
+        "Blank-T",
+        Some("notebook-1"),
+    );
     wait_until("upload", Duration::from_secs(20), || {
         s.pending() == 0 && s.state().acked_client_seq >= 1
     });
@@ -268,10 +290,7 @@ fn blank_template_uploads_without_background_blob() {
         .iter()
         .find(|n| n.title == "Blank-T")
         .unwrap();
-    assert!(matches!(
-        blank_nb.pages[0].background,
-        BackgroundRef::Blank
-    ));
+    assert!(matches!(blank_nb.pages[0].background, BackgroundRef::Blank));
     assert_eq!(
         srv.snapshot_hash(&library_id(&e.sync)),
         snapshot_sha256(&local).unwrap().as_str()
@@ -305,12 +324,8 @@ fn offline_patterned_create_survives_restart_then_uploads_without_duplication() 
     stop(s);
 
     // Local notebook remains durable across restart.
-    let reopened_bg = fs::read(
-        nb_dir(&e.lib, &nb_id)
-            .join("page-1")
-            .join("background.raw"),
-    )
-    .unwrap();
+    let reopened_bg =
+        fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
     assert_eq!(reopened_bg, bg);
 
     let srv = server("tmpl-offline");
@@ -328,22 +343,11 @@ fn offline_patterned_create_survives_restart_then_uploads_without_duplication() 
     );
     // Re-sync converges without changing the background hash.
     let hash1 = sha.clone();
-    write(
-        &s,
-        &e.lib,
-        &nb_id,
-        "page-1",
-        &[(10.0, 10.0), (20.0, 40.0)],
-    );
+    write(&s, &e.lib, &nb_id, "page-1", &[(10.0, 10.0), (20.0, 40.0)]);
     wait_until("stroke", Duration::from_secs(20), || {
         s.state().acked_client_seq >= pending_before.len() as u64 + 1
     });
-    let bg_after = fs::read(
-        nb_dir(&e.lib, &nb_id)
-            .join("page-1")
-            .join("background.raw"),
-    )
-    .unwrap();
+    let bg_after = fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
     assert_eq!(sha256_hex(&bg_after), hash1);
     assert_eq!(
         srv.snapshot_hash(&lid),

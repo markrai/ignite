@@ -108,9 +108,8 @@ pub fn generate_page_background(
     let len_u64 = u64::from(width)
         .checked_mul(u64::from(height))
         .ok_or_else(|| format!("REFUSE TEMPLATE: dimension overflow {width}x{height}"))?;
-    let len = usize::try_from(len_u64).map_err(|_| {
-        format!("REFUSE TEMPLATE: dimension overflow {width}x{height}")
-    })?;
+    let len = usize::try_from(len_u64)
+        .map_err(|_| format!("REFUSE TEMPLATE: dimension overflow {width}x{height}"))?;
     let mut buf = Vec::new();
     buf.try_reserve_exact(len).map_err(|e| {
         format!("REFUSE TEMPLATE: cannot allocate {len} bytes for {width}x{height}: {e}")
@@ -300,7 +299,10 @@ mod tests {
         let w = 120u32;
         let h = 200u32;
         let usable = usable_height(h);
-        assert!(usable > RULED_SPACING_PX, "fixture must fit at least one rule");
+        assert!(
+            usable > RULED_SPACING_PX,
+            "fixture must fit at least one rule"
+        );
         for style in [
             PageTemplate::Ruled,
             PageTemplate::Grid,
@@ -385,10 +387,7 @@ mod tests {
         let grid = generate_page_background(PageTemplate::Grid, w, h).unwrap();
         assert_eq!(grid[index(w, GRID_SPACING_PX, 0)], MARK_GRAY);
         assert_eq!(grid[index(w, 0, GRID_SPACING_PX)], MARK_GRAY);
-        assert_eq!(
-            grid[index(w, GRID_SPACING_PX, GRID_SPACING_PX)],
-            MARK_GRAY
-        );
+        assert_eq!(grid[index(w, GRID_SPACING_PX, GRID_SPACING_PX)], MARK_GRAY);
 
         let dotted = generate_page_background(PageTemplate::Dotted, w, h).unwrap();
         let cx = DOTTED_SPACING_PX;
@@ -521,13 +520,13 @@ mod tests {
     #[test]
     fn matches_existing_paper_background_for_blank_scribe_size() {
         // Blank must match `ui_gfx::paper_background` semantics: packed all 0xFF.
-        let bg = generate_page_background(
-            PageTemplate::Blank,
-            SCRIBE_PANEL_WIDTH,
-            SCRIBE_PANEL_HEIGHT,
-        )
-        .unwrap();
-        assert_eq!(bg.len(), (SCRIBE_PANEL_WIDTH * SCRIBE_PANEL_HEIGHT) as usize);
+        let bg =
+            generate_page_background(PageTemplate::Blank, SCRIBE_PANEL_WIDTH, SCRIBE_PANEL_HEIGHT)
+                .unwrap();
+        assert_eq!(
+            bg.len(),
+            (SCRIBE_PANEL_WIDTH * SCRIBE_PANEL_HEIGHT) as usize
+        );
         assert!(bg.iter().all(|&b| b == PAPER_WHITE));
     }
 }

@@ -62,8 +62,7 @@ mod tests {
 
     fn fresh_library(label: &str) -> (PathBuf, crate::library::LibraryRepository) {
         let root = tmp(label);
-        let opened =
-            open_or_create_library(&root, InkRequest::Default, &geo(), &paper()).unwrap();
+        let opened = open_or_create_library(&root, InkRequest::Default, &geo(), &paper()).unwrap();
         (root, opened.repository)
     }
 
@@ -173,9 +172,8 @@ mod tests {
             );
 
             let g = geo();
-            let bref =
-                background_ref_for(&opened.loaded.background, g.xres, g.yres, g.line_length)
-                    .unwrap();
+            let bref = background_ref_for(&opened.loaded.background, g.xres, g.yres, g.line_length)
+                .unwrap();
             match template {
                 PageTemplate::Blank => assert!(matches!(bref, BackgroundRef::Blank)),
                 _ => assert!(matches!(bref, BackgroundRef::Blob { .. })),
@@ -216,7 +214,10 @@ mod tests {
         )
         .unwrap();
         let page2 = read_background_raw(&nb, &inserted.inserted_page_id);
-        assert_eq!(page2, page1, "insert-after must copy source background bytes");
+        assert_eq!(
+            page2, page1,
+            "insert-after must copy source background bytes"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
