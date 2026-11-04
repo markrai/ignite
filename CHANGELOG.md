@@ -10,6 +10,11 @@
   are unchanged). Non-blank templates sync as ordinary background blobs with no
   protocol or schema migration. Mark spacing and E Ink–tuned intensity (including
   3×3 dotted marks) are fixed generator constants.
+- Ignite Web: the same Select paper flow (Blank / Ruled / Grid / Dotted) when
+  creating a notebook. Patterned papers generate Kindle-panel Gray8 bytes that
+  match the Rust generator byte-for-byte, publish via `PUT /v1/blobs/{sha}`, then
+  submit `CreateNotebook`. Blank still creates without a blob. Patterned creation
+  requires connectivity (no offline blob upload queue yet).
 
 ## [0.9.17] - 2026-11-03
 

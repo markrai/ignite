@@ -1,0 +1,51 @@
+{
+  "geometry": "scribe_panel_packed",
+  "height": 2480,
+  "reserved_bottom_rows": 57,
+  "source": "scribe_app::paper_templates::generate_page_background",
+  "stride": 1860,
+  "templates": {
+    "blank": {
+      "byte_len": 4612800,
+      "encoding": "gray8",
+      "file": "paper-templates/blank.gray8.gz",
+      "height": 2480,
+      "reserved_bottom_rows": 57,
+      "sha256": "e0da10b7da1436277386d7711916afad1fa1672d9e762705aae8a61570dd90c4",
+      "stride": 1860,
+      "width": 1860
+    },
+    "dotted": {
+      "byte_len": 4612800,
+      "encoding": "gray8",
+      "file": "paper-templates/dotted.gray8.gz",
+      "height": 2480,
+      "reserved_bottom_rows": 57,
+      "sha256": "53ac6f63c070ee6197fac3b22e73e2631349c362409cd186d1668cfebe543c83",
+      "stride": 1860,
+      "width": 1860
+    },
+    "grid": {
+      "byte_len": 4612800,
+      "encoding": "gray8",
+      "file": "paper-templates/grid.gray8.gz",
+      "height": 2480,
+      "reserved_bottom_rows": 57,
+      "sha256": "4fc8bbadd8877e1eaffd596e3ba0e8a39b3a41b2853ef2986ba95531e6b4c257",
+      "stride": 1860,
+      "width": 1860
+    },
+    "ruled": {
+      "byte_len": 4612800,
+      "encoding": "gray8",
+      "file": "paper-templates/ruled.gray8.gz",
+      "height": 2480,
+      "reserved_bottom_rows": 57,
+      "sha256": "97055b9aee2203bed30bc852ba7384b21594b1de44c3a742dc0373343aa504c5",
+      "stride": 1860,
+      "width": 1860
+    }
+  },
+  "v": 1,
+  "width": 1860
+}

@@ -1012,6 +1012,7 @@ dependencies = [
 name = "scribe-sync-tool"
 version = "0.9.17"
 dependencies = [
+ "flate2",
  "kindle-platform",
  "notebook-core",
  "scribe-app",

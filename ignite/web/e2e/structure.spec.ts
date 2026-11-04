@@ -16,6 +16,8 @@ test("create, rename, delete notebook; insert and delete page; sole rules; creat
 
   await sidebar.getByTestId("new-notebook").click();
   const nbDialog = page.getByTestId("notebook-dialog");
+  await expect(nbDialog.getByTestId("select-paper")).toBeVisible();
+  await nbDialog.getByTestId("paper-blank").click();
   await nbDialog.getByTestId("notebook-name-input").fill("Lab book");
   await nbDialog.getByTestId("dialog-submit").click();
   await expect(nbDialog).toHaveCount(0);
@@ -49,6 +51,8 @@ test("create, rename, delete notebook; insert and delete page; sole rules; creat
   await synced(page, server, 5);
   await sidebar.getByTestId("folder-menu").click();
   await folderDialog.getByTestId("action-new-notebook").click();
+  await expect(nbDialog.getByTestId("select-paper")).toBeVisible();
+  await nbDialog.getByTestId("paper-blank").click();
   await nbDialog.getByTestId("notebook-name-input").fill("Filed");
   await nbDialog.getByTestId("dialog-submit").click();
   await expect(sidebar.getByTestId("notebook-item")).toHaveCount(4);

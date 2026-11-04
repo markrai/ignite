@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { orderLibrary, SORT_LABELS, type SortMode } from "../model/librarySort";
 import type { SnapshotFolder, SnapshotNotebook } from "../model/types";
 import { ProtocolViolation, validateTitle } from "../model/validate";
+import { PAGE_TEMPLATE_CHOICES, pageTemplateLabel, type PageTemplate } from "../paper/paperTemplates";
 import type { FolderIntent } from "../replica/store";
 import { FolderIcon, ListSortDescendingIcon, NotebookIcon } from "./Icons";
 
@@ -25,7 +26,7 @@ interface Props {
   mintFolderId: () => string;
   /** Queue one folder operation; resolves false when nothing was queued. */
   commit: (intent: FolderIntent) => Promise<boolean>;
-  createNotebook: (title: string, folderId: string | null) => Promise<boolean>;
+  createNotebook: (title: string, folderId: string | null, template: PageTemplate) => Promise<boolean>;
   renameNotebook: (notebookId: string, title: string) => Promise<boolean>;
   deleteNotebook: (notebookId: string) => Promise<boolean>;
   canDeleteNotebook: boolean;
@@ -40,7 +41,8 @@ type Dialog =
   | { kind: "folder-menu"; folder: SnapshotFolder }
   | { kind: "notebook-menu"; notebook: SnapshotNotebook; folderId: string | null }
   | { kind: "pick"; notebook: SnapshotNotebook; exclude: string | null }
-  | { kind: "notebook-name"; heading: string; submit: string; initial: string; notebookId: string | null; folderId: string | null }
+  | { kind: "select-paper"; folderId: string | null; titleDefault: string }
+  | { kind: "notebook-name"; heading: string; submit: string; initial: string; notebookId: string | null; folderId: string | null; template?: PageTemplate }
   | { kind: "confirm-delete"; folder: SnapshotFolder }
   | { kind: "confirm-delete-notebook"; notebook: SnapshotNotebook };
 
@@ -130,7 +132,7 @@ export function NotebookSidebar({
             aria-label="New notebook"
             title={readOnlyReason ?? "New notebook"}
             onClick={() =>
-              setDialog({ kind: "notebook-name", heading: "New notebook", submit: "Create", initial: `Notebook ${notebooks.length + 1}`, notebookId: null, folderId: null })
+              setDialog({ kind: "select-paper", folderId: null, titleDefault: `Notebook ${notebooks.length + 1}` })
             }
           >
             <NotebookIcon />
@@ -204,12 +206,9 @@ export function NotebookSidebar({
                           data-testid="folder-new-notebook"
                           onClick={() =>
                             setDialog({
-                              kind: "notebook-name",
-                              heading: "New notebook",
-                              submit: "Create",
-                              initial: `Notebook ${notebooks.length + 1}`,
-                              notebookId: null,
+                              kind: "select-paper",
                               folderId: f.folder_id,
+                              titleDefault: `Notebook ${notebooks.length + 1}`,
                             })
                           }
                         >
@@ -246,13 +245,13 @@ export function NotebookSidebar({
             }
             return run({ type: "create_folder", folder_id: id, title });
           }}
-          onSubmitNotebook={async (title, notebookId, folderId) => {
+          onSubmitNotebook={async (title, notebookId, folderId, template) => {
             setDialog(null);
             if (notebookId) {
               await renameNotebook(notebookId, title);
               return;
             }
-            await createNotebook(title, folderId);
+            await createNotebook(title, folderId, template ?? "blank");
           }}
           onDeleteNotebook={async (id) => {
             setDialog(null);
@@ -282,7 +281,7 @@ function SidebarDialog({
   onClose: () => void;
   onOpen: (d: Dialog) => void;
   onSubmitName: (title: string, folderId: string | null) => Promise<void>;
-  onSubmitNotebook: (title: string, notebookId: string | null, folderId: string | null) => Promise<void>;
+  onSubmitNotebook: (title: string, notebookId: string | null, folderId: string | null, template?: PageTemplate) => Promise<void>;
   onDeleteNotebook: (notebookId: string) => Promise<void>;
   canDeleteNotebook: boolean;
   run: (intent: FolderIntent) => Promise<void>;
@@ -311,12 +310,9 @@ function SidebarDialog({
             data-testid="action-new-notebook"
             onClick={() =>
               onOpen({
-                kind: "notebook-name",
-                heading: "New notebook",
-                submit: "Create",
-                initial: "Notebook",
-                notebookId: null,
+                kind: "select-paper",
                 folderId: dialog.folder.folder_id,
+                titleDefault: "Notebook",
               })
             }
           >
@@ -431,6 +427,37 @@ function SidebarDialog({
         </>
       );
       break;
+    case "select-paper":
+      heading = "Select paper";
+      body = (
+        <div className="dialog-actions vertical" data-testid="select-paper">
+          {PAGE_TEMPLATE_CHOICES.map((template) => (
+            <button
+              key={template}
+              type="button"
+              className="btn"
+              data-testid={`paper-${template}`}
+              onClick={() =>
+                onOpen({
+                  kind: "notebook-name",
+                  heading: "New notebook",
+                  submit: "Create",
+                  initial: dialog.titleDefault,
+                  notebookId: null,
+                  folderId: dialog.folderId,
+                  template,
+                })
+              }
+            >
+              {pageTemplateLabel(template)}
+            </button>
+          ))}
+          <button type="button" className="btn subtle" data-testid="paper-cancel" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
+      );
+      break;
     case "notebook-name":
       heading = dialog.heading;
       body = (
@@ -439,7 +466,7 @@ function SidebarDialog({
           submit={dialog.submit}
           inputTestId="notebook-name-input"
           onCancel={onClose}
-          onSubmit={(t) => void onSubmitNotebook(t, dialog.notebookId, dialog.folderId)}
+          onSubmit={(t) => void onSubmitNotebook(t, dialog.notebookId, dialog.folderId, dialog.template)}
         />
       );
       break;
@@ -461,7 +488,12 @@ function SidebarDialog({
       break;
   }
   const dialogTestId =
-    dialog.kind === "notebook-name" || dialog.kind === "confirm-delete-notebook" || dialog.kind === "notebook-menu" ? "notebook-dialog" : "folder-dialog";
+    dialog.kind === "notebook-name" ||
+    dialog.kind === "select-paper" ||
+    dialog.kind === "confirm-delete-notebook" ||
+    dialog.kind === "notebook-menu"
+      ? "notebook-dialog"
+      : "folder-dialog";
   return (
     <div className="dialog-scrim" onClick={onClose}>
       <div className="dialog" role="dialog" aria-modal="true" aria-label={heading} data-testid={dialogTestId} onClick={(e) => e.stopPropagation()}>

@@ -5,7 +5,16 @@ import type { FinishedStroke } from "../authoring/capture";
 import { DEFAULT_TEXT_SESSION_FONT_SIZE, stepTextFontSize, textFontPercent } from "../authoring/textSession";
 import { SORT_LABELS } from "../model/librarySort";
 import { linkJumpLabel, MISSING_LINK_LABEL, preserveSelection, resolve, resolveLinkTarget, stepPage } from "../model/selection";
+import type { BlobApi } from "../api/blobApi";
 import type { PageSpec, SnapshotNotebook, SyncPageLink, SyncStroke, SyncText, SyncSnapshotV1 } from "../model/types";
+import {
+  commitFolderOn,
+  commitStructureOn,
+  initiatingCreateStillValid,
+  publishThenCreateNotebook,
+  type ReadyReplica,
+} from "../paper/createNotebookPublish";
+import type { PageTemplate } from "../paper/paperTemplates";
 import type { BlobCache } from "../rendering/background";
 import { zoomIn, zoomOut, type ZoomMode } from "../rendering/viewport";
 import { conflictText, type CoordinatorState, type OverlayOp, type SyncCoordinator } from "../replica/coordinator";
@@ -33,6 +42,8 @@ export type ReplicaHandle =
       projectTexts: (texts: readonly SyncText[], ops: readonly TextProjectOp[]) => { texts: SyncText[]; changed: boolean[] };
       projectLibrary: (snapshot: SyncSnapshotV1, ops: readonly LibraryOp[]) => { notebooks: SnapshotNotebook[]; folders: import("../model/types").SnapshotFolder[]; changed: boolean[] };
       createNotebookRender: () => import("../model/types").RenderProfileRef;
+      /** Authenticated PUT /v1/blobs/{sha} for patterned CreateNotebook backgrounds. */
+      blobApi: BlobApi;
     };
 
 interface Props {
@@ -103,6 +114,17 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
   }, [toast]);
   const drawing = useRef(false);
   const typeSession = useRef<TypeSession | null>(null);
+  const replicaRef = useRef(replica);
+  replicaRef.current = replica;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const writing = uiMode === "ink";
   const typing = uiMode === "type";
 
@@ -149,6 +171,8 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
       return snapshot;
     }
   }, [snapshot, sync.overlay, through, projectLibrary]);
+  const viewSnapshotRef = useRef(viewSnapshot);
+  viewSnapshotRef.current = viewSnapshot;
   const viewSel = viewSnapshot ? preserveSelection(snapshot ?? null, state.selection, viewSnapshot) : state.selection;
   const r = viewSnapshot ? resolve(viewSnapshot, viewSel) : null;
   const pageId = r?.page.page_id ?? "";
@@ -316,38 +340,78 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
   );
 
   const createNotebook = useCallback(
-    async (title: string, folderId: string | null): Promise<boolean> => {
+    async (title: string, folderId: string | null, template: PageTemplate = "blank"): Promise<boolean> => {
       if (!(await finalizeTextForTransition())) return false;
-      if (replica.kind !== "ready" || !viewSnapshot) return false;
-      let notebookId: string;
-      let pageId: string;
-      let render: import("../model/types").RenderProfileRef;
-      try {
-        notebookId = replica.mintId("notebook");
-        pageId = replica.mintId("page");
-        render = replica.createNotebookRender();
-      } catch {
-        setNotice("Couldn’t create a notebook on this device. Nothing was changed.");
-        return false;
-      }
-      const last = viewSnapshot.notebooks.at(-1)?.notebook_id;
-      const first_page: PageSpec = { page_id: pageId, background: { kind: "blank" }, render };
-      const ok = await commitStructure({
-        type: "create_notebook",
-        notebook_id: notebookId,
-        title,
-        ...(last ? { after_notebook_id: last } : {}),
-        first_page,
+      const initiating = replicaRef.current;
+      const initiatingSession = sessionRef.current;
+      const snapAtStart = viewSnapshotRef.current;
+      if (initiating.kind !== "ready" || !snapAtStart) return false;
+      const ready: ReadyReplica = initiating;
+
+      const { ok, notice } = await publishThenCreateNotebook({
+        template,
+        blobApi: ready.blobApi,
+        stillValid: () =>
+          initiatingCreateStillValid({
+            mounted: mountedRef.current,
+            initiating: ready,
+            currentReplica: replicaRef.current,
+            initiatingSession,
+            currentSession: sessionRef.current,
+          }),
+        commit: async (background) => {
+          // Snapshot may have advanced; still commit only on the initiating replica.
+          const snap = viewSnapshotRef.current;
+          if (
+            !snap ||
+            !initiatingCreateStillValid({
+              mounted: mountedRef.current,
+              initiating: ready,
+              currentReplica: replicaRef.current,
+              initiatingSession,
+              currentSession: sessionRef.current,
+            })
+          ) {
+            return false;
+          }
+          let notebookId: string;
+          let pageId: string;
+          let render: import("../model/types").RenderProfileRef;
+          try {
+            notebookId = ready.mintId("notebook");
+            pageId = ready.mintId("page");
+            render = ready.createNotebookRender();
+          } catch {
+            return false;
+          }
+          const last = snap.notebooks.at(-1)?.notebook_id;
+          const first_page: PageSpec = { page_id: pageId, background, render };
+          const created = await commitStructureOn(ready, {
+            type: "create_notebook",
+            notebook_id: notebookId,
+            title,
+            ...(last ? { after_notebook_id: last } : {}),
+            first_page,
+          });
+          if (!created) return false;
+          initiatingSession.select({ notebookId, pageId });
+          if (folderId) {
+            const filed = await commitFolderOn(ready, {
+              type: "set_notebook_folder",
+              notebook_id: notebookId,
+              folder_id: folderId,
+            });
+            if (!filed) setNotice("Notebook created, but it could not be added to the folder. It is in the main list.");
+          }
+          return true;
+        },
       });
-      if (!ok) return false;
-      session.select({ notebookId, pageId });
-      if (folderId) {
-        const filed = await commitFolder({ type: "set_notebook_folder", notebook_id: notebookId, folder_id: folderId });
-        if (!filed) setNotice("Notebook created, but it could not be added to the folder. It is in the main list.");
+      if (!ok) {
+        setNotice(notice ?? "Couldn’t create a notebook on this device. Nothing was changed.");
       }
-      return true;
+      return ok;
     },
-    [replica, viewSnapshot, commitStructure, commitFolder, session, finalizeTextForTransition],
+    [finalizeTextForTransition],
   );
 
   const mintOperationId = useCallback(() => (replica.kind === "ready" ? replica.mintId("operation") : ""), [replica]);

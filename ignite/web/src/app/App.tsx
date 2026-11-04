@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { createBlobApi, type BlobApi } from "../api/blobApi";
 import { createControlApi, type ControlApi, type ServerStatusPublic } from "../api/controlApi";
 import { createReadOnlyApi, UnauthorizedError, type ReadOnlyApi } from "../api/readOnlyApi";
 import { createReplicaApi, type ReplicaApi } from "../api/replicaApi";
@@ -26,6 +27,8 @@ interface Connection {
   api: ReadOnlyApi;
   /** POST-only replica API; handed to the sync coordinator and nothing else. */
   replicaApi: ReplicaApi;
+  /** Authenticated PUT /v1/blobs/{sha} for patterned notebook backgrounds (Slice 6B). */
+  blobApi: BlobApi;
   /** Session-scoped verified blob cache (dropped with the connection). */
   blobs: BlobCache;
   libraries: LibrarySummary[];
@@ -57,7 +60,7 @@ async function attempt(token: string | null, remember: boolean, product: ServerS
     const blobs = new BlobCache((sha) => api.blob(sha), decodeToCanvas);
     return {
       kind: "connected",
-      conn: { api, replicaApi: createReplicaApi(token), blobs, libraries, product },
+      conn: { api, replicaApi: createReplicaApi(token), blobApi: createBlobApi(token), blobs, libraries, product },
       libraryId: libraries.length === 1 ? libraries[0]!.library_id : null,
     };
   } catch (e) {
@@ -284,6 +287,7 @@ function useReplica(conn: Connection | null, session: LibrarySession | null, loc
             projectTexts: (t, ops) => bridge.projectTexts(t, ops),
             projectLibrary: (snap, ops) => bridge.projectLibrary(snap, ops),
             createNotebookRender: () => bridge.createNotebookRender(),
+            blobApi: conn.blobApi,
           },
         });
       } catch (e) {
