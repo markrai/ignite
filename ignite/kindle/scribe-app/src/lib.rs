@@ -58,6 +58,7 @@ pub mod orch;
 pub mod page_label;
 pub mod page_ledger;
 pub mod page_thumb;
+pub mod paper_templates;
 pub mod prefs;
 pub mod pressure;
 pub mod pressure_curve;
