@@ -3723,6 +3723,7 @@ fn execute_ui_command(
             Ok(())
         }
         UiCommand::GoHome => {
+            crate::chrome::set_erase_mode(false);
             if x.ui.view == AppView::Sync {
                 crate::server_link::with_global(|l| {
                     l.send(crate::server_link::LinkCmd::LeaveSyncScreen)
@@ -3967,6 +3968,14 @@ fn execute_ui_command(
                     present_ui(x, ctrl, None)
                 }
             }
+        }
+        UiCommand::ToggleEraser => {
+            let on = !crate::chrome::erase_mode();
+            crate::chrome::set_erase_mode(on);
+            println!("erase_mode on={on}");
+            let chrome = chrome_for_page(&*x.manifest, ctrl.session.page_id())?;
+            // Band-only repaint (no full-panel flash); chrome is visible whenever it was tapped.
+            ctrl.transport_mut().repair_chrome(chrome)
         }
         UiCommand::Undo => {
             ctrl.totals.undo_gestures += 1;
@@ -5251,7 +5260,7 @@ pub fn run_page_session(
             break 1;
         }
 
-        let polled = src.poll_event();
+        let mut polled = src.poll_event();
         match &polled {
             Ok(SourcePoll::Event(ev)) => {
                 last_stylus_us = ctrl.transport().now_us();
@@ -5320,6 +5329,7 @@ pub fn run_page_session(
                 move_coalesce.moves_seen, move_coalesce.previews_rendered, move_coalesce.coalesced,
             );
         }
+        let mut remap_pen_to_eraser = false;
         if let Ok(SourcePoll::Event(ev)) = &polled {
             if ev.kind == StylusEventKind::Down {
                 // Pen remains drawing-only. It also supersedes an old move in the narrow undo
@@ -5362,6 +5372,18 @@ pub fn run_page_session(
             };
             if consumed {
                 continue;
+            }
+            // On-screen Erase mode: the router left this Down to the page, so the pen tip erases.
+            remap_pen_to_eraser = crate::eraser::pen_down_acts_as_eraser(
+                crate::chrome::erase_mode(),
+                ev.kind,
+                ev.tool,
+            );
+        }
+        if remap_pen_to_eraser {
+            if let Ok(SourcePoll::Event(ev)) = polled.as_mut() {
+                ev.tool = StylusTool::Eraser;
+                println!("erase_mode pen_down_as_eraser=true");
             }
         }
         match polled {

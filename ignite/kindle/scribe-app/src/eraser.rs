@@ -391,3 +391,33 @@ mod tests {
         assert!(!g.is_active());
     }
 }
+
+/// With on-screen Erase mode on, a pen-tip Down that the router left to the page starts an
+/// eraser gesture instead of a stroke. Only the Down is remapped: Move/Up follow the active
+/// eraser gesture's own state. UI taps are routed with the real tool first, so the pen can
+/// still operate chrome (including turning Erase mode off).
+pub fn pen_down_acts_as_eraser(
+    erase_mode: bool,
+    kind: kindle_platform::StylusEventKind,
+    tool: kindle_platform::StylusTool,
+) -> bool {
+    erase_mode
+        && kind == kindle_platform::StylusEventKind::Down
+        && tool == kindle_platform::StylusTool::Pen
+}
+
+#[cfg(test)]
+mod erase_mode_tests {
+    use super::pen_down_acts_as_eraser;
+    use kindle_platform::{StylusEventKind as K, StylusTool as T};
+
+    #[test]
+    fn only_a_pen_down_is_remapped_and_only_when_the_mode_is_on() {
+        assert!(pen_down_acts_as_eraser(true, K::Down, T::Pen));
+        assert!(!pen_down_acts_as_eraser(false, K::Down, T::Pen));
+        assert!(!pen_down_acts_as_eraser(true, K::Move, T::Pen));
+        assert!(!pen_down_acts_as_eraser(true, K::Up, T::Pen));
+        assert!(!pen_down_acts_as_eraser(true, K::Hover, T::Pen));
+        assert!(!pen_down_acts_as_eraser(true, K::Down, T::Eraser));
+    }
+}

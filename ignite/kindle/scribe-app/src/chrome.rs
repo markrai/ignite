@@ -6,6 +6,8 @@
 //! Chrome is painted after background + strokes and is never part of `background.raw`,
 //! `strokes.jsonl`, or `edits.jsonl`.
 
+use std::cell::Cell;
+
 use kindle_platform::{DirtyRegion, FbGeometry};
 
 use crate::notebook::{page_index, PersistedNotebookManifestV1};
@@ -18,6 +20,22 @@ const BUTTON_PAD: u32 = 14;
 const LABEL_SCALE: u32 = 7;
 const TITLE_SCALE: u32 = 8;
 const PAGE_SCALE: u32 = 8;
+const ERASE_W: u32 = 250;
+
+thread_local! {
+    /// Transient on-screen Erase mode (never persisted). The UI thread owns it: it is flipped by
+    /// the Erase chrome button, read when chrome is painted and when a pen Down is routed.
+    static ERASE_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the pen tip currently acts as the eraser (on-screen Erase mode).
+pub fn erase_mode() -> bool {
+    ERASE_MODE.with(Cell::get)
+}
+
+pub fn set_erase_mode(on: bool) {
+    ERASE_MODE.with(|m| m.set(on));
+}
 
 /// Positional page state painted in the bottom band (1-based `index`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +74,8 @@ pub fn page_chrome_for(
 pub enum ChromeHit {
     Home,
     Undo,
+    /// Toggle the on-screen Erase mode (pen tip erases while on).
+    Erase,
     PageMenu,
     PreviousPage,
     NextPage,
@@ -70,6 +90,7 @@ pub struct ChromeLayout {
     pub home: Rect,
     pub title: Rect,
     pub undo: Rect,
+    pub erase: Rect,
     pub menu: Rect,
     pub previous: Rect,
     pub next: Rect,
@@ -86,8 +107,14 @@ impl ChromeLayout {
         let home = Rect::new(20, BUTTON_PAD, 260, bh);
         let menu = Rect::new(w.saturating_sub(20 + 200), BUTTON_PAD, 200, bh);
         let undo = Rect::new(menu.x.saturating_sub(24 + 260), BUTTON_PAD, 260, bh);
+        let erase = Rect::new(undo.x.saturating_sub(24 + ERASE_W), BUTTON_PAD, ERASE_W, bh);
         let title_x = home.right() + 40;
-        let title = Rect::new(title_x, BUTTON_PAD, undo.x.saturating_sub(40 + title_x), bh);
+        let title = Rect::new(
+            title_x,
+            BUTTON_PAD,
+            erase.x.saturating_sub(40 + title_x),
+            bh,
+        );
         let nb_h = BOTTOM_BAND_H - RULE_H - 2 * 10;
         let nb_y = bottom_y + RULE_H + 10;
         let cx = w / 2;
@@ -100,6 +127,7 @@ impl ChromeLayout {
             home,
             title,
             undo,
+            erase,
             menu,
             previous,
             next,
@@ -117,6 +145,7 @@ impl ChromeLayout {
         let hit = [
             (self.home, ChromeHit::Home),
             (self.undo, ChromeHit::Undo),
+            (self.erase, ChromeHit::Erase),
             (self.menu, ChromeHit::PageMenu),
             (self.previous, ChromeHit::PreviousPage),
             (self.next, ChromeHit::NextPage),
@@ -161,6 +190,14 @@ pub fn render_notebook_chrome(
 
     button(&mut c, layout.home, "HOME", BLACK);
     button(&mut c, layout.undo, "UNDO", BLACK);
+    if erase_mode() {
+        // Mode is on: inverted button so it reads at a glance.
+        c.fill(layout.erase, BLACK);
+        c.frame(layout.erase, 4, BLACK);
+        c.text_centered(layout.erase.inset(8), LABEL_SCALE, "ERASE", WHITE);
+    } else {
+        button(&mut c, layout.erase, "ERASE", BLACK);
+    }
     c.fill(layout.menu, WHITE);
     c.frame(layout.menu, 4, BLACK);
     c.dots(layout.menu, 18, BLACK);
@@ -191,4 +228,83 @@ pub fn render_notebook_chrome(
     );
     c.text_centered(layout.page_label, PAGE_SCALE, &page.label(), BLACK);
     Ok(layout)
+}
+
+#[cfg(test)]
+mod erase_button_tests {
+    use super::*;
+
+    fn geo() -> FbGeometry {
+        FbGeometry {
+            xres: 1860,
+            yres: 2480,
+            xres_virtual: 1872,
+            yres_virtual: 4960,
+            xoffset: 0,
+            yoffset: 0,
+            bits_per_pixel: 8,
+            line_length: 1872,
+            smem_len: 1872 * 4960,
+        }
+    }
+
+    fn centre(r: Rect) -> UiPoint {
+        UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        }
+    }
+
+    #[test]
+    fn erase_button_fits_the_top_band_without_overlapping_neighbours() {
+        let l = ChromeLayout::new(&geo());
+        assert!(l.erase.y + l.erase.h <= TOP_BAND_H - RULE_H);
+        assert!(
+            l.erase.x >= l.title.x + l.title.w,
+            "title must end before Erase"
+        );
+        assert!(
+            l.erase.x + l.erase.w <= l.undo.x,
+            "Erase must end before Undo"
+        );
+        assert!(l.home.right() <= l.title.x);
+        assert!(
+            l.title.w >= 500,
+            "title keeps a usable width, got {}",
+            l.title.w
+        );
+    }
+
+    #[test]
+    fn tapping_erase_hits_erase_and_neighbours_keep_their_targets() {
+        let l = ChromeLayout::new(&geo());
+        assert_eq!(l.hit(centre(l.erase)), Some(ChromeHit::Erase));
+        assert_eq!(l.hit(centre(l.undo)), Some(ChromeHit::Undo));
+        assert_eq!(l.hit(centre(l.home)), Some(ChromeHit::Home));
+        assert_eq!(l.hit(centre(l.menu)), Some(ChromeHit::PageMenu));
+        assert_eq!(l.hit(centre(l.title)), Some(ChromeHit::Inert));
+    }
+
+    #[test]
+    fn button_is_inverted_only_while_erase_mode_is_on() {
+        let g = geo();
+        let l = ChromeLayout::new(&g);
+        // An interior pixel away from the label and the frame.
+        let (x, y) = (l.erase.x + 16, l.erase.y + 16);
+        let at = |fb: &[u8]| fb[y as usize * g.line_length as usize + x as usize];
+        let page = PageChrome { index: 1, count: 2 };
+
+        set_erase_mode(false);
+        let mut fb = vec![0x80u8; g.smem_len as usize];
+        render_notebook_chrome(&mut fb, &g, "T", page).unwrap();
+        assert_eq!(at(&fb), WHITE);
+
+        set_erase_mode(true);
+        let mut fb = vec![0x80u8; g.smem_len as usize];
+        render_notebook_chrome(&mut fb, &g, "T", page).unwrap();
+        assert_eq!(at(&fb), BLACK);
+
+        set_erase_mode(false);
+        assert!(!erase_mode());
+    }
 }
