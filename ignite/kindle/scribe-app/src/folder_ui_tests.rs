@@ -167,14 +167,31 @@ mod tests {
         let mut fb = vec![0u8; g.smem_len as usize];
         render_home_view(&mut fb, &g, &c, &ui.folders, Some("folder-1"), &ui.home).unwrap();
 
-        // + NEW inside a folder: straight to the editor, filed in this folder.
+        // + NEW inside a folder: paper picker, then title; filed in this folder.
         ui.on_tap(&g, center(l.new_button), &c, "Notebook 5", None);
         match &ui.modal {
+            Some(Modal::PaperChooser {
+                notebook_title,
+                folder_id: Some(folder_id),
+            }) => {
+                assert_eq!(folder_id, "folder-1");
+                assert_eq!(notebook_title, "Notebook 5");
+            }
+            other => panic!("{other:?}"),
+        }
+        let paper = ui.modal.clone().unwrap();
+        ui.on_tap(&g, button(&g, &paper, "GRID"), &c, "Notebook 5", None);
+        match &ui.modal {
             Some(Modal::TitleEntry {
-                purpose: TitlePurpose::CreateNotebookInFolder { folder_id },
+                purpose:
+                    TitlePurpose::CreateNotebookInFolder {
+                        folder_id,
+                        template,
+                    },
                 editor,
             }) => {
                 assert_eq!(folder_id, "folder-1");
+                assert_eq!(*template, crate::paper_templates::PageTemplate::Grid);
                 assert_eq!(editor.text(), "Notebook 5");
             }
             other => panic!("{other:?}"),

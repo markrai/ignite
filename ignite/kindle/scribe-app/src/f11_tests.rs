@@ -397,11 +397,24 @@ mod tests {
             None,
         );
         assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
+        let paper = ui.modal.clone().unwrap();
+        assert!(matches!(paper, Modal::PaperChooser { folder_id: None, .. }), "{paper:?}");
+        let cmd = ui.on_tap(
+            &g,
+            dialog_button(&g, &paper, "BLANK"),
+            &c,
+            "Notebook 10",
+            None,
+        );
+        assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
         match &ui.modal {
             Some(Modal::TitleEntry {
-                purpose: TitlePurpose::Create,
+                purpose: TitlePurpose::Create { template },
                 editor,
-            }) => assert_eq!(editor.text(), "Notebook 10"),
+            }) => {
+                assert_eq!(*template, crate::paper_templates::PageTemplate::Blank);
+                assert_eq!(editor.text(), "Notebook 10");
+            }
             other => panic!("{other:?}"),
         }
         // Cancel closes without any durable command.
@@ -559,7 +572,9 @@ mod tests {
         let g = panel_geo();
         let mut ui = home_ui(2, 0);
         ui.show_modal(Modal::TitleEntry {
-            purpose: TitlePurpose::Create,
+            purpose: TitlePurpose::Create {
+                template: crate::paper_templates::PageTemplate::Ruled,
+            },
             editor: TitleEditor::new("Notebook 3"),
         });
         // Clear the proposed title.
@@ -592,7 +607,13 @@ mod tests {
         let cmd = ui.on_tap(&g, UiPoint { x: 5, y: 5 }, &cards(2), "x", None);
         assert_eq!(cmd, UiCommand::None);
         let cmd = tap_key(&mut ui, &g, EditorKey::Submit);
-        assert_eq!(cmd, UiCommand::CreateNotebook("Work".into()));
+        assert_eq!(
+            cmd,
+            UiCommand::CreateNotebook {
+                title: "Work".into(),
+                template: crate::paper_templates::PageTemplate::Ruled,
+            }
+        );
         assert!(ui.modal.is_none());
     }
 
@@ -1103,7 +1124,9 @@ mod tests {
         });
         assert_eq!(drive(&mut ui, &mut router, &mut c, &scribble(1000.0)), 1);
         ui.show_modal(Modal::TitleEntry {
-            purpose: TitlePurpose::Create,
+            purpose: TitlePurpose::Create {
+                template: crate::paper_templates::PageTemplate::Blank,
+            },
             editor: TitleEditor::new("x"),
         });
         assert_eq!(drive(&mut ui, &mut router, &mut c, &scribble(1500.0)), 1);
@@ -1244,6 +1267,17 @@ mod tests {
             ui.on_tap(
                 &g,
                 dialog_button(&g, &chooser, "NEW NOTEBOOK"),
+                &cards(2),
+                "Notebook 3",
+                None
+            ),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        let paper = ui.modal.clone().unwrap();
+        assert_eq!(
+            ui.on_tap(
+                &g,
+                dialog_button(&g, &paper, "BLANK"),
                 &cards(2),
                 "Notebook 3",
                 None

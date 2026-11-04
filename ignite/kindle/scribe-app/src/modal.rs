@@ -4,6 +4,7 @@
 use kindle_platform::FbGeometry;
 
 use crate::keyboard::TitleEditor;
+use crate::paper_templates::PageTemplate;
 use crate::ui_gfx::{wrap_text, Canvas, Rect, UiPoint, BLACK, GRAY, WHITE};
 
 const BOX_MARGIN_X: u32 = 120;
@@ -18,7 +19,10 @@ const BUTTON_SCALE: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TitlePurpose {
-    Create,
+    /// Main-list notebook create after the paper picker.
+    Create {
+        template: PageTemplate,
+    },
     Rename {
         notebook_id: String,
         original: String,
@@ -34,6 +38,7 @@ pub enum TitlePurpose {
     /// + NEW inside an open folder: the new notebook goes into that folder.
     CreateNotebookInFolder {
         folder_id: String,
+        template: PageTemplate,
     },
 }
 
@@ -57,6 +62,11 @@ pub enum Modal {
     NewChooser {
         notebook_title: String,
         folder_title: String,
+    },
+    /// Paper style for a new notebook. `folder_id` is set when creating inside a folder.
+    PaperChooser {
+        notebook_title: String,
+        folder_id: Option<String>,
     },
     FolderMenu {
         folder_id: String,
@@ -169,6 +179,8 @@ pub enum ButtonId {
     Ok,
     NewNotebook,
     NewFolder,
+    /// Paper picker choice (`PageTemplate`).
+    PickPaper(PageTemplate),
     AddToFolder,
     ChangeFolder,
     RemoveFromFolder,
@@ -241,6 +253,19 @@ pub fn dialog_spec(modal: &Modal) -> Option<DialogSpec> {
                 button(ButtonId::NewFolder, "NEW FOLDER"),
                 button(ButtonId::Cancel, "CANCEL"),
             ],
+            vertical: true,
+        },
+        Modal::PaperChooser { .. } => DialogSpec {
+            heading: "Select paper".into(),
+            body: Vec::new(),
+            buttons: {
+                let mut buttons: Vec<DialogButton> = PageTemplate::picker_choices()
+                    .into_iter()
+                    .map(|t| button(ButtonId::PickPaper(t), t.dialog_label()))
+                    .collect();
+                buttons.push(button(ButtonId::Cancel, "CANCEL"));
+                buttons
+            },
             vertical: true,
         },
         Modal::FolderMenu { title, .. } => DialogSpec {

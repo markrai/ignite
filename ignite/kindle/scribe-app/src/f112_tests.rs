@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(finger, UiCommand::OpenNotebook("notebook-2".into()));
         assert_eq!(finger, pen);
 
-        // + NEW → chooser → NEW NOTEBOOK → title editor.
+        // + NEW → chooser → NEW NOTEBOOK → paper → title editor.
         let mut ui = UiState::launch_home(0, 9);
         let cmd = tap_resolve(&mut ui, center(layout.new_button), None);
         assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
@@ -167,6 +167,17 @@ mod tests {
             .buttons
             .iter()
             .find(|(b, _)| b.label == "NEW NOTEBOOK")
+            .unwrap();
+        let cmd = tap_resolve(&mut ui, center(*r), None);
+        assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
+        let paper = ui.modal.clone().unwrap();
+        assert!(matches!(paper, Modal::PaperChooser { .. }), "{paper:?}");
+        let spec = crate::modal::dialog_spec(&paper).unwrap();
+        let dl = crate::modal::DialogLayout::new(&g, &spec);
+        let (_, r) = dl
+            .buttons
+            .iter()
+            .find(|(b, _)| b.label == "BLANK")
             .unwrap();
         let cmd = tap_resolve(&mut ui, center(*r), None);
         assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
@@ -326,7 +337,9 @@ mod tests {
         // Title keyboard.
         let mut kb = UiState::launch_home(0, 2);
         kb.show_modal(Modal::TitleEntry {
-            purpose: TitlePurpose::Create,
+            purpose: TitlePurpose::Create {
+                template: crate::paper_templates::PageTemplate::Blank,
+            },
             editor: TitleEditor::new("x"),
         });
         assert!(gesture(&kb, &line((1500, 900), (500, 900), 20), 200, false).is_empty());

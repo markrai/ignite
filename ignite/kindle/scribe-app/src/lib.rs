@@ -60,6 +60,8 @@ pub mod page_ledger;
 pub mod page_thumb;
 #[cfg(test)]
 mod page_template_durable_tests;
+#[cfg(test)]
+mod page_template_ui_tests;
 pub mod paper_templates;
 pub mod prefs;
 pub mod pressure;

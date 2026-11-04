@@ -53,6 +53,23 @@ pub enum PageTemplate {
     Dotted,
 }
 
+impl PageTemplate {
+    /// Fixed Kindle dialog labels for the paper picker (uppercase, matching other menus).
+    pub const fn dialog_label(self) -> &'static str {
+        match self {
+            Self::Blank => "BLANK",
+            Self::Ruled => "RULED",
+            Self::Grid => "GRID",
+            Self::Dotted => "DOTTED",
+        }
+    }
+
+    /// Choices offered by the notebook paper picker, in display order.
+    pub const fn picker_choices() -> [Self; 4] {
+        [Self::Blank, Self::Ruled, Self::Grid, Self::Dotted]
+    }
+}
+
 /// How many bottom rows must stay white so scrub sampling + chrome fill are no-ops.
 ///
 /// Equals `min(height, chrome_band_height_px() + 8)`. On short fixtures the whole

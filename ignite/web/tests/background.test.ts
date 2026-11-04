@@ -151,7 +151,7 @@ describe("page-template-like Gray8 blobs (Ruled / Grid / Dotted)", () => {
     ["Ruled", ruled],
     ["Grid", grid],
     ["Dotted", dotted],
-  ] as const)("%s verifies and decodes under strokes", async (_name, gen) => {
+  ] as const)("%s verifies and decodes as Gray8", async (_name, gen) => {
     const bytes = gen();
     expect(bytes.some((v) => v === MARK)).toBe(true);
     expect(bytes.some((v) => v === PAPER)).toBe(true);
@@ -159,7 +159,7 @@ describe("page-template-like Gray8 blobs (Ruled / Grid / Dotted)", () => {
     await verifyBlob(bytes, blobRef);
     const rgba = gray8ToRgba(bytes, W, H, W);
     expect(rgba.length).toBe(W * H * 4);
-    // Gray channel preserved; fully opaque — ready to paint beneath vector strokes.
+    // Gray channel preserved; fully opaque for the background paint path.
     for (let i = 0; i < bytes.length; i++) {
       expect(rgba[i * 4]).toBe(bytes[i]);
       expect(rgba[i * 4 + 3]).toBe(255);

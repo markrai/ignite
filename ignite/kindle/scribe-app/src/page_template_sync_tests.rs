@@ -206,7 +206,7 @@ fn durable_template_create_captures_create_notebook_and_blob_identity() {
 }
 
 #[test]
-fn identical_ruled_backgrounds_dedupe_to_one_blob_and_upload_once() {
+fn identical_ruled_backgrounds_dedupe_to_one_content_addressed_blob() {
     let srv = server("tmpl-dedupe");
     let e = env("tmpl-dedupe");
     write_config(&e.sync, &srv.url(), &srv.token, false);
@@ -215,16 +215,11 @@ fn identical_ruled_backgrounds_dedupe_to_one_blob_and_upload_once() {
     let (nb_b, bg_b) = create_templated(&s, &e.lib, PageTemplate::Ruled, "Ruled-B", Some(&nb_a));
     assert_eq!(bg_a, bg_b);
     let sha = sha256_hex(&bg_a);
+    // Content-addressed outbox store: identical backgrounds share one blob file.
     assert_eq!(
         blob_files(&e.sync).iter().filter(|n| *n == sha.as_str()).count(),
         1
     );
-    // Only one Ruled blob file overall among nonblank templates created here.
-    let ruled_blobs: Vec<_> = blob_files(&e.sync)
-        .into_iter()
-        .filter(|n| n == sha.as_str())
-        .collect();
-    assert_eq!(ruled_blobs, vec![sha.to_string()]);
 
     wait_until("upload", Duration::from_secs(30), || {
         s.pending() == 0 && s.state().acked_client_seq >= 2
@@ -233,15 +228,12 @@ fn identical_ruled_backgrounds_dedupe_to_one_blob_and_upload_once() {
     let lid = library_id(&e.sync);
     let (st, body) = srv.get(&format!("/v1/blobs/{sha}"));
     assert!(st < 300, "blob GET status {st} body={body}");
-    // Snapshot must reference the same SHA twice and match local.
+    // Both notebooks reference the same SHA; local snapshot matches the server.
     let local = local_snapshot(&e.lib);
     let refs: Vec<_> = local
         .notebooks
         .iter()
-        .filter(|n| {
-            // titles Ruled-A / Ruled-B
-            n.title.starts_with("Ruled-")
-        })
+        .filter(|n| n.title.starts_with("Ruled-"))
         .flat_map(|n| n.pages.iter())
         .filter_map(|p| match &p.background {
             BackgroundRef::Blob { sha256, .. } => Some(sha256.as_str().to_string()),
