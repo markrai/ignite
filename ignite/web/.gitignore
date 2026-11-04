@@ -1,5 +1,6 @@
 node_modules/
 dist/
+e2e/harness/dist/
 test-results/
 playwright-report/
 blob-report/

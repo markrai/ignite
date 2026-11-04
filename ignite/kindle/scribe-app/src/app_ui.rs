@@ -19,6 +19,7 @@ use crate::home::{home_rows, AppView, HomeCard, HomeHit, HomeLayout, HomeRow, Ho
 use crate::keyboard::{EditorKey, EditorOutcome, KeyboardLayout, TitleEditor};
 use crate::link_picker::LinkPickerState;
 use crate::modal::{dialog_spec, ButtonId, DialogLayout, Modal, TitlePurpose, PICKER_PAGE};
+use crate::paper_templates::PageTemplate;
 use crate::prefs::SideButtonAction;
 use crate::server_link::LinkView;
 use crate::settings_ui::{PreferencesHit, PreferencesLayout, SettingsChromeHit};
@@ -43,7 +44,10 @@ pub enum UiCommand {
     None,
     Redraw(Redraw),
     OpenNotebook(String),
-    CreateNotebook(String),
+    CreateNotebook {
+        title: String,
+        template: PageTemplate,
+    },
     RenameNotebook {
         notebook_id: String,
         title: String,
@@ -110,6 +114,7 @@ pub enum UiCommand {
     CreateNotebookInFolder {
         title: String,
         folder_id: String,
+        template: PageTemplate,
     },
     /// Cancel the link-target picker (no durable write).
     LinkPickerCancel,
@@ -531,10 +536,10 @@ impl UiState {
             }
             Some(HomeHit::New) => {
                 self.modal = Some(match open {
-                    // Inside a folder: a notebook, filed in that folder (no nested folders).
-                    Some(folder_id) => Modal::TitleEntry {
-                        purpose: TitlePurpose::CreateNotebookInFolder { folder_id },
-                        editor: TitleEditor::new(next_default_title),
+                    // Inside a folder: pick paper, then title; notebook is filed in that folder.
+                    Some(folder_id) => Modal::PaperChooser {
+                        notebook_title: next_default_title.to_string(),
+                        folder_id: Some(folder_id),
                     },
                     None => Modal::NewChooser {
                         notebook_title: next_default_title.to_string(),
@@ -812,9 +817,9 @@ impl UiState {
                 UiCommand::Redraw(Redraw::Full)
             }
             (Modal::NewChooser { notebook_title, .. }, ButtonId::NewNotebook) => {
-                self.modal = Some(Modal::TitleEntry {
-                    purpose: TitlePurpose::Create,
-                    editor: TitleEditor::new(&notebook_title),
+                self.modal = Some(Modal::PaperChooser {
+                    notebook_title,
+                    folder_id: None,
                 });
                 UiCommand::Redraw(Redraw::Full)
             }
@@ -822,6 +827,25 @@ impl UiState {
                 self.modal = Some(Modal::TitleEntry {
                     purpose: TitlePurpose::CreateFolder,
                     editor: TitleEditor::new(&folder_title),
+                });
+                UiCommand::Redraw(Redraw::Full)
+            }
+            (
+                Modal::PaperChooser {
+                    notebook_title,
+                    folder_id,
+                },
+                ButtonId::PickPaper(template),
+            ) => {
+                self.modal = Some(Modal::TitleEntry {
+                    purpose: match folder_id {
+                        Some(folder_id) => TitlePurpose::CreateNotebookInFolder {
+                            folder_id,
+                            template,
+                        },
+                        None => TitlePurpose::Create { template },
+                    },
+                    editor: TitleEditor::new(&notebook_title),
                 });
                 UiCommand::Redraw(Redraw::Full)
             }
@@ -934,12 +958,17 @@ impl UiState {
                 UiCommand::Redraw(Redraw::Full)
             }
             EditorOutcome::Submit(title) => match purpose {
-                TitlePurpose::Create => UiCommand::CreateNotebook(title),
+                TitlePurpose::Create { template } => UiCommand::CreateNotebook { title, template },
                 TitlePurpose::ServerUrl => UiCommand::SyncManualUrl(title),
                 TitlePurpose::CreateFolder => UiCommand::CreateFolder(title),
-                TitlePurpose::CreateNotebookInFolder { folder_id } => {
-                    UiCommand::CreateNotebookInFolder { title, folder_id }
-                }
+                TitlePurpose::CreateNotebookInFolder {
+                    folder_id,
+                    template,
+                } => UiCommand::CreateNotebookInFolder {
+                    title,
+                    folder_id,
+                    template,
+                },
                 TitlePurpose::RenameFolder {
                     folder_id,
                     original,

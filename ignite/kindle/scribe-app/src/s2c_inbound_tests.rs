@@ -14,8 +14,8 @@ use notebook_core::{new_stroke_id, PagePoint, Point, Stroke, ERASER_HIT_RADIUS_C
 use scribe_sync_server::{generate_token, ServerConfig, ServerHandle, Store, TokenVerifier};
 use sync_engine::LibraryState;
 use sync_protocol::{
-    snapshot_sha256, BackgroundFormat, LineageReplacement, PageSpec, SnapshotPage, StrokeStyle,
-    SyncPoint, SyncStroke, SyncText, TextFace, TextId,
+    snapshot_sha256, BackgroundEncoding, BackgroundFormat, BackgroundRef, LineageReplacement,
+    PageSpec, SnapshotPage, StrokeStyle, SyncPoint, SyncStroke, SyncText, TextFace, TextId,
 };
 
 use super::inbound::parse_tail;
@@ -2938,4 +2938,386 @@ fn inbound_parse_tail_decodes_replace_stroke_lineages() {
         items[0].envelope.operation,
         SyncOperationV1::ReplaceStrokeLineages { .. }
     ));
+}
+
+// ------------------------------------------------------------------ Slice 3: page templates
+
+fn template_durable_bg(template: crate::paper_templates::PageTemplate) -> Vec<u8> {
+    let g = geo();
+    let mut bg =
+        crate::paper_templates::generate_page_background(template, g.xres, g.yres).unwrap();
+    crate::page_label::scrub_chrome_band(&mut bg, &g).unwrap();
+    bg
+}
+
+fn template_background_ref(bytes: &[u8]) -> BackgroundRef {
+    let g = geo();
+    if bytes
+        .iter()
+        .all(|&b| b == crate::paper_templates::PAPER_WHITE)
+    {
+        return BackgroundRef::Blank;
+    }
+    BackgroundRef::Blob {
+        sha256: sha256_hex(bytes),
+        byte_len: bytes.len() as u64,
+        format: BackgroundFormat {
+            encoding: BackgroundEncoding::Gray8,
+            width: g.xres,
+            height: g.yres,
+            stride: g.xres, // packed generator output
+        },
+    }
+}
+
+#[test]
+fn page_templates_inbound_materialize_byte_identical_for_all_templates() {
+    use crate::paper_templates::PageTemplate;
+    use crate::store::BackgroundIdentityV1;
+    use kindle_platform::rect_checksum;
+
+    let srv = server();
+    let (k, s) = kindle(&srv);
+    let lib = s.state().library_id;
+    let (nb0, p0) = first_page(&srv, lib);
+    let mut remote = Remote::new(lib);
+    let templates = [
+        PageTemplate::Blank,
+        PageTemplate::Ruled,
+        PageTemplate::Grid,
+        PageTemplate::Dotted,
+    ];
+    let mut after = Some(nb0);
+    let mut created: Vec<(PageTemplate, NotebookId, PageId, Vec<u8>)> = Vec::new();
+    for template in templates {
+        let bytes = template_durable_bg(template);
+        let bg = template_background_ref(&bytes);
+        if let BackgroundRef::Blob { sha256, .. } = &bg {
+            assert!(
+                srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes))
+                    .0
+                    < 300,
+                "{template:?} blob PUT"
+            );
+            // Idempotent second PUT of the same content-addressed blob.
+            assert!(
+                srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes))
+                    .0
+                    < 300,
+                "{template:?} blob PUT dedupe"
+            );
+        }
+        let page_id = PageId::from_uuid(Uuid::now_v7()).unwrap();
+        let notebook_id = NotebookId::from_uuid(Uuid::now_v7()).unwrap();
+        remote.submit(
+            &srv,
+            vec![SyncOperationV1::CreateNotebook {
+                notebook_id,
+                title: format!("Tmpl-{template:?}"),
+                after_notebook_id: after,
+                first_page: PageSpec {
+                    page_id,
+                    background: bg,
+                    render: p0.render.clone(),
+                },
+            }],
+        );
+        after = Some(notebook_id);
+        created.push((template, notebook_id, page_id, bytes));
+    }
+    converge(&s, &srv);
+    assert_match(&k, &s, &srv);
+
+    let (hash_a, snap_a) = srv.snapshot(lib);
+    let (hash_b, snap_b) = srv.snapshot(lib);
+    assert_eq!(hash_a, hash_b, "snapshot hash stable across reconstruction");
+    assert_eq!(snap_a, snap_b);
+    assert_eq!(local_snapshot(&k.lib), snap_a);
+
+    let ident = read_identity(&k.lib).unwrap().unwrap();
+    let g = geo();
+    for (template, notebook_id, page_id, bytes) in &created {
+        let (nb_local, page_local) = ident
+            .notebooks
+            .iter()
+            .find(|(_, g)| **g == *notebook_id)
+            .map(|(l, _)| {
+                let pl = ident.pages[l]
+                    .iter()
+                    .find(|(_, g)| **g == *page_id)
+                    .unwrap()
+                    .0
+                    .clone();
+                (l.clone(), pl)
+            })
+            .unwrap_or_else(|| panic!("{template:?} binding missing"));
+        let dir = k.lib.join("notebooks").join(&nb_local);
+        let raw = fs::read(dir.join(&page_local).join("background.raw")).unwrap();
+        assert_eq!(raw, *bytes, "{template:?} materialized bytes");
+
+        let mut scrubbed = raw.clone();
+        assert!(
+            !crate::page_label::scrub_chrome_band(&mut scrubbed, &g).unwrap(),
+            "{template:?} scrub must be a no-op"
+        );
+        assert_eq!(scrubbed, raw);
+
+        let (_store, loaded) = load_existing_page(&dir, &page_local).unwrap();
+        assert_eq!(loaded.background, *bytes);
+        assert_eq!(loaded.header.background_checksum, rect_checksum(bytes));
+        assert_eq!(loaded.header.background_bytes, bytes.len() as u64);
+        let id = loaded
+            .header
+            .background_identity
+            .clone()
+            .expect("identity published");
+        assert_eq!(id, BackgroundIdentityV1::from_pixels(bytes));
+        match template {
+            PageTemplate::Blank => assert!(matches!(id, BackgroundIdentityV1::Blank { .. })),
+            _ => assert!(matches!(id, BackgroundIdentityV1::Blob { .. })),
+        }
+
+        // Runtime openability (geometry + sealed profile).
+        crate::notebook::load_page_for_switch(&dir, &page_local, &loaded.render_profile, &g)
+            .unwrap_or_else(|e| panic!("{template:?} not openable: {e}"));
+    }
+
+    // Stroke on a patterned page; reopen preserves background + stroke.
+    let (grid_tmpl, grid_nb, grid_page, grid_bytes) = created
+        .iter()
+        .find(|(t, ..)| *t == PageTemplate::Grid)
+        .unwrap();
+    let stroke = remote_stroke(line(200.0, 300.0, 400.0, 0.55));
+    remote.submit(&srv, vec![add(*grid_nb, *grid_page, &stroke)]);
+    converge(&s, &srv);
+    assert_match(&k, &s, &srv);
+    let ident = read_identity(&k.lib).unwrap().unwrap();
+    let nb_local = ident
+        .notebooks
+        .iter()
+        .find(|(_, g)| **g == *grid_nb)
+        .unwrap()
+        .0
+        .clone();
+    let page_local = ident.pages[&nb_local]
+        .iter()
+        .find(|(_, g)| **g == *grid_page)
+        .unwrap()
+        .0
+        .clone();
+    let dir = k.lib.join("notebooks").join(&nb_local);
+    let (_store, loaded) = load_existing_page(&dir, &page_local).unwrap();
+    assert_eq!(
+        loaded.background, *grid_bytes,
+        "{grid_tmpl:?} bg after stroke"
+    );
+    assert_eq!(loaded.strokes.len(), 1);
+}
+
+#[test]
+fn page_template_shared_background_dedupes_blob_and_preserves_refs() {
+    use crate::paper_templates::PageTemplate;
+
+    let srv = server();
+    let (k, s) = kindle(&srv);
+    let lib = s.state().library_id;
+    let (nb0, p0) = first_page(&srv, lib);
+    let bytes = template_durable_bg(PageTemplate::Ruled);
+    let bg = template_background_ref(&bytes);
+    let BackgroundRef::Blob { sha256, .. } = &bg else {
+        panic!("Ruled must be Blob");
+    };
+    assert!(
+        srv.call("PUT", &format!("/v1/blobs/{sha256}"), Some(&bytes))
+            .0
+            < 300
+    );
+    let mut remote = Remote::new(lib);
+    let n1 = NotebookId::from_uuid(Uuid::now_v7()).unwrap();
+    let n2 = NotebookId::from_uuid(Uuid::now_v7()).unwrap();
+    let p1 = PageId::from_uuid(Uuid::now_v7()).unwrap();
+    let p2 = PageId::from_uuid(Uuid::now_v7()).unwrap();
+    remote.submit(
+        &srv,
+        vec![
+            SyncOperationV1::CreateNotebook {
+                notebook_id: n1,
+                title: "Ruled-1".into(),
+                after_notebook_id: Some(nb0),
+                first_page: PageSpec {
+                    page_id: p1,
+                    background: bg.clone(),
+                    render: p0.render.clone(),
+                },
+            },
+            SyncOperationV1::CreateNotebook {
+                notebook_id: n2,
+                title: "Ruled-2".into(),
+                after_notebook_id: Some(n1),
+                first_page: PageSpec {
+                    page_id: p2,
+                    background: bg.clone(),
+                    render: p0.render.clone(),
+                },
+            },
+        ],
+    );
+    converge(&s, &srv);
+    assert_match(&k, &s, &srv);
+    let (_, snap) = srv.snapshot(lib);
+    let refs: Vec<_> = snap
+        .notebooks
+        .iter()
+        .filter(|n| n.title.starts_with("Ruled-"))
+        .flat_map(|n| n.pages.iter())
+        .filter_map(|p| match &p.background {
+            BackgroundRef::Blob { sha256, .. } => Some(sha256.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refs.len(), 2);
+    assert!(refs.iter().all(|r| r == sha256.as_str()));
+    // Retrievable once; content-addressed store has a single object.
+    let (st, body) = srv.call("GET", &format!("/v1/blobs/{sha256}"), None);
+    assert_eq!(st, 200);
+    assert_eq!(body, bytes);
+}
+
+#[test]
+fn page_template_missing_and_mismatched_blob_refs_rejected_by_server() {
+    use crate::paper_templates::PageTemplate;
+
+    let srv = server();
+    let (k, s) = kindle(&srv);
+    let lib = s.state().library_id;
+    let (nb0, p0) = first_page(&srv, lib);
+    let bytes = template_durable_bg(PageTemplate::Dotted);
+    let real = sha256_hex(&bytes);
+    assert!(
+        srv.call("PUT", &format!("/v1/blobs/{real}"), Some(&bytes))
+            .0
+            < 300
+    );
+
+    // Unknown SHA (never uploaded).
+    let fake = sha256_hex(b"absent-template-blob");
+    let mut remote = Remote::new(lib);
+    let env = remote.env(SyncOperationV1::CreatePage {
+        notebook_id: nb0,
+        page: PageSpec {
+            page_id: PageId::from_uuid(Uuid::now_v7()).unwrap(),
+            background: BackgroundRef::Blob {
+                sha256: fake.clone(),
+                byte_len: bytes.len() as u64,
+                format: BackgroundFormat {
+                    encoding: BackgroundEncoding::Gray8,
+                    width: geo().xres,
+                    height: geo().yres,
+                    stride: geo().xres,
+                },
+            },
+            render: p0.render.clone(),
+        },
+        after_page_id: Some(p0.page_id),
+    });
+    let body = format!(
+        "{{\"envelopes\":[{}]}}",
+        String::from_utf8(env.to_canonical_bytes().unwrap()).unwrap()
+    );
+    let (st, resp) = srv.call(
+        "POST",
+        &format!("/v1/libraries/{lib}/operations"),
+        Some(body.as_bytes()),
+    );
+    assert_eq!(st, 422, "{}", String::from_utf8_lossy(&resp));
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    assert_eq!(v["error"], "missing_blobs");
+
+    // Structurally malformed: byte_len ≠ stride×height is refused by the protocol codec
+    // before any HTTP submission (malformed BackgroundRef).
+    let g = geo();
+    let malformed = remote.env(SyncOperationV1::CreatePage {
+        notebook_id: nb0,
+        page: PageSpec {
+            page_id: PageId::from_uuid(Uuid::now_v7()).unwrap(),
+            background: BackgroundRef::Blob {
+                sha256: real.clone(),
+                byte_len: bytes.len() as u64 + 1,
+                format: BackgroundFormat {
+                    encoding: BackgroundEncoding::Gray8,
+                    width: g.xres,
+                    height: g.yres,
+                    stride: g.xres,
+                },
+            },
+            render: p0.render.clone(),
+        },
+        after_page_id: Some(p0.page_id),
+    });
+    let err = malformed.to_canonical_bytes().unwrap_err();
+    assert!(
+        err.to_string().contains("byte_len"),
+        "malformed BackgroundRef must fail closed: {err}"
+    );
+
+    // Correct SHA but declared under a different valid geometry length than the indexed
+    // packed blob → missing_blobs (index length must match the reference).
+    let mut remote = Remote::new(lib);
+    let env = remote.env(SyncOperationV1::CreatePage {
+        notebook_id: nb0,
+        page: PageSpec {
+            page_id: PageId::from_uuid(Uuid::now_v7()).unwrap(),
+            background: BackgroundRef::Blob {
+                sha256: real.clone(),
+                byte_len: u64::from(g.line_length) * u64::from(g.yres),
+                format: BackgroundFormat {
+                    encoding: BackgroundEncoding::Gray8,
+                    width: g.xres,
+                    height: g.yres,
+                    stride: g.line_length,
+                },
+            },
+            render: p0.render.clone(),
+        },
+        after_page_id: Some(p0.page_id),
+    });
+    let body = format!(
+        "{{\"envelopes\":[{}]}}",
+        String::from_utf8(env.to_canonical_bytes().unwrap()).unwrap()
+    );
+    let (st, resp) = srv.call(
+        "POST",
+        &format!("/v1/libraries/{lib}/operations"),
+        Some(body.as_bytes()),
+    );
+    assert_eq!(st, 422, "{}", String::from_utf8_lossy(&resp));
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    assert_eq!(v["error"], "missing_blobs");
+
+    // Valid structural CreatePage with the correct blob is accepted.
+    let mut remote = Remote::new(lib);
+    remote.submit(
+        &srv,
+        vec![SyncOperationV1::CreatePage {
+            notebook_id: nb0,
+            page: PageSpec {
+                page_id: PageId::from_uuid(Uuid::now_v7()).unwrap(),
+                background: BackgroundRef::Blob {
+                    sha256: real,
+                    byte_len: bytes.len() as u64,
+                    format: BackgroundFormat {
+                        encoding: BackgroundEncoding::Gray8,
+                        width: geo().xres,
+                        height: geo().yres,
+                        stride: geo().xres,
+                    },
+                },
+                render: p0.render.clone(),
+            },
+            after_page_id: Some(p0.page_id),
+        }],
+    );
+    converge(&s, &srv);
+    assert_match(&k, &s, &srv);
+    let _ = k;
 }

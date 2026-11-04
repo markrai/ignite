@@ -85,7 +85,9 @@ describe("read-only API boundary", () => {
       // The control-plane client (claim, pairing, administration, 1G-B restore upload/cancel)
       // mutates only /control/v1, never notebook data (pinned in control.test.ts).
       const control = r === "api/controlApi.ts";
-      if (!control) expect(text, r).not.toMatch(/method:\s*["'](PUT|PATCH|DELETE)["']/i);
+      // Slice 6B: authenticated PUT /v1/blobs/{sha} for patterned CreateNotebook backgrounds.
+      const blobPut = r === "api/blobApi.ts";
+      if (!control && !blobPut) expect(text, r).not.toMatch(/method:\s*["'](PUT|PATCH|DELETE)["']/i);
       if (r !== "api/replicaApi.ts" && !control) expect(text, r).not.toMatch(/method:\s*["']POST["']/i);
       expect(text, r).not.toMatch(/new\s+(XMLHttpRequest|WebSocket|EventSource)\b|sendBeacon\s*\(/);
       const pwa = r === "pwa/registerUpdate.ts";
@@ -98,7 +100,9 @@ describe("read-only API boundary", () => {
       // Components, pointer capture and rendering never touch the network directly.
       if (/^(components|authoring|rendering)\//.test(r)) expect(text, r).not.toMatch(/\bfetch\s*\(|replicaApi/);
       // The replica API is created by the app shell and used only by the sync coordinator.
-      if (text.includes('/replicaApi"')) expect(["app/App.tsx", "replica/coordinator.ts"]).toContain(r);
+      if (text.includes('/replicaApi"')) {
+        expect(["app/App.tsx", "replica/coordinator.ts", "api/blobApi.ts", "paper/publishTemplateBackground.ts"]).toContain(r);
+      }
       // Only the replica store opens IndexedDB — plus, by explicit exception, the UI preference
       // store (its own database; checked below to hold no replica state or credentials).
       if (/\bindexedDB\b/.test(text)) expect(["replica/store.ts", "app/prefsDb.ts"]).toContain(r);
@@ -107,6 +111,10 @@ describe("read-only API boundary", () => {
     expect(replica.match(/method:\s*"POST"/g)).toHaveLength(1);
     expect(replica).toContain("`/v1/libraries/${id}/operations`");
     expect(replica).not.toMatch(/\/v1\/blobs|genesis"/);
+    const blobApi = readFileSync(join(src, "api/blobApi.ts"), "utf8");
+    expect(blobApi.match(/method:\s*"PUT"/g)).toHaveLength(1);
+    expect(blobApi).toContain("`/v1/blobs/${sha}`");
+    expect(blobApi).not.toMatch(/\/v1\/libraries|genesis"|method:\s*"POST"/);
     // The preference exception is narrow: its own database, UI preferences only, no tokens,
     // no replica/sync path.
     expect(readFileSync(join(src, "app/prefsDb.ts"), "utf8")).toContain('export const DB = "scribe-web-prefs";');

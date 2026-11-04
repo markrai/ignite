@@ -14,11 +14,16 @@
 //!   exported by the Kindle bridge from a library built through the product's durable paths.
 //!   IDs are freshly minted, so it is only rewritten with `SCRIBE_REGEN_WEB_FIXTURES=1`; every
 //!   run re-validates it strictly and checks its pinned SHA-256 and required features.
+//! * `tests/fixtures/paper-templates-v1.json` (+ gzipped Gray8): Scribe-panel packed backgrounds
+//!   from `scribe_app::paper_templates` for ignite-web parity (Slice 6B).
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use kindle_platform::{raster_line_variable_radius, FbGeometry};
 use notebook_core::{
     new_stroke_id, PagePoint, Point, ScribeDisplayTransform, Stroke, StrokeId, CANONICAL_HEIGHT,
@@ -31,6 +36,10 @@ use scribe_app::library::{
 };
 use scribe_app::notebook::{
     insert_page_after_durable, InsertPageHooks, PersistedNotebookManifestV1,
+};
+use scribe_app::paper_templates::{
+    generate_page_background, reserved_bottom_rows, PageTemplate, SCRIBE_PANEL_HEIGHT,
+    SCRIBE_PANEL_WIDTH,
 };
 use scribe_app::pressure_curve::{
     interpolate_q, quantize_pressure, PressureCurveV1, PRESSURE_Q_MAX, STYLE_LEGACY_FIXED_V1,
@@ -717,4 +726,119 @@ fn snapshot_fixture_is_real_canonical_rust_output() {
         m["second_library"]["snapshot_sha256"].as_str().unwrap()
     );
     assert_ne!(snap_b.library_id, snap.library_id);
+}
+
+// ------------------------------------------------------------------ paper templates (Slice 6B)
+
+fn paper_template_name(t: PageTemplate) -> &'static str {
+    match t {
+        PageTemplate::Blank => "blank",
+        PageTemplate::Ruled => "ruled",
+        PageTemplate::Grid => "grid",
+        PageTemplate::Dotted => "dotted",
+    }
+}
+
+fn generate_paper_template_fixtures() {
+    let dir = fixtures();
+    let gz_dir = dir.join("paper-templates");
+    fs::create_dir_all(&gz_dir).unwrap();
+    let w = SCRIBE_PANEL_WIDTH;
+    let h = SCRIBE_PANEL_HEIGHT;
+    let reserved = reserved_bottom_rows(h);
+    assert_eq!(reserved, 57, "Scribe chrome+sample reserve must stay 57");
+    let mut templates = serde_json::Map::new();
+    for t in PageTemplate::picker_choices() {
+        let name = paper_template_name(t);
+        let bytes = generate_page_background(t, w, h).expect(name);
+        assert_eq!(bytes.len(), (w * h) as usize);
+        let sha = sha256_hex(&bytes);
+        let gz_name = format!("paper-templates/{name}.gray8.gz");
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&bytes).unwrap();
+        let gz = enc.finish().unwrap();
+        fs::write(dir.join(&gz_name), &gz).unwrap();
+        templates.insert(
+            name.to_string(),
+            json!({
+                "sha256": sha.as_str(),
+                "byte_len": bytes.len(),
+                "width": w,
+                "height": h,
+                "stride": w,
+                "encoding": "gray8",
+                "reserved_bottom_rows": reserved,
+                "file": gz_name,
+            }),
+        );
+    }
+    let mut m = serde_json::to_string_pretty(&json!({
+        "v": 1,
+        "source": "scribe_app::paper_templates::generate_page_background",
+        "geometry": "scribe_panel_packed",
+        "width": w,
+        "height": h,
+        "stride": w,
+        "reserved_bottom_rows": reserved,
+        "templates": templates,
+    }))
+    .unwrap();
+    m.push('\n');
+    pin_text(&dir.join("paper-templates-v1.json"), &m);
+}
+
+#[test]
+fn paper_template_fixtures_match_rust_generator() {
+    if regen() {
+        generate_paper_template_fixtures();
+    }
+    let dir = fixtures();
+    let path = dir.join("paper-templates-v1.json");
+    let m: Value = serde_json::from_slice(&fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e} (run with SCRIBE_REGEN_WEB_FIXTURES=1)",
+            path.display()
+        )
+    }))
+    .unwrap();
+    assert_eq!(m["v"], 1);
+    assert_eq!(m["width"], SCRIBE_PANEL_WIDTH);
+    assert_eq!(m["height"], SCRIBE_PANEL_HEIGHT);
+    assert_eq!(m["stride"], SCRIBE_PANEL_WIDTH);
+    assert_eq!(
+        m["reserved_bottom_rows"],
+        reserved_bottom_rows(SCRIBE_PANEL_HEIGHT)
+    );
+
+    for t in PageTemplate::picker_choices() {
+        let name = paper_template_name(t);
+        let entry = &m["templates"][name];
+        let bytes = generate_page_background(t, SCRIBE_PANEL_WIDTH, SCRIBE_PANEL_HEIGHT).unwrap();
+        let sha = sha256_hex(&bytes);
+        assert_eq!(
+            entry["sha256"].as_str().unwrap(),
+            sha.as_str(),
+            "{name}: pinned SHA drifted from paper_templates.rs"
+        );
+        assert_eq!(entry["byte_len"].as_u64().unwrap(), bytes.len() as u64);
+        assert_eq!(entry["width"], SCRIBE_PANEL_WIDTH);
+        assert_eq!(entry["height"], SCRIBE_PANEL_HEIGHT);
+        assert_eq!(entry["stride"], SCRIBE_PANEL_WIDTH);
+        assert_eq!(entry["encoding"], "gray8");
+
+        let gz_path = dir.join(entry["file"].as_str().unwrap());
+        let gz = fs::read(&gz_path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} (run with SCRIBE_REGEN_WEB_FIXTURES=1)",
+                gz_path.display()
+            )
+        });
+        let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
+        let mut restored = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut restored).unwrap();
+        assert_eq!(
+            restored, bytes,
+            "{name}: gzipped fixture must decompress to generator bytes"
+        );
+    }
 }

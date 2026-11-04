@@ -52,12 +52,13 @@ use crate::lasso::{
     move_dirty_bounds, move_replacements, LassoSelection, LassoState, MoveCommit, TouchOverlayDirty,
 };
 use crate::library::{
-    consume_dev_library_op, create_notebook_durable, delete_notebook_durable, open_active_notebook,
-    open_or_create_library_shell, peek_dev_library_op, rename_notebook_durable,
-    switch_notebook_durable, CreateNotebookHooks, DeleteNotebookHooks, DevLibraryOp,
-    LibraryRepository, NotebookQuarantineOutcome, RenameNotebookHooks, SwitchNotebookCommit,
-    SwitchNotebookHooks, DEV_CREATE_NOTEBOOK_TRIGGER, DEV_DELETE_NOTEBOOK_TRIGGER,
-    DEV_HOME_TRIGGER, DEV_LIBRARY_NEXT_TRIGGER, DEV_LIBRARY_OPEN_TRIGGER, DEV_LIBRARY_PREV_TRIGGER,
+    consume_dev_library_op, create_notebook_durable, create_notebook_durable_with_template,
+    delete_notebook_durable, open_active_notebook, open_or_create_library_shell,
+    peek_dev_library_op, rename_notebook_durable, switch_notebook_durable, CreateNotebookHooks,
+    DeleteNotebookHooks, DevLibraryOp, LibraryRepository, NotebookQuarantineOutcome,
+    RenameNotebookHooks, SwitchNotebookCommit, SwitchNotebookHooks, DEV_CREATE_NOTEBOOK_TRIGGER,
+    DEV_DELETE_NOTEBOOK_TRIGGER, DEV_HOME_TRIGGER, DEV_LIBRARY_NEXT_TRIGGER,
+    DEV_LIBRARY_OPEN_TRIGGER, DEV_LIBRARY_PREV_TRIGGER,
 };
 use crate::link_picker::{LinkPickerState, PendingLink};
 use crate::modal::{dialog_spec, render_dialog, DialogSpec, Modal, TitlePurpose};
@@ -368,7 +369,7 @@ impl KindleTransport {
             return Err("internal: render_title_entry without a title modal".into());
         };
         let (heading, submit) = match purpose {
-            TitlePurpose::Create => ("NEW NOTEBOOK", "CREATE"),
+            TitlePurpose::Create { .. } => ("NEW NOTEBOOK", "CREATE"),
             TitlePurpose::Rename { .. } => ("RENAME NOTEBOOK", "SAVE"),
             TitlePurpose::ServerUrl => ("SERVER ADDRESS", "CONNECT"),
             TitlePurpose::CreateFolder => ("NEW FOLDER", "CREATE"),
@@ -3728,20 +3729,23 @@ fn execute_ui_command(
                 })
             },
         ),
-        UiCommand::CreateNotebookInFolder { title, folder_id } => {
-            let paper = paper_background(&x.geo);
-            match create_notebook_durable(
+        UiCommand::CreateNotebookInFolder {
+            title,
+            folder_id,
+            template,
+        } => {
+            match create_notebook_durable_with_template(
                 x.library,
                 x.notebook_profile,
                 &x.geo,
-                &paper,
+                template,
                 Some(&title),
                 &CreateNotebookHooks::default(),
             ) {
                 Ok(commit) => {
                     sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
                     println!(
-                        "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui folder={folder_id}",
+                        "notebook_created notebook={} title={:?} template={template:?} manifest_persist_us={} active_notebook={} source=ui folder={folder_id}",
                         commit.notebook_id,
                         commit.title,
                         commit.manifest_persist_us,
@@ -3772,26 +3776,27 @@ fn execute_ui_command(
                     })
                 }
                 Err(e) => {
-                    eprintln!("notebook_create_failed title={title:?} detail={e}");
+                    eprintln!(
+                        "notebook_create_failed title={title:?} template={template:?} detail={e}"
+                    );
                     x.ui.show_error("The notebook couldn't be created.");
                     present_ui(x, ctrl, None)
                 }
             }
         }
-        UiCommand::CreateNotebook(title) => {
-            let paper = paper_background(&x.geo);
-            match create_notebook_durable(
+        UiCommand::CreateNotebook { title, template } => {
+            match create_notebook_durable_with_template(
                 x.library,
                 x.notebook_profile,
                 &x.geo,
-                &paper,
+                template,
                 Some(&title),
                 &CreateNotebookHooks::default(),
             ) {
                 Ok(commit) => {
                     sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
                     println!(
-                        "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui",
+                        "notebook_created notebook={} title={:?} template={template:?} manifest_persist_us={} active_notebook={} source=ui",
                         commit.notebook_id,
                         commit.title,
                         commit.manifest_persist_us,
@@ -3803,7 +3808,9 @@ fn execute_ui_command(
                     })
                 }
                 Err(e) => {
-                    eprintln!("notebook_create_failed title={title:?} detail={e}");
+                    eprintln!(
+                        "notebook_create_failed title={title:?} template={template:?} detail={e}"
+                    );
                     x.ui.show_error("The notebook couldn't be created.");
                     present_ui(x, ctrl, None)
                 }
