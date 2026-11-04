@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
 import { libraryPrefs } from "../app/libraryPrefs";
 import type { FinishedStroke } from "../authoring/capture";
@@ -115,9 +115,8 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
   const drawing = useRef(false);
   const typeSession = useRef<TypeSession | null>(null);
   const replicaRef = useRef(replica);
-  replicaRef.current = replica;
   const sessionRef = useRef(session);
-  sessionRef.current = session;
+  const viewSnapshotRef = useRef<SyncSnapshotV1 | null>(null);
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -171,8 +170,12 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
       return snapshot;
     }
   }, [snapshot, sync.overlay, through, projectLibrary]);
-  const viewSnapshotRef = useRef(viewSnapshot);
-  viewSnapshotRef.current = viewSnapshot;
+  // Keep createNotebook identity checks current without writing refs during render (react-hooks/refs).
+  useLayoutEffect(() => {
+    replicaRef.current = replica;
+    sessionRef.current = session;
+    viewSnapshotRef.current = viewSnapshot;
+  }, [replica, session, viewSnapshot]);
   const viewSel = viewSnapshot ? preserveSelection(snapshot ?? null, state.selection, viewSnapshot) : state.selection;
   const r = viewSnapshot ? resolve(viewSnapshot, viewSel) : null;
   const pageId = r?.page.page_id ?? "";

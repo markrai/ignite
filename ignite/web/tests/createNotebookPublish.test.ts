@@ -230,7 +230,6 @@ describe("publishThenCreateNotebook session race", () => {
     const put = vi.fn();
     const commits: unknown[] = [];
     const initiating = readyReplica({ put }, commits);
-    const s1 = session("lib-a");
     const result = await publishThenCreateNotebook({
       template: "blank",
       blobApi: initiating.blobApi,
