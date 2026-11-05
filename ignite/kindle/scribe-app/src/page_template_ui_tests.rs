@@ -260,9 +260,16 @@ mod tests {
             title: "Projects".into(),
             notebook_ids: vec!["notebook-2".into()],
         }];
-        ui.settle_home(&c);
+        ui.settle_home(&g, &c);
         ui.home_folder = Some("folder-1".into());
-        let layout = HomeLayout::for_rows(&g, &ui.home, &ui.home_rows(&c), true, false);
+        let layout = HomeLayout::for_rows(
+            &g,
+            &ui.home,
+            &ui.home_rows(&c),
+            true,
+            false,
+            ui.home_viewport(&g),
+        );
         ui.on_tap(&g, center(layout.new_button), &c, "Notebook 4", None);
         let paper = ui.modal.clone().unwrap();
         match &paper {

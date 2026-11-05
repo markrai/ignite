@@ -44,10 +44,12 @@ use crate::fullscreen::{
     compose_notebook_layers, recompose_dirty_notebook_layers,
     recompose_dirty_notebook_layers_translated,
 };
-use crate::home::{home_cards, render_home_view, AppView, HomeCard, HomeState};
+use crate::home::{
+    home_cards, render_home_search_composer, render_home_view, AppView, HomeCard, HomeState,
+};
 use crate::ink::parse_ink_request;
 use crate::ink::InkRequest;
-use crate::keyboard::render_title_editor;
+use crate::keyboard::{render_title_editor, TitleEditor};
 use crate::lasso::{
     move_dirty_bounds, move_replacements, LassoSelection, LassoState, MoveCommit, TouchOverlayDirty,
 };
@@ -298,6 +300,57 @@ impl KindleTransport {
         Ok(())
     }
 
+    /// Home + docked search keyboard. `region` limits the e-ink refresh after a full paint.
+    fn render_home_search(
+        &mut self,
+        cards: &[HomeCard],
+        folders: &[FolderInfo],
+        open_folder: Option<&str>,
+        state: &HomeState,
+        editor: &TitleEditor,
+        region: Option<Rect>,
+    ) -> Result<(), String> {
+        self.chrome_on_panel = false;
+        let (summary, _) = render_home_search_composer(
+            self.fb.as_slice_mut(),
+            &self.geometry,
+            cards,
+            folders,
+            open_folder,
+            state,
+            editor,
+        )?;
+        match region {
+            Some(r) => {
+                println!(
+                    "home_search_gc16_region visible_entries={} total_entries={} viewport_page={}/{} rect=({},{},{},{})",
+                    summary.visible_entries,
+                    summary.total_entries,
+                    summary.viewport_page + 1,
+                    summary.viewport_pages,
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
+                );
+                self.refresh_rect(r)
+            }
+            None => {
+                let (marker, collision) = self.refresh_full()?;
+                println!(
+                    "home_search_gc16_full marker={marker} collision={collision} folders={} open_folder={} visible_entries={} total_entries={} viewport_page={}/{}",
+                    folders.len(),
+                    open_folder.unwrap_or("-"),
+                    summary.visible_entries,
+                    summary.total_entries,
+                    summary.viewport_page + 1,
+                    summary.viewport_pages,
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// D1 Sync screen (GC16 FULL).
     fn render_sync(&mut self, view: &crate::server_link::LinkView) -> Result<(), String> {
         self.chrome_on_panel = false;
@@ -377,7 +430,6 @@ impl KindleTransport {
             TitlePurpose::CreateFolder => ("NEW FOLDER", "CREATE"),
             TitlePurpose::RenameFolder { .. } => ("RENAME FOLDER", "SAVE"),
             TitlePurpose::CreateNotebookInFolder { .. } => ("NEW NOTEBOOK", "CREATE"),
-            TitlePurpose::Search => ("SEARCH", "SEARCH"),
         };
         self.chrome_on_panel = false;
         render_title_editor(
@@ -2925,17 +2977,28 @@ fn present_ui(
             }
             let cards = home_cards(x.library);
             refresh_folder_view(x.ui, x.folders, x.library);
-            x.ui.settle_home(&cards);
+            x.ui.settle_home(&x.geo, &cards);
             let open = x.ui.open_folder().map(|f| f.id.clone());
-            let search = x.ui.home_search_query().map(str::to_owned);
-            ctrl.transport_mut().render_home(
-                &cards,
-                &x.ui.folders,
-                open.as_deref(),
-                search.as_deref(),
-                &x.ui.home,
-                x.ui.modal.as_ref(),
-            )
+            if let Some(editor) = x.ui.search_editor.clone() {
+                ctrl.transport_mut().render_home_search(
+                    &cards,
+                    &x.ui.folders,
+                    open.as_deref(),
+                    &x.ui.home,
+                    &editor,
+                    region,
+                )
+            } else {
+                let search = x.ui.home_search_query().map(str::to_owned);
+                ctrl.transport_mut().render_home(
+                    &cards,
+                    &x.ui.folders,
+                    open.as_deref(),
+                    search.as_deref(),
+                    &x.ui.home,
+                    x.ui.modal.as_ref(),
+                )
+            }
         }
         AppView::Sync => {
             let Some(view) = crate::server_link::with_global(|l| l.view()) else {
@@ -4332,7 +4395,7 @@ pub fn run_page_session(
         eprintln!("folders_unreadable detail={e} (folders are read-only this session)");
     }
     refresh_folder_view(&mut ui, &folders, &library);
-    ui.settle_home(&launch_cards);
+    ui.settle_home(&g, &launch_cards);
     crate::launch_clock::mark("home_paint_submit");
     if let Err(e) = transport.render_home(&launch_cards, &ui.folders, None, None, &ui.home, None) {
         eprintln!("error: render Home at launch: {e}");
