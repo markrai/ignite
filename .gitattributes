@@ -1,2 +1,4 @@
 tools/release/kindle-release-public-key.hex text eol=lf
+# Embedded into scribe-app via include_str!; CRLF breaks the OTA contract parser header match.
+deployment/kindle/publication_component_contract.v1 text eol=lf
 ignite/kindle/scribe-lifecycle/src/lipc.rs text eol=lf diff

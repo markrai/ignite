@@ -81,7 +81,9 @@ def disposable_root(tmp_path: Path):
 def test_contract_file_matches_python_authority() -> None:
     committed = (_HERE / "publication_component_contract.v1").read_bytes()
     assert committed == build_component_contract_bytes()
+    assert b"\r" not in committed, "contract must stay LF-only (Kindle include_str! / OTA)"
     assert b"role_count=22\n" in committed
+    assert committed.startswith(b"IGNITE_PUBLICATION_COMPONENT_CONTRACT_V1\n")
 
 
 def test_build_and_validate_production_evidence(tmp_path: Path) -> None:

@@ -1564,6 +1564,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_embedded_contract_surfaces_as_staging_failed_not_worker_disconnect() {
+        let mut state = SoftwareUpdateState::default();
+        let gen = state.begin_check().unwrap();
+        let handoff = install_handoff("0.9.14");
+        assert!(state.apply_result(gen, Ok(UpdateCheckOutcome::Available(handoff.clone()))));
+        let dl_gen = state.begin_download(handoff).unwrap();
+        let staging_err = crate::verified_update_staging::StagingError::Trust(
+            crate::publication_trust_boundary::ProductionTrustError::MalformedEvidence(
+                "unsupported contract schema",
+            ),
+        );
+        assert!(state.apply_download_result(
+            dl_gen,
+            Err(UpdateInstallError::StagingFailed(staging_err.to_string())),
+        ));
+        match &state.phase {
+            UpdateCheckPhase::InstallFailed { message, .. } => {
+                assert_eq!(message, "staging failed: unsupported contract schema");
+                assert!(!message.contains("download worker ended without a result"));
+            }
+            other => panic!("expected InstallFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn install_failed_on_spawn_error_is_retryable() {
         let key = install_signing_key();
         let (src, staging) = temp_install_pair("spawn-retry");
