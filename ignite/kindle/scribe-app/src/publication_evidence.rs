@@ -57,23 +57,31 @@ pub struct ValidatedProductionEvidence {
     pub components: Vec<ValidatedComponentClaim>,
 }
 
-fn contracts() -> &'static [ComponentContract] {
+fn contracts() -> Result<&'static [ComponentContract], ProductionTrustError> {
     use std::sync::OnceLock;
-    static CONTRACTS: OnceLock<Vec<ComponentContract>> = OnceLock::new();
-    CONTRACTS
-        .get_or_init(|| {
-            parse_contract_table(CONTRACT_BYTES).expect("embedded component contract must parse")
-        })
-        .as_slice()
+    static CONTRACTS: OnceLock<Result<Vec<ComponentContract>, &'static str>> = OnceLock::new();
+    match CONTRACTS.get_or_init(|| parse_contract_table(CONTRACT_BYTES)) {
+        Ok(rows) => Ok(rows.as_slice()),
+        Err(reason) => Err(ProductionTrustError::MalformedEvidence(*reason)),
+    }
 }
 
+/// Parse the embedded component-contract table.
+///
+/// Line endings: this trusted host/device table may arrive as LF or CRLF from
+/// `include_str!` on Windows checkouts; both are accepted. Signed production
+/// *evidence* documents remain LF-only elsewhere in this module.
 fn parse_contract_table(raw: &str) -> Result<Vec<ComponentContract>, &'static str> {
-    let lines: Vec<&str> = raw.trim_end_matches('\n').split('\n').collect();
-    if lines.len() < 4 {
+    // `str::lines` accepts LF and CRLF; do not use split('\n') here.
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.len() < 2 {
         return Err("contract too short");
     }
     if lines[0] != "IGNITE_PUBLICATION_COMPONENT_CONTRACT_V1" || lines[1] != "schema=1" {
         return Err("unsupported contract schema");
+    }
+    if lines.len() < 3 {
+        return Err("contract too short");
     }
     let count = lines[2]
         .strip_prefix("role_count=")
@@ -151,7 +159,7 @@ pub fn parse_and_validate_production_evidence(
         ));
     }
     let lines: Vec<&str> = text[..text.len() - 1].split('\n').collect();
-    let contracts = contracts();
+    let contracts = contracts()?;
     let expected_line_count = 10 + contracts.len() + 1;
     if lines.len() != expected_line_count {
         return Err(ProductionTrustError::MalformedEvidence(
@@ -431,8 +439,8 @@ pub fn embedded_contract_digest_hex() -> String {
     encode_hex(&Sha256::digest(CONTRACT_BYTES.as_bytes()))
 }
 
-pub fn embedded_contract_role_count() -> usize {
-    contracts().len()
+pub fn embedded_contract_role_count() -> Result<usize, ProductionTrustError> {
+    Ok(contracts()?.len())
 }
 
 /// Build a canonical production-format evidence document for fixture staging tests.
@@ -471,7 +479,7 @@ pub(crate) fn build_minimal_production_evidence(
         encode_hex(&Sha256::digest(b"fixture-component-bytes"))
     };
     let mut components = Vec::new();
-    for contract in contracts() {
+    for contract in contracts()? {
         let claim = match contract.presence_policy {
             PackagePresencePolicy::Required => ValidatedComponentClaim {
                 role: contract.role.to_string(),
@@ -517,17 +525,79 @@ pub(crate) fn build_minimal_production_evidence(
 mod tests {
     use super::*;
 
+    fn lf_contract_fixture() -> String {
+        CONTRACT_BYTES.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
     #[test]
     fn embedded_contract_has_twenty_two_roles() {
-        assert_eq!(embedded_contract_role_count(), 22);
+        assert_eq!(embedded_contract_role_count().unwrap(), 22);
+        // Working tree + CI checkout must embed LF (see .gitattributes eol=lf).
+        assert!(
+            !CONTRACT_BYTES.contains('\r'),
+            "embedded publication_component_contract.v1 must not contain CR"
+        );
         assert!(CONTRACT_BYTES.starts_with("IGNITE_PUBLICATION_COMPONENT_CONTRACT_V1\n"));
-        assert!(CONTRACT_BYTES.contains("|required\n") || CONTRACT_BYTES.contains("|required\r"));
-        assert!(contracts()[0].presence_policy == PackagePresencePolicy::Required);
+        assert!(CONTRACT_BYTES.contains("|required\n"));
+        assert_eq!(
+            contracts().unwrap()[0].presence_policy,
+            PackagePresencePolicy::Required
+        );
+    }
+
+    #[test]
+    fn parse_contract_table_accepts_lf_and_crlf() {
+        let lf = lf_contract_fixture();
+        let crlf = lf.replace('\n', "\r\n");
+        let from_lf = parse_contract_table(&lf).expect("LF contract");
+        let from_crlf = parse_contract_table(&crlf).expect("CRLF contract");
+        assert_eq!(from_lf.len(), 22);
+        assert_eq!(from_crlf.len(), 22);
+        assert_eq!(from_lf[0].role, from_crlf[0].role);
+        assert_eq!(from_lf[0].presence_policy, from_crlf[0].presence_policy);
+        assert_eq!(from_lf.last().unwrap().role, from_crlf.last().unwrap().role);
+    }
+
+    #[test]
+    fn parse_contract_table_refuses_malformed_without_panic() {
+        let bad_schema =
+            "IGNITE_PUBLICATION_COMPONENT_CONTRACT_V1\r\nschema=99\r\nrole_count=0\r\n";
+        assert_eq!(
+            parse_contract_table(bad_schema),
+            Err("unsupported contract schema")
+        );
+        assert_eq!(parse_contract_table(""), Err("contract too short"));
+        assert_eq!(
+            parse_contract_table("IGNITE_PUBLICATION_COMPONENT_CONTRACT_V1\nschema=1\n"),
+            Err("contract too short")
+        );
+        let bad_count = "IGNITE_PUBLICATION_COMPONENT_CONTRACT_V1\nschema=1\nrole_count=1\n";
+        assert_eq!(
+            parse_contract_table(bad_count),
+            Err("contract role count mismatch")
+        );
+    }
+
+    #[test]
+    fn malformed_embedded_contract_surfaces_as_trust_error_not_panic() {
+        // contracts() maps parse failures into ProductionTrustError so the download
+        // worker can return AuthorizationFailed instead of dying disconnected.
+        let err = parse_contract_table("not-a-contract\nschema=1\n")
+            .err()
+            .expect("malformed");
+        let mapped = ProductionTrustError::MalformedEvidence(err);
+        let message = mapped.to_string();
+        assert!(
+            message.contains("unsupported contract schema"),
+            "message={message}"
+        );
+        assert!(!message.contains("download worker ended without a result"));
     }
 
     #[test]
     fn mandatory_direct_copy_absence_fails_claim_validation() {
         // Minimal structurally ordered document with scribe-app absent.
+        let contracts = contracts().unwrap();
         let mut lines = vec![
             EVIDENCE_HEADER.to_string(),
             format!("schema={EVIDENCE_SCHEMA}"),
@@ -538,9 +608,9 @@ mod tests {
             format!("scriptlet_sha256={}", "ab".repeat(32)),
             "payload_dirname=Ignite-Kindle-3.3.1".to_string(),
             format!("package_profile_sha256={}", "cd".repeat(32)),
-            format!("component_role_count={}", contracts().len()),
+            format!("component_role_count={}", contracts.len()),
         ];
-        for contract in contracts() {
+        for contract in contracts {
             if contract.role == "scribe-app" {
                 lines.push(format!(
                     "component={}|absent|0|-|{}|-|{}",
