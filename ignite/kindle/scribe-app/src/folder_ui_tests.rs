@@ -46,7 +46,13 @@ mod tests {
     }
 
     fn layout(g: &FbGeometry, ui: &UiState, c: &[HomeCard]) -> HomeLayout {
-        HomeLayout::for_rows(g, &ui.home, &ui.home_rows(c), ui.open_folder().is_some())
+        HomeLayout::for_rows(
+            g,
+            &ui.home,
+            &ui.home_rows(c),
+            ui.open_folder().is_some(),
+            ui.home_search_query().is_some(),
+        )
     }
 
     fn button(g: &FbGeometry, modal: &Modal, label: &str) -> UiPoint {
@@ -76,7 +82,7 @@ mod tests {
         let mut folders: Vec<FolderInfo> = (1..=7).map(|n| folder(n, &[])).collect();
         folders[0] = folder(1, &[1, 2]);
         folders[6] = folder(7, &[3]);
-        let rows = home_rows(&c, &folders, None);
+        let rows = home_rows(&c, &folders, None, None);
         assert_eq!(
             rows[..3],
             [
@@ -93,14 +99,14 @@ mod tests {
 
         // Folder view: that folder's notebooks, library order.
         assert_eq!(
-            home_rows(&c, &folders, Some("folder-1")),
+            home_rows(&c, &folders, Some("folder-1"), None),
             vec![HomeRow::Notebook(0), HomeRow::Notebook(1)]
         );
 
         // Many folders span pages; each folder appears on exactly one page.
         let many: Vec<FolderInfo> = (1..=20).map(|n| folder(n, &[])).collect();
         let g = panel_geo();
-        let rows = home_rows(&c, &many, None);
+        let rows = home_rows(&c, &many, None, None);
         assert_eq!(rows.len(), 20usize.div_ceil(FOLDERS_PER_ROW) + 10);
         let mut seen = Vec::new();
         let mut state = HomeState::selecting(0, 10);
@@ -108,7 +114,7 @@ mod tests {
         assert_eq!(state.page, 1, "notebook 0 follows the 7 folder rows");
         state.page = 0;
         loop {
-            let l = HomeLayout::for_rows(&g, &state, &rows, false);
+            let l = HomeLayout::for_rows(&g, &state, &rows, false, false);
             assert!(l.cards.len() + l.folders.len() / FOLDERS_PER_ROW <= ROWS_PER_PAGE + 1);
             seen.extend(l.folders.iter().map(|(f, _, _)| *f));
             // Tiles of one row share y and never overlap.
@@ -165,7 +171,16 @@ mod tests {
             vec![1, 2]
         );
         let mut fb = vec![0u8; g.smem_len as usize];
-        render_home_view(&mut fb, &g, &c, &ui.folders, Some("folder-1"), &ui.home).unwrap();
+        render_home_view(
+            &mut fb,
+            &g,
+            &c,
+            &ui.folders,
+            Some("folder-1"),
+            None,
+            &ui.home,
+        )
+        .unwrap();
 
         // + NEW inside a folder: paper picker, then title; filed in this folder.
         ui.on_tap(&g, center(l.new_button), &c, "Notebook 5", None);

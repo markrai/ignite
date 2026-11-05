@@ -33,6 +33,8 @@ mod folder_ui_tests;
 pub mod folders;
 pub mod fullscreen;
 pub mod home;
+#[cfg(test)]
+mod home_search_tests;
 pub mod ink;
 pub mod input_lag;
 pub mod install_intent;

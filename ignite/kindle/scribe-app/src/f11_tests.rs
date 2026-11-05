@@ -1381,17 +1381,23 @@ mod tests {
     }
 
     #[test]
-    fn search_placeholder_is_inert_and_tools_opens_a_fresh_tools_screen() {
+    fn search_opens_keyboard_and_tools_opens_a_fresh_tools_screen() {
         let g = panel_geo_for_tools();
         let c = cards(3);
         let mut ui = home_ui(3, 0);
         let layout = HomeLayout::new(&g, &ui.home, 3);
-        let before = ui.clone();
         assert_eq!(
             ui.on_tap(&g, center(layout.search), &c, "Notebook 4", None),
-            UiCommand::None
+            UiCommand::Redraw(Redraw::Full)
         );
-        assert_eq!(ui, before, "search placeholder changes nothing");
+        match &ui.modal {
+            Some(Modal::TitleEntry {
+                purpose: TitlePurpose::Search,
+                ..
+            }) => {}
+            other => panic!("expected search keyboard, got {other:?}"),
+        }
+        ui.modal = None;
 
         assert_eq!(
             ui.on_tap(&g, center(layout.tools_button), &c, "Notebook 4", None),

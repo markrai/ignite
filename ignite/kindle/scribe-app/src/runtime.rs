@@ -264,6 +264,7 @@ impl KindleTransport {
         cards: &[HomeCard],
         folders: &[FolderInfo],
         open_folder: Option<&str>,
+        search: Option<&str>,
         state: &HomeState,
         modal: Option<&Modal>,
     ) -> Result<(), String> {
@@ -274,6 +275,7 @@ impl KindleTransport {
             cards,
             folders,
             open_folder,
+            search,
             state,
         )?;
         if let Some(spec) = modal.and_then(dialog_spec) {
@@ -375,6 +377,7 @@ impl KindleTransport {
             TitlePurpose::CreateFolder => ("NEW FOLDER", "CREATE"),
             TitlePurpose::RenameFolder { .. } => ("RENAME FOLDER", "SAVE"),
             TitlePurpose::CreateNotebookInFolder { .. } => ("NEW NOTEBOOK", "CREATE"),
+            TitlePurpose::Search => ("SEARCH", "SEARCH"),
         };
         self.chrome_on_panel = false;
         render_title_editor(
@@ -2924,10 +2927,12 @@ fn present_ui(
             refresh_folder_view(x.ui, x.folders, x.library);
             x.ui.settle_home(&cards);
             let open = x.ui.open_folder().map(|f| f.id.clone());
+            let search = x.ui.home_search_query().map(str::to_owned);
             ctrl.transport_mut().render_home(
                 &cards,
                 &x.ui.folders,
                 open.as_deref(),
+                search.as_deref(),
                 &x.ui.home,
                 x.ui.modal.as_ref(),
             )
@@ -4329,7 +4334,7 @@ pub fn run_page_session(
     refresh_folder_view(&mut ui, &folders, &library);
     ui.settle_home(&launch_cards);
     crate::launch_clock::mark("home_paint_submit");
-    if let Err(e) = transport.render_home(&launch_cards, &ui.folders, None, &ui.home, None) {
+    if let Err(e) = transport.render_home(&launch_cards, &ui.folders, None, None, &ui.home, None) {
         eprintln!("error: render Home at launch: {e}");
         drop(src);
         return abort_after_loading(e);
