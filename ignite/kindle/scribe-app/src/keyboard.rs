@@ -23,6 +23,17 @@ const KEY_GAP: u32 = 18;
 const KEY_SCALE: u32 = 9;
 const ACTION_GAP: u32 = 60;
 const ACTION_H: u32 = 190;
+/// Bottom padding below the Done/Cancel row inside the keys band.
+const KEYS_BOTTOM_PAD: u32 = 20;
+/// Gap between Home content and a docked search keyboard.
+pub const SEARCH_KEYBOARD_GAP: u32 = 24;
+
+/// Height of the docked key block (letter/symbol rows + actions), independent of panel size.
+pub fn docked_keys_height() -> u32 {
+    // Four key rows at `row_y(0..3)`, then `row_y(4) + ACTION_GAP` for Done/Cancel, then pad.
+    // `row_y(i) = i * (KEY_H + KEY_GAP)`, so the action row origin contributes four KEY_GAP steps.
+    4 * KEY_H + 4 * KEY_GAP + ACTION_GAP + ACTION_H + KEYS_BOTTOM_PAD
+}
 
 const LETTER_ROWS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
 const SYMBOL_ROWS: [&str; 3] = ["1234567890", "-_.'&!?,(", ")#+/:;\""];
@@ -158,12 +169,26 @@ pub struct KeyboardLayout {
 }
 
 impl KeyboardLayout {
+    /// Full-screen title editor keyboard (create/rename/folder/server).
     pub fn new(geo: &FbGeometry, symbols: bool) -> Self {
+        Self::with_keys_top(geo, symbols, KEYS_TOP, true)
+    }
+
+    /// Search keyboard docked so its bottom sits near the panel bottom.
+    pub fn docked(geo: &FbGeometry, symbols: bool) -> Self {
+        let keys_top = geo
+            .yres
+            .saturating_sub(docked_keys_height())
+            .max(KEYS_TOP / 2);
+        Self::with_keys_top(geo, symbols, keys_top, false)
+    }
+
+    fn with_keys_top(geo: &FbGeometry, symbols: bool, keys_top: u32, include_field: bool) -> Self {
         let width = geo.xres.saturating_sub(2 * MARGIN);
         let unit = (width.saturating_sub(9 * KEY_GAP)) / 10;
         let rows = if symbols { SYMBOL_ROWS } else { LETTER_ROWS };
         let mut keys = Vec::new();
-        let row_y = |i: u32| KEYS_TOP + i * (KEY_H + KEY_GAP);
+        let row_y = |i: u32| keys_top + i * (KEY_H + KEY_GAP);
         let row_w = |n: u32| n * unit + n.saturating_sub(1) * KEY_GAP;
 
         // Rows 1 and 2: centered character rows.
@@ -214,10 +239,24 @@ impl KeyboardLayout {
             Rect::new(MARGIN + width - half, y5, half, ACTION_H),
         ));
 
-        let keys_area = Rect::new(0, KEYS_TOP, geo.xres, y5 + ACTION_H + 20 - KEYS_TOP);
+        let keys_area = Rect::new(
+            0,
+            keys_top,
+            geo.xres,
+            y5 + ACTION_H + KEYS_BOTTOM_PAD - keys_top,
+        );
+        let (field, status) = if include_field {
+            (
+                Rect::new(MARGIN, FIELD_Y, width, FIELD_H),
+                Rect::new(MARGIN, STATUS_Y, width, 7 * STATUS_SCALE + 20),
+            )
+        } else {
+            // Search uses the Home search bar as the field; placeholders for API stability.
+            (Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0))
+        };
         Self {
-            field: Rect::new(MARGIN, FIELD_Y, width, FIELD_H),
-            status: Rect::new(MARGIN, STATUS_Y, width, 7 * STATUS_SCALE + 20),
+            field,
+            status,
             keys_area,
             keys,
         }
@@ -313,6 +352,23 @@ pub fn render_title_editor(
         BLACK,
     );
 
+    paint_keys(&mut c, &layout, editor, submit_label);
+    Ok(layout)
+}
+
+/// Paint only the docked search key block (Home search bar is the query field).
+pub fn paint_docked_search_keys(c: &mut Canvas<'_>, layout: &KeyboardLayout, editor: &TitleEditor) {
+    // Clear the keys band so prior Home/pager pixels cannot ghost through.
+    c.fill(layout.keys_area, WHITE);
+    paint_keys(c, layout, editor, "DONE");
+}
+
+fn paint_keys(
+    c: &mut Canvas<'_>,
+    layout: &KeyboardLayout,
+    editor: &TitleEditor,
+    submit_label: &str,
+) {
     for (key, rect) in &layout.keys {
         let label = key_label(*key, editor, submit_label);
         let inverted =
@@ -334,5 +390,21 @@ pub fn render_title_editor(
         };
         c.text_centered(rect.inset(8), scale, &label, fg);
     }
-    Ok(layout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_gfx::panel_geo;
+
+    #[test]
+    fn docked_keys_height_matches_laid_out_keys_area() {
+        let g = panel_geo();
+        let layout = KeyboardLayout::docked(&g, false);
+        assert_eq!(layout.keys_area.h, docked_keys_height());
+        assert_eq!(layout.keys_area.bottom(), g.yres);
+        let symbols = KeyboardLayout::docked(&g, true);
+        assert_eq!(symbols.keys_area.h, docked_keys_height());
+        assert_eq!(symbols.keys_area.bottom(), g.yres);
+    }
 }

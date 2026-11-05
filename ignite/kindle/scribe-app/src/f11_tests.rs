@@ -205,7 +205,10 @@ mod tests {
         assert!(ui.modal.is_none());
         assert_eq!(ui.home.selected_index, 6);
         assert_eq!(ui.home.page, 1);
-        assert!(ui.home.visible_range(8).contains(&6));
+        assert!(ui
+            .home
+            .visible_range(8, crate::home::HomeViewport::standard_paging())
+            .contains(&6));
         assert!(!ui.allows_page_input());
 
         // Rendering Home and building cards is read-only.
@@ -253,16 +256,17 @@ mod tests {
 
     #[test]
     fn home_viewport_paging_for_1_6_7_20_notebooks() {
+        let vp = crate::home::HomeViewport::standard_paging();
         for (total, pages) in [(1usize, 1usize), (6, 1), (7, 2), (20, 4)] {
             assert_eq!(viewport_page_count(total), pages, "total={total}");
             let mut seen = Vec::new();
             let mut state = HomeState::selecting(0, total);
             loop {
-                let range = state.visible_range(total);
+                let range = state.visible_range(total, vp);
                 assert!(!range.is_empty(), "empty viewport page total={total}");
                 assert!(range.len() <= ROWS_PER_PAGE);
                 seen.extend(range);
-                if !state.can_page_next(total) {
+                if !state.can_page_next(total, vp) {
                     break;
                 }
                 state.page += 1;
@@ -279,30 +283,31 @@ mod tests {
                 sync: false,
                 reveal: false,
             };
-            stale.normalize(total);
+            stale.normalize(total, vp);
             assert_eq!(stale.page, pages - 1);
             assert_eq!(stale.selected_index, total - 1);
-            assert!(!stale.visible_range(total).is_empty());
+            assert!(!stale.visible_range(total, vp).is_empty());
         }
     }
 
     #[test]
     fn selected_notebook_is_always_in_the_visible_viewport() {
+        let vp = crate::home::HomeViewport::standard_paging();
         for total in 1..=20 {
             for idx in 0..total {
                 let s = HomeState::selecting(idx, total);
-                assert!(s.visible_range(total).contains(&idx), "{total}/{idx}");
+                assert!(s.visible_range(total, vp).contains(&idx), "{total}/{idx}");
                 let mut ui = home_ui(total, 0);
                 ui.enter_home(idx, total);
-                assert!(ui.home.visible_range(total).contains(&idx));
+                assert!(ui.home.visible_range(total, vp).contains(&idx));
             }
             // Developer cursor wraps across viewport pages and stays visible.
             let mut s = HomeState::selecting(total - 1, total);
             s.select_next(total);
             assert_eq!(s.selected_index, 0);
-            assert!(s.visible_range(total).contains(&0));
+            assert!(s.visible_range(total, vp).contains(&0));
             s.select_previous(total);
-            assert!(s.visible_range(total).contains(&(total - 1)));
+            assert!(s.visible_range(total, vp).contains(&(total - 1)));
         }
     }
 
@@ -840,7 +845,10 @@ mod tests {
         assert_eq!(lib.active_notebook_id(), "notebook-6");
         assert_eq!(ui.home.selected_index, 5);
         assert_eq!(ui.home.page, 0);
-        assert!(!ui.home.visible_range(total).is_empty());
+        assert!(!ui
+            .home
+            .visible_range(total, crate::home::HomeViewport::standard_paging())
+            .is_empty());
         assert!(root.join(".notebook-trash").is_dir());
         let _ = fs::remove_dir_all(root);
     }
@@ -1390,14 +1398,12 @@ mod tests {
             ui.on_tap(&g, center(layout.search), &c, "Notebook 4", None),
             UiCommand::Redraw(Redraw::Full)
         );
-        match &ui.modal {
-            Some(Modal::TitleEntry {
-                purpose: TitlePurpose::Search,
-                ..
-            }) => {}
-            other => panic!("expected search keyboard, got {other:?}"),
-        }
-        ui.modal = None;
+        assert!(
+            ui.search_editor.is_some(),
+            "expected docked search editor, got modal={:?}",
+            ui.modal
+        );
+        ui.search_editor = None;
 
         assert_eq!(
             ui.on_tap(&g, center(layout.tools_button), &c, "Notebook 4", None),

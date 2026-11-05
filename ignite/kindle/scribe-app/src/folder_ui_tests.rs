@@ -7,7 +7,7 @@ mod tests {
     use crate::folders::FolderInfo;
     use crate::home::{
         home_rows, render_home_view, HomeCard, HomeHit, HomeLayout, HomeRow, HomeState,
-        FOLDERS_PER_ROW, ROWS_PER_PAGE,
+        HomeViewport, FOLDERS_PER_ROW, ROWS_PER_PAGE,
     };
     use crate::modal::{dialog_spec, DialogLayout, Modal, TitlePurpose, PICKER_PAGE};
     use crate::ui_gfx::{panel_geo, Rect, UiPoint};
@@ -39,9 +39,10 @@ mod tests {
     }
 
     fn ui_with(folders: Vec<FolderInfo>, total: usize) -> UiState {
+        let g = panel_geo();
         let mut ui = UiState::launch_home(0, total);
         ui.folders = folders;
-        ui.settle_home(&cards(total));
+        ui.settle_home(&g, &cards(total));
         ui
     }
 
@@ -51,7 +52,8 @@ mod tests {
             &ui.home,
             &ui.home_rows(c),
             ui.open_folder().is_some(),
-            ui.home_search_query().is_some(),
+            ui.home_search_chrome_active(),
+            ui.home_viewport(g),
         )
     }
 
@@ -110,11 +112,12 @@ mod tests {
         assert_eq!(rows.len(), 20usize.div_ceil(FOLDERS_PER_ROW) + 10);
         let mut seen = Vec::new();
         let mut state = HomeState::selecting(0, 10);
-        state.settle(&rows, &c, &many);
+        let vp = HomeViewport::standard(&g);
+        state.settle(&rows, &c, &many, vp);
         assert_eq!(state.page, 1, "notebook 0 follows the 7 folder rows");
         state.page = 0;
         loop {
-            let l = HomeLayout::for_rows(&g, &state, &rows, false, false);
+            let l = HomeLayout::for_rows(&g, &state, &rows, false, false, vp);
             assert!(l.cards.len() + l.folders.len() / FOLDERS_PER_ROW <= ROWS_PER_PAGE + 1);
             seen.extend(l.folders.iter().map(|(f, _, _)| *f));
             // Tiles of one row share y and never overlap.
@@ -123,7 +126,7 @@ mod tests {
                     assert!(w[0].1.right() < w[1].1.x);
                 }
             }
-            if !state.can_page_next(rows.len()) {
+            if !state.can_page_next(rows.len(), vp) {
                 break;
             }
             state.page += 1;
@@ -140,15 +143,16 @@ mod tests {
         let c = cards(12);
         let folders: Vec<FolderInfo> = (1..=18).map(|n| folder(n, &[])).collect();
         // 6 folder rows fill page 0; notebook index 0 is on page 1.
+        let g = panel_geo();
         let mut ui = UiState::launch_home(0, 12);
         ui.folders = folders.clone();
-        ui.settle_home(&c);
+        ui.settle_home(&g, &c);
         assert_eq!(ui.home.page, 1);
         // Filed in folder 1 → its tile row is on page 0.
         let mut ui = UiState::launch_home(0, 12);
         ui.folders = folders;
         ui.folders[0] = folder(1, &[1]);
-        ui.settle_home(&c);
+        ui.settle_home(&g, &c);
         assert_eq!(ui.home.page, 0);
     }
 
@@ -221,7 +225,7 @@ mod tests {
 
         // A vanished open folder falls back to the main list.
         ui.home_folder = Some("folder-9".into());
-        ui.settle_home(&c);
+        ui.settle_home(&g, &c);
         assert_eq!(ui.home_folder, None);
     }
 

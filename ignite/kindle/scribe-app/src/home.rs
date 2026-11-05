@@ -1,9 +1,9 @@
 //! Gate F11 framebuffer-native Home/library view.
 //!
 //! Cards with large pen targets, a visible New control, and deterministic viewport paging
-//! (`ROWS_PER_PAGE` rows per Home page). The viewport is transient UI state; it never
+//! ([`HomeViewport`] rows per page). The viewport is transient UI state; it never
 //! changes `library.meta`. This renderer paints only the live framebuffer; callers submit
-//! one GC16 FULL refresh afterward.
+//! one GC16 FULL refresh afterward (or a region refresh while search editing).
 //!
 //! Folders (Kindle-local, `folders.rs`): the main list shows folder tiles first, three per row,
 //! then the notebooks in no folder; rows page together, so folders are never repeated on later
@@ -11,9 +11,11 @@
 
 use kindle_platform::FbGeometry;
 
+use crate::keyboard::{docked_keys_height, SEARCH_KEYBOARD_GAP};
 use crate::library::LibraryRepository;
 use crate::ui_gfx::{
-    fit_text, scale_to_fit, Canvas, Rect, UiPoint, BLACK, GLYPH_H, GLYPH_W, GRAY, WHITE,
+    fit_text, fit_text_tail, scale_to_fit, text_width, Canvas, Rect, UiPoint, BLACK, GLYPH_H,
+    GLYPH_W, GRAY, WHITE,
 };
 
 pub use crate::folders::FolderInfo;
@@ -48,6 +50,14 @@ const TILE_MENU_W: u32 = 140;
 const TILE_TITLE_SCALE: u32 = 7;
 const TILE_TITLE_MIN_SCALE: u32 = 3;
 const TILE_META_SCALE: u32 = 5;
+const TILE_META_MIN_SCALE: u32 = 3;
+/// Normal folder tile inset and icon (comfortable Home rows).
+const TILE_INSET: u32 = 30;
+const TILE_ICON_W: u32 = 90;
+const TILE_ICON_H: u32 = 70;
+const TILE_ICON_TITLE_GAP: u32 = 24;
+const TILE_TITLE_META_GAP: u32 = 8;
+const TILE_META_BOTTOM_PAD: u32 = 26;
 pub const SEARCH_PLACEHOLDER: &str = "Search notebooks...";
 /// Clear-search control: same minimum pen target as other Home chrome (≥ 130 px).
 const CLEAR_SEARCH_W: u32 = BAR_H;
@@ -118,12 +128,22 @@ pub fn notebook_title_matches(title: &str, query: &str) -> bool {
     title.to_lowercase().contains(&q.to_lowercase())
 }
 
+/// How many notebooks in `folder` match `query` (original membership, library order).
+pub fn folder_match_count(folder: &FolderInfo, cards: &[HomeCard], query: &str) -> usize {
+    folder
+        .notebook_ids
+        .iter()
+        .filter_map(|id| cards.iter().find(|c| c.notebook_id == *id))
+        .filter(|c| notebook_title_matches(&c.title, query))
+        .count()
+}
+
 /// Rows of the current view.
 ///
-/// - With `query`: every library notebook whose title matches (original manifest indices),
-///   including notebooks inside folders; folder tiles are omitted.
-/// - Main list (`open == None`, no query): folder rows first, then every notebook in no folder.
-/// - Inside a folder (no query): that folder's notebooks, in library order.
+/// - Main list + `query`: folder tiles for folders with ≥1 match, then matching root notebooks.
+/// - Open folder + `query`: matching notebooks in that folder only.
+/// - Main list, no query: folder rows first, then unfiled notebooks.
+/// - Open folder, no query: that folder's notebooks in library order.
 pub fn home_rows(
     cards: &[HomeCard],
     folders: &[FolderInfo],
@@ -131,11 +151,39 @@ pub fn home_rows(
     query: Option<&str>,
 ) -> Vec<HomeRow> {
     if let Some(q) = query {
-        return cards
+        if let Some(f) = open.and_then(|id| folders.iter().find(|f| f.id == id)) {
+            return cards
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    f.notebook_ids.contains(&c.notebook_id) && notebook_title_matches(&c.title, q)
+                })
+                .map(|(i, _)| HomeRow::Notebook(i))
+                .collect();
+        }
+        let matching_folders: Vec<usize> = folders
             .iter()
             .enumerate()
-            .filter(|(_, c)| notebook_title_matches(&c.title, q))
-            .map(|(i, _)| HomeRow::Notebook(i))
+            .filter(|(_, f)| folder_match_count(f, cards, q) > 0)
+            .map(|(i, _)| i)
+            .collect();
+        let foldered: std::collections::HashSet<&str> = folders
+            .iter()
+            .flat_map(|f| f.notebook_ids.iter().map(String::as_str))
+            .collect();
+        return matching_folders
+            .chunks(FOLDERS_PER_ROW)
+            .map(|c| HomeRow::Folders(c.to_vec()))
+            .chain(
+                cards
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        !foldered.contains(c.notebook_id.as_str())
+                            && notebook_title_matches(&c.title, q)
+                    })
+                    .map(|(i, _)| HomeRow::Notebook(i)),
+            )
             .collect();
     }
     match open.and_then(|id| folders.iter().find(|f| f.id == id)) {
@@ -184,8 +232,63 @@ fn plain_rows(total: usize) -> Vec<HomeRow> {
     (0..total).map(HomeRow::Notebook).collect()
 }
 
+/// Shared Home paging capacity used by state, layout, hit-testing, and paint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HomeViewport {
+    pub rows_per_page: usize,
+    /// Absolute Y at the bottom of the Home content band (pager sits above this).
+    pub content_bottom: u32,
+}
+
+impl HomeViewport {
+    /// Paging-only capacity (layout Y unused). Prefer [`Self::standard`] when painting.
+    pub fn standard_paging() -> Self {
+        Self {
+            rows_per_page: ROWS_PER_PAGE,
+            content_bottom: 0,
+        }
+    }
+
+    /// Ordinary Home: full panel below the chrome, [`ROWS_PER_PAGE`] rows.
+    pub fn standard(geo: &FbGeometry) -> Self {
+        Self {
+            rows_per_page: ROWS_PER_PAGE,
+            content_bottom: geo.yres.saturating_sub(PAGER_BOTTOM_MARGIN),
+        }
+    }
+
+    /// Home with a bottom-docked search keyboard: derive rows from remaining height.
+    pub fn for_search_editing(geo: &FbGeometry) -> Self {
+        let content_bottom = geo
+            .yres
+            .saturating_sub(docked_keys_height().saturating_add(SEARCH_KEYBOARD_GAP));
+        let pager_y = content_bottom.saturating_sub(PAGER_H);
+        let cards_bottom = pager_y.saturating_sub(CARD_GAP * 2);
+        let avail = cards_bottom.saturating_sub(CARDS_TOP);
+        // Target ~3 rows on Scribe; clamp so cards stay finger-sized on other panels.
+        const MIN_CARD_H: u32 = 200;
+        let fitting = if avail < MIN_CARD_H {
+            1
+        } else {
+            ((avail + CARD_GAP) / (MIN_CARD_H + CARD_GAP)).max(1)
+        };
+        Self {
+            rows_per_page: (fitting as usize).clamp(1, ROWS_PER_PAGE),
+            content_bottom,
+        }
+    }
+
+    pub fn page_count(self, total: usize) -> usize {
+        total.div_ceil(self.rows_per_page.max(1)).max(1)
+    }
+}
+
 pub fn viewport_page_count(total: usize) -> usize {
-    total.div_ceil(ROWS_PER_PAGE).max(1)
+    HomeViewport {
+        rows_per_page: ROWS_PER_PAGE,
+        content_bottom: 0,
+    }
+    .page_count(total)
 }
 
 /// Transient Home selection + viewport page. Selection starts on the active notebook.
@@ -217,32 +320,41 @@ impl HomeState {
             sync: false,
             reveal: true,
         };
-        s.normalize(total);
-        s.page = s.selected_index / ROWS_PER_PAGE;
+        let vp = HomeViewport::standard_paging();
+        s.normalize(total, vp);
+        s.page = s.selected_index / vp.rows_per_page.max(1);
         s
     }
 
     /// Keep selection and viewport inside the library. Empty viewport pages are impossible.
-    pub fn normalize(&mut self, total: usize) {
+    pub fn normalize(&mut self, total: usize, vp: HomeViewport) {
         self.selected_index = self.selected_index.min(total.saturating_sub(1));
-        self.page = self.page.min(viewport_page_count(total) - 1);
+        self.page = self.page.min(vp.page_count(total) - 1);
     }
 
     pub fn ensure_selected_visible(&mut self, total: usize) {
-        self.normalize(total);
-        self.page = self.selected_index / ROWS_PER_PAGE;
+        let vp = HomeViewport::standard_paging();
+        self.normalize(total, vp);
+        self.page = self.selected_index / vp.rows_per_page.max(1);
         self.reveal = true;
     }
 
     /// Fit the viewport to the laid-out `rows`. Selection stays a library index; a pending
     /// reveal moves the viewport to the row showing the selected notebook (or its folder tile).
-    pub fn settle(&mut self, rows: &[HomeRow], cards: &[HomeCard], folders: &[FolderInfo]) {
+    pub fn settle(
+        &mut self,
+        rows: &[HomeRow],
+        cards: &[HomeCard],
+        folders: &[FolderInfo],
+        vp: HomeViewport,
+    ) {
+        let rpp = vp.rows_per_page.max(1);
         self.selected_index = self.selected_index.min(cards.len().saturating_sub(1));
         if std::mem::take(&mut self.reveal) {
-            self.page = row_of_card(rows, cards, folders, self.selected_index)
-                .map_or(0, |row| row / ROWS_PER_PAGE);
+            self.page =
+                row_of_card(rows, cards, folders, self.selected_index).map_or(0, |row| row / rpp);
         }
-        self.page = self.page.min(viewport_page_count(rows.len()) - 1);
+        self.page = self.page.min(vp.page_count(rows.len()) - 1);
     }
 
     /// F10 developer cursor controls: wrap through the full manifest order.
@@ -260,18 +372,19 @@ impl HomeState {
         }
     }
 
-    /// Library indices shown on the current viewport page.
-    pub fn visible_range(&self, total: usize) -> std::ops::Range<usize> {
-        let start = (self.page * ROWS_PER_PAGE).min(total);
-        start..(start + ROWS_PER_PAGE).min(total)
+    /// Row indices shown on the current viewport page.
+    pub fn visible_range(&self, total: usize, vp: HomeViewport) -> std::ops::Range<usize> {
+        let rpp = vp.rows_per_page.max(1);
+        let start = (self.page * rpp).min(total);
+        start..(start + rpp).min(total)
     }
 
     pub fn can_page_previous(&self) -> bool {
         self.page > 0
     }
 
-    pub fn can_page_next(&self, total: usize) -> bool {
-        self.page + 1 < viewport_page_count(total)
+    pub fn can_page_next(&self, total: usize, vp: HomeViewport) -> bool {
+        self.page + 1 < vp.page_count(total)
     }
 }
 
@@ -323,6 +436,10 @@ pub struct HomeLayout {
     pub rows_len: usize,
     /// Inside a folder: top-left is Back, the search area shows the folder title.
     pub in_folder: bool,
+    /// Viewport capacity used for this layout (must match settle/hit).
+    pub viewport: HomeViewport,
+    /// Band covering chrome + cards + pager (for region refresh while searching).
+    pub content_band: Rect,
     pub pager_previous: Rect,
     pub pager_next: Rect,
     pub pager_label: Rect,
@@ -331,7 +448,14 @@ pub struct HomeLayout {
 impl HomeLayout {
     /// Notebooks only (no folders): one row per library notebook.
     pub fn new(geo: &FbGeometry, state: &HomeState, total: usize) -> Self {
-        Self::for_rows(geo, state, &plain_rows(total), false, false)
+        Self::for_rows(
+            geo,
+            state,
+            &plain_rows(total),
+            false,
+            false,
+            HomeViewport::standard(geo),
+        )
     }
 
     pub fn for_rows(
@@ -340,17 +464,18 @@ impl HomeLayout {
         all: &[HomeRow],
         in_folder: bool,
         search_active: bool,
+        vp: HomeViewport,
     ) -> Self {
         let width = geo.xres.saturating_sub(2 * MARGIN);
-        let pager_y = geo.yres.saturating_sub(PAGER_H + PAGER_BOTTOM_MARGIN);
+        let pager_y = vp.content_bottom.saturating_sub(PAGER_H);
         let cards_bottom = pager_y.saturating_sub(CARD_GAP * 2);
-        let rows = ROWS_PER_PAGE as u32;
+        let rows = vp.rows_per_page.max(1) as u32;
         let card_h = (cards_bottom.saturating_sub(CARDS_TOP + (rows - 1) * CARD_GAP)) / rows;
         let per = FOLDERS_PER_ROW as u32;
         let tile_w = width.saturating_sub((per - 1) * TILE_GAP) / per;
         let mut cards = Vec::new();
         let mut folders = Vec::new();
-        for (row, index) in state.visible_range(all.len()).enumerate() {
+        for (row, index) in state.visible_range(all.len(), vp).enumerate() {
             let y = CARDS_TOP + row as u32 * (card_h + CARD_GAP);
             match &all[index] {
                 HomeRow::Notebook(i) => {
@@ -429,6 +554,8 @@ impl HomeLayout {
             folders,
             rows_len: all.len(),
             in_folder,
+            viewport: vp,
+            content_band: Rect::new(0, 0, geo.xres, vp.content_bottom),
             pager_previous: Rect::new(MARGIN, pager_y, PAGER_BUTTON_W, PAGER_H),
             pager_next: Rect::new(
                 geo.xres.saturating_sub(MARGIN + PAGER_BUTTON_W),
@@ -460,7 +587,7 @@ impl HomeLayout {
             return Some(HomeHit::Tools);
         }
         // Main list only: clear has priority over the search field. Inside a folder the
-        // search rect shows the folder title and stays inert.
+        // search rect shows the folder title (and filter hint) and is not a search opener.
         if !self.in_folder {
             if let Some(clear) = self.clear_search {
                 if clear.contains(p.x, p.y) {
@@ -490,7 +617,7 @@ impl HomeLayout {
         if self.pager_previous.contains(p.x, p.y) && state.can_page_previous() {
             return Some(HomeHit::PagePrevious);
         }
-        if self.pager_next.contains(p.x, p.y) && state.can_page_next(total) {
+        if self.pager_next.contains(p.x, p.y) && state.can_page_next(total, self.viewport) {
             return Some(HomeHit::PageNext);
         }
         None
@@ -503,6 +630,8 @@ pub struct HomeRenderSummary {
     pub total_entries: usize,
     pub viewport_page: usize,
     pub viewport_pages: usize,
+    /// Chrome + cards + pager band (for search region refresh).
+    pub content_band: Rect,
 }
 
 fn pages_label(count: Option<usize>) -> String {
@@ -579,9 +708,13 @@ fn draw_back_icon(c: &mut Canvas<'_>, r: Rect) {
 
 /// Folder pictogram: a tab over a body outline.
 fn draw_folder_icon(c: &mut Canvas<'_>, r: Rect) {
-    let tab_h = r.h / 5;
+    let tab_h = (r.h / 5).max(1);
     c.fill(Rect::new(r.x, r.y, r.w * 2 / 5, tab_h + 4), BLACK);
-    c.frame(Rect::new(r.x, r.y + tab_h, r.w, r.h - tab_h), 6, BLACK);
+    c.frame(
+        Rect::new(r.x, r.y + tab_h, r.w, r.h.saturating_sub(tab_h)),
+        6,
+        BLACK,
+    );
 }
 
 fn notebooks_label(n: usize) -> String {
@@ -589,6 +722,133 @@ fn notebooks_label(n: usize) -> String {
         "1 notebook".into()
     } else {
         format!("{n} notebooks")
+    }
+}
+
+fn notebooks_label_short(n: usize) -> String {
+    if n == 1 {
+        "1 nb".into()
+    } else {
+        format!("{n} nbs")
+    }
+}
+
+/// Folder-tile notebook count text that fits in `width`, preserving the exact numeric count.
+///
+/// Prefers the full label at the largest scale that fits, then a short "N nb(s)" form, then the
+/// bare number. Never truncates digits.
+pub fn folder_count_label(n: usize, width: u32) -> (String, u32) {
+    let candidates = [notebooks_label(n), notebooks_label_short(n), n.to_string()];
+    for label in candidates {
+        let scale = scale_to_fit(&label, TILE_META_SCALE, TILE_META_MIN_SCALE, width);
+        if text_width(&label, scale) <= width {
+            return (label, scale);
+        }
+    }
+    // Extremely narrow tiles: still show the full number at the minimum scale.
+    let num = n.to_string();
+    (
+        num.clone(),
+        scale_to_fit(&num, TILE_META_SCALE, TILE_META_MIN_SCALE, width),
+    )
+}
+
+/// Painted folder-tile content (icon / title / notebook-count). Hit targets stay on the tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FolderTileContent {
+    pub icon: Rect,
+    pub title: Rect,
+    pub meta: Rect,
+    pub title_scale: u32,
+    pub compact: bool,
+}
+
+/// Lay out folder icon, title, and count inside `tile` (text ends before `menu_x`).
+///
+/// Uses the normal stacked arrangement when height allows; otherwise packs a compact stack
+/// from the tile's own height and glyph sizes so title and count cannot overlap.
+pub fn folder_tile_content(tile: Rect, menu_x: u32, title: &str) -> FolderTileContent {
+    let meta_h = GLYPH_H * TILE_META_SCALE;
+    let text_x_normal = tile.x.saturating_add(TILE_INSET);
+    let text_w_normal = menu_x
+        .saturating_sub(text_x_normal.saturating_add(8))
+        .max(1);
+    let mut title_scale =
+        scale_to_fit(title, TILE_TITLE_SCALE, TILE_TITLE_MIN_SCALE, text_w_normal);
+    let normal_need = TILE_INSET
+        .saturating_add(TILE_ICON_H)
+        .saturating_add(TILE_ICON_TITLE_GAP)
+        .saturating_add(GLYPH_H * title_scale)
+        .saturating_add(TILE_TITLE_META_GAP)
+        .saturating_add(meta_h)
+        .saturating_add(TILE_META_BOTTOM_PAD);
+
+    let (icon, title_y, meta_y, text_x, text_w, compact) = if tile.h >= normal_need {
+        let icon = Rect::new(
+            tile.x.saturating_add(TILE_INSET),
+            tile.y.saturating_add(TILE_INSET),
+            TILE_ICON_W,
+            TILE_ICON_H,
+        );
+        (
+            icon,
+            icon.bottom().saturating_add(TILE_ICON_TITLE_GAP),
+            tile.bottom()
+                .saturating_sub(meta_h.saturating_add(TILE_META_BOTTOM_PAD)),
+            text_x_normal,
+            text_w_normal,
+            false,
+        )
+    } else {
+        // Compact: pad/gap from tile height; place meta then title then icon so they cannot overlap.
+        let pad = (tile.h / 12).clamp(4, TILE_INSET);
+        let gap = (tile.h / 20).clamp(2, TILE_ICON_TITLE_GAP / 2);
+        let text_x = tile.x.saturating_add(pad);
+        let text_w = menu_x.saturating_sub(text_x.saturating_add(8)).max(1);
+        title_scale = scale_to_fit(title, TILE_TITLE_SCALE, TILE_TITLE_MIN_SCALE, text_w);
+        let min_icon_h = (GLYPH_H * 3).min(TILE_ICON_H);
+        while title_scale > TILE_TITLE_MIN_SCALE {
+            let need = pad
+                .saturating_mul(2)
+                .saturating_add(min_icon_h)
+                .saturating_add(gap.saturating_mul(2))
+                .saturating_add(GLYPH_H * title_scale)
+                .saturating_add(meta_h);
+            if need <= tile.h {
+                break;
+            }
+            title_scale -= 1;
+        }
+        let title_h = GLYPH_H * title_scale;
+        let meta_y = tile.bottom().saturating_sub(pad.saturating_add(meta_h));
+        let title_y = meta_y.saturating_sub(gap.saturating_add(title_h));
+        let icon_top = tile.y.saturating_add(pad);
+        let icon_bottom = title_y.saturating_sub(gap).max(icon_top.saturating_add(1));
+        let icon_h = icon_bottom.saturating_sub(icon_top).min(TILE_ICON_H).max(1);
+        let icon_w = icon_h
+            .saturating_mul(TILE_ICON_W)
+            .checked_div(TILE_ICON_H.max(1))
+            .unwrap_or(icon_h)
+            .clamp(1, TILE_ICON_W);
+        let icon = Rect::new(text_x, icon_top, icon_w, icon_h);
+        (icon, title_y, meta_y, text_x, text_w, true)
+    };
+
+    let shown = fit_text(title, title_scale, text_w);
+    let title_h = GLYPH_H * title_scale;
+    let title_rect = Rect::new(
+        text_x,
+        title_y,
+        text_width(&shown, title_scale).min(text_w).max(1),
+        title_h,
+    );
+    let meta_rect = Rect::new(text_x, meta_y, text_w, meta_h);
+    FolderTileContent {
+        icon,
+        title: title_rect,
+        meta: meta_rect,
+        title_scale,
+        compact,
     }
 }
 
@@ -630,10 +890,32 @@ pub fn render_home(
     render_home_view(fb, geo, cards, &[], None, None, state)
 }
 
+/// Options for painting Home (standard or search-editing composer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HomePaintOpts<'a> {
+    pub search: Option<&'a str>,
+    /// Live draft shown in the search field while the docked keyboard is open.
+    pub search_draft: Option<&'a str>,
+    pub viewport: HomeViewport,
+    /// Draw a caret in the search field (search editing).
+    pub search_caret: bool,
+}
+
+impl<'a> HomePaintOpts<'a> {
+    pub fn standard(geo: &FbGeometry, search: Option<&'a str>) -> Self {
+        Self {
+            search,
+            search_draft: None,
+            viewport: HomeViewport::standard(geo),
+            search_caret: false,
+        }
+    }
+}
+
 /// Home with folders: the main list (`open == None`) or one open folder.
 ///
-/// `search` is a transient title filter on the main list. Inside a folder the search area
-/// remains the inert folder title (existing behavior), regardless of `search`.
+/// `search` filters both the main list (folders + root matches) and an open folder's
+/// notebooks. Folder chrome shows the folder title plus a filter hint when searching.
 pub fn render_home_view(
     fb: &mut [u8],
     geo: &FbGeometry,
@@ -643,23 +925,54 @@ pub fn render_home_view(
     search: Option<&str>,
     state: &HomeState,
 ) -> Result<HomeRenderSummary, String> {
+    render_home_view_with(
+        fb,
+        geo,
+        cards,
+        folders,
+        open,
+        state,
+        HomePaintOpts::standard(geo, search),
+    )
+}
+
+pub fn render_home_view_with(
+    fb: &mut [u8],
+    geo: &FbGeometry,
+    cards: &[HomeCard],
+    folders: &[FolderInfo],
+    open: Option<&str>,
+    state: &HomeState,
+    opts: HomePaintOpts<'_>,
+) -> Result<HomeRenderSummary, String> {
     let open_folder = open.and_then(|id| folders.iter().find(|f| f.id == id));
-    // Folder view keeps the unfiltered folder notebook list; search applies on the main list.
-    let query = if open_folder.is_some() { None } else { search };
+    let query = opts.search;
     let rows = home_rows(cards, folders, open_folder.map(|f| f.id.as_str()), query);
     let total = rows.len();
     let mut state = *state;
-    state.settle(&rows, cards, folders);
-    let search_active = query.is_some();
-    let layout = HomeLayout::for_rows(geo, &state, &rows, open_folder.is_some(), search_active);
+    let vp = opts.viewport;
+    state.settle(&rows, cards, folders, vp);
+    let search_active = query.is_some() || opts.search_draft.is_some();
+    let layout = HomeLayout::for_rows(
+        geo,
+        &state,
+        &rows,
+        open_folder.is_some(),
+        search_active && open_folder.is_none(),
+        vp,
+    );
     let mut c = Canvas::new(fb, geo)?;
     // Full white clear: no stale notebook page, modal, or previous Home frame survives.
     c.fill_all(WHITE);
     let text_y = layout.search.y + (BAR_H - GLYPH_H * 7) / 2;
     if let Some(f) = open_folder {
         draw_back_icon(&mut c, layout.exit_icon);
-        // The folder's name where search sits on the main list (inert).
-        let name = fit_text(&f.title, 8, layout.search.w.saturating_sub(40));
+        let title = if query.is_some() {
+            format!("{} (filtered)", f.title)
+        } else {
+            f.title.clone()
+        };
+        let name = fit_text(&title, 8, layout.search.w.saturating_sub(40));
         c.text(
             layout.search.x + 20,
             layout.search.y + (BAR_H - GLYPH_H * 8) / 2,
@@ -670,10 +983,29 @@ pub fn render_home_view(
     } else {
         draw_exit_icon(&mut c, layout.exit_icon);
         c.frame(layout.search, 3, GRAY);
-        let label = search.unwrap_or(SEARCH_PLACEHOLDER);
-        let ink = if search.is_some() { BLACK } else { GRAY };
-        let search_text = fit_text(label, 7, layout.search.w.saturating_sub(60));
+        let label = opts
+            .search_draft
+            .or(opts.search)
+            .unwrap_or(SEARCH_PLACEHOLDER);
+        let ink = if opts.search_draft.is_some() || opts.search.is_some() {
+            BLACK
+        } else {
+            GRAY
+        };
+        let inner_w = layout.search.w.saturating_sub(60);
+        let search_text = if opts.search_caret {
+            fit_text_tail(label, 7, inner_w.saturating_sub(16))
+        } else {
+            fit_text(label, 7, inner_w)
+        };
         c.text(layout.search.x + 30, text_y, 7, &search_text, ink);
+        if opts.search_caret {
+            let cursor_x = layout.search.x + 30 + crate::ui_gfx::text_width(&search_text, 7) + 8;
+            c.fill(
+                Rect::new(cursor_x, text_y.saturating_sub(4), 8, GLYPH_H * 7 + 8),
+                BLACK,
+            );
+        }
         if let Some(clear) = layout.clear_search {
             c.frame(clear, 3, BLACK);
             c.text_centered(clear.inset(8), 8, "X", BLACK);
@@ -700,20 +1032,25 @@ pub fn render_home_view(
             BLACK,
         );
         c.dots(Rect::new(menu.x + 4, menu.y, menu.w - 4, menu.h), 18, BLACK);
-        let icon = Rect::new(tile.x + 30, tile.y + 30, 90, 70);
-        draw_folder_icon(&mut c, icon);
-        let text_x = tile.x + 30;
-        let text_w = menu.x.saturating_sub(text_x + 20);
-        let scale = scale_to_fit(&f.title, TILE_TITLE_SCALE, TILE_TITLE_MIN_SCALE, text_w);
-        let title = fit_text(&f.title, scale, text_w);
-        c.text(text_x, icon.bottom() + 24, scale, &title, BLACK);
+        let content = folder_tile_content(*tile, menu.x, &f.title);
+        draw_folder_icon(&mut c, content.icon);
+        let text_w = menu.x.saturating_sub(content.title.x.saturating_add(8));
+        let title = fit_text(&f.title, content.title_scale, text_w);
         c.text(
-            text_x,
-            tile.bottom().saturating_sub(GLYPH_H * TILE_META_SCALE + 26),
-            TILE_META_SCALE,
-            &notebooks_label(f.notebook_ids.len()),
+            content.title.x,
+            content.title.y,
+            content.title_scale,
+            &title,
             BLACK,
         );
+        let count = if let Some(q) = query {
+            folder_match_count(f, cards, q)
+        } else {
+            f.notebook_ids.len()
+        };
+        let (meta, meta_scale) = folder_count_label(count, content.meta.w);
+        let meta_y = content.meta.y + content.meta.h.saturating_sub(GLYPH_H * meta_scale) / 2;
+        c.text(content.meta.x, meta_y, meta_scale, &meta, BLACK);
     }
 
     if rows.is_empty() {
@@ -723,7 +1060,7 @@ pub fn render_home_view(
             geo.xres.saturating_sub(2 * MARGIN),
             200,
         );
-        let empty = if search_active {
+        let empty = if query.is_some() {
             "No notebooks found"
         } else if open_folder.is_some() {
             "This folder is empty"
@@ -763,13 +1100,13 @@ pub fn render_home_view(
         );
     }
 
-    let pages = viewport_page_count(total);
+    let pages = vp.page_count(total);
     let prev_ink = if state.can_page_previous() {
         BLACK
     } else {
         GRAY
     };
-    let next_ink = if state.can_page_next(total) {
+    let next_ink = if state.can_page_next(total, vp) {
         BLACK
     } else {
         GRAY
@@ -810,7 +1147,89 @@ pub fn render_home_view(
         total_entries: total,
         viewport_page: state.page,
         viewport_pages: pages,
+        content_band: layout.content_band,
     })
+}
+
+/// Paint Home results with a bottom-docked search keyboard (query lives in the search field).
+pub fn render_home_search_composer(
+    fb: &mut [u8],
+    geo: &FbGeometry,
+    cards: &[HomeCard],
+    folders: &[FolderInfo],
+    open: Option<&str>,
+    state: &HomeState,
+    editor: &crate::keyboard::TitleEditor,
+) -> Result<(HomeRenderSummary, crate::keyboard::KeyboardLayout), String> {
+    let draft = editor.text();
+    let query = {
+        let t = draft.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    };
+    let summary = render_home_view_with(
+        fb,
+        geo,
+        cards,
+        folders,
+        open,
+        state,
+        HomePaintOpts {
+            search: query,
+            search_draft: Some(draft),
+            viewport: HomeViewport::for_search_editing(geo),
+            search_caret: true,
+        },
+    )?;
+    let keyboard = crate::keyboard::KeyboardLayout::docked(geo, editor.symbols());
+    let mut c = Canvas::new(fb, geo)?;
+    crate::keyboard::paint_docked_search_keys(&mut c, &keyboard, editor);
+    Ok((summary, keyboard))
+}
+
+/// Shared Home + docked-keyboard geometry for search editing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HomeSearchGeometry {
+    pub viewport: HomeViewport,
+    pub home: HomeLayout,
+    pub keyboard: crate::keyboard::KeyboardLayout,
+}
+
+impl HomeSearchGeometry {
+    pub fn new(
+        geo: &FbGeometry,
+        state: &HomeState,
+        rows: &[HomeRow],
+        in_folder: bool,
+        search_active: bool,
+        symbols: bool,
+    ) -> Self {
+        let viewport = HomeViewport::for_search_editing(geo);
+        let home = HomeLayout::for_rows(geo, state, rows, in_folder, search_active, viewport);
+        let keyboard = crate::keyboard::KeyboardLayout::docked(geo, symbols);
+        Self {
+            viewport,
+            home,
+            keyboard,
+        }
+    }
+
+    /// Dirty band covering chrome, results, pager, and (optionally) keys.
+    pub fn dirty_region(&self, include_keys: bool) -> Rect {
+        if include_keys {
+            Rect::new(
+                0,
+                0,
+                self.home.content_band.w.max(self.keyboard.keys_area.w),
+                self.keyboard.keys_area.bottom(),
+            )
+        } else {
+            self.home.content_band
+        }
+    }
 }
 
 #[cfg(test)]
@@ -952,14 +1371,16 @@ mod tests {
         let rows = home_rows(&cards, &folders, None, Some("ALPHA"));
         assert_eq!(
             rows,
-            vec![HomeRow::Notebook(0), HomeRow::Notebook(2)],
-            "original library indices; foldered notebook-3 included"
+            vec![HomeRow::Folders(vec![0]), HomeRow::Notebook(0),],
+            "matching folder tile + matching root notebook; foldered draft is inside the folder"
         );
-        assert!(
-            !rows.iter().any(|r| matches!(r, HomeRow::Folders(_))),
-            "folder tiles omitted while searching"
-        );
+        assert_eq!(folder_match_count(&folders[0], &cards, "ALPHA"), 1);
         assert!(home_rows(&cards, &folders, None, Some("zzz")).is_empty());
+        assert_eq!(
+            home_rows(&cards, &folders, Some("folder-1"), Some("ALPHA")),
+            vec![HomeRow::Notebook(2)],
+            "folder drill-in keeps only that folder's matches"
+        );
     }
 
     #[test]
@@ -967,7 +1388,7 @@ mod tests {
         let g = panel_geo();
         let st = HomeState::selecting(0, 3);
         let rows = plain_rows(3);
-        let l = HomeLayout::for_rows(&g, &st, &rows, false, true);
+        let l = HomeLayout::for_rows(&g, &st, &rows, false, true, HomeViewport::standard(&g));
         let clear = l.clear_search.expect("clear control when search active");
         assert!(clear.w >= 130 && clear.h >= 130, "{clear:?}");
         assert!(clear.x >= l.search.right());
@@ -982,7 +1403,7 @@ mod tests {
         };
         assert_eq!(l.hit(mid_search, &st, 3), Some(HomeHit::Search));
         // Inside a folder the title area stays inert even if search_active is set.
-        let folder_l = HomeLayout::for_rows(&g, &st, &rows, true, true);
+        let folder_l = HomeLayout::for_rows(&g, &st, &rows, true, true, HomeViewport::standard(&g));
         assert!(folder_l.clear_search.is_none());
         let folder_mid = UiPoint {
             x: folder_l.search.x + folder_l.search.w / 2,

@@ -15,7 +15,10 @@ use crate::chrome::{ChromeHit, ChromeLayout, PageChrome};
 use crate::display_events::DisplayEvents;
 use crate::folders::FolderInfo;
 use crate::fullscreen::NotebookChromeState;
-use crate::home::{home_rows, AppView, HomeCard, HomeHit, HomeLayout, HomeRow, HomeState};
+use crate::home::{
+    home_rows, AppView, HomeCard, HomeHit, HomeLayout, HomeRow, HomeSearchGeometry, HomeState,
+    HomeViewport,
+};
 use crate::keyboard::{EditorKey, EditorOutcome, KeyboardLayout, TitleEditor};
 use crate::link_picker::LinkPickerState;
 use crate::modal::{dialog_spec, ButtonId, DialogLayout, Modal, TitlePurpose, PICKER_PAGE};
@@ -193,9 +196,13 @@ pub struct UiState {
     pub next_folder_title: String,
     /// Home shows this folder's notebooks (transient; never durable).
     pub home_folder: Option<String>,
-    /// Transient case-insensitive title filter on the main list (`None` = no filter).
-    /// Never written to library metadata, folders, or sync.
+    /// Live case-insensitive title filter (`None` = no filter). Applies on the main list and
+    /// inside an open folder. Never written to library metadata, folders, or sync.
     pub home_search: Option<String>,
+    /// Snapshot of [`Self::home_search`] when the docked search keyboard opened (Cancel restores).
+    pub home_search_backup: Option<String>,
+    /// Docked Home search keyboard (`Some` = composing over filtered results).
+    pub search_editor: Option<TitleEditor>,
 }
 
 impl UiState {
@@ -216,6 +223,8 @@ impl UiState {
             next_folder_title: crate::folders::default_folder_title(1),
             home_folder: None,
             home_search: None,
+            home_search_backup: None,
+            search_editor: None,
         }
     }
 
@@ -225,26 +234,89 @@ impl UiState {
         self.folders.iter().find(|f| f.id == id)
     }
 
-    /// Active search query for main-list row construction (ignored while a folder is open).
+    /// Active title filter for row construction (also applies inside an open folder).
     pub fn home_search_query(&self) -> Option<&str> {
-        if self.open_folder().is_some() {
+        self.home_search.as_deref()
+    }
+
+    /// Normalize a raw draft into a stored filter (`None` when empty after trim).
+    fn normalize_search_query(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
             None
         } else {
-            self.home_search.as_deref()
+            Some(trimmed.to_string())
         }
     }
 
-    /// Apply or clear the Home title filter. Resets paging; does not leave a stale reveal.
+    /// Apply or clear the committed Home title filter. Resets paging; leaves folder alone.
     pub fn set_home_search(&mut self, query: Option<String>) {
-        self.home_search = query.and_then(|q| {
-            let trimmed = q.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
-        self.home_folder = None;
+        self.home_search = query.and_then(|q| Self::normalize_search_query(&q));
+        self.home.page = 0;
+        self.home.reveal = false;
+    }
+
+    /// Viewport capacity for the current Home presentation.
+    pub fn home_viewport(&self, geo: &FbGeometry) -> HomeViewport {
+        if self.search_editor.is_some() {
+            HomeViewport::for_search_editing(geo)
+        } else {
+            HomeViewport::standard(geo)
+        }
+    }
+
+    /// Whether the search field chrome shows the clear control.
+    pub fn home_search_chrome_active(&self) -> bool {
+        self.search_editor.is_some() || self.home_search.is_some()
+    }
+
+    /// Open the docked search keyboard over Home results.
+    pub fn begin_home_search(&mut self) {
+        self.home_search_backup = self.home_search.clone();
+        let initial = self.home_search.as_deref().unwrap_or("");
+        self.search_editor = Some(TitleEditor::new(initial));
+        self.home.page = 0;
+        self.home.reveal = false;
+    }
+
+    /// Push live draft text into the filter (does not dismiss the keyboard or clear a folder).
+    pub fn apply_live_search_text(&mut self, raw: &str) {
+        self.home_search = Self::normalize_search_query(raw);
+        self.home.page = 0;
+        self.home.reveal = false;
+    }
+
+    /// Close the docked keyboard. `commit` keeps the live filter; cancel restores the backup.
+    pub fn finish_home_search(&mut self, commit: bool) {
+        if !commit {
+            self.home_search = self.home_search_backup.clone();
+        } else if let Some(editor) = &self.search_editor {
+            self.home_search = Self::normalize_search_query(editor.text());
+        }
+        self.search_editor = None;
+        self.home_search_backup = None;
+        self.home.page = 0;
+        self.home.reveal = false;
+    }
+
+    /// Drop any open search editor / backup (query already live or irrelevant after navigation).
+    pub fn clear_search_session(&mut self) {
+        self.search_editor = None;
+        self.home_search_backup = None;
+    }
+
+    /// Clear the live filter and any open editor draft.
+    ///
+    /// While a search session is open, the Cancel backup is preserved so Cancel can still
+    /// restore the query that was committed when the keyboard opened.
+    pub fn clear_home_search(&mut self) {
+        self.home_search = None;
+        if self.search_editor.is_none() {
+            self.home_search_backup = None;
+        }
+        if let Some(editor) = &mut self.search_editor {
+            *editor = TitleEditor::new("");
+        }
         self.home.page = 0;
         self.home.reveal = false;
     }
@@ -260,13 +332,32 @@ impl UiState {
     }
 
     /// Drop a vanished open folder and fit the Home viewport to the current rows.
-    pub fn settle_home(&mut self, cards: &[HomeCard]) {
+    pub fn settle_home(&mut self, geo: &FbGeometry, cards: &[HomeCard]) {
         if self.home_folder.is_some() && self.open_folder().is_none() {
             self.home_folder = None;
             self.home.reveal = true;
         }
         let rows = self.home_rows(cards);
-        self.home.settle(&rows, cards, &self.folders);
+        let vp = self.home_viewport(geo);
+        self.home.settle(&rows, cards, &self.folders, vp);
+    }
+
+    /// Shared Home + docked-keyboard geometry while searching.
+    pub fn home_search_geometry(&self, geo: &FbGeometry, cards: &[HomeCard]) -> HomeSearchGeometry {
+        let rows = self.home_rows(cards);
+        let symbols = self
+            .search_editor
+            .as_ref()
+            .map(TitleEditor::symbols)
+            .unwrap_or(false);
+        HomeSearchGeometry::new(
+            geo,
+            &self.home,
+            &rows,
+            self.open_folder().is_some(),
+            self.home_search_chrome_active(),
+            symbols,
+        )
     }
 
     fn folder_of(&self, notebook_id: &str) -> Option<&FolderInfo> {
@@ -355,6 +446,7 @@ impl UiState {
         self.home.sync = self.sync_enabled;
         self.chrome = NotebookChromeState::default();
         self.link_picker = None;
+        self.clear_search_session();
     }
 
     /// Normal notebook entry: fullscreen writing (chrome hidden).
@@ -485,6 +577,9 @@ impl UiState {
         next_default_title: &str,
         notebook: Option<NotebookUiContext>,
     ) -> UiCommand {
+        if self.search_editor.is_some() && self.view == AppView::Home {
+            return self.on_search_composer_tap(geo, p, cards, next_default_title);
+        }
         if self.modal.is_some() {
             return self.on_modal_tap(geo, p, cards);
         }
@@ -501,6 +596,74 @@ impl UiState {
         }
     }
 
+    fn on_search_composer_tap(
+        &mut self,
+        geo: &FbGeometry,
+        p: UiPoint,
+        cards: &[HomeCard],
+        next_default_title: &str,
+    ) -> UiCommand {
+        self.settle_home(geo, cards);
+        let geom = self.home_search_geometry(geo, cards);
+        if let Some(key) = geom.keyboard.hit(p) {
+            return self.on_search_editor_key(geo, key);
+        }
+        // Results / chrome above the keyboard share Home hit testing.
+        self.on_home_hit(geo, p, cards, next_default_title, &geom.home, true)
+    }
+
+    fn on_search_editor_key(&mut self, geo: &FbGeometry, key: EditorKey) -> UiCommand {
+        let Some(mut editor) = self.search_editor.take() else {
+            return UiCommand::None;
+        };
+        match key {
+            EditorKey::Submit => {
+                self.search_editor = Some(editor);
+                self.finish_home_search(true);
+                UiCommand::Redraw(Redraw::Full)
+            }
+            EditorKey::Cancel => {
+                self.search_editor = Some(editor);
+                self.finish_home_search(false);
+                UiCommand::Redraw(Redraw::Full)
+            }
+            other => {
+                // Compare text before/after: Shift+letter returns KeysChanged even when text mutates.
+                let before = editor.text().to_string();
+                let outcome = editor.apply(other);
+                let text_changed = editor.text() != before;
+                if text_changed {
+                    self.apply_live_search_text(editor.text());
+                }
+                self.search_editor = Some(editor);
+                if matches!(outcome, EditorOutcome::Unchanged) && !text_changed {
+                    return UiCommand::None;
+                }
+                let include_keys = matches!(outcome, EditorOutcome::KeysChanged)
+                    || matches!(other, EditorKey::Mode | EditorKey::Shift);
+                let symbols = self
+                    .search_editor
+                    .as_ref()
+                    .map(TitleEditor::symbols)
+                    .unwrap_or(false);
+                let kb = KeyboardLayout::docked(geo, symbols);
+                let vp = HomeViewport::for_search_editing(geo);
+                let dirty = if text_changed {
+                    if include_keys {
+                        Rect::new(0, 0, geo.xres, kb.keys_area.bottom())
+                    } else {
+                        Rect::new(0, 0, geo.xres, vp.content_bottom)
+                    }
+                } else if include_keys {
+                    kb.keys_area
+                } else {
+                    return UiCommand::None;
+                };
+                UiCommand::Redraw(Redraw::Region(dirty))
+            }
+        }
+    }
+
     fn on_home_tap(
         &mut self,
         geo: &FbGeometry,
@@ -508,15 +671,20 @@ impl UiState {
         cards: &[HomeCard],
         next_default_title: &str,
     ) -> UiCommand {
-        let total = cards.len();
         // Resolve against the settled view, but a tap that hits nothing changes no state.
         let before = self.clone();
-        self.settle_home(cards);
+        self.settle_home(geo, cards);
         let rows = self.home_rows(cards);
-        let open = self.open_folder().map(|f| f.id.clone());
-        let search_active = self.home_search_query().is_some();
-        let layout = HomeLayout::for_rows(geo, &self.home, &rows, open.is_some(), search_active);
-        let hit = layout.hit(p, &self.home, total);
+        let open = self.open_folder().is_some();
+        let layout = HomeLayout::for_rows(
+            geo,
+            &self.home,
+            &rows,
+            open,
+            self.home_search_chrome_active(),
+            self.home_viewport(geo),
+        );
+        let hit = layout.hit(p, &self.home, cards.len());
         let cmd = match hit {
             // These change no Home state: leave the snapshot exactly as it was.
             None => Some(UiCommand::None),
@@ -529,25 +697,62 @@ impl UiState {
             *self = before;
             return cmd;
         }
+        self.on_home_hit(geo, p, cards, next_default_title, &layout, false)
+    }
+
+    fn on_home_hit(
+        &mut self,
+        geo: &FbGeometry,
+        p: UiPoint,
+        cards: &[HomeCard],
+        next_default_title: &str,
+        layout: &HomeLayout,
+        composing: bool,
+    ) -> UiCommand {
+        let total = cards.len();
+        let open = self.open_folder().map(|f| f.id.clone());
+        let hit = layout.hit(p, &self.home, total);
         match hit {
             None | Some(HomeHit::Exit) | Some(HomeHit::Sync) | Some(HomeHit::Tools) => {
-                UiCommand::None
+                if composing {
+                    if matches!(
+                        hit,
+                        Some(HomeHit::Exit) | Some(HomeHit::Sync) | Some(HomeHit::Tools)
+                    ) {
+                        self.finish_home_search(true);
+                    }
+                    match hit {
+                        Some(HomeHit::Exit) => UiCommand::ExitApp,
+                        Some(HomeHit::Sync) => UiCommand::OpenSync,
+                        Some(HomeHit::Tools) => UiCommand::OpenTools,
+                        _ => UiCommand::None,
+                    }
+                } else {
+                    UiCommand::None
+                }
             }
             Some(HomeHit::Search) => {
-                let initial = self.home_search.as_deref().unwrap_or("");
-                self.modal = Some(Modal::TitleEntry {
-                    purpose: TitlePurpose::Search,
-                    editor: TitleEditor::new(initial),
-                });
-                UiCommand::Redraw(Redraw::Full)
+                if composing {
+                    // Already editing; tapping the field is inert.
+                    UiCommand::None
+                } else {
+                    self.begin_home_search();
+                    UiCommand::Redraw(Redraw::Full)
+                }
             }
             Some(HomeHit::ClearSearch) => {
-                self.set_home_search(None);
-                UiCommand::Redraw(Redraw::Full)
+                self.clear_home_search();
+                if composing {
+                    let geom = self.home_search_geometry(geo, cards);
+                    UiCommand::Redraw(Redraw::Region(geom.dirty_region(true)))
+                } else {
+                    UiCommand::Redraw(Redraw::Full)
+                }
             }
             Some(HomeHit::Back) => {
-                // Back to the main list, showing the folder just left.
+                // Back to the main list, showing the folder just left. Query is retained.
                 self.home_folder = None;
+                let vp = self.home_viewport(geo);
                 let main = self.home_rows(cards);
                 if let Some(fi) = open
                     .as_deref()
@@ -557,19 +762,25 @@ impl UiState {
                         .iter()
                         .position(|r| matches!(r, HomeRow::Folders(v) if v.contains(&fi)))
                     {
-                        self.home.page = row / crate::home::ROWS_PER_PAGE;
+                        self.home.page = row / vp.rows_per_page.max(1);
                     }
                 }
                 UiCommand::Redraw(Redraw::Full)
             }
             Some(HomeHit::OpenFolder(fi)) => {
-                self.home_search = None;
+                if composing {
+                    // Commit draft, dismiss keyboard, keep the query for filtered drill-in.
+                    self.finish_home_search(true);
+                }
                 self.home_folder = Some(self.folders[fi].id.clone());
                 self.home.page = 0;
                 self.home.reveal = false;
                 UiCommand::Redraw(Redraw::Full)
             }
             Some(HomeHit::FolderMenu(fi)) => {
+                if composing {
+                    self.finish_home_search(true);
+                }
                 self.modal = Some(Modal::FolderMenu {
                     folder_id: self.folders[fi].id.clone(),
                     title: self.folders[fi].title.clone(),
@@ -577,6 +788,9 @@ impl UiState {
                 UiCommand::Redraw(Redraw::Full)
             }
             Some(HomeHit::New) => {
+                if composing {
+                    self.finish_home_search(true);
+                }
                 self.modal = Some(match open {
                     // Inside a folder: pick paper, then title; notebook is filed in that folder.
                     Some(folder_id) => Modal::PaperChooser {
@@ -592,9 +806,13 @@ impl UiState {
             }
             Some(HomeHit::OpenCard(i)) => {
                 self.home.selected_index = i;
+                self.clear_search_session();
                 UiCommand::OpenNotebook(cards[i].notebook_id.clone())
             }
             Some(HomeHit::CardMenu(i)) => {
+                if composing {
+                    self.finish_home_search(true);
+                }
                 self.home.selected_index = i;
                 let notebook_id = cards[i].notebook_id.clone();
                 let title = cards[i].title.clone();
@@ -610,11 +828,21 @@ impl UiState {
             }
             Some(HomeHit::PagePrevious) => {
                 self.home.page -= 1;
-                UiCommand::Redraw(Redraw::Full)
+                if composing {
+                    let geom = self.home_search_geometry(geo, cards);
+                    UiCommand::Redraw(Redraw::Region(geom.home.content_band))
+                } else {
+                    UiCommand::Redraw(Redraw::Full)
+                }
             }
             Some(HomeHit::PageNext) => {
                 self.home.page += 1;
-                UiCommand::Redraw(Redraw::Full)
+                if composing {
+                    let geom = self.home_search_geometry(geo, cards);
+                    UiCommand::Redraw(Redraw::Region(geom.home.content_band))
+                } else {
+                    UiCommand::Redraw(Redraw::Full)
+                }
             }
         }
     }
@@ -968,16 +1196,6 @@ impl UiState {
             });
             return UiCommand::None;
         };
-        // Search queries must not pass through notebook title validation.
-        if matches!(purpose, TitlePurpose::Search) && key == EditorKey::Submit {
-            let trimmed = editor.text().trim();
-            if trimmed.is_empty() {
-                self.set_home_search(None);
-            } else {
-                self.set_home_search(Some(trimmed.to_string()));
-            }
-            return UiCommand::Redraw(Redraw::Full);
-        }
         let outcome = editor.apply(key);
         let reopen = |editor: &TitleEditor, purpose: TitlePurpose| Modal::TitleEntry {
             purpose,
@@ -1041,16 +1259,6 @@ impl UiState {
                     } else {
                         UiCommand::RenameNotebook { notebook_id, title }
                     }
-                }
-                // Intercepted before apply(); kept for exhaustiveness.
-                TitlePurpose::Search => {
-                    let trimmed = title.trim();
-                    if trimmed.is_empty() {
-                        self.set_home_search(None);
-                    } else {
-                        self.set_home_search(Some(trimmed.to_string()));
-                    }
-                    UiCommand::Redraw(Redraw::Full)
                 }
             },
         }
