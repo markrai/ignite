@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.19] - 2026-11-05
+
+### Added
+
+- Kindle Home notebook title search: tap **Search notebooks...** to filter the
+  library by title (case-insensitive), including notebooks inside folders.
+  Results open the matching notebook; Cancel, empty/clear search, and empty
+  results keep folder navigation and Home paging intact. Search state is
+  transient and does not change notebook metadata, ordering, storage, or sync.
+
 ## [0.9.18] - 2026-11-04
 
 ### Added
