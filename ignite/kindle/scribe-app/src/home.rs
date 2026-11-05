@@ -49,6 +49,8 @@ const TILE_TITLE_SCALE: u32 = 7;
 const TILE_TITLE_MIN_SCALE: u32 = 3;
 const TILE_META_SCALE: u32 = 5;
 pub const SEARCH_PLACEHOLDER: &str = "Search notebooks...";
+/// Clear-search control: same minimum pen target as other Home chrome (≥ 130 px).
+const CLEAR_SEARCH_W: u32 = BAR_H;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppView {
@@ -107,9 +109,35 @@ pub enum HomeRow {
     Notebook(usize),
 }
 
-/// Rows of the current view. Main list (`open == None`): folder rows first, then every notebook
-/// in no folder, in library order. Inside a folder: that folder's notebooks, in library order.
-pub fn home_rows(cards: &[HomeCard], folders: &[FolderInfo], open: Option<&str>) -> Vec<HomeRow> {
+/// Case-insensitive title substring match for Home search (Unicode lowercase).
+pub fn notebook_title_matches(title: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return false;
+    }
+    title.to_lowercase().contains(&q.to_lowercase())
+}
+
+/// Rows of the current view.
+///
+/// - With `query`: every library notebook whose title matches (original manifest indices),
+///   including notebooks inside folders; folder tiles are omitted.
+/// - Main list (`open == None`, no query): folder rows first, then every notebook in no folder.
+/// - Inside a folder (no query): that folder's notebooks, in library order.
+pub fn home_rows(
+    cards: &[HomeCard],
+    folders: &[FolderInfo],
+    open: Option<&str>,
+    query: Option<&str>,
+) -> Vec<HomeRow> {
+    if let Some(q) = query {
+        return cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| notebook_title_matches(&c.title, q))
+            .map(|(i, _)| HomeRow::Notebook(i))
+            .collect();
+    }
     match open.and_then(|id| folders.iter().find(|f| f.id == id)) {
         Some(f) => cards
             .iter()
@@ -267,8 +295,10 @@ pub enum HomeHit {
     Sync,
     /// Tools screen (Import Kindle notebooks, ...).
     Tools,
-    /// Search placeholder: consumed, does nothing (search is not implemented yet).
-    SearchPlaceholder,
+    /// Open the search keyboard (main list only).
+    Search,
+    /// Clear the active title filter (main list, search active).
+    ClearSearch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,8 +307,10 @@ pub struct HomeLayout {
     pub exit_icon: Rect,
     /// Square touch target around `exit_icon`.
     pub exit_hit: Rect,
-    /// Flexible-width, inert search placeholder.
+    /// Flexible-width search field (main list). Inside a folder this rect holds the folder title.
     pub search: Rect,
+    /// Clear-search control (≥ 130×130) when a filter is active on the main list.
+    pub clear_search: Option<Rect>,
     pub new_button: Rect,
     /// D1: hit/drawn only when `HomeState::sync`.
     pub sync_button: Rect,
@@ -299,10 +331,16 @@ pub struct HomeLayout {
 impl HomeLayout {
     /// Notebooks only (no folders): one row per library notebook.
     pub fn new(geo: &FbGeometry, state: &HomeState, total: usize) -> Self {
-        Self::for_rows(geo, state, &plain_rows(total), false)
+        Self::for_rows(geo, state, &plain_rows(total), false, false)
     }
 
-    pub fn for_rows(geo: &FbGeometry, state: &HomeState, all: &[HomeRow], in_folder: bool) -> Self {
+    pub fn for_rows(
+        geo: &FbGeometry,
+        state: &HomeState,
+        all: &[HomeRow],
+        in_folder: bool,
+        search_active: bool,
+    ) -> Self {
         let width = geo.xres.saturating_sub(2 * MARGIN);
         let pager_y = geo.yres.saturating_sub(PAGER_H + PAGER_BOTTOM_MARGIN);
         let cards_bottom = pager_y.saturating_sub(CARD_GAP * 2);
@@ -360,16 +398,30 @@ impl HomeLayout {
             new_button.x
         }
         .saturating_sub(BAR_GAP);
-        let search = Rect::new(
-            search_left,
-            BAR_Y,
-            search_right.saturating_sub(search_left),
-            BAR_H,
-        );
+        let (search, clear_search) = if search_active && !in_folder {
+            let clear_x = search_right.saturating_sub(CLEAR_SEARCH_W);
+            let clear_search = Rect::new(clear_x, BAR_Y, CLEAR_SEARCH_W, BAR_H);
+            let search_w = clear_x.saturating_sub(BAR_GAP).saturating_sub(search_left);
+            (
+                Rect::new(search_left, BAR_Y, search_w, BAR_H),
+                Some(clear_search),
+            )
+        } else {
+            (
+                Rect::new(
+                    search_left,
+                    BAR_Y,
+                    search_right.saturating_sub(search_left),
+                    BAR_H,
+                ),
+                None,
+            )
+        };
         Self {
             exit_icon,
             exit_hit,
             search,
+            clear_search,
             new_button,
             sync_button,
             tools_button,
@@ -407,8 +459,17 @@ impl HomeLayout {
         if self.tools_button.contains(p.x, p.y) {
             return Some(HomeHit::Tools);
         }
-        if self.search.contains(p.x, p.y) {
-            return Some(HomeHit::SearchPlaceholder);
+        // Main list only: clear has priority over the search field. Inside a folder the
+        // search rect shows the folder title and stays inert.
+        if !self.in_folder {
+            if let Some(clear) = self.clear_search {
+                if clear.contains(p.x, p.y) {
+                    return Some(HomeHit::ClearSearch);
+                }
+            }
+            if self.search.contains(p.x, p.y) {
+                return Some(HomeHit::Search);
+            }
         }
         for (index, tile, menu) in &self.folders {
             if menu.contains(p.x, p.y) {
@@ -566,24 +627,31 @@ pub fn render_home(
     cards: &[HomeCard],
     state: &HomeState,
 ) -> Result<HomeRenderSummary, String> {
-    render_home_view(fb, geo, cards, &[], None, state)
+    render_home_view(fb, geo, cards, &[], None, None, state)
 }
 
 /// Home with folders: the main list (`open == None`) or one open folder.
+///
+/// `search` is a transient title filter on the main list. Inside a folder the search area
+/// remains the inert folder title (existing behavior), regardless of `search`.
 pub fn render_home_view(
     fb: &mut [u8],
     geo: &FbGeometry,
     cards: &[HomeCard],
     folders: &[FolderInfo],
     open: Option<&str>,
+    search: Option<&str>,
     state: &HomeState,
 ) -> Result<HomeRenderSummary, String> {
     let open_folder = open.and_then(|id| folders.iter().find(|f| f.id == id));
-    let rows = home_rows(cards, folders, open_folder.map(|f| f.id.as_str()));
+    // Folder view keeps the unfiltered folder notebook list; search applies on the main list.
+    let query = if open_folder.is_some() { None } else { search };
+    let rows = home_rows(cards, folders, open_folder.map(|f| f.id.as_str()), query);
     let total = rows.len();
     let mut state = *state;
     state.settle(&rows, cards, folders);
-    let layout = HomeLayout::for_rows(geo, &state, &rows, open_folder.is_some());
+    let search_active = query.is_some();
+    let layout = HomeLayout::for_rows(geo, &state, &rows, open_folder.is_some(), search_active);
     let mut c = Canvas::new(fb, geo)?;
     // Full white clear: no stale notebook page, modal, or previous Home frame survives.
     c.fill_all(WHITE);
@@ -601,10 +669,15 @@ pub fn render_home_view(
         );
     } else {
         draw_exit_icon(&mut c, layout.exit_icon);
-        // Inert search placeholder (flexible width).
         c.frame(layout.search, 3, GRAY);
-        let search_text = fit_text(SEARCH_PLACEHOLDER, 7, layout.search.w.saturating_sub(60));
-        c.text(layout.search.x + 30, text_y, 7, &search_text, GRAY);
+        let label = search.unwrap_or(SEARCH_PLACEHOLDER);
+        let ink = if search.is_some() { BLACK } else { GRAY };
+        let search_text = fit_text(label, 7, layout.search.w.saturating_sub(60));
+        c.text(layout.search.x + 30, text_y, 7, &search_text, ink);
+        if let Some(clear) = layout.clear_search {
+            c.frame(clear, 3, BLACK);
+            c.text_centered(clear.inset(8), 8, "X", BLACK);
+        }
     }
     if state.sync {
         c.frame(layout.sync_button, 4, BLACK);
@@ -643,14 +716,23 @@ pub fn render_home_view(
         );
     }
 
-    if open_folder.is_some() && rows.is_empty() {
+    if rows.is_empty() {
         let r = Rect::new(
             MARGIN,
             CARDS_TOP + 120,
             geo.xres.saturating_sub(2 * MARGIN),
             200,
         );
-        c.text_centered(r, 8, "This folder is empty", GRAY);
+        let empty = if search_active {
+            "No notebooks found"
+        } else if open_folder.is_some() {
+            "This folder is empty"
+        } else {
+            ""
+        };
+        if !empty.is_empty() {
+            c.text_centered(r, 8, empty, GRAY);
+        }
     }
 
     for (index, card, menu) in &layout.cards {
@@ -826,16 +908,87 @@ mod tests {
             y: r.y + r.h / 2,
         };
         assert_eq!(l.hit(c(l.tools_button), &st, 3), Some(HomeHit::Tools));
-        assert_eq!(l.hit(c(l.search), &st, 3), Some(HomeHit::SearchPlaceholder));
+        assert_eq!(l.hit(c(l.search), &st, 3), Some(HomeHit::Search));
         assert_eq!(l.hit(c(l.sync_button), &st, 3), Some(HomeHit::Sync));
-        // Without sync the search placeholder takes the freed space.
+        // Without sync the search field takes the freed space.
         st.sync = false;
         let l2 = HomeLayout::new(&g, &st, 3);
         assert!(l2.search.w > l.search.w);
+        assert_eq!(l2.hit(c(l.sync_button), &st, 3), Some(HomeHit::Search));
+    }
+
+    #[test]
+    fn notebook_title_matches_is_case_insensitive_substring() {
+        assert!(notebook_title_matches("Project Alpha", "alpha"));
+        assert!(notebook_title_matches("Café Notes", "café"));
+        assert!(!notebook_title_matches("Work", "play"));
+        assert!(!notebook_title_matches("Work", "   "));
+    }
+
+    #[test]
+    fn search_rows_keep_library_indices_and_include_foldered_notebooks() {
+        let cards = vec![
+            HomeCard {
+                notebook_id: "notebook-1".into(),
+                title: "Alpha".into(),
+                page_count: Some(1),
+            },
+            HomeCard {
+                notebook_id: "notebook-2".into(),
+                title: "Beta Work".into(),
+                page_count: Some(2),
+            },
+            HomeCard {
+                notebook_id: "notebook-3".into(),
+                title: "alpha draft".into(),
+                page_count: Some(3),
+            },
+        ];
+        let folders = vec![FolderInfo {
+            id: "folder-1".into(),
+            title: "Projects".into(),
+            notebook_ids: vec!["notebook-3".into()],
+        }];
+        let rows = home_rows(&cards, &folders, None, Some("ALPHA"));
         assert_eq!(
-            l2.hit(c(l.sync_button), &st, 3),
-            Some(HomeHit::SearchPlaceholder)
+            rows,
+            vec![HomeRow::Notebook(0), HomeRow::Notebook(2)],
+            "original library indices; foldered notebook-3 included"
         );
+        assert!(
+            !rows.iter().any(|r| matches!(r, HomeRow::Folders(_))),
+            "folder tiles omitted while searching"
+        );
+        assert!(home_rows(&cards, &folders, None, Some("zzz")).is_empty());
+    }
+
+    #[test]
+    fn clear_search_hit_is_at_least_130_and_outranks_search_field() {
+        let g = panel_geo();
+        let st = HomeState::selecting(0, 3);
+        let rows = plain_rows(3);
+        let l = HomeLayout::for_rows(&g, &st, &rows, false, true);
+        let clear = l.clear_search.expect("clear control when search active");
+        assert!(clear.w >= 130 && clear.h >= 130, "{clear:?}");
+        assert!(clear.x >= l.search.right());
+        let corner = UiPoint {
+            x: clear.x + 1,
+            y: clear.y + 1,
+        };
+        assert_eq!(l.hit(corner, &st, 3), Some(HomeHit::ClearSearch));
+        let mid_search = UiPoint {
+            x: l.search.x + l.search.w / 2,
+            y: l.search.y + l.search.h / 2,
+        };
+        assert_eq!(l.hit(mid_search, &st, 3), Some(HomeHit::Search));
+        // Inside a folder the title area stays inert even if search_active is set.
+        let folder_l = HomeLayout::for_rows(&g, &st, &rows, true, true);
+        assert!(folder_l.clear_search.is_none());
+        let folder_mid = UiPoint {
+            x: folder_l.search.x + folder_l.search.w / 2,
+            y: folder_l.search.y + folder_l.search.h / 2,
+        };
+        assert_eq!(folder_l.hit(folder_mid, &st, 3), None);
     }
 
     #[test]

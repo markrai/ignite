@@ -40,6 +40,8 @@ pub enum TitlePurpose {
         folder_id: String,
         template: PageTemplate,
     },
+    /// Transient Home title filter (does not validate as a notebook title).
+    Search,
 }
 
 /// Folder buttons shown per picker page (PREVIOUS/NEXT page through the rest).

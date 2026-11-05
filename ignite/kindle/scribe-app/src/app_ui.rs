@@ -193,6 +193,9 @@ pub struct UiState {
     pub next_folder_title: String,
     /// Home shows this folder's notebooks (transient; never durable).
     pub home_folder: Option<String>,
+    /// Transient case-insensitive title filter on the main list (`None` = no filter).
+    /// Never written to library metadata, folders, or sync.
+    pub home_search: Option<String>,
 }
 
 impl UiState {
@@ -212,6 +215,7 @@ impl UiState {
             folders: Vec::new(),
             next_folder_title: crate::folders::default_folder_title(1),
             home_folder: None,
+            home_search: None,
         }
     }
 
@@ -221,12 +225,37 @@ impl UiState {
         self.folders.iter().find(|f| f.id == id)
     }
 
+    /// Active search query for main-list row construction (ignored while a folder is open).
+    pub fn home_search_query(&self) -> Option<&str> {
+        if self.open_folder().is_some() {
+            None
+        } else {
+            self.home_search.as_deref()
+        }
+    }
+
+    /// Apply or clear the Home title filter. Resets paging; does not leave a stale reveal.
+    pub fn set_home_search(&mut self, query: Option<String>) {
+        self.home_search = query.and_then(|q| {
+            let trimmed = q.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        self.home_folder = None;
+        self.home.page = 0;
+        self.home.reveal = false;
+    }
+
     /// Rows of the Home view currently shown.
     pub fn home_rows(&self, cards: &[HomeCard]) -> Vec<HomeRow> {
         home_rows(
             cards,
             &self.folders,
             self.open_folder().map(|f| f.id.as_str()),
+            self.home_search_query(),
         )
     }
 
@@ -485,11 +514,12 @@ impl UiState {
         self.settle_home(cards);
         let rows = self.home_rows(cards);
         let open = self.open_folder().map(|f| f.id.clone());
-        let layout = HomeLayout::for_rows(geo, &self.home, &rows, open.is_some());
+        let search_active = self.home_search_query().is_some();
+        let layout = HomeLayout::for_rows(geo, &self.home, &rows, open.is_some(), search_active);
         let hit = layout.hit(p, &self.home, total);
         let cmd = match hit {
             // These change no Home state: leave the snapshot exactly as it was.
-            None | Some(HomeHit::SearchPlaceholder) => Some(UiCommand::None),
+            None => Some(UiCommand::None),
             Some(HomeHit::Exit) => Some(UiCommand::ExitApp),
             Some(HomeHit::Sync) => Some(UiCommand::OpenSync),
             Some(HomeHit::Tools) => Some(UiCommand::OpenTools),
@@ -500,11 +530,21 @@ impl UiState {
             return cmd;
         }
         match hit {
-            None
-            | Some(HomeHit::SearchPlaceholder)
-            | Some(HomeHit::Exit)
-            | Some(HomeHit::Sync)
-            | Some(HomeHit::Tools) => UiCommand::None,
+            None | Some(HomeHit::Exit) | Some(HomeHit::Sync) | Some(HomeHit::Tools) => {
+                UiCommand::None
+            }
+            Some(HomeHit::Search) => {
+                let initial = self.home_search.as_deref().unwrap_or("");
+                self.modal = Some(Modal::TitleEntry {
+                    purpose: TitlePurpose::Search,
+                    editor: TitleEditor::new(initial),
+                });
+                UiCommand::Redraw(Redraw::Full)
+            }
+            Some(HomeHit::ClearSearch) => {
+                self.set_home_search(None);
+                UiCommand::Redraw(Redraw::Full)
+            }
             Some(HomeHit::Back) => {
                 // Back to the main list, showing the folder just left.
                 self.home_folder = None;
@@ -523,8 +563,10 @@ impl UiState {
                 UiCommand::Redraw(Redraw::Full)
             }
             Some(HomeHit::OpenFolder(fi)) => {
+                self.home_search = None;
                 self.home_folder = Some(self.folders[fi].id.clone());
                 self.home.page = 0;
+                self.home.reveal = false;
                 UiCommand::Redraw(Redraw::Full)
             }
             Some(HomeHit::FolderMenu(fi)) => {
@@ -926,6 +968,16 @@ impl UiState {
             });
             return UiCommand::None;
         };
+        // Search queries must not pass through notebook title validation.
+        if matches!(purpose, TitlePurpose::Search) && key == EditorKey::Submit {
+            let trimmed = editor.text().trim();
+            if trimmed.is_empty() {
+                self.set_home_search(None);
+            } else {
+                self.set_home_search(Some(trimmed.to_string()));
+            }
+            return UiCommand::Redraw(Redraw::Full);
+        }
         let outcome = editor.apply(key);
         let reopen = |editor: &TitleEditor, purpose: TitlePurpose| Modal::TitleEntry {
             purpose,
@@ -989,6 +1041,16 @@ impl UiState {
                     } else {
                         UiCommand::RenameNotebook { notebook_id, title }
                     }
+                }
+                // Intercepted before apply(); kept for exhaustiveness.
+                TitlePurpose::Search => {
+                    let trimmed = title.trim();
+                    if trimmed.is_empty() {
+                        self.set_home_search(None);
+                    } else {
+                        self.set_home_search(Some(trimmed.to_string()));
+                    }
+                    UiCommand::Redraw(Redraw::Full)
                 }
             },
         }
