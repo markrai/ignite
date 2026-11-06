@@ -241,10 +241,26 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
     #[cfg(unix)]
     use std::thread;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
+
+    /// Serialize flock-holding tests in this process.
+    ///
+    /// Linux `fork` duplicates open file descriptions; `O_CLOEXEC` only drops
+    /// them at `exec`. A parallel `Command::spawn` can therefore keep another
+    /// test's exclusive flock alive across that test's `drop`, yielding a false
+    /// `Contended` on reacquire. This is test harness interference, not a
+    /// production lock-lifetime defect (staging/lifecycle do not fork mid-hold
+    /// except the intentional inheritable lifecycle handoff).
+    fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct TestPath(PathBuf);
 
@@ -266,6 +282,7 @@ mod tests {
 
     #[test]
     fn exclusive_acquisition_contends_and_releases() {
+        let _serial = serial_guard();
         let path = TestPath::new("exclusive");
         let first = acquire_exclusive(&path.0).expect("first");
         assert!(matches!(
@@ -280,7 +297,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn lock_fd_is_cloexec_and_not_inherited_across_exec() {
+        let _serial = serial_guard();
+        let path = TestPath::new("cloexec");
+        let guard = acquire_exclusive(&path.0).expect("acquire");
+        let fd = guard.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "lock fd must be CLOEXEC, flags={flags:#x}"
+        );
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "if [ -e /proc/self/fd/{fd} ]; then echo yes; else echo no; fi"
+            ))
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.trim(),
+            "no",
+            "child inherited lock fd: {stdout:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(guard);
+        let again = acquire_exclusive(&path.0).expect("after drop");
+        drop(again);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlink_lock_path_is_refused() {
+        let _serial = serial_guard();
         use std::os::unix::fs::symlink;
         let target = TestPath::new("target");
         std::fs::write(&target.0, b"target").expect("target");
@@ -295,6 +345,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn killed_holder_releases_kernel_lock() {
+        let _serial = serial_guard();
         let lock_path = TestPath::new("crash-lock");
         let ready_path = TestPath::new("crash-ready");
         let executable = std::env::current_exe().expect("test executable");
@@ -335,6 +386,8 @@ mod tests {
     #[test]
     #[ignore = "subprocess fixture"]
     fn holder_fixture() {
+        // No serial_guard: runs in a child process while the parent
+        // killed_holder_releases_kernel_lock already holds the mutex.
         let path =
             PathBuf::from(std::env::var_os("IGNITE_TEST_UPDATER_TXLOCK_PATH").expect("lock path"));
         let ready =
