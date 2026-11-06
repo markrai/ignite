@@ -950,6 +950,7 @@ dependencies = [
  "sha2",
  "sync-engine",
  "sync-protocol",
+ "updater-transaction-lock",
  "ureq",
  "uuid",
 ]
@@ -961,6 +962,7 @@ dependencies = [
  "libc",
  "libloading",
  "sha2",
+ "updater-transaction-lock",
  "uuid",
 ]
 
@@ -1345,6 +1347,14 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "updater-transaction-lock"
+version = "0.9.20"
+dependencies = [
+ "libc",
+ "uuid",
+]
 
 [[package]]
 name = "ureq"

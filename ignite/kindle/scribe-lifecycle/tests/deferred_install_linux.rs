@@ -81,6 +81,74 @@ fn sfx_like_sealed_exec_inherits_updater_lock_and_preserves_dollar_zero() {
 }
 
 #[test]
+fn staging_cannot_acquire_shared_lock_while_lifecycle_holds_across_exec() {
+    use updater_transaction_lock::{acquire_exclusive, AcquireError};
+
+    let root = temp_root("stage-vs-lifecycle-lock");
+    let lock_path = root.join("updater.lock");
+    let ready = root.join("holder.ready");
+    let release = root.join("holder.release");
+
+    // Hold the shared updater lock across an inherited exec the same way install-runtime does.
+    let holder_script = root.join("hold.sh");
+    fs::write(
+        &holder_script,
+        format!(
+            "#!/bin/sh\n\
+set -eu\n\
+[ \"${{IGNITE_UPDATER_LOCK_HELD:-}}\" = 1 ]\n\
+[ -n \"${{IGNITE_UPDATER_LOCK_FD:-}}\" ]\n\
+printf 'ready\\n' > '{}'\n\
+while [ ! -f '{}' ]; do sleep 0.05; done\n\
+exit 0\n",
+            ready.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&holder_script).unwrap().permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(&holder_script, perms).unwrap();
+
+    let lifecycle = PathBuf::from(env!("CARGO_BIN_EXE_scribe-lifecycle"));
+    let mut child = Command::new(&lifecycle)
+        .args([
+            "--with-updater-transaction-lock",
+            "--",
+            "sh",
+            holder_script.to_str().unwrap(),
+        ])
+        .env("IGNITE_TEST_UPDATER_LOCK_PATH", &lock_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lifecycle holder");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            child.try_wait().expect("poll holder").is_none(),
+            "holder exited before ready"
+        );
+        assert!(Instant::now() < deadline, "holder readiness timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Staging / shared helper must see the same kernel lock as contended.
+    assert!(
+        matches!(acquire_exclusive(&lock_path), Err(AcquireError::Contended)),
+        "staging must not acquire while lifecycle holds across installer exec"
+    );
+
+    fs::write(&release, b"go\n").unwrap();
+    let status = child.wait().expect("reap holder");
+    assert!(status.success(), "holder failed: {status}");
+    let _reacquire = acquire_exclusive(&lock_path).expect("lock free after lifecycle exit");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn deferred_install_cli_runs_sfx_under_inherited_lock() {
     let root = temp_root("deferred-ok");
     let update = root.join("update");

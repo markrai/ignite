@@ -1,0 +1,12 @@
+[package]
+name = "updater-transaction-lock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared exclusive flock for Kindle updater transactions (staging + lifecycle)"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+uuid = { version = "1", default-features = false, features = ["std", "v4"] }
