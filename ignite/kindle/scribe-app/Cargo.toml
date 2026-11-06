@@ -51,6 +51,7 @@ fontdue = { version = "0.9", default-features = false }
 # Authenticated Kindle release metadata. Verification only; no key generation or network stack.
 ed25519-dalek = { version = "2.2", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+updater-transaction-lock = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

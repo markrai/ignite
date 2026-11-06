@@ -15,6 +15,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use updater_transaction_lock::{self, AcquireError, UpdaterLockGuard};
+
 use ed25519_dalek::VerifyingKey;
 
 use crate::publication_trust_boundary::{
@@ -85,6 +87,10 @@ pub enum StagingError {
     RevalidationFailed(String),
     CrossModeRoot(String),
     InterruptedPublication(String),
+    /// Updater transaction lock contended, unusable, or unavailable.
+    UpdaterBusy(String),
+    /// Completed candidate may not be replaced under current updater state / version policy.
+    SupersessionRefused(String),
 }
 
 impl std::fmt::Display for StagingError {
@@ -122,6 +128,8 @@ impl std::fmt::Display for StagingError {
             Self::RevalidationFailed(e) => write!(f, "staging revalidation failed: {e}"),
             Self::CrossModeRoot(e) => write!(f, "staging root/mode mismatch: {e}"),
             Self::InterruptedPublication(e) => write!(f, "interrupted publication: {e}"),
+            Self::UpdaterBusy(e) => write!(f, "updater transaction busy: {e}"),
+            Self::SupersessionRefused(e) => write!(f, "staging supersession refused: {e}"),
         }
     }
 }
@@ -170,6 +178,19 @@ pub struct StageRequest {
     pub source: AssetSource,
     pub trust: TrustMode,
     pub root_kind: StagingRootKind,
+    /// Authoritative installed application version (compile-time product digits in production).
+    pub installed_version: String,
+    /// HostTest override for `…/state`. Production derives from the approved staging root.
+    pub updater_state_dir: Option<PathBuf>,
+    /// HostTest override for the updater transaction lock path. Production uses
+    /// [`DEFAULT_UPDATER_LOCK`].
+    pub updater_lock_path: Option<PathBuf>,
+    /// Invoked after the work tree is authenticated and before the pre-publish
+    /// updater-state recheck. Production leaves this `None`.
+    pub before_publish_hook: Option<fn()>,
+    /// Invoked after `publish_work_to_root` while the updater lock is still held,
+    /// before leftover / identity finalization. Production leaves this `None`.
+    pub after_publish_hook: Option<fn()>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,6 +336,11 @@ pub fn parse_command(args: &[String]) -> Result<StageCommand, StagingError> {
         source,
         trust,
         root_kind: StagingRootKind::Production,
+        installed_version: crate::software_update::installed_version().to_string(),
+        updater_state_dir: None,
+        updater_lock_path: None,
+        before_publish_hook: None,
+        after_publish_hook: None,
     }))
 }
 
@@ -510,11 +536,13 @@ pub const STAGED_ASSETS_DIR: &str = ASSETS_DIR;
 
 /// Conservatively reconcile interrupted `.next`/`.prev` publish artifacts.
 ///
-/// Ambiguous mid-swap states refuse. Abandoned `.next` beside an intact published
-/// tree is dropped. Restores `.prev` only when the live name is missing.
+/// Ambiguous mid-swap states refuse without deleting evidence. Abandoned `.next`
+/// beside an intact published tree is dropped only when the shape cannot be a
+/// partially-advanced cross-version publish. Restores `.prev` only when the live
+/// name is missing. Always verifies live record/assets tag identity when both exist.
 fn reconcile_interrupted_publication(root: &Path) -> Result<(), StagingError> {
     if !has_publish_leftovers(root) {
-        return Ok(());
+        return verify_record_assets_tag_identity(root);
     }
 
     let next_assets = root.join(ASSETS_NEXT);
@@ -533,6 +561,15 @@ fn reconcile_interrupted_publication(root: &Path) -> Result<(), StagingError> {
     if !record.exists() && next_record.exists() && prev_record.exists() {
         return Err(StagingError::InterruptedPublication(
             "ambiguous STAGING_RECORD.next/.prev swap".into(),
+        ));
+    }
+
+    // W4: assets promoted (R4) while live record still names the previous candidate
+    // and RECORD.next holds the replacement. Path-presence "abandoned next" would
+    // silently produce {assets=B, RECORD=A}. Refuse and preserve evidence.
+    if assets.is_dir() && record.is_file() && prev_assets.exists() && next_record.exists() {
+        return Err(StagingError::InterruptedPublication(
+            "partially-advanced publication: live record lags promoted assets".into(),
         ));
     }
 
@@ -573,7 +610,500 @@ fn reconcile_interrupted_publication(root: &Path) -> Result<(), StagingError> {
             "unresolved .next/.prev publication artifacts".into(),
         ));
     }
+    verify_record_assets_tag_identity(root)
+}
+
+fn tag_to_version(tag: &str) -> Option<&str> {
+    tag.strip_prefix('v').filter(|version| !version.is_empty())
+}
+
+/// Observational consistency check: live `STAGING_RECORD.expected_tag` must name the
+/// live assets manifest filename and agree with its plaintext `tag=` field.
+/// Does not authenticate signatures — full trust verification runs separately.
+fn verify_record_assets_tag_identity(root: &Path) -> Result<(), StagingError> {
+    let record_path = root.join(RECORD_NAME);
+    let assets = root.join(ASSETS_DIR);
+    if !record_path.is_file() || !assets.is_dir() {
+        return Ok(());
+    }
+    let parsed = parse_strict_record(&record_path)?;
+    let Some(version) = tag_to_version(&parsed.expected_tag) else {
+        return Err(StagingError::InterruptedPublication(format!(
+            "record expected_tag {} is not a v-prefixed version",
+            parsed.expected_tag
+        )));
+    };
+    let names = ReleaseAssetNames::for_version(version).map_err(|err| {
+        StagingError::InterruptedPublication(format!(
+            "record expected_tag {} cannot derive asset names: {err}",
+            parsed.expected_tag
+        ))
+    })?;
+    let manifest_path = assets.join(&names.release_manifest);
+    match fs::symlink_metadata(&manifest_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StagingError::InterruptedPublication(format!(
+                "record expected_tag={} disagrees with assets (missing {})",
+                parsed.expected_tag, names.release_manifest
+            )));
+        }
+        Err(err) => return Err(StagingError::Io(err.to_string())),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(StagingError::UnsafeRoot(
+                manifest_path.display().to_string(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let bytes = read_bounded_file(
+        &manifest_path,
+        MAX_CACHED_METADATA_BYTES,
+        "release_manifest",
+    )?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut asset_tag: Option<&str> = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("tag=") {
+            if asset_tag.is_some() {
+                return Err(StagingError::InterruptedPublication(
+                    "assets manifest declares tag= more than once".into(),
+                ));
+            }
+            asset_tag = Some(value);
+        }
+    }
+    let Some(asset_tag) = asset_tag else {
+        return Err(StagingError::InterruptedPublication(
+            "assets manifest missing tag= field".into(),
+        ));
+    };
+    if asset_tag != parsed.expected_tag {
+        return Err(StagingError::InterruptedPublication(format!(
+            "record expected_tag={} disagrees with assets manifest tag={}",
+            parsed.expected_tag, asset_tag
+        )));
+    }
     Ok(())
+}
+
+fn try_hold_updater_lock(path: &Path) -> Result<UpdaterLockGuard, StagingError> {
+    updater_transaction_lock::acquire_exclusive(path).map_err(|err| match err {
+        AcquireError::Contended => {
+            StagingError::UpdaterBusy("updater transaction lock is held".into())
+        }
+        AcquireError::Unsafe(detail) => StagingError::UpdaterBusy(detail),
+        AcquireError::Io { action, source } => {
+            StagingError::UpdaterBusy(format!("updater lock {action} failed: {source}"))
+        }
+    })
+}
+
+fn resolve_updater_lock_path(request: &StageRequest) -> PathBuf {
+    request
+        .updater_lock_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(updater_transaction_lock::DEFAULT_LOCK_PATH))
+}
+
+fn resolve_updater_state_dir(request: &StageRequest) -> Result<PathBuf, StagingError> {
+    if let Some(dir) = &request.updater_state_dir {
+        return Ok(dir.clone());
+    }
+    if is_exact_production_staging_root(&request.staging_root)
+        || is_exact_fixture_staging_root(&request.staging_root)
+    {
+        return Ok(PathBuf::from(UPDATER_STATE_PARENT));
+    }
+    if request.root_kind == StagingRootKind::HostTest {
+        if let Some(parent) = request.staging_root.parent() {
+            if parent.file_name().and_then(|name| name.to_str()) == Some("state") {
+                return Ok(parent.to_path_buf());
+            }
+        }
+    }
+    Err(StagingError::SupersessionRefused(
+        "cannot resolve updater state directory for staging root".into(),
+    ))
+}
+
+fn assert_updater_transaction_clear(state_dir: &Path) -> Result<(), StagingError> {
+    let update_dir = state_dir.join("update");
+    // Missing update/ is admissible; an existing symlink or non-directory is not.
+    if require_safe_recovery_dir(&update_dir, "state/update")? {
+        refuse_if_present(
+            &update_dir.join(crate::install_intent::INTENT_FILE_NAME),
+            "install-intent.v1 present; refusing supersession without deleting evidence",
+        )?;
+        refuse_if_present(
+            &update_dir.join(crate::update_qualification::JOURNAL_NAME),
+            "ignite-qualify.journal present; refusing supersession without deleting evidence",
+        )?;
+        refuse_orphan_temps(
+            &update_dir,
+            &[
+                (".pending-health.", ".tmp"),
+                (".pending-verify.", ".tmp"),
+                (".lkg-verify.", ".tmp"),
+                (".ignite-qualify.", ".tmp"),
+                (".install-intent.", ".tmp"),
+            ],
+        )?;
+    }
+
+    let Some(app_root) = state_dir.parent() else {
+        return Err(StagingError::SupersessionRefused(
+            "updater state directory has no parent app root".into(),
+        ));
+    };
+
+    // Align with installation authorization / installer recovery gates. Committed
+    // activate markers without an unresolved journal remain admissible here; the
+    // staging-specific activation check below is stricter about open journals.
+    match crate::installation_authorization::evaluate_app_root_recovery_for_update(app_root) {
+        crate::installation_authorization::PrerequisiteStatus::Satisfied => {}
+        crate::installation_authorization::PrerequisiteStatus::Refused(detail) => {
+            return Err(StagingError::SupersessionRefused(detail));
+        }
+        other => {
+            return Err(StagingError::SupersessionRefused(format!(
+                "recovery preflight not clear: {other:?}"
+            )));
+        }
+    }
+
+    // Staging replacement of published assets must not proceed over an unresolved
+    // activation journal, even when rollback would satisfy installation recovery.
+    assert_staging_activation_clear(app_root)?;
+
+    let run_dir = app_root.join("run");
+    if require_safe_recovery_dir(&run_dir, "run")? {
+        refuse_if_present(
+            &run_dir.join("ignite-activate.journal.tmp"),
+            "activate journal temp present; refusing supersession without deleting evidence",
+        )?;
+        refuse_if_present(
+            &run_dir.join("ignite-activate.committed.tmp"),
+            "activate commit temp present; refusing supersession without deleting evidence",
+        )?;
+        refuse_orphan_temps(
+            &run_dir,
+            &[(".commit-verify.", ".tmp"), (".ignite-activate.", ".tmp")],
+        )?;
+    }
+
+    let previous = app_root.join("previous-release");
+    if require_safe_recovery_dir(&previous, "previous-release")? {
+        refuse_orphan_temps(
+            &previous,
+            &[
+                (".ignite-lkg-inventory.", ".tmp"),
+                (".appreg-handler.", ".tmp"),
+                (".lkg-complete.", ".tmp"),
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Staging-specific activation gate. Installation recovery may accept a journal
+/// when rollback is possible; replacing staged assets requires a completed
+/// activation state per the installer contract, or no journal at all.
+///
+/// Never deletes, rewrites, or retires activation evidence.
+fn assert_staging_activation_clear(app_root: &Path) -> Result<(), StagingError> {
+    let run_dir = app_root.join("run");
+    let journal = run_dir.join("ignite-activate.journal");
+    let committed = run_dir.join("ignite-activate.committed");
+
+    let journal_meta = match fs::symlink_metadata(&journal) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // No journal: committed-only leftovers remain admissible (installer
+            // leftover cleanup / existing harmless-marker behavior).
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(StagingError::SupersessionRefused(format!(
+                "cannot stat activate journal: {err}"
+            )));
+        }
+        Ok(meta) => meta,
+    };
+    if journal_meta.file_type().is_symlink() {
+        return Err(StagingError::SupersessionRefused(
+            "activate journal must not be a symlink; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+    if !journal_meta.is_file() {
+        return Err(StagingError::SupersessionRefused(
+            "activate journal exists but is not a regular file; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+
+    let committed_meta = match fs::symlink_metadata(&committed) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StagingError::SupersessionRefused(
+                "activate journal without completed commit marker; refusing supersession without deleting evidence"
+                    .into(),
+            ));
+        }
+        Err(err) => {
+            return Err(StagingError::SupersessionRefused(format!(
+                "cannot stat activate commit marker: {err}"
+            )));
+        }
+        Ok(meta) => meta,
+    };
+    if committed_meta.file_type().is_symlink() {
+        return Err(StagingError::SupersessionRefused(
+            "activate commit marker must not be a symlink; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+    if !committed_meta.is_file() {
+        return Err(StagingError::SupersessionRefused(
+            "activate commit marker exists but is not a regular file; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+
+    // Journal + commit: admit only when the installer contract treats this as a
+    // safely completed leftover (validate_committed_transaction).
+    let commit_txn = parse_activate_commit_marker_for_staging(&committed)?;
+    if let Some(journal_txn) = read_activate_journal_txn(&journal)? {
+        if journal_txn != commit_txn {
+            return Err(StagingError::SupersessionRefused(
+                "activate journal and commit marker transaction ids differ; refusing supersession without deleting evidence"
+                    .into(),
+            ));
+        }
+    } else {
+        return Err(StagingError::SupersessionRefused(
+            "activate journal missing txn id while commit marker present; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+const MAX_ACTIVATE_COMMIT_BYTES: u64 = 256;
+const MAX_ACTIVATE_JOURNAL_BYTES: u64 = 64 * 1024;
+
+/// Returns the commit transaction id when the marker matches installer
+/// `validate_committed_transaction` rules for a completed leftover.
+fn parse_activate_commit_marker_for_staging(path: &Path) -> Result<String, StagingError> {
+    let bytes = read_bounded_file(path, MAX_ACTIVATE_COMMIT_BYTES, "activate commit marker")
+        .map_err(|err| {
+            StagingError::SupersessionRefused(format!(
+                "activate commit marker unreadable ({err}); refusing supersession without deleting evidence"
+            ))
+        })?;
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(marker) = text.lines().next() else {
+        return Err(StagingError::SupersessionRefused(
+            "activate commit marker empty; refusing supersession without deleting evidence".into(),
+        ));
+    };
+
+    // Legacy v1: installer accepts and cleans up without further txn checks.
+    if let Some(txn) = marker.strip_prefix("committed txn=") {
+        if txn.is_empty() || marker.contains('\0') {
+            return Err(StagingError::SupersessionRefused(
+                "malformed legacy activate commit marker; refusing supersession without deleting evidence"
+                    .into(),
+            ));
+        }
+        return Ok(txn.to_string());
+    }
+
+    let (txn, pending) = if let Some(rest) = marker.strip_prefix("ignite-activate-commit-v2 txn=") {
+        if let Some(txn) = rest.strip_suffix(" pending_health=0") {
+            (txn, 0_u8)
+        } else if let Some(txn) = rest.strip_suffix(" pending_health=1") {
+            (txn, 1_u8)
+        } else {
+            return Err(StagingError::SupersessionRefused(
+                "malformed or unsupported activate commit marker; refusing supersession without deleting evidence"
+                    .into(),
+            ));
+        }
+    } else {
+        return Err(StagingError::SupersessionRefused(
+            "malformed or unsupported activate commit marker; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    };
+
+    if !activate_txn_id_plausible(txn) {
+        return Err(StagingError::SupersessionRefused(
+            "malformed transaction id in activate commit marker; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+
+    // Canonical single-line encoding (installer cmp check).
+    let expected = format!("ignite-activate-commit-v2 txn={txn} pending_health={pending}\n");
+    if bytes != expected.as_bytes() {
+        return Err(StagingError::SupersessionRefused(
+            "activate commit marker is not canonically encoded; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+
+    // pending_health=1 implies an unfinished candidate-health transaction. Staging
+    // already refuses live pending-health evidence; a commit claiming it without
+    // that evidence (or with it) is contradictory for asset replacement.
+    if pending == 1 {
+        return Err(StagingError::SupersessionRefused(
+            "activate commit marker claims pending_health=1; refusing supersession without deleting evidence"
+                .into(),
+        ));
+    }
+
+    Ok(txn.to_string())
+}
+
+fn activate_txn_id_plausible(txn: &str) -> bool {
+    // Installer: ^[0-9]{8}T[0-9]{6}Z-[0-9]+$
+    let Some((date, rest)) = txn.split_once('T') else {
+        return false;
+    };
+    if date.len() != 8 || !date.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let Some((time, pid)) = rest.split_once("Z-") else {
+        return false;
+    };
+    time.len() == 6
+        && time.chars().all(|c| c.is_ascii_digit())
+        && !pid.is_empty()
+        && pid.chars().all(|c| c.is_ascii_digit())
+}
+
+fn read_activate_journal_txn(path: &Path) -> Result<Option<String>, StagingError> {
+    let bytes = read_bounded_file(path, MAX_ACTIVATE_JOURNAL_BYTES, "activate journal").map_err(
+        |err| {
+            StagingError::SupersessionRefused(format!(
+                "activate journal unreadable ({err}); refusing supersession without deleting evidence"
+            ))
+        },
+    )?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut txn: Option<String> = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("# txn=") {
+            txn = Some(value.to_string());
+        }
+    }
+    Ok(txn)
+}
+
+/// Completed `STAGING_RECORD` requires a real, non-symlink published `assets/` directory.
+/// Contradictory completed state is refused without deleting or overwriting evidence.
+fn require_completed_published_assets(root: &Path) -> Result<(), StagingError> {
+    let assets = root.join(ASSETS_DIR);
+    match fs::symlink_metadata(&assets) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(StagingError::RevalidationFailed(
+                "completed staging record present but published assets directory missing".into(),
+            ))
+        }
+        Err(err) => Err(StagingError::RevalidationFailed(format!(
+            "completed staging record present but cannot stat published assets: {err}"
+        ))),
+        Ok(meta) if meta.file_type().is_symlink() => Err(StagingError::RevalidationFailed(
+            "completed staging record present but published assets path is a symlink".into(),
+        )),
+        Ok(meta) if !meta.is_dir() => Err(StagingError::RevalidationFailed(
+            "completed staging record present but published assets path is not a directory".into(),
+        )),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Returns `true` when `dir` exists as a real directory and may be enumerated.
+/// Missing directories are admissible (`Ok(false)`). Symlinks and non-directories refuse.
+fn require_safe_recovery_dir(dir: &Path, label: &str) -> Result<bool, StagingError> {
+    match fs::symlink_metadata(dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(StagingError::SupersessionRefused(format!(
+            "cannot stat {label}: {err}"
+        ))),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(StagingError::SupersessionRefused(format!(
+                    "{label} must not be a symlink; refusing supersession without deleting evidence"
+                )));
+            }
+            if !meta.is_dir() {
+                return Err(StagingError::SupersessionRefused(format!(
+                    "{label} exists but is not a directory; refusing supersession without deleting evidence"
+                )));
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn refuse_orphan_temps(dir: &Path, patterns: &[(&str, &str)]) -> Result<(), StagingError> {
+    let entries = fs::read_dir(dir).map_err(|err| {
+        StagingError::SupersessionRefused(format!("cannot read {}: {err}", dir.display()))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            StagingError::SupersessionRefused(format!("cannot enumerate {}: {err}", dir.display()))
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if patterns
+            .iter()
+            .any(|(prefix, suffix)| name.starts_with(prefix) && name.ends_with(suffix))
+        {
+            return Err(StagingError::SupersessionRefused(format!(
+                "orphan updater temp {name}; refusing supersession without deleting evidence"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn refuse_if_present(path: &Path, message: &str) -> Result<(), StagingError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(StagingError::SupersessionRefused(message.into())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(StagingError::SupersessionRefused(format!(
+            "cannot stat {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn admit_supersession(request: &StageRequest, staged_tag: &str) -> Result<(), StagingError> {
+    let Some(staged_version) = tag_to_version(staged_tag) else {
+        return Err(StagingError::ExistingCandidate(staged_tag.to_string()));
+    };
+    match crate::software_update::compare_stable_versions(&request.version, staged_version) {
+        Some(std::cmp::Ordering::Greater) => {}
+        _ => {
+            return Err(StagingError::ExistingCandidate(staged_tag.to_string()));
+        }
+    }
+    match crate::software_update::compare_stable_versions(
+        &request.version,
+        &request.installed_version,
+    ) {
+        Some(std::cmp::Ordering::Greater) => {}
+        _ => {
+            return Err(StagingError::SupersessionRefused(format!(
+                "requested {} is not newer than installed {}",
+                request.version, request.installed_version
+            )));
+        }
+    }
+    let state_dir = resolve_updater_state_dir(request)?;
+    assert_updater_transaction_clear(&state_dir)
 }
 
 pub fn validate_staging_root(root: &Path, kind: StagingRootKind) -> Result<(), StagingError> {
@@ -692,36 +1222,51 @@ pub fn stage_verified_update(request: &StageRequest) -> Result<StageResult, Stag
     }
     let names = ReleaseAssetNames::for_version(&request.version)?;
 
+    // Hold the shared updater transaction lock before reconcile / eligibility /
+    // acquire / publish. Contended or unusable → refuse without mutating staging.
+    let lock_path = resolve_updater_lock_path(request);
+    let updater_lock = try_hold_updater_lock(&lock_path)?;
+
+    // Read-only transaction-safety preflight before any destructive .next/.prev
+    // reconciliation. Ordinary first-time staging with a clean root skips this so
+    // it is not blocked by unrelated optional updater state; the pre-publish
+    // recheck still applies before publication.
+    if has_publish_leftovers(&request.staging_root) {
+        let state_dir = resolve_updater_state_dir(request)?;
+        assert_updater_transaction_clear(&state_dir)?;
+    }
+
     // Fail-closed reconciliation of interrupted .next/.prev artifacts before any
     // success path. Ambiguous mid-swap states refuse; abandoned next beside an
     // intact published tree is dropped; .prev is restored only when live names
-    // are missing.
+    // are missing. Cross-version partially-advanced publish refuses.
     reconcile_interrupted_publication(&request.staging_root)?;
 
     // Distinguish absent vs valid vs corrupt records. Never `.ok()` away parse errors:
     // malformed/oversized/unreadable/unsafe records fail closed.
     let existing_record = inspect_existing_staging_record(&request.staging_root.join(RECORD_NAME))?;
     let assets_published = request.staging_root.join(ASSETS_DIR).is_dir();
+    let mut superseding_completed = false;
 
     match existing_record {
         Some(hint) if hint.observations.staging_complete => {
+            // Completed observation always requires a real published assets tree
+            // before same-tag revalidation or different-tag supersession.
+            require_completed_published_assets(&request.staging_root)?;
             if hint.expected_tag != request.expected_tag {
-                return Err(StagingError::ExistingCandidate(hint.expected_tag));
+                // Re-check gates under the held lock before touching work/.
+                admit_supersession(request, &hint.expected_tag)?;
+                superseding_completed = true;
+            } else {
+                let result = revalidate_published_assets(request, &names)?;
+                if has_publish_leftovers(&request.staging_root) {
+                    return Err(StagingError::InterruptedPublication(
+                        "publish leftovers remain after revalidation".into(),
+                    ));
+                }
+                verify_record_assets_tag_identity(&request.staging_root)?;
+                return Ok(result);
             }
-            // Completed candidate: never silently reacquire.
-            if !assets_published {
-                return Err(StagingError::RevalidationFailed(
-                    "completed staging record present but published assets directory missing"
-                        .into(),
-                ));
-            }
-            let result = revalidate_published_assets(request, &names)?;
-            if has_publish_leftovers(&request.staging_root) {
-                return Err(StagingError::InterruptedPublication(
-                    "publish leftovers remain after revalidation".into(),
-                ));
-            }
-            return Ok(result);
         }
         Some(_incomplete) => {
             // Valid incomplete observation: try revalidation, else crash-recovery acquire.
@@ -733,6 +1278,7 @@ pub fn stage_verified_update(request: &StageRequest) -> Result<StageResult, Stag
                                 "publish leftovers remain after revalidation".into(),
                             ));
                         }
+                        verify_record_assets_tag_identity(&request.staging_root)?;
                         return Ok(result);
                     }
                     Err(StagingError::RevalidationFailed(_)) => {}
@@ -750,6 +1296,7 @@ pub fn stage_verified_update(request: &StageRequest) -> Result<StageResult, Stag
                                 "publish leftovers remain after revalidation".into(),
                             ));
                         }
+                        verify_record_assets_tag_identity(&request.staging_root)?;
                         return Ok(result);
                     }
                     Err(StagingError::RevalidationFailed(_)) => {}
@@ -827,14 +1374,61 @@ pub fn stage_verified_update(request: &StageRequest) -> Result<StageResult, Stag
     append_observation_lines(&mut trust_report, &observations);
     write_draft_record(&work, &request.expected_tag, &observations, &trust_report)?;
 
+    // Recheck updater transaction state under the held lock before publication.
+    // A failed new candidate must not destroy a recoverable completed predecessor.
+    updater_lock
+        .revalidate(&lock_path)
+        .map_err(|err| match err {
+            AcquireError::Contended => {
+                StagingError::UpdaterBusy("updater transaction lock is held".into())
+            }
+            AcquireError::Unsafe(detail) => StagingError::UpdaterBusy(detail),
+            AcquireError::Io { action, source } => {
+                StagingError::UpdaterBusy(format!("updater lock {action} failed: {source}"))
+            }
+        })?;
+    let state_dir = resolve_updater_state_dir(request)?;
+    if let Some(hook) = request.before_publish_hook {
+        hook();
+    }
+    assert_updater_transaction_clear(&state_dir)?;
+    if superseding_completed {
+        // Staged completed record may have changed only via this process; re-admit.
+        if let Some(hint) =
+            inspect_existing_staging_record(&request.staging_root.join(RECORD_NAME))?
+        {
+            if hint.observations.staging_complete && hint.expected_tag != request.expected_tag {
+                admit_supersession(request, &hint.expected_tag)?;
+            }
+        }
+    }
+
     publish_work_to_root(&request.staging_root, &work)?;
+    if let Some(hook) = request.after_publish_hook {
+        hook();
+    }
 
     if has_publish_leftovers(&request.staging_root) {
         return Err(StagingError::InterruptedPublication(
             "publish leftovers remain after publication".into(),
         ));
     }
+    verify_record_assets_tag_identity(&request.staging_root)?;
+    updater_lock
+        .revalidate(&lock_path)
+        .map_err(|err| match err {
+            AcquireError::Contended => {
+                StagingError::UpdaterBusy("updater transaction lock is held".into())
+            }
+            AcquireError::Unsafe(detail) => StagingError::UpdaterBusy(detail),
+            AcquireError::Io { action, source } => {
+                StagingError::UpdaterBusy(format!("updater lock {action} failed: {source}"))
+            }
+        })?;
 
+    // updater_lock remains held through leftover checks, identity verification,
+    // revalidation, and construction of the success result below.
+    let _hold_through_success = &updater_lock;
     Ok(StageResult {
         observations,
         record_path: request.staging_root.join(RECORD_NAME),
@@ -1458,6 +2052,7 @@ pub fn require_completed_staging_observation(
             "interrupted publish leftovers present".into(),
         ));
     }
+    verify_record_assets_tag_identity(root)?;
     match inspect_existing_staging_record(&root.join(RECORD_NAME))? {
         None => Err(StagingError::RecordInvalid("staging record absent".into())),
         Some(parsed) => {
@@ -1537,10 +2132,10 @@ mod tests {
         .into_bytes()
     }
 
-    fn production_format_evidence() -> Vec<u8> {
+    fn production_format_evidence_for(version: &str) -> Vec<u8> {
         let digest = encode_hex(&Sha256::digest(INSTALLER));
         build_minimal_production_evidence(
-            VERSION,
+            version,
             INSTALLER.len() as u64,
             &digest,
             &"ab".repeat(32),
@@ -1548,46 +2143,47 @@ mod tests {
         .expect("minimal production evidence")
     }
 
-    fn write_fixture_dir(dir: &Path, key: &SigningKey) {
-        let evidence = production_format_evidence();
+    fn write_fixture_dir_version(dir: &Path, key: &SigningKey, version: &str) {
+        let tag = format!("v{version}");
+        let evidence = production_format_evidence_for(version);
         let digest = Sha256::digest(INSTALLER);
         let release = format!(
-            "schema={MANIFEST_SCHEMA}\nversion={VERSION}\ntag={TAG}\nartifact=Install Ignite v{VERSION}.sh\nbytes={}\nsha256={}\n",
+            "schema={MANIFEST_SCHEMA}\nversion={version}\ntag={tag}\nartifact=Install Ignite v{version}.sh\nbytes={}\nsha256={}\n",
             INSTALLER.len(),
             encode_hex(&digest),
         )
         .into_bytes();
         let binding = format!(
-            "{BINDING_HEADER}\nschema={BINDING_SCHEMA}\nrelease_tag={TAG}\nrelease_version={VERSION}\nrelease_manifest_sha256={}\nscriptlet_sha256={}\npublication_evidence_sha256={}\npublisher_authentication_scope={BINDING_SCOPE}\n",
+            "{BINDING_HEADER}\nschema={BINDING_SCHEMA}\nrelease_tag={tag}\nrelease_version={version}\nrelease_manifest_sha256={}\nscriptlet_sha256={}\npublication_evidence_sha256={}\npublisher_authentication_scope={BINDING_SCOPE}\n",
             encode_hex(&Sha256::digest(&release)),
             encode_hex(&digest),
             encode_hex(&Sha256::digest(&evidence)),
         )
         .into_bytes();
         fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join(format!("Install Ignite v{VERSION}.sh")), INSTALLER).unwrap();
+        fs::write(dir.join(format!("Install Ignite v{version}.sh")), INSTALLER).unwrap();
         fs::write(
-            dir.join(format!("ignite-kindle-v{VERSION}.manifest")),
+            dir.join(format!("ignite-kindle-v{version}.manifest")),
             &release,
         )
         .unwrap();
         fs::write(
-            dir.join(format!("ignite-kindle-v{VERSION}.manifest.sig")),
+            dir.join(format!("ignite-kindle-v{version}.manifest.sig")),
             sign_envelope(&release, SIGNATURE_SCHEMA, key),
         )
         .unwrap();
         fs::write(
-            dir.join(format!("ignite-kindle-v{VERSION}.publication-evidence")),
+            dir.join(format!("ignite-kindle-v{version}.publication-evidence")),
             &evidence,
         )
         .unwrap();
         fs::write(
-            dir.join(format!("ignite-kindle-v{VERSION}.publication-binding")),
+            dir.join(format!("ignite-kindle-v{version}.publication-binding")),
             &binding,
         )
         .unwrap();
         fs::write(
-            dir.join(format!("ignite-kindle-v{VERSION}.publication-binding.sig")),
+            dir.join(format!("ignite-kindle-v{version}.publication-binding.sig")),
             sign_envelope(&binding, BINDING_SIGNATURE_SCHEMA, key),
         )
         .unwrap();
@@ -1598,6 +2194,10 @@ mod tests {
         .unwrap();
     }
 
+    fn write_fixture_dir(dir: &Path, key: &SigningKey) {
+        write_fixture_dir_version(dir, key, VERSION);
+    }
+
     fn temp_pair(label: &str) -> (PathBuf, PathBuf) {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1605,16 +2205,35 @@ mod tests {
             .as_nanos();
         let base = std::env::temp_dir().join(format!("ignite-3i-{label}-{stamp}"));
         let src = base.join("src");
-        let staging = base.join("staging");
+        // Mirror production: app_root/state/verified-update with data as a sibling of app_root.
+        let staging = base.join("app").join("state").join("verified-update");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(base.join("app").join("state")).unwrap();
         (src, staging)
     }
 
     fn fixture_request(src: &Path, staging: &Path, key: &SigningKey) -> StageRequest {
+        fixture_request_version(src, staging, key, VERSION)
+    }
+
+    fn fixture_request_version(
+        src: &Path,
+        staging: &Path,
+        key: &SigningKey,
+        version: &str,
+    ) -> StageRequest {
+        let state_dir = staging
+            .parent()
+            .expect("staging under state/")
+            .to_path_buf();
+        let lock_path = state_dir
+            .parent()
+            .expect("state parent")
+            .join("updater-transaction.lock");
         StageRequest {
-            expected_tag: TAG.into(),
-            version: VERSION.into(),
+            expected_tag: format!("v{version}"),
+            version: version.to_string(),
             staging_root: staging.to_path_buf(),
             source: AssetSource::LocalDirectory {
                 root: src.to_path_buf(),
@@ -1623,6 +2242,11 @@ mod tests {
                 public_key: key.verifying_key().to_bytes(),
             },
             root_kind: StagingRootKind::HostTest,
+            installed_version: "3.3.0".into(),
+            updater_state_dir: Some(state_dir),
+            updater_lock_path: Some(lock_path),
+            before_publish_hook: None,
+            after_publish_hook: None,
         }
     }
 
@@ -1665,14 +2289,8 @@ mod tests {
         write_fixture_dir(&src, &key);
         let fixture = fixture_request(&src, &staging, &key);
         stage_verified_update(&fixture).expect("fixture");
-        let production = StageRequest {
-            expected_tag: TAG.into(),
-            version: VERSION.into(),
-            staging_root: staging.clone(),
-            source: AssetSource::LocalDirectory { root: src.clone() },
-            trust: TrustMode::Production,
-            root_kind: StagingRootKind::HostTest,
-        };
+        let mut production = fixture_request(&src, &staging, &key);
+        production.trust = TrustMode::Production;
         let err = stage_verified_update(&production).expect_err("production blocked");
         assert!(
             matches!(
@@ -1901,14 +2519,9 @@ mod tests {
         );
         fs::write(staging.join(RECORD_NAME), forged.as_bytes()).unwrap();
         // Hint may parse, but authenticity requires assets — stage production refuses.
-        let req = StageRequest {
-            expected_tag: TAG.into(),
-            version: VERSION.into(),
-            staging_root: staging.clone(),
-            source: AssetSource::LocalDirectory { root: src.clone() },
-            trust: TrustMode::Production,
-            root_kind: StagingRootKind::HostTest,
-        };
+        let mut req = fixture_request(&src, &staging, &signing_key());
+        req.trust = TrustMode::Production;
+        req.source = AssetSource::LocalDirectory { root: src.clone() };
         let err = stage_verified_update(&req).expect_err("forged record insufficient");
         assert!(matches!(
             err,
@@ -2017,14 +2630,8 @@ mod tests {
         let key = signing_key();
         let (src, staging) = temp_pair("prod-pin");
         write_fixture_dir(&src, &key);
-        let req = StageRequest {
-            expected_tag: TAG.into(),
-            version: VERSION.into(),
-            staging_root: staging.clone(),
-            source: AssetSource::LocalDirectory { root: src.clone() },
-            trust: TrustMode::Production,
-            root_kind: StagingRootKind::HostTest,
-        };
+        let mut req = fixture_request(&src, &staging, &key);
+        req.trust = TrustMode::Production;
         let err = stage_verified_update(&req).expect_err("production refused");
         assert!(
             matches!(
@@ -2212,17 +2819,1155 @@ mod tests {
     }
 
     #[test]
-    fn different_tag_completed_candidate_refused() {
+    fn older_or_equal_tag_cannot_supersede_completed_candidate() {
         let key = signing_key();
-        let (src, staging) = temp_pair("diff-tag");
-        write_fixture_dir(&src, &key);
-        stage_verified_update(&fixture_request(&src, &staging, &key)).unwrap();
-        let mut other = fixture_request(&src, &staging, &key);
-        other.expected_tag = "v9.9.9".into();
-        other.version = "9.9.9".into();
-        let err = stage_verified_update(&other).expect_err("different tag");
-        assert!(matches!(err, StagingError::ExistingCandidate(_)));
+        let (src, staging) = temp_pair("diff-tag-older");
+        write_fixture_dir_version(&src, &key, "3.3.2");
+        stage_verified_update(&fixture_request_version(&src, &staging, &key, "3.3.2")).unwrap();
+
+        let older_src = src.parent().unwrap().join("src-older");
+        write_fixture_dir_version(&older_src, &key, "3.3.1");
+        let mut older = fixture_request_version(&older_src, &staging, &key, "3.3.1");
+        older.installed_version = "3.3.0".into();
+        let err = stage_verified_update(&older).expect_err("older must refuse");
+        assert!(
+            matches!(err, StagingError::ExistingCandidate(_)),
+            "unexpected {err}"
+        );
+
+        let equal = fixture_request_version(&src, &staging, &key, "3.3.2");
+        let again = stage_verified_update(&equal).expect("same tag revalidate");
+        assert!(again.observations.all_complete());
         let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[test]
+    fn newer_tag_supersedes_completed_candidate_when_safe() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-ok");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let req_b = fixture_request_version(&src_b, &staging, &key, "3.3.2");
+        let result = stage_verified_update(&req_b).expect("supersession");
+        assert!(result.observations.all_complete());
+        assert_eq!(result.release_tag.as_deref(), Some("v3.3.2"));
+        let loaded = load_staging_record(&staging, StagingRootKind::HostTest).unwrap();
+        assert!(loaded.all_complete());
+        let record = fs::read_to_string(staging.join(RECORD_NAME)).unwrap();
+        assert!(record.contains("expected_tag=v3.3.2"));
+        assert!(staging
+            .join(ASSETS_DIR)
+            .join("ignite-kindle-v3.3.2.manifest")
+            .is_file());
+        assert!(!staging
+            .join(ASSETS_DIR)
+            .join("ignite-kindle-v3.3.1.manifest")
+            .exists());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_download_failure_preserves_previous_candidate() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-fail-dl");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let old_record = fs::read(staging.join(RECORD_NAME)).unwrap();
+
+        let empty = src_a.parent().unwrap().join("empty-src");
+        fs::create_dir_all(&empty).unwrap();
+        let mut req_b = fixture_request_version(&empty, &staging, &key, "3.3.2");
+        req_b.source = AssetSource::LocalDirectory { root: empty };
+        assert!(stage_verified_update(&req_b).is_err());
+        assert_eq!(fs::read(staging.join(RECORD_NAME)).unwrap(), old_record);
+        assert!(staging
+            .join(ASSETS_DIR)
+            .join("ignite-kindle-v3.3.1.manifest")
+            .is_file());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_signature_failure_never_publishes_new_complete() {
+        let key = signing_key();
+        let other = SigningKey::from_bytes(&[42_u8; 32]);
+        let (src_a, staging) = temp_pair("supersede-bad-sig");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let old_record = fs::read(staging.join(RECORD_NAME)).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        // Tamper binding signature with wrong key material by rewriting under other key.
+        write_fixture_dir_version(&src_b, &other, "3.3.2");
+        let req_b = fixture_request_version(&src_b, &staging, &key, "3.3.2");
+        assert!(stage_verified_update(&req_b).is_err());
+        assert_eq!(fs::read(staging.join(RECORD_NAME)).unwrap(), old_record);
+        assert!(fs::read_to_string(staging.join(RECORD_NAME))
+            .unwrap()
+            .contains("expected_tag=v3.3.1"));
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_when_pending_health_present() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-pending");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let state = staging.parent().unwrap();
+        let update = state.join("update");
+        fs::create_dir_all(&update).unwrap();
+        let pending = b"IGNITE_PENDING_HEALTH_V1\nschema=1\nstatus=pending-health\n";
+        fs::write(update.join("pending-health.v1"), pending).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("pending-health");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(_)),
+            "unexpected {err}"
+        );
+        assert_eq!(fs::read(update.join("pending-health.v1")).unwrap(), pending);
+        assert!(fs::read_to_string(staging.join(RECORD_NAME))
+            .unwrap()
+            .contains("expected_tag=v3.3.1"));
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_when_install_intent_present() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-intent");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let state = staging.parent().unwrap();
+        let update = state.join("update");
+        crate::install_intent::write_intent_atomic(
+            &update,
+            &crate::install_intent::InstallIntent {
+                expected_tag: "v3.3.1".into(),
+                version: "3.3.1".into(),
+                staging_root: PathBuf::from("/mnt/us/scribe-app/state/verified-update"),
+                storage_contract: "ignite-storage-v1".into(),
+                intent_txn: "txn-test".into(),
+            },
+        )
+        .unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("intent");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(_)),
+            "unexpected {err}"
+        );
+        assert!(crate::install_intent::intent_path(&update).is_file());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_when_not_newer_than_installed() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-installed");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let mut req_b = fixture_request_version(&src_b, &staging, &key, "3.3.2");
+        req_b.installed_version = "3.3.2".into();
+        let err = stage_verified_update(&req_b).expect_err("not newer than installed");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(_)),
+            "unexpected {err}"
+        );
+        assert!(fs::read_to_string(staging.join(RECORD_NAME))
+            .unwrap()
+            .contains("expected_tag=v3.3.1"));
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_when_updater_lock_contended() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-lock");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        let req_a = fixture_request_version(&src_a, &staging, &key, "3.3.1");
+        stage_verified_update(&req_a).unwrap();
+
+        let lock_path = req_a.updater_lock_path.clone().unwrap();
+        let holder =
+            updater_transaction_lock::acquire_exclusive(&lock_path).expect("hold shared lock");
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("lock busy");
+        assert!(
+            matches!(err, StagingError::UpdaterBusy(_)),
+            "unexpected {err}"
+        );
+        drop(holder);
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn lock_held_through_post_publish_validation_blocks_concurrent_stage() {
+        use std::sync::Mutex;
+        static HOOK_LOCK: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+        fn assert_contended_after_publish() {
+            let path = HOOK_LOCK.lock().unwrap().clone().unwrap();
+            assert!(
+                matches!(
+                    updater_transaction_lock::acquire_exclusive(&path),
+                    Err(AcquireError::Contended)
+                ),
+                "post-publish validation must still hold the updater lock"
+            );
+        }
+
+        let key = signing_key();
+        let (src, staging) = temp_pair("lock-through-validate");
+        write_fixture_dir_version(&src, &key, "3.3.1");
+        let mut req = fixture_request_version(&src, &staging, &key, "3.3.1");
+        *HOOK_LOCK.lock().unwrap() = req.updater_lock_path.clone();
+        req.after_publish_hook = Some(assert_contended_after_publish);
+        let result = stage_verified_update(&req).expect("stage with post-publish lock hold");
+        assert!(result.observations.all_complete());
+        // After success returns, the lock is released and can be acquired again.
+        let _reacquire =
+            updater_transaction_lock::acquire_exclusive(req.updater_lock_path.as_ref().unwrap())
+                .expect("lock released after success");
+        *HOOK_LOCK.lock().unwrap() = None;
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supersession_refuses_symlinked_update_dir_without_mutation() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("symlink-update");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let state = staging.parent().unwrap();
+        let real_update = state.parent().unwrap().join("foreign-update");
+        fs::create_dir_all(&real_update).unwrap();
+        let sentinel = real_update.join("KEEP");
+        fs::write(&sentinel, b"alive").unwrap();
+        let update = state.join("update");
+        std::os::unix::fs::symlink(&real_update, &update).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("symlink update/");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("symlink")),
+            "unexpected {err}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"alive");
+        assert!(fs::read_to_string(staging.join(RECORD_NAME))
+            .unwrap()
+            .contains("expected_tag=v3.3.1"));
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supersession_refuses_symlinked_run_dir_without_mutation() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("symlink-run");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        let foreign = app_root.parent().unwrap().join("foreign-run");
+        fs::create_dir_all(&foreign).unwrap();
+        let sentinel = foreign.join("KEEP");
+        fs::write(&sentinel, b"alive").unwrap();
+        let run = app_root.join("run");
+        std::os::unix::fs::symlink(&foreign, &run).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("symlink run/");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("symlink")),
+            "unexpected {err}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"alive");
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supersession_refuses_symlinked_previous_release_without_mutation() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("symlink-prev");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        let foreign = app_root.parent().unwrap().join("foreign-prev");
+        fs::create_dir_all(&foreign).unwrap();
+        let sentinel = foreign.join("KEEP");
+        fs::write(&sentinel, b"alive").unwrap();
+        std::os::unix::fs::symlink(&foreign, app_root.join("previous-release")).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("symlink previous-release/");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(_)),
+            "unexpected {err}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"alive");
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_nondirectory_update_path() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("file-update");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let update = staging.parent().unwrap().join("update");
+        fs::write(&update, b"not-a-dir").unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("file update/");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("not a directory")),
+            "unexpected {err}"
+        );
+        assert_eq!(fs::read(&update).unwrap(), b"not-a-dir");
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_previous_release_staging_leftover() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-prev-staging");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        fs::create_dir_all(app_root.join("previous-release.staging")).unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("previous-release.staging");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("previous-release.staging")),
+            "unexpected {err}"
+        );
+        assert!(app_root.join("previous-release.staging").exists());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+            let entries = match fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let meta = match fs::symlink_metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                if meta.file_type().is_symlink() {
+                    let target = fs::read_link(&path)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "<unreadable-link>".into());
+                    out.insert(format!("symlink:{rel}"), target.into_bytes());
+                } else if meta.is_dir() {
+                    out.insert(format!("dir:{rel}"), Vec::new());
+                    walk(base, &path, out);
+                } else if meta.is_file() {
+                    out.insert(
+                        format!("file:{rel}"),
+                        fs::read(&path).unwrap_or_else(|_| b"<unreadable>".to_vec()),
+                    );
+                } else {
+                    out.insert(format!("other:{rel}"), Vec::new());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        if root.exists() {
+            out.insert("dir:.".into(), Vec::new());
+            walk(root, root, &mut out);
+        }
+        out
+    }
+
+    fn write_install_intent_for_staging(staging: &Path, tag: &str, version: &str) {
+        let update = staging.parent().unwrap().join("update");
+        fs::create_dir_all(&update).unwrap();
+        crate::install_intent::write_intent_atomic(
+            &update,
+            &crate::install_intent::InstallIntent {
+                expected_tag: tag.into(),
+                version: version.into(),
+                staging_root: PathBuf::from("/mnt/us/scribe-app/state/verified-update"),
+                storage_contract: "ignite-storage-v1".into(),
+                intent_txn: "txn-test".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn intent_with_assets_next_refuses_before_reconcile_without_mutation() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("intent-next-nmutate");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+
+        // Abandoned .next beside intact published tree — reconcile would delete it.
+        fs::create_dir_all(staging.join(ASSETS_NEXT)).unwrap();
+        fs::write(
+            staging.join(ASSETS_NEXT).join("sentinel"),
+            b"next-evidence\n",
+        )
+        .unwrap();
+        write_install_intent_for_staging(&staging, "v3.3.1", "3.3.1");
+
+        let before_staging = snapshot_tree(&staging);
+        let before_update = snapshot_tree(&staging.parent().unwrap().join("update"));
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("intent must refuse before reconcile");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("install-intent")),
+            "unexpected {err}"
+        );
+
+        assert_eq!(
+            snapshot_tree(&staging),
+            before_staging,
+            "staging tree must be byte-identical after refusal"
+        );
+        assert_eq!(
+            snapshot_tree(&staging.parent().unwrap().join("update")),
+            before_update,
+            "update/ evidence must be byte-identical after refusal"
+        );
+        assert_eq!(
+            fs::read(staging.join(ASSETS_NEXT).join("sentinel")).unwrap(),
+            b"next-evidence\n"
+        );
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn intent_with_assets_prev_refuses_before_reconcile_without_mutation() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("intent-prev-nmutate");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+
+        fs::create_dir_all(staging.join(ASSETS_PREV)).unwrap();
+        fs::write(
+            staging.join(ASSETS_PREV).join("sentinel"),
+            b"prev-evidence\n",
+        )
+        .unwrap();
+        fs::write(staging.join(RECORD_PREV), b"prev-record-evidence\n").unwrap();
+        write_install_intent_for_staging(&staging, "v3.3.1", "3.3.1");
+
+        let before_staging = snapshot_tree(&staging);
+        let before_update = snapshot_tree(&staging.parent().unwrap().join("update"));
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("intent must refuse before reconcile");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("install-intent")),
+            "unexpected {err}"
+        );
+        assert_eq!(snapshot_tree(&staging), before_staging);
+        assert_eq!(
+            snapshot_tree(&staging.parent().unwrap().join("update")),
+            before_update
+        );
+        assert_eq!(
+            fs::read(staging.join(ASSETS_PREV).join("sentinel")).unwrap(),
+            b"prev-evidence\n"
+        );
+        assert_eq!(
+            fs::read(staging.join(RECORD_PREV)).unwrap(),
+            b"prev-record-evidence\n"
+        );
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_allows_harmless_activate_committed_marker() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-committed-ok");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        fs::create_dir_all(app_root.join("run")).unwrap();
+        fs::write(
+            app_root.join("run").join("ignite-activate.committed"),
+            b"ignite-activate-commit-v2 txn=done pending_health=0\n",
+        )
+        .unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let result =
+            stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+                .expect("committed-only must not block");
+        assert!(result.observations.all_complete());
+        assert!(app_root
+            .join("run")
+            .join("ignite-activate.committed")
+            .is_file());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_activate_journal_without_rollback() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-activate-journal");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        fs::create_dir_all(app_root.join("run")).unwrap();
+        fs::write(
+            app_root.join("run").join("ignite-activate.journal"),
+            b"# ignite-activate v2\n",
+        )
+        .unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("unresolved activate journal");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("activate journal")),
+            "unexpected {err}"
+        );
+        assert!(app_root
+            .join("run")
+            .join("ignite-activate.journal")
+            .is_file());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_activate_journal_even_with_valid_rollback() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("journal-with-rollback");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        let prev = app_root.join("previous-release");
+        fs::create_dir_all(&prev).unwrap();
+        fs::write(prev.join("scribe-app"), b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(app_root.join("run")).unwrap();
+        let journal = app_root.join("run").join("ignite-activate.journal");
+        fs::write(
+            &journal,
+            b"# ignite-activate v2\n# txn=20260101T000000Z-1\n# phase=pending\n",
+        )
+        .unwrap();
+        let before = snapshot_tree(&app_root.join("run"));
+        let before_prev = snapshot_tree(&prev);
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("journal with rollback must still refuse staging");
+        assert!(
+            matches!(
+                err,
+                StagingError::SupersessionRefused(ref d)
+                    if d.contains("activate journal without completed commit marker")
+            ),
+            "unexpected {err}"
+        );
+        assert_eq!(snapshot_tree(&app_root.join("run")), before);
+        assert_eq!(snapshot_tree(&prev), before_prev);
+        assert!(fs::read_to_string(staging.join(RECORD_NAME))
+            .unwrap()
+            .contains("expected_tag=v3.3.1"));
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_journal_with_malformed_commit_marker() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("journal-bad-commit");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        fs::create_dir_all(app_root.join("run")).unwrap();
+        fs::write(
+            app_root.join("run").join("ignite-activate.journal"),
+            b"# ignite-activate v2\n# txn=20260101T000000Z-1\n",
+        )
+        .unwrap();
+        fs::write(
+            app_root.join("run").join("ignite-activate.committed"),
+            b"not-a-valid-commit-marker\n",
+        )
+        .unwrap();
+        let before = snapshot_tree(&app_root.join("run"));
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("malformed commit");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(ref d) if d.contains("commit marker")),
+            "unexpected {err}"
+        );
+        assert_eq!(snapshot_tree(&app_root.join("run")), before);
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_refuses_journal_with_mismatched_commit_txn() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("journal-txn-mismatch");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        fs::create_dir_all(app_root.join("run")).unwrap();
+        fs::write(
+            app_root.join("run").join("ignite-activate.journal"),
+            b"# ignite-activate v2\n# txn=20260101T000000Z-1\n",
+        )
+        .unwrap();
+        fs::write(
+            app_root.join("run").join("ignite-activate.committed"),
+            b"ignite-activate-commit-v2 txn=20260101T000000Z-2 pending_health=0\n",
+        )
+        .unwrap();
+        let before = snapshot_tree(&app_root.join("run"));
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("txn mismatch");
+        assert!(
+            matches!(
+                err,
+                StagingError::SupersessionRefused(ref d) if d.contains("transaction ids differ")
+            ),
+            "unexpected {err}"
+        );
+        assert_eq!(snapshot_tree(&app_root.join("run")), before);
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_admits_matching_journal_and_completed_commit() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("journal-commit-ok");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let app_root = staging.parent().unwrap().parent().unwrap();
+        fs::create_dir_all(app_root.join("run")).unwrap();
+        let txn = "20260101T000000Z-42";
+        fs::write(
+            app_root.join("run").join("ignite-activate.journal"),
+            format!("# ignite-activate v2\n# txn={txn}\n# phase=committed-leftover\n"),
+        )
+        .unwrap();
+        fs::write(
+            app_root.join("run").join("ignite-activate.committed"),
+            format!("ignite-activate-commit-v2 txn={txn} pending_health=0\n"),
+        )
+        .unwrap();
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let result =
+            stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+                .expect("matching journal+commit leftover must admit");
+        assert!(result.observations.all_complete());
+        assert_eq!(result.release_tag.as_deref(), Some("v3.3.2"));
+        // Evidence is preserved — staging never retires activation markers.
+        assert!(app_root
+            .join("run")
+            .join("ignite-activate.journal")
+            .is_file());
+        assert!(app_root
+            .join("run")
+            .join("ignite-activate.committed")
+            .is_file());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn completed_record_missing_assets_refuses_supersession_without_mutation() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("complete-no-assets");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let record_before = fs::read(staging.join(RECORD_NAME)).unwrap();
+        fs::remove_dir_all(staging.join(ASSETS_DIR)).unwrap();
+        let before = snapshot_tree(&staging);
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("missing assets must refuse");
+        assert!(
+            matches!(
+                err,
+                StagingError::RevalidationFailed(ref d)
+                    if d.contains("published assets directory missing")
+            ),
+            "unexpected {err}"
+        );
+        assert_eq!(snapshot_tree(&staging), before);
+        assert_eq!(fs::read(staging.join(RECORD_NAME)).unwrap(), record_before);
+        assert!(!staging.join("work").exists());
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn completed_record_assets_file_refuses_supersession_without_mutation() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("complete-assets-file");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let record_before = fs::read(staging.join(RECORD_NAME)).unwrap();
+        fs::remove_dir_all(staging.join(ASSETS_DIR)).unwrap();
+        fs::write(staging.join(ASSETS_DIR), b"not-a-directory\n").unwrap();
+        let before = snapshot_tree(&staging);
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let err = stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"))
+            .expect_err("assets file must refuse");
+        assert!(
+            matches!(
+                err,
+                StagingError::RevalidationFailed(ref d) if d.contains("not a directory")
+            ),
+            "unexpected {err}"
+        );
+        assert_eq!(snapshot_tree(&staging), before);
+        assert_eq!(fs::read(staging.join(RECORD_NAME)).unwrap(), record_before);
+        assert_eq!(
+            fs::read(staging.join(ASSETS_DIR)).unwrap(),
+            b"not-a-directory\n"
+        );
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    fn write_completed_draft_record(path: &Path, tag: &str) {
+        let draft = format!(
+            "{RECORD_HEADER}\nschema=1\nexpected_tag={tag}\ndownload_complete=true\npublisher_authenticated=true\npublication_claims_validated=true\nscriptlet_verified=true\nstaging_complete=true\npublisher_authentication=verified-under-test-only-fixture-key\ninstallation_binding=unverified\nexecution_binding=unverified\nfirst_launch_admission=unavailable\ndata_compatibility=unknown\npromotion_authorized=false\nauthorization=none\n"
+        );
+        fs::write(path, draft.as_bytes()).unwrap();
+    }
+
+    fn copy_signed_assets(src: &Path, dest_assets: &Path, version: &str) {
+        fs::create_dir_all(dest_assets).unwrap();
+        for name in [
+            format!("Install Ignite v{version}.sh"),
+            format!("ignite-kindle-v{version}.manifest"),
+            format!("ignite-kindle-v{version}.manifest.sig"),
+            format!("ignite-kindle-v{version}.publication-evidence"),
+            format!("ignite-kindle-v{version}.publication-binding"),
+            format!("ignite-kindle-v{version}.publication-binding.sig"),
+        ] {
+            fs::copy(src.join(&name), dest_assets.join(&name)).unwrap();
+        }
+    }
+
+    fn seed_work_candidate_b(staging: &Path, src_b: &Path) {
+        let work = staging.join("work");
+        let _ = fs::remove_dir_all(&work);
+        copy_signed_assets(src_b, &work.join(ASSETS_DIR), "3.3.2");
+        write_completed_draft_record(&work.join(RECORD_NAME), "v3.3.2");
+    }
+
+    #[derive(Clone, Copy)]
+    enum CrashBoundary {
+        BeforePublish,
+        AfterAssetsNext,
+        AfterRecordNext,
+        AfterAssetsPrev,
+        AfterAssetsLive,
+        AfterRecordPrev,
+        AfterRecordLive,
+        AfterPrevRetired,
+    }
+
+    fn apply_publish_crash(staging: &Path, boundary: CrashBoundary) {
+        let work = staging.join("work");
+        match boundary {
+            CrashBoundary::BeforePublish => {}
+            CrashBoundary::AfterAssetsNext => {
+                fs::rename(work.join(ASSETS_DIR), staging.join(ASSETS_NEXT)).unwrap();
+            }
+            CrashBoundary::AfterRecordNext => {
+                fs::rename(work.join(ASSETS_DIR), staging.join(ASSETS_NEXT)).unwrap();
+                fs::rename(work.join(RECORD_NAME), staging.join(RECORD_NEXT)).unwrap();
+            }
+            CrashBoundary::AfterAssetsPrev => {
+                fs::rename(work.join(ASSETS_DIR), staging.join(ASSETS_NEXT)).unwrap();
+                fs::rename(work.join(RECORD_NAME), staging.join(RECORD_NEXT)).unwrap();
+                fs::rename(staging.join(ASSETS_DIR), staging.join(ASSETS_PREV)).unwrap();
+            }
+            CrashBoundary::AfterAssetsLive => {
+                fs::rename(work.join(ASSETS_DIR), staging.join(ASSETS_NEXT)).unwrap();
+                fs::rename(work.join(RECORD_NAME), staging.join(RECORD_NEXT)).unwrap();
+                fs::rename(staging.join(ASSETS_DIR), staging.join(ASSETS_PREV)).unwrap();
+                fs::rename(staging.join(ASSETS_NEXT), staging.join(ASSETS_DIR)).unwrap();
+            }
+            CrashBoundary::AfterRecordPrev => {
+                fs::rename(work.join(ASSETS_DIR), staging.join(ASSETS_NEXT)).unwrap();
+                fs::rename(work.join(RECORD_NAME), staging.join(RECORD_NEXT)).unwrap();
+                fs::rename(staging.join(ASSETS_DIR), staging.join(ASSETS_PREV)).unwrap();
+                fs::rename(staging.join(ASSETS_NEXT), staging.join(ASSETS_DIR)).unwrap();
+                fs::rename(staging.join(RECORD_NAME), staging.join(RECORD_PREV)).unwrap();
+            }
+            CrashBoundary::AfterRecordLive => {
+                fs::rename(work.join(ASSETS_DIR), staging.join(ASSETS_NEXT)).unwrap();
+                fs::rename(work.join(RECORD_NAME), staging.join(RECORD_NEXT)).unwrap();
+                fs::rename(staging.join(ASSETS_DIR), staging.join(ASSETS_PREV)).unwrap();
+                fs::rename(staging.join(ASSETS_NEXT), staging.join(ASSETS_DIR)).unwrap();
+                fs::rename(staging.join(RECORD_NAME), staging.join(RECORD_PREV)).unwrap();
+                fs::rename(staging.join(RECORD_NEXT), staging.join(RECORD_NAME)).unwrap();
+            }
+            CrashBoundary::AfterPrevRetired => {
+                fs::rename(work.join(ASSETS_DIR), staging.join(ASSETS_NEXT)).unwrap();
+                fs::rename(work.join(RECORD_NAME), staging.join(RECORD_NEXT)).unwrap();
+                fs::rename(staging.join(ASSETS_DIR), staging.join(ASSETS_PREV)).unwrap();
+                fs::rename(staging.join(ASSETS_NEXT), staging.join(ASSETS_DIR)).unwrap();
+                fs::rename(staging.join(RECORD_NAME), staging.join(RECORD_PREV)).unwrap();
+                fs::rename(staging.join(RECORD_NEXT), staging.join(RECORD_NAME)).unwrap();
+                let _ = fs::remove_dir_all(staging.join(ASSETS_PREV));
+                let _ = fs::remove_file(staging.join(RECORD_PREV));
+                let _ = fs::remove_dir_all(&work);
+            }
+        }
+    }
+
+    fn authorize_tag_against_staging(
+        staging: &Path,
+        key: &SigningKey,
+        tag: &str,
+        version: &str,
+    ) -> crate::installation_authorization::AuthorizationDecision {
+        let app_root = staging.parent().unwrap().parent().unwrap().to_path_buf();
+        let tree = app_root.parent().unwrap().to_path_buf();
+        let device = crate::installation_authorization::DeviceFacts {
+            architecture: crate::installation_authorization::SUPPORTED_ARCHITECTURE.into(),
+            firmware: Some(crate::installation_authorization::SUPPORTED_FIRMWARE.into()),
+            app_root: app_root.clone(),
+            data_root: tree.join("data"),
+            recovery_root: tree.join("recovery"),
+            documents_root: tree.join("documents"),
+        };
+        for dir in [
+            &device.data_root,
+            &device.recovery_root,
+            &device.documents_root,
+        ] {
+            let _ = fs::create_dir_all(dir);
+        }
+        let auth = crate::installation_authorization::AuthorizeRequest {
+            expected_tag: tag.into(),
+            version: version.into(),
+            staging_root: staging.to_path_buf(),
+            root_kind: StagingRootKind::HostTest,
+            device,
+            installed_version: "3.3.0".into(),
+            user_approved: true,
+        };
+        crate::installation_authorization::evaluate_installation_authorization_harness(
+            &auth,
+            &key.verifying_key().to_bytes(),
+        )
+        .expect("evaluate")
+    }
+
+    #[test]
+    fn cross_version_publish_crash_boundaries_are_fail_closed() {
+        let key = signing_key();
+        let boundaries = [
+            CrashBoundary::BeforePublish,
+            CrashBoundary::AfterAssetsNext,
+            CrashBoundary::AfterRecordNext,
+            CrashBoundary::AfterAssetsPrev,
+            CrashBoundary::AfterAssetsLive,
+            CrashBoundary::AfterRecordPrev,
+            CrashBoundary::AfterRecordLive,
+            CrashBoundary::AfterPrevRetired,
+        ];
+        for (idx, boundary) in boundaries.into_iter().enumerate() {
+            let (src_a, staging) = temp_pair(&format!("crash-b{idx}"));
+            write_fixture_dir_version(&src_a, &key, "3.3.1");
+            stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1"))
+                .unwrap();
+            let src_b = src_a.parent().unwrap().join("src-b");
+            write_fixture_dir_version(&src_b, &key, "3.3.2");
+            seed_work_candidate_b(&staging, &src_b);
+            apply_publish_crash(&staging, boundary);
+
+            // First reconcile/stage observation and a second pass must agree.
+            let first =
+                stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"));
+            let second =
+                stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2"));
+
+            match boundary {
+                CrashBoundary::BeforePublish
+                | CrashBoundary::AfterAssetsNext
+                | CrashBoundary::AfterRecordNext => {
+                    // Live A intact; abandoned .next dropped; B can supersede cleanly.
+                    let result = first.expect("recoverable A then supersede");
+                    assert!(result.observations.all_complete());
+                    assert_eq!(result.release_tag.as_deref(), Some("v3.3.2"));
+                    assert!(second.expect("idempotent").observations.all_complete());
+                    let auth_b = authorize_tag_against_staging(&staging, &key, "v3.3.2", "3.3.2");
+                    assert!(auth_b.installation_authorized);
+                    let auth_a = authorize_tag_against_staging(&staging, &key, "v3.3.1", "3.3.1");
+                    assert!(!auth_a.candidate_authenticated.is_satisfied());
+                }
+                CrashBoundary::AfterAssetsPrev | CrashBoundary::AfterRecordPrev => {
+                    // Ambiguous mid-swap: refuse, preserve leftovers, no mixed auth grant.
+                    let err = first.expect_err("ambiguous must refuse");
+                    assert!(
+                        matches!(err, StagingError::InterruptedPublication(_)),
+                        "boundary {idx:?}: {err}"
+                    );
+                    let err2 = second.expect_err("idempotent refuse");
+                    assert!(matches!(err2, StagingError::InterruptedPublication(_)));
+                    assert!(
+                        has_publish_leftovers(&staging)
+                            || staging.join(ASSETS_PREV).exists()
+                            || staging.join(RECORD_PREV).exists()
+                            || staging.join(ASSETS_NEXT).exists()
+                            || staging.join(RECORD_NEXT).exists()
+                            || !staging.join(ASSETS_DIR).exists()
+                            || !staging.join(RECORD_NAME).exists()
+                    );
+                    let auth_a = authorize_tag_against_staging(&staging, &key, "v3.3.1", "3.3.1");
+                    let auth_b = authorize_tag_against_staging(&staging, &key, "v3.3.2", "3.3.2");
+                    assert!(!auth_a.installation_authorized);
+                    assert!(!auth_b.installation_authorized);
+                    assert!(
+                        !auth_a.candidate_authenticated.is_satisfied()
+                            || !auth_b.candidate_authenticated.is_satisfied()
+                            || matches!(
+                                load_staging_record(&staging, StagingRootKind::HostTest),
+                                Err(_)
+                            )
+                    );
+                }
+                CrashBoundary::AfterAssetsLive => {
+                    // W4: assets=B, RECORD=A, leftovers prove mid-swap → refuse, keep evidence.
+                    let err = first.expect_err("W4 refuse");
+                    assert!(
+                        matches!(err, StagingError::InterruptedPublication(_)),
+                        "W4: {err}"
+                    );
+                    assert!(second
+                        .expect_err("idempotent W4")
+                        .to_string()
+                        .contains("interrupted publication"));
+                    assert!(staging.join(ASSETS_PREV).exists());
+                    assert!(staging.join(RECORD_NEXT).exists());
+                    assert!(fs::read_to_string(staging.join(RECORD_NAME))
+                        .unwrap()
+                        .contains("expected_tag=v3.3.1"));
+                    assert!(staging
+                        .join(ASSETS_DIR)
+                        .join("ignite-kindle-v3.3.2.manifest")
+                        .is_file());
+                    let auth_a = authorize_tag_against_staging(&staging, &key, "v3.3.1", "3.3.1");
+                    let auth_b = authorize_tag_against_staging(&staging, &key, "v3.3.2", "3.3.2");
+                    assert!(!auth_a.installation_authorized);
+                    assert!(!auth_b.installation_authorized);
+                    assert!(!auth_a.candidate_authenticated.is_satisfied());
+                }
+                CrashBoundary::AfterRecordLive | CrashBoundary::AfterPrevRetired => {
+                    // B published (prev may still need sweep). Should complete as B.
+                    let result = first.expect("B published");
+                    assert_eq!(result.release_tag.as_deref(), Some("v3.3.2"));
+                    assert!(second.expect("idempotent B").observations.all_complete());
+                    assert!(!has_publish_leftovers(&staging));
+                    let auth_b = authorize_tag_against_staging(&staging, &key, "v3.3.2", "3.3.2");
+                    assert!(auth_b.installation_authorized);
+                    let auth_a = authorize_tag_against_staging(&staging, &key, "v3.3.1", "3.3.1");
+                    assert!(!auth_a.candidate_authenticated.is_satisfied());
+                }
+            }
+            let _ = fs::remove_dir_all(src_a.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn intent_injected_after_admit_before_publish_refuses_and_keeps_old() {
+        use std::sync::Mutex;
+        static HOOK_UPDATE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+        fn inject_intent() {
+            let update = HOOK_UPDATE.lock().unwrap().clone().unwrap();
+            crate::install_intent::write_intent_atomic(
+                &update,
+                &crate::install_intent::InstallIntent {
+                    expected_tag: "v3.3.1".into(),
+                    version: "3.3.1".into(),
+                    staging_root: PathBuf::from("/mnt/us/scribe-app/state/verified-update"),
+                    storage_contract: "ignite-storage-v1".into(),
+                    intent_txn: "txn-race".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-race-intent");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let old_record = fs::read(staging.join(RECORD_NAME)).unwrap();
+        let update = staging.parent().unwrap().join("update");
+        *HOOK_UPDATE.lock().unwrap() = Some(update.clone());
+
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        let mut req_b = fixture_request_version(&src_b, &staging, &key, "3.3.2");
+        req_b.before_publish_hook = Some(inject_intent);
+        let err = stage_verified_update(&req_b).expect_err("intent race");
+        assert!(
+            matches!(err, StagingError::SupersessionRefused(_)),
+            "unexpected {err}"
+        );
+        assert_eq!(fs::read(staging.join(RECORD_NAME)).unwrap(), old_record);
+        assert!(crate::install_intent::intent_path(&update).is_file());
+        *HOOK_UPDATE.lock().unwrap() = None;
+        let _ = fs::remove_dir_all(src_a.parent().unwrap());
+    }
+
+    #[test]
+    fn supersession_then_authorization_binds_only_new_candidate() {
+        let key = signing_key();
+        let (src_a, staging) = temp_pair("supersede-auth");
+        write_fixture_dir_version(&src_a, &key, "3.3.1");
+        stage_verified_update(&fixture_request_version(&src_a, &staging, &key, "3.3.1")).unwrap();
+        let src_b = src_a.parent().unwrap().join("src-b");
+        write_fixture_dir_version(&src_b, &key, "3.3.2");
+        stage_verified_update(&fixture_request_version(&src_b, &staging, &key, "3.3.2")).unwrap();
+        crate::storage_contract::write_contract_file_atomic(
+            &staging.join(ASSETS_DIR),
+            &crate::storage_contract::StorageContract::current(),
+        )
+        .unwrap();
+
+        // Layout must agree with production: app_root owns state/verified-update;
+        // data/recovery/documents are siblings of app_root (not nested under it).
+        let app_root = staging.parent().unwrap().parent().unwrap().to_path_buf();
+        let tree = app_root.parent().unwrap().to_path_buf();
+        let device = crate::installation_authorization::DeviceFacts {
+            architecture: crate::installation_authorization::SUPPORTED_ARCHITECTURE.into(),
+            firmware: Some(crate::installation_authorization::SUPPORTED_FIRMWARE.into()),
+            app_root: app_root.clone(),
+            data_root: tree.join("data"),
+            recovery_root: tree.join("recovery"),
+            documents_root: tree.join("documents"),
+        };
+        for dir in [
+            &device.data_root,
+            &device.recovery_root,
+            &device.documents_root,
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let auth = crate::installation_authorization::AuthorizeRequest {
+            expected_tag: "v3.3.2".into(),
+            version: "3.3.2".into(),
+            staging_root: staging.clone(),
+            root_kind: StagingRootKind::HostTest,
+            device: device.clone(),
+            installed_version: "3.3.0".into(),
+            user_approved: true,
+        };
+        // cfg(test) harness only: disposable fixture key treated as official pin so
+        // installation_authorized can be meaningfully asserted without shipping keys.
+        let decision =
+            crate::installation_authorization::evaluate_installation_authorization_harness(
+                &auth,
+                &key.verifying_key().to_bytes(),
+            )
+            .expect("authorize new");
+        assert!(
+            decision.installation_authorized,
+            "new candidate must authorize; refusals={:?}",
+            decision.refusal_reasons
+        );
+        assert!(decision.candidate_authenticated.is_satisfied());
+        assert!(decision.bound_scriptlet_path.is_some());
+        assert_eq!(
+            require_completed_staging_observation(&staging, StagingRootKind::HostTest)
+                .unwrap()
+                .expected_tag,
+            "v3.3.2"
+        );
+
+        let stale = crate::installation_authorization::AuthorizeRequest {
+            expected_tag: "v3.3.1".into(),
+            version: "3.3.1".into(),
+            staging_root: staging.clone(),
+            root_kind: StagingRootKind::HostTest,
+            device,
+            installed_version: "3.3.0".into(),
+            user_approved: true,
+        };
+        let stale_decision =
+            crate::installation_authorization::evaluate_installation_authorization_harness(
+                &stale,
+                &key.verifying_key().to_bytes(),
+            )
+            .expect("evaluate stale tag");
+        assert!(
+            !stale_decision.installation_authorized,
+            "old tag must not install against new assets"
+        );
+        assert!(
+            !stale_decision.candidate_authenticated.is_satisfied(),
+            "old tag must fail candidate authentication/identity, got {:?}",
+            stale_decision.candidate_authenticated
+        );
+        let reasons = stale_decision.refusal_reasons.join("\n");
+        assert!(
+            reasons.contains("staging_tag_mismatch")
+                || reasons.contains("expected_tag")
+                || reasons.contains("does not match authorization request"),
+            "expected staging tag / identity refusal, got {reasons}"
+        );
+        let _ = fs::remove_dir_all(tree);
     }
 
     #[test]

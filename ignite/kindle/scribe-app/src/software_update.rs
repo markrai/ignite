@@ -668,6 +668,11 @@ pub fn download_and_stage_official_with_progress(
         source,
         trust,
         root_kind,
+        installed_version: installed.to_string(),
+        updater_state_dir: None,
+        updater_lock_path: None,
+        before_publish_hook: None,
+        after_publish_hook: None,
     };
     let result = stage_verified_update(&req)
         .map_err(|e| UpdateInstallError::StagingFailed(e.to_string()))?;
@@ -797,6 +802,21 @@ pub fn stage_and_prepare_ready_for_tests(
             public_key: key.verifying_key().to_bytes(),
         },
         root_kind: StagingRootKind::HostTest,
+        installed_version: handoff.installed_version.clone(),
+        updater_state_dir: staging_root.parent().map(Path::to_path_buf),
+        updater_lock_path: staging_root
+            .parent()
+            .and_then(|state| state.parent())
+            .and_then(|app| app.parent())
+            .map(|tree| tree.join("updater-transaction.lock"))
+            .or_else(|| {
+                staging_root
+                    .parent()
+                    .and_then(|state| state.parent())
+                    .map(|app| app.join("updater-transaction.lock"))
+            }),
+        before_publish_hook: None,
+        after_publish_hook: None,
     };
     let _result = stage_verified_update(&req)
         .map_err(|e| UpdateInstallError::StagingFailed(e.to_string()))?;
@@ -1312,8 +1332,9 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ignite-1b-{label}-{stamp}"));
         std::fs::remove_dir_all(&base).ok();
         let src = base.join("src");
-        let staging = base.join("staging");
+        let staging = base.join("app").join("state").join("verified-update");
         std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(base.join("app").join("state")).unwrap();
         (src, staging)
     }
 

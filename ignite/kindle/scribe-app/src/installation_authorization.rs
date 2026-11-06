@@ -265,6 +265,22 @@ pub(crate) fn evaluate_installation_authorization_fixture(
     )
 }
 
+/// cfg(test) harness only: disposable key treated as official pin for all-gates proofs.
+/// Never wired to CLI. Compiled only for tests.
+#[cfg(test)]
+pub(crate) fn evaluate_installation_authorization_harness(
+    request: &AuthorizeRequest,
+    public_key: &[u8; 32],
+) -> Result<AuthorizationDecision, AuthorizeError> {
+    validate_staging_root(&request.staging_root, request.root_kind)?;
+    evaluate_with_authenticator(
+        request,
+        Authenticator::TestHarnessProductionKey {
+            public_key: *public_key,
+        },
+    )
+}
+
 enum Authenticator {
     OfficialProductionPin,
     /// cfg(test) only — never linked into shipping builds.
@@ -1017,7 +1033,14 @@ fn refuse_unresolved_recovery_leftover(path: &Path, label: &str) -> Prerequisite
 }
 
 fn evaluate_recovery_readiness(device: &DeviceFacts) -> PrerequisiteStatus {
-    let app_root = &device.app_root;
+    evaluate_app_root_recovery_for_update(&device.app_root)
+}
+
+/// Installer / authorization recovery readiness for an application root.
+///
+/// Used by staging supersession preflight so policy stays aligned with
+/// [`evaluate_recovery_readiness`]. Never deletes evidence.
+pub(crate) fn evaluate_app_root_recovery_for_update(app_root: &Path) -> PrerequisiteStatus {
     match fs::symlink_metadata(app_root) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return PrerequisiteStatus::Refused(format!(
@@ -1528,9 +1551,10 @@ mod tests {
             .as_nanos();
         let base = std::env::temp_dir().join(format!("ignite-3j-{label}-{stamp}"));
         let src = base.join("src");
-        let staging = base.join("staging");
+        let staging = base.join("app").join("state").join("verified-update");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(base.join("app").join("state")).unwrap();
         (src, staging)
     }
 
@@ -1538,6 +1562,7 @@ mod tests {
         DeviceFacts {
             architecture: SUPPORTED_ARCHITECTURE.into(),
             firmware: Some(SUPPORTED_FIRMWARE.into()),
+            // Agree with staging under base/app/state/verified-update.
             app_root: base.join("app"),
             data_root: base.join("data"),
             recovery_root: base.join("recovery"),
@@ -1547,6 +1572,14 @@ mod tests {
 
     fn stage_fixture(src: &Path, staging: &Path, key: &SigningKey) {
         write_fixture_dir(src, key);
+        let state_dir = staging
+            .parent()
+            .expect("host staging under state/")
+            .to_path_buf();
+        let lock_path = state_dir
+            .parent()
+            .expect("state parent")
+            .join("updater-transaction.lock");
         stage_verified_update(&StageRequest {
             expected_tag: TAG.into(),
             version: VERSION.into(),
@@ -1558,6 +1591,11 @@ mod tests {
                 public_key: key.verifying_key().to_bytes(),
             },
             root_kind: StagingRootKind::HostTest,
+            installed_version: "0.9.14".into(),
+            updater_state_dir: Some(state_dir),
+            updater_lock_path: Some(lock_path),
+            before_publish_hook: None,
+            after_publish_hook: None,
         })
         .expect("fixture stage");
         crate::storage_contract::write_contract_file_atomic(

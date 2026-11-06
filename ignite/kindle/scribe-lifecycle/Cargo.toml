@@ -13,6 +13,7 @@ path = "src/main.rs"
 libloading = "0.8"
 sha2 = { version = "0.10", default-features = false }
 uuid = { version = "1", default-features = false, features = ["v4"] }
+updater-transaction-lock = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

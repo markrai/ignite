@@ -8,14 +8,16 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use updater_transaction_lock::{self, AcquireError};
+
 pub const RUN_ARGUMENT: &str = "--with-updater-transaction-lock";
 pub const VERIFY_ARGUMENT: &str = "--verify-updater-transaction-lock";
-pub const DEFAULT_LOCK_PATH: &str = "/tmp/ignite-updater-transaction.lock";
+pub const DEFAULT_LOCK_PATH: &str = updater_transaction_lock::DEFAULT_LOCK_PATH;
 pub const HELD_ENV: &str = "IGNITE_UPDATER_LOCK_HELD";
 pub const FD_ENV: &str = "IGNITE_UPDATER_LOCK_FD";
 #[cfg(debug_assertions)]
@@ -57,6 +59,14 @@ fn io_error(action: &'static str, source: io::Error) -> LockError {
     LockError::Io { action, source }
 }
 
+fn map_acquire_error(error: AcquireError) -> LockError {
+    match error {
+        AcquireError::Contended => LockError::Contended,
+        AcquireError::Unsafe(detail) => LockError::Unsafe(detail),
+        AcquireError::Io { action, source } => LockError::Io { action, source },
+    }
+}
+
 fn configured_lock_path() -> PathBuf {
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os(TEST_LOCK_PATH_ENV) {
@@ -81,45 +91,10 @@ fn try_lock_fd(fd: RawFd) -> Result<(), LockError> {
 }
 
 fn acquire_at(path: &Path) -> Result<File, LockError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| io_error("open", error))?;
-
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error("inspect", error))?;
-    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
-        return Err(LockError::Unsafe(
-            "lock path is not a singly linked regular file".to_owned(),
-        ));
-    }
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(LockError::Unsafe(
-            "lock file is not owned by the current effective user".to_owned(),
-        ));
-    }
-
-    let path_metadata =
-        std::fs::symlink_metadata(path).map_err(|error| io_error("reinspect", error))?;
-    if path_metadata.file_type().is_symlink()
-        || path_metadata.dev() != metadata.dev()
-        || path_metadata.ino() != metadata.ino()
-    {
-        return Err(LockError::Unsafe(
-            "lock path changed while it was being opened".to_owned(),
-        ));
-    }
-
-    try_lock_fd(file.as_raw_fd())?;
-
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| io_error("set permissions", error))?;
-    Ok(file)
+    // Shared helper owns O_NOFOLLOW / owner / nlink / flock semantics used by staging.
+    updater_transaction_lock::acquire_exclusive(path)
+        .map(updater_transaction_lock::UpdaterLockGuard::into_file)
+        .map_err(map_acquire_error)
 }
 
 /// Held by a future promotion decision after it has acquired the lifecycle launch gate.

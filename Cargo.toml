@@ -10,6 +10,7 @@ members = [
     "ignite/core/nbk-reader",
     "ignite/core/scribe-web-wasm",
     "ignite/kindle/scribe-lifecycle",
+    "ignite/kindle/updater-transaction-lock",
     "ignite/kindle/kindle-platform",
     "ignite/kindle/ink-probe",
     "ignite/kindle/scribe-app",
@@ -29,6 +30,7 @@ default-members = [
     "ignite/core/nbk-reader",
     "ignite/core/scribe-web-wasm",
     "ignite/kindle/scribe-lifecycle",
+    "ignite/kindle/updater-transaction-lock",
     "ignite/kindle/kindle-platform",
     "ignite/kindle/ink-probe",
     "ignite/kindle/scribe-app",
@@ -50,6 +52,7 @@ sync-engine = { path = "ignite/core/sync-engine" }
 control-protocol = { path = "ignite/core/control-protocol" }
 nbk-reader = { path = "ignite/core/nbk-reader" }
 kindle-platform = { path = "ignite/kindle/kindle-platform" }
+updater-transaction-lock = { path = "ignite/kindle/updater-transaction-lock" }
 scribe-app = { path = "ignite/kindle/scribe-app" }
 scribe-sync-server = { path = "ignite/server/scribe-sync-server" }
 scribe-server = { path = "ignite/server/scribe-server" }
