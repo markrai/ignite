@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.21] - 2026-11-06
+
+### Fixed
+
+- Kindle in-app OTA can supersede an obsolete completed `verified-update`
+  staging candidate with a newer official release. Staging and lifecycle share
+  one updater transaction lock; supersession stays fail-closed on install
+  intent, pending-health, unresolved activation evidence, interrupted
+  publication leftovers (including W4 cross-version mid-swap), and missing or
+  unsafe published assets. Same-tag revalidation and Scriptlet authentication
+  are unchanged.
+
 ## [0.9.19] - 2026-11-05
 
 ### Added
