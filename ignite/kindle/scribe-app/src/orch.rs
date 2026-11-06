@@ -13,6 +13,19 @@ use sync_protocol::{SyncPageLink, SyncText};
 /// After Pen Up, defer GC16 until idle this long with empty input intent (Gate F4.1).
 pub const CLEAN_REFRESH_IDLE_US: u64 = 150_000;
 
+/// Stylus mode stays armed this long after a Pen Up ("linger"), so a quick next stroke (the
+/// next letter) continues the wet path at once. Before linger, every Pen Up blocked the loop on
+/// the final DU's WAIT (~180 ms measured on a Scribe 1, FW 5.18.3) before disarming, and a pen
+/// Down inside that window started ~0.2 s late. Once input is quiet this long, [`settle`] runs
+/// WAIT → disarm → durable append; the DU finished long before, so that costs only the fsync.
+///
+/// [`settle`]: StrokeController::settle
+pub const LINGER_SETTLE_US: u64 = 350_000;
+
+/// Longest a finished stroke may stay unpersisted while strokes keep coming (bounds what a
+/// crash or power loss can lose). Reaching it settles inline at Pen Up (one WAIT).
+pub const MAX_UNPERSISTED_US: u64 = 5_000_000;
+
 /// Software phase timings for one Pen Up (not physical pen→panel latency).
 #[derive(Clone, Copy, Debug, Default)]
 #[allow(dead_code)] // gc16_* reserved when idle-clean path records send/wait separately
@@ -260,6 +273,13 @@ pub struct StrokeController<T: InkTransport, S: PageStore = MemoryPageStore> {
     pub last_up_kernel_us: Option<u64>,
     pub last_up_handler_return_us: Option<u64>,
     pub last_finished_stroke_id: Option<StrokeId>,
+    /// Strokes committed to the model at Pen Up whose durable append waits for [`Self::settle`]
+    /// (no FS I/O while armed).
+    pending_persist: Vec<Stroke>,
+    /// When the oldest entry of `pending_persist` was finished.
+    unpersisted_since_us: Option<u64>,
+    /// Userspace time of the last Pen Up (linger timer).
+    last_up_us: Option<u64>,
 }
 
 impl<T: InkTransport> StrokeController<T, MemoryPageStore> {
@@ -324,6 +344,9 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
             last_up_kernel_us: None,
             last_up_handler_return_us: None,
             last_finished_stroke_id: None,
+            pending_persist: Vec::new(),
+            unpersisted_since_us: None,
+            last_up_us: None,
         }
     }
 
@@ -357,6 +380,118 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
 
     pub fn is_armed(&self) -> bool {
         self.life.is_armed()
+    }
+
+    /// Between strokes with stylus mode still armed (see [`LINGER_SETTLE_US`]). Anything other
+    /// than the next pen stroke must [`Self::settle`] first.
+    pub fn is_lingering(&self) -> bool {
+        self.life.is_armed() && self.session.is_idle()
+    }
+
+    /// Finished strokes not yet durable (waiting for [`Self::settle`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn unpersisted_strokes(&self) -> usize {
+        self.pending_persist.len()
+    }
+
+    /// End a linger now: WAIT on the last wet DU, disarm, append the finished strokes durably.
+    /// `Ok(false)` when not lingering (nothing to do).
+    pub fn settle(&mut self) -> Result<bool, CtrlError> {
+        if !self.is_lingering() {
+            return Ok(false);
+        }
+        let mut timing = PenUpPhaseTiming::default();
+        let n = self.pending_persist.len();
+        self.settle_inner(&mut timing)?;
+        println!(
+            "pen_settle final_wait_us={} disarm_us={} strokes_persisted={n} persist_fsync_us={}",
+            timing.final_wait_us, timing.disarm_us, timing.persist_fsync_us
+        );
+        Ok(true)
+    }
+
+    /// Settle once input has been quiet for [`LINGER_SETTLE_US`] after the last Pen Up.
+    pub fn maybe_settle(&mut self, input_queue_empty: bool) -> Result<bool, CtrlError> {
+        if !self.is_lingering() || !input_queue_empty {
+            return Ok(false);
+        }
+        let now = self.transport.now_us();
+        if self
+            .last_up_us
+            .is_some_and(|up| now.saturating_sub(up) < LINGER_SETTLE_US)
+        {
+            return Ok(false);
+        }
+        self.settle()
+    }
+
+    fn settle_inner(&mut self, timing: &mut PenUpPhaseTiming) -> Result<(), CtrlError> {
+        let t_wait0 = self.transport.now_us();
+        if let Err(e) = self.wait_last_wet_timed(timing) {
+            // The strokes are already in the model; idle GC16 repaints from it.
+            eprintln!("warning: settle WAIT: {e}");
+        }
+        timing.final_wait_us = timing
+            .final_wait_us
+            .max(self.transport.now_us().saturating_sub(t_wait0));
+        let t_disarm0 = self.transport.now_us();
+        if let Err(e) = self.disarm_clean() {
+            return Err(CtrlError::Fatal(format!("SET_STYLUS_MODE(0) failed: {e}")));
+        }
+        timing.disarm_us = self.transport.now_us().saturating_sub(t_disarm0);
+        self.persist_pending(timing)?;
+        self.idle_since_us = Some(self.transport.now_us());
+        Ok(())
+    }
+
+    /// Durable append of every finished stroke, oldest first. Disarmed only.
+    fn persist_pending(&mut self, timing: &mut PenUpPhaseTiming) -> Result<(), CtrlError> {
+        if self.pending_persist.is_empty() {
+            return Ok(());
+        }
+        // Durable append only after proven disarm (no FS I/O while armed).
+        debug_assert!(!self.life.is_armed());
+        if self.life.is_armed() {
+            self.totals.persistence_errors += 1;
+            return Err(CtrlError::Fatal(
+                "refusing durable write while StylusModeArmed".into(),
+            ));
+        }
+        if !self.store.is_writable() {
+            self.totals.persistence_errors += 1;
+            return Err(CtrlError::Fatal(
+                "store not writable (truncated-tail recovery incomplete)".into(),
+            ));
+        }
+        for stroke in std::mem::take(&mut self.pending_persist) {
+            match self.store.append_committed_stroke(&stroke) {
+                Ok(pt) => {
+                    self.last_persist = Some(pt);
+                    self.totals.strokes_durable += 1;
+                    timing.persist_append_us += pt.append_us;
+                    timing.persist_fsync_us += pt.fsync_us;
+                    println!(
+                        "stroke_commit id={} model_committed=true durable=true persist_append_us={} persist_fsync_us={} persist_commit_us={}",
+                        stroke.id,
+                        pt.append_us,
+                        pt.fsync_us,
+                        pt.commit_us()
+                    );
+                }
+                Err(e) => {
+                    self.totals.persistence_errors += 1;
+                    eprintln!(
+                        "stroke_commit id={} model_committed=true durable=false fatal=true err={e}",
+                        stroke.id
+                    );
+                    return Err(CtrlError::Fatal(format!(
+                        "durable append/fsync failed: {e}"
+                    )));
+                }
+            }
+        }
+        self.unpersisted_since_us = None;
+        Ok(())
     }
 
     /// Retained durable texts for the bound page (source for `TextOverlay`, not the overlay).
@@ -421,6 +556,8 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
                 "bind_page refused: session not Idle".into(),
             ));
         }
+        // Finished strokes of the old page go to the old page's store before rebinding.
+        self.settle()?;
         if self.life.is_armed() {
             return Err(CtrlError::Fatal(
                 "bind_page refused: stylus mode still armed".into(),
@@ -454,6 +591,7 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
         &mut self,
         stroke_id: &StrokeId,
     ) -> Result<PersistTiming, CtrlError> {
+        self.settle()?;
         if !self.session.is_idle() {
             return Err(CtrlError::Recoverable(
                 "erase refused: session not Idle".into(),
@@ -499,6 +637,7 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
         &mut self,
         replacements: &[crate::store::PersistedReplacementV2],
     ) -> Result<PersistTiming, CtrlError> {
+        self.settle()?;
         if !self.session.is_idle() {
             return Err(CtrlError::Recoverable(
                 "replace refused: session not Idle".into(),
@@ -539,6 +678,7 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
     /// (or inherits prior delete path). If split into fragments, one replace clears all
     /// visible fragments sharing the same root.
     pub fn undo_last_visible_stroke(&mut self) -> Result<UndoResult, CtrlError> {
+        self.settle()?;
         if !self.session.is_idle() {
             return Err(CtrlError::Recoverable(
                 "undo refused: session not Idle".into(),
@@ -597,23 +737,30 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
         if !self.input_timing_compatible {
             self.stats.input_to_du_unavailable = true;
         }
+        // Lingering (still armed from the previous stroke): keep the wet path and its last DU
+        // marker; settle will WAIT on the newest one.
+        let lingering = self.life.is_armed();
         self.policy.clear();
         self.stroke_dirty = None;
-        self.last_wet_marker = None;
+        if !lingering {
+            self.last_wet_marker = None;
+        }
         self.last_submit_us = None;
         self.last_page = Some(page);
         self.last_pressure = pressure;
 
         let t0 = self.transport.now_us();
-        if let Err(e) = self.transport.arm() {
-            let _ = self.session.on_stream_gap();
-            return Err(CtrlError::Fatal(format!("arm: {e}")));
-        }
-        if let Err(e) = self.life.mark_armed() {
-            // Armed in hardware but lifecycle corrupt — attempt disarm then fatal.
-            let _ = self.transport.disarm();
-            let _ = self.session.on_stream_gap();
-            return Err(CtrlError::Fatal(format!("lifecycle arm: {e}")));
+        if !lingering {
+            if let Err(e) = self.transport.arm() {
+                let _ = self.session.on_stream_gap();
+                return Err(CtrlError::Fatal(format!("arm: {e}")));
+            }
+            if let Err(e) = self.life.mark_armed() {
+                // Armed in hardware but lifecycle corrupt — attempt disarm then fatal.
+                let _ = self.transport.disarm();
+                let _ = self.session.on_stream_gap();
+                return Err(CtrlError::Fatal(format!("lifecycle arm: {e}")));
+            }
         }
         self.stats.arm_us = self.transport.now_us().saturating_sub(t0);
         self.stats.stroke_start_us = Some(self.transport.now_us());
@@ -722,37 +869,8 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
         }
         timing.final_du_us = self.transport.now_us().saturating_sub(t_du0);
 
-        let t_wait0 = self.transport.now_us();
-        let wait_err = self.wait_last_wet_timed(&mut timing).err();
-        timing.final_wait_us = timing
-            .final_wait_us
-            .max(self.transport.now_us().saturating_sub(t_wait0));
-
-        let t_disarm0 = self.transport.now_us();
-        if let Err(e) = self.disarm_clean() {
-            let _ = self.session.on_stream_gap();
-            self.stroke_dirty = None;
-            self.last_page = None;
-            return Err(CtrlError::Fatal(format!("SET_STYLUS_MODE(0) failed: {e}")));
-        }
-        timing.disarm_us = self.transport.now_us().saturating_sub(t_disarm0);
-
-        if let Some(e) = wait_err {
-            let gap = self.session.on_stream_gap();
-            if let Some(c) = gap.cancelled.as_ref() {
-                eprintln!(
-                    "stroke_cancelled id={} points={} reason=WAIT_failed_after_disarm",
-                    c.id,
-                    c.points.len()
-                );
-            }
-            self.stroke_dirty = None;
-            self.last_page = None;
-            return Err(CtrlError::Recoverable(format!(
-                "WAIT failed after successful disarm: {e}"
-            )));
-        }
-
+        // Finish the stroke in the model now; WAIT, disarm and the durable append wait for
+        // `settle` (linger), so a quick next stroke is not blocked behind the final DU.
         let t_model0 = self.transport.now_us();
         let Some(mut up) = self.session.on_pen_up(page, pressure) else {
             return Err(CtrlError::Fatal(
@@ -769,44 +887,13 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
             .map_err(CtrlError::Fatal)?;
         self.session.register_committed_root(&up.stroke.id);
 
-        // Durable append only after proven disarm (no FS I/O while armed).
-        debug_assert!(!self.life.is_armed());
-        if self.life.is_armed() {
-            self.totals.persistence_errors += 1;
-            return Err(CtrlError::Fatal(
-                "refusing durable write while StylusModeArmed".into(),
-            ));
-        }
-        if !self.store.is_writable() {
-            self.totals.persistence_errors += 1;
-            return Err(CtrlError::Fatal(
-                "store not writable (truncated-tail recovery incomplete)".into(),
-            ));
-        }
-        match self.store.append_committed_stroke(&up.stroke) {
-            Ok(pt) => {
-                self.last_persist = Some(pt);
-                self.totals.strokes_durable += 1;
-                timing.persist_append_us = pt.append_us;
-                timing.persist_fsync_us = pt.fsync_us;
-                println!(
-                    "stroke_commit id={} model_committed=true durable=true persist_append_us={} persist_fsync_us={} persist_commit_us={}",
-                    up.stroke.id,
-                    pt.append_us,
-                    pt.fsync_us,
-                    pt.commit_us()
-                );
-            }
-            Err(e) => {
-                self.totals.persistence_errors += 1;
-                eprintln!(
-                    "stroke_commit id={} model_committed=true durable=false fatal=true err={e}",
-                    up.stroke.id
-                );
-                return Err(CtrlError::Fatal(format!(
-                    "durable append/fsync failed: {e}"
-                )));
-            }
+        let now = self.transport.now_us();
+        self.pending_persist.push(up.stroke.clone());
+        let since = *self.unpersisted_since_us.get_or_insert(now);
+        self.last_up_us = Some(now);
+        let settled_inline = now.saturating_sub(since) >= MAX_UNPERSISTED_US;
+        if settled_inline {
+            self.settle_inner(&mut timing)?;
         }
 
         // Defer GC16: accumulate dirty; return to input ASAP (F4.1).
@@ -822,11 +909,14 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
         self.last_pen_up_timing = Some(timing);
         self.last_finished_stroke_id = Some(up.stroke.id.clone());
         self.last_up_handler_return_us = Some(self.transport.now_us());
-        self.idle_since_us = Some(self.transport.now_us());
+        if settled_inline {
+            self.idle_since_us = Some(self.transport.now_us());
+        }
         self.log_stroke_committed(&up.stroke.id, up.stroke.points.len());
         println!(
             "pen_up_phases final_du_us={} final_wait_us={} disarm_us={} model_finish_us={} \
-             persist_append_us={} persist_fsync_us={} gc16_deferred={} pen_up_total_handler_us={}",
+             persist_append_us={} persist_fsync_us={} gc16_deferred={} pen_up_total_handler_us={} \
+             lingering={} unpersisted={}",
             timing.final_du_us,
             timing.final_wait_us,
             timing.disarm_us,
@@ -834,7 +924,9 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
             timing.persist_append_us,
             timing.persist_fsync_us,
             timing.gc16_deferred,
-            timing.pen_up_total_handler_us
+            timing.pen_up_total_handler_us,
+            self.is_lingering(),
+            self.pending_persist.len()
         );
         Ok(up.stroke.id)
     }
@@ -873,6 +965,7 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
 
     /// Flush pending clean now (shutdown / explicit). Idle+disarmed only.
     pub fn flush_pending_clean(&mut self) -> Result<bool, CtrlError> {
+        self.settle()?;
         let Some(dirty) = self.pending_clean.take() else {
             return Ok(false);
         };
@@ -914,6 +1007,10 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
 
     /// Stream gap handling. Idle gaps do not invent cancellation.
     pub fn on_stream_gap(&mut self, had_active_contact: bool) -> Result<(), CtrlError> {
+        if self.is_lingering() {
+            // Between strokes: finished strokes are kept, not cancelled.
+            self.settle()?;
+        }
         self.totals.input_stream_gaps += 1;
         let active = had_active_contact || self.session.is_wet_active() || self.life.is_armed();
         if active {
@@ -948,6 +1045,7 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
                     "StreamGap SET_STYLUS_MODE(0) failed: {e}"
                 )));
             }
+            self.persist_pending(&mut PenUpPhaseTiming::default())?;
         }
         let gap = self.session.on_stream_gap();
         if let Some(c) = gap.cancelled.as_ref() {
@@ -977,6 +1075,7 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
                         "shutdown SET_STYLUS_MODE(0) failed: {e}"
                     )));
                 }
+                self.persist_pending(&mut PenUpPhaseTiming::default())?;
             }
             let _ = self.session.on_stream_gap();
         }
@@ -1091,7 +1190,10 @@ impl<T: InkTransport, S: PageStore> StrokeController<T, S> {
 
     fn emergency_disarm(&mut self) -> Result<(), String> {
         let _ = self.wait_last_wet();
-        self.disarm_clean()
+        self.disarm_clean()?;
+        // Strokes finished before this failure are still good: make them durable.
+        self.persist_pending(&mut PenUpPhaseTiming::default())
+            .map_err(|e| format!("{e:?}"))
     }
 
     fn log_stroke_committed(&self, id: &StrokeId, points: usize) {
@@ -1317,6 +1419,117 @@ mod tests {
         PagePoint::new(x, y)
     }
 
+    fn count(c: &StrokeController<FakeTransport>, step: TransportStep) -> usize {
+        c.transport().steps.iter().filter(|s| **s == step).count()
+    }
+
+    #[test]
+    fn linger_quick_strokes_never_wait_or_rearm() {
+        let mut c = StrokeController::new("page-f0", FakeTransport::new(), 8_000);
+        for i in 0..4 {
+            let x = 100.0 * i as f32;
+            c.on_pen_down(pt(x, 0.0), None).unwrap();
+            c.transport_mut().now += 10_000;
+            c.on_pen_move(pt(x + 50.0, 50.0), None, None).unwrap();
+            c.on_pen_up(pt(x + 60.0, 60.0), None).unwrap();
+            c.transport_mut().now += 100_000; // next letter 0.1 s later
+        }
+        assert_eq!(c.session.committed_count(), 4);
+        assert_eq!(count(&c, TransportStep::Arm), 1, "armed once for the burst");
+        assert_eq!(count(&c, TransportStep::Wait), 0, "no WAIT on any Pen Up");
+        assert_eq!(count(&c, TransportStep::Disarm), 0);
+        assert_eq!(c.store().stroke_count(), 0);
+        assert_eq!(c.transport().du_while_disarmed_attempts, 0);
+        assert!(c.settle().unwrap());
+        assert_eq!(count(&c, TransportStep::Wait), 1);
+        assert_eq!(count(&c, TransportStep::Disarm), 1);
+        let ids: Vec<_> = c
+            .session
+            .committed_strokes()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        let stored: Vec<_> = c.store().strokes.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, stored, "persisted in authoring order");
+    }
+
+    #[test]
+    fn maybe_settle_waits_for_quiet_input() {
+        let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
+        c.on_pen_down(pt(0.0, 0.0), None).unwrap();
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        c.transport_mut().now += LINGER_SETTLE_US - 1_000;
+        assert!(!c.maybe_settle(true).unwrap(), "too soon");
+        c.transport_mut().now += 2_000;
+        assert!(!c.maybe_settle(false).unwrap(), "input still queued");
+        assert!(c.maybe_settle(true).unwrap());
+        assert!(!c.is_armed());
+        assert_eq!(c.store().stroke_count(), 1);
+        // Idle GC16 follows the settle, never while armed.
+        c.transport_mut().now += CLEAN_REFRESH_IDLE_US + 1;
+        assert!(c.maybe_idle_clean(true).unwrap());
+        assert_eq!(c.transport().gc16_while_armed_attempts, 0);
+    }
+
+    #[test]
+    fn continuous_writing_is_persisted_at_least_every_cap() {
+        let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
+        let mut t = 0u64;
+        while t <= MAX_UNPERSISTED_US + 200_000 {
+            c.on_pen_down(pt(0.0, 0.0), None).unwrap();
+            c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+            c.transport_mut().now += 150_000;
+            t += 150_000;
+        }
+        assert!(c.totals.strokes_durable > 0, "cap settled inline");
+        assert!(c.unpersisted_strokes() < 5);
+    }
+
+    #[test]
+    fn page_switch_undo_and_gaps_settle_first() {
+        let mut c = StrokeController::new("page-1", FakeTransport::new(), 25_000);
+        c.on_pen_down(pt(0.0, 0.0), None).unwrap();
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        // Undo right after writing works (settles, then undoes the durable stroke).
+        c.undo_last_visible_stroke().unwrap();
+        assert!(!c.is_armed());
+        assert_eq!(c.totals.strokes_durable, 1);
+
+        // A stream gap between strokes keeps the finished stroke.
+        c.on_pen_down(pt(0.0, 0.0), None).unwrap();
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        c.on_stream_gap(false).unwrap();
+        assert_eq!(c.session.strokes_cancelled(), 0);
+        assert_eq!(c.totals.strokes_durable, 2);
+        assert!(!c.is_armed());
+
+        // A gap mid-stroke cancels only the wet stroke; earlier strokes still become durable.
+        c.on_pen_down(pt(0.0, 0.0), None).unwrap();
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        c.on_pen_down(pt(20.0, 20.0), None).unwrap();
+        c.on_stream_gap(true).unwrap();
+        assert_eq!(c.session.strokes_cancelled(), 1);
+        assert_eq!(c.totals.strokes_durable, 3);
+        assert!(!c.is_armed());
+
+        // Switching pages persists to the OLD page's store before rebinding.
+        c.on_pen_down(pt(0.0, 0.0), None).unwrap();
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        let before = c.store().stroke_count();
+        c.bind_page("page-2", vec![], MemoryPageStore::new())
+            .unwrap();
+        assert_eq!(c.totals.strokes_durable, 4);
+        assert_eq!(c.store().stroke_count(), 0, "new page's store untouched");
+        assert!(before < 4);
+
+        // Shutdown while lingering persists too.
+        c.on_pen_down(pt(0.0, 0.0), None).unwrap();
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        c.shutdown().unwrap();
+        assert_eq!(c.store().stroke_count(), 1);
+        assert!(!c.is_armed());
+    }
+
     #[test]
     fn successful_stroke_sequence() {
         let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
@@ -1329,7 +1542,13 @@ mod tests {
         assert_eq!(c.session.committed_count(), 1);
         assert_eq!(c.session.committed_strokes()[0].id, id);
         assert!(c.is_idle());
+        // Linger: still armed, not yet durable.
+        assert!(c.is_lingering());
+        assert_eq!(c.unpersisted_strokes(), 1);
+        assert!(c.settle().unwrap());
         assert!(!c.life().is_armed());
+        assert_eq!(c.totals.strokes_durable, 1);
+        assert!(!c.settle().unwrap(), "nothing left to settle");
     }
 
     #[test]
@@ -1340,6 +1559,7 @@ mod tests {
         c.transport_mut().now += 30_000;
         c.on_pen_move(pt(50.0, 50.0), None, None).unwrap();
         c.on_pen_up(pt(60.0, 60.0), None).unwrap();
+        c.settle().unwrap();
         assert!(c.life().can_send(UpdateClass::Ordinary));
         assert_eq!(c.transport().gc16_while_armed_attempts, 0);
         assert_eq!(c.transport().du_while_disarmed_attempts, 0);
@@ -1397,24 +1617,26 @@ mod tests {
     }
 
     #[test]
-    fn pen_up_failed_disarm_no_commit_fatal() {
+    fn settle_failed_disarm_is_fatal_and_nothing_persisted() {
         let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
         c.on_pen_down(pt(0.0, 0.0), None).unwrap();
         c.transport_mut().fail_disarm = true;
-        let err = c.on_pen_up(pt(10.0, 10.0), None).unwrap_err();
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        let err = c.settle().unwrap_err();
         assert!(err.is_fatal());
-        assert_eq!(c.session.committed_count(), 0);
+        assert_eq!(c.totals.strokes_durable, 0);
+        assert_eq!(c.store().stroke_count(), 0);
     }
 
     #[test]
-    fn pen_up_wait_fail_after_disarm_cancels_recoverable() {
+    fn settle_wait_failure_still_disarms_and_persists() {
         let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
         c.on_pen_down(pt(0.0, 0.0), None).unwrap();
         c.transport_mut().fail_wait = true;
-        let err = c.on_pen_up(pt(10.0, 10.0), None).unwrap_err();
-        assert!(!err.is_fatal());
-        assert_eq!(c.session.committed_count(), 0);
-        assert!(c.is_idle());
+        c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        assert!(c.settle().unwrap());
+        assert_eq!(c.session.committed_count(), 1);
+        assert_eq!(c.store().stroke_count(), 1);
         assert!(!c.life().is_armed());
     }
 
@@ -1452,6 +1674,7 @@ mod tests {
         let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
         c.on_pen_down(pt(0.0, 0.0), None).unwrap();
         c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        c.settle().unwrap();
         // F4.1: GC16 deferred until idle clean.
         assert_eq!(c.stats.gc16_commits, 0);
         c.transport_mut().now += CLEAN_REFRESH_IDLE_US + 1;
@@ -1517,6 +1740,9 @@ mod tests {
         let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
         c.on_pen_down(pt(0.0, 0.0), None).unwrap();
         c.on_pen_up(pt(10.0, 10.0), None).unwrap();
+        assert_eq!(c.totals.strokes_durable, 0, "durable only after settle");
+        c.transport_mut().now += LINGER_SETTLE_US;
+        assert!(c.maybe_settle(true).unwrap());
         assert_eq!(c.totals.strokes_durable, 1);
         assert_eq!(c.store().stroke_count(), 1);
         // Deferred: no GC16 yet on pen-up path.
@@ -1551,6 +1777,7 @@ mod tests {
         c.on_pen_move(pt(240.0, 200.0), None, None).unwrap();
         c.on_pen_up(pt(300.0, 180.0), None).unwrap();
         assert_eq!(c.session.committed_count(), 2);
+        c.settle().unwrap();
         assert_eq!(c.store().stroke_count(), 2);
         let a = &c.session.committed_strokes()[0];
         let b = &c.session.committed_strokes()[1];
@@ -1570,6 +1797,7 @@ mod tests {
         c.on_pen_down(pt(20.0, 100.0), None).unwrap();
         c.on_pen_up(pt(80.0, 100.0), None).unwrap();
         assert_eq!(c.session.committed_count(), 2);
+        c.settle().unwrap();
         assert_eq!(c.store().stroke_count(), 2);
     }
 
@@ -1585,7 +1813,8 @@ mod tests {
             store,
         );
         c.on_pen_down(pt(0.0, 0.0), None).unwrap();
-        let err = c.on_pen_up(pt(5.0, 5.0), None).unwrap_err();
+        c.on_pen_up(pt(5.0, 5.0), None).unwrap();
+        let err = c.settle().unwrap_err();
         assert!(err.is_fatal());
         assert_eq!(c.totals.strokes_durable, 0);
         assert_eq!(c.totals.persistence_errors, 1);
@@ -1596,12 +1825,15 @@ mod tests {
 
     #[test]
     fn no_persist_while_armed_sequencing() {
-        // Append only invoked from on_pen_up after disarm_clean.
+        // Append only invoked after disarm_clean (settle), never while armed.
         let mut c = StrokeController::new("page-f0", FakeTransport::new(), 25_000);
         c.on_pen_down(pt(0.0, 0.0), None).unwrap();
         assert!(c.life().is_armed());
         assert_eq!(c.store().stroke_count(), 0);
         c.on_pen_up(pt(1.0, 1.0), None).unwrap();
+        assert!(c.life().is_armed());
+        assert_eq!(c.store().stroke_count(), 0);
+        c.settle().unwrap();
         assert!(!c.life().is_armed());
         assert_eq!(c.store().stroke_count(), 1);
     }

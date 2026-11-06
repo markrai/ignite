@@ -1276,6 +1276,8 @@ fn navigate(
     current_bg: &mut Vec<u8>,
     action: NavDownAction,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         // Mid-stroke: ignore navigation.
         return Ok(false);
@@ -1468,6 +1470,8 @@ fn delete_current_page(
     notebook_profile: &RenderProfile,
     current_bg: &mut Vec<u8>,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_delete_ignored reason=not_idle");
         return Ok(false);
@@ -1568,6 +1572,8 @@ fn move_current_page(
     current_bg: &[u8],
     direction: MovePageDirection,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_move_ignored reason=not_idle");
         return Ok(false);
@@ -1635,6 +1641,8 @@ fn insert_page_after_current(
     notebook_profile: &RenderProfile,
     current_bg: &mut Vec<u8>,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_insert_ignored reason=not_idle");
         return Ok(false);
@@ -1991,6 +1999,8 @@ fn handle_lasso_action(
     cached_move_ids: &mut Option<HashSet<String>>,
     frame_diag: Option<TouchFrameDiag>,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     match action {
         FingerAction::Tap(_) | FingerAction::NextPage | FingerAction::PreviousPage => {
             return Ok(false)
@@ -5361,6 +5371,15 @@ pub fn run_page_session(
                 }
             };
             if consumed {
+                if ev.kind == StylusEventKind::Down && ctrl.is_lingering() {
+                    if let Err(e) = ctrl.settle() {
+                        eprintln!("error: settle before ui tap: {e}");
+                        let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                        shutdown_safe = safe;
+                        stylus_mode_disarm_failed = disarm_fail;
+                        break 1;
+                    }
+                }
                 continue;
             }
         }
@@ -5370,6 +5389,13 @@ pub fn run_page_session(
                 StylusEventKind::Down if ev.tool == StylusTool::Eraser => {
                     if nav.is_active() || eraser.is_active() {
                         continue;
+                    }
+                    if let Err(e) = ctrl.settle() {
+                        eprintln!("error: settle before erase: {e}");
+                        let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                        shutdown_safe = safe;
+                        stylus_mode_disarm_failed = disarm_fail;
+                        break 1;
                     }
                     if !ctrl.is_idle() || ctrl.is_armed() {
                         // Never interrupt an active pen stroke / armed wet path.
@@ -5463,6 +5489,14 @@ pub fn run_page_session(
                                     }
                                     NavDownAction::UndoLastStroke => {
                                         ctrl.totals.undo_gestures += 1;
+                                        if let Err(e) = ctrl.settle() {
+                                            eprintln!("error: settle before undo: {e}");
+                                            let (_c, safe, disarm_fail) =
+                                                finish_shutdown(&mut ctrl, false);
+                                            shutdown_safe = safe;
+                                            stylus_mode_disarm_failed = disarm_fail;
+                                            break 1;
+                                        }
                                         if !ctrl.is_idle() || ctrl.is_armed() {
                                             // Never interrupt wet stroke / armed stylus mode.
                                             continue;
@@ -5769,6 +5803,14 @@ pub fn run_page_session(
             Ok(SourcePoll::WouldBlock) => {
                 ctrl.totals.max_input_backlog =
                     ctrl.totals.max_input_backlog.max(src.backlog() as u64);
+                // End a linger once input is quiet (WAIT → disarm → durable append).
+                if let Err(e) = ctrl.maybe_settle(src.backlog() == 0) {
+                    eprintln!("error: settle: {e}");
+                    let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                    shutdown_safe = safe;
+                    stylus_mode_disarm_failed = disarm_fail;
+                    break 1;
+                }
                 // No partial refresh may land on a panel the screensaver owns.
                 let idle_clean = if router.display_valid() {
                     ctrl.maybe_idle_clean(src.backlog() == 0)
