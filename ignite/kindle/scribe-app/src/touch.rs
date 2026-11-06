@@ -25,13 +25,16 @@ pub const TAP_MAX_TRAVEL_PX: u32 = 50;
 pub const LASSO_LONG_PRESS_MS: u64 = 450;
 /// Recorded taps lasted 12–140 ms.
 pub const TAP_MAX_MS: u64 = 700;
-/// Recorded deliberate swipes covered 520–900 px horizontally.
-pub const SWIPE_MIN_DX_PX: u32 = 350;
+/// Recorded deliberate swipes covered 520–900 px horizontally. Lowered from 350 px after a
+/// session (2026-11-05) where only 1 of several swipes registered; a short flick is still
+/// several times the 50 px tap tolerance.
+pub const SWIPE_MIN_DX_PX: u32 = 250;
 /// Recorded slow swipe: ~960 ms.
 pub const SWIPE_MAX_MS: u64 = 1200;
 /// Horizontal edge zones reserved for Kindle: contacts starting here never page-swipe.
-/// 8% (149 px): recorded natural right-to-left swipes started at x = 1547–1688.
-pub const EDGE_FRACTION_PERCENT: u32 = 8;
+/// 3% (55 px). Was 8% (149 px), which also swallowed natural left-to-right ("back") swipes,
+/// which start close to the left edge. Rejected swipes are logged (`finger_swipe_rejected`).
+pub const EDGE_FRACTION_PERCENT: u32 = 3;
 /// Touch stays suppressed this long after the last stylus event. The stylus parser reports
 /// proximity while the pen is in range (Hover) but emits no event when it leaves, so recent
 /// stylus activity is the proximity signal.
@@ -686,6 +689,23 @@ fn classify(
         );
     }
     // Drag from UI beyond tap tolerance, edge-origin, vertical/diagonal/short: no action.
+    if origin != FingerOrigin::Ui {
+        let reason = if origin == FingerOrigin::Edge {
+            "edge_origin"
+        } else if dx.unsigned_abs() < u64::from(SWIPE_MIN_DX_PX) {
+            "too_short"
+        } else if dx.unsigned_abs() < 2 * dy.unsigned_abs() {
+            "not_horizontal"
+        } else if dur_ms > SWIPE_MAX_MS {
+            "too_slow"
+        } else {
+            "not_page_input"
+        };
+        println!(
+            "finger_swipe_rejected reason={reason} start_x={} dx={dx} dy={dy} dur_ms={dur_ms}",
+            start.x
+        );
+    }
     (None, diag)
 }
 
