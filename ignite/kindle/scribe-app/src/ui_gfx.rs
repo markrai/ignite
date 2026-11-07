@@ -539,6 +539,7 @@ pub fn glyph_bits(ch: char) -> &'static [u8; 7] {
         '|' => &[
             0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
         ],
+        '·' => &[0, 0, 0b01100, 0b01100, 0, 0, 0],
         _ => &REPLACEMENT,
     }
 }
@@ -616,7 +617,7 @@ mod tests {
         for ch in ('a'..='z').chain('A'..='Z').chain('0'..='9') {
             assert!(has_glyph(ch), "{ch}");
         }
-        for ch in "-_.'&!?,():;/#+\" ".chars() {
+        for ch in "-_.'&!?,():;/#+\" ·".chars() {
             assert!(has_glyph(ch), "{ch:?}");
         }
         assert!(!has_glyph('é'));

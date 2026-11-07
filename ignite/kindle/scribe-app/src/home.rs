@@ -140,7 +140,8 @@ pub fn folder_match_count(folder: &FolderInfo, cards: &[HomeCard], query: &str) 
 
 /// Rows of the current view.
 ///
-/// - Main list + `query`: folder tiles for folders with ≥1 match, then matching root notebooks.
+/// - Main list + `query`: every matching notebook (library order), then folder tiles for
+///   folders with ≥1 match. Foldered notebooks appear as cards and again via their folder.
 /// - Open folder + `query`: matching notebooks in that folder only.
 /// - Main list, no query: folder rows first, then unfiled notebooks.
 /// - Open folder, no query: that folder's notebooks in library order.
@@ -167,22 +168,15 @@ pub fn home_rows(
             .filter(|(_, f)| folder_match_count(f, cards, q) > 0)
             .map(|(i, _)| i)
             .collect();
-        let foldered: std::collections::HashSet<&str> = folders
+        return cards
             .iter()
-            .flat_map(|f| f.notebook_ids.iter().map(String::as_str))
-            .collect();
-        return matching_folders
-            .chunks(FOLDERS_PER_ROW)
-            .map(|c| HomeRow::Folders(c.to_vec()))
+            .enumerate()
+            .filter(|(_, c)| notebook_title_matches(&c.title, q))
+            .map(|(i, _)| HomeRow::Notebook(i))
             .chain(
-                cards
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| {
-                        !foldered.contains(c.notebook_id.as_str())
-                            && notebook_title_matches(&c.title, q)
-                    })
-                    .map(|(i, _)| HomeRow::Notebook(i)),
+                matching_folders
+                    .chunks(FOLDERS_PER_ROW)
+                    .map(|c| HomeRow::Folders(c.to_vec())),
             )
             .collect();
     }
@@ -642,6 +636,22 @@ fn pages_label(count: Option<usize>) -> String {
     }
 }
 
+/// Notebook-card secondary line: page count, plus parent folder on the main list.
+pub fn notebook_meta_label(count: Option<usize>, folder_title: Option<&str>) -> String {
+    let pages = pages_label(count);
+    match folder_title {
+        Some(folder) if !folder.is_empty() => format!("{pages} · {folder}"),
+        _ => pages,
+    }
+}
+
+fn parent_folder_title<'a>(folders: &'a [FolderInfo], notebook_id: &str) -> Option<&'a str> {
+    folders
+        .iter()
+        .find(|f| f.notebook_ids.iter().any(|id| id == notebook_id))
+        .map(|f| f.title.as_str())
+}
+
 /// Doorway-exit pictogram inside one glyph cell (50x70 at scale 10): a door frame open on its
 /// right side with an arrow leaving through the gap, drawn in font units.
 fn draw_exit_icon(c: &mut Canvas<'_>, r: Rect) {
@@ -1091,13 +1101,17 @@ pub fn render_home_view_with(
         let title_y = card.y + card.h / 2 - 7 * TITLE_SCALE - 12;
         let title = fit_text(&entry.title, TITLE_SCALE, text_w);
         c.text(text_x, title_y, TITLE_SCALE, &title, BLACK);
-        c.text(
-            text_x,
-            card.y + card.h / 2 + 24,
+        let folder_title = if open_folder.is_none() {
+            parent_folder_title(folders, &entry.notebook_id)
+        } else {
+            None
+        };
+        let meta = fit_text(
+            &notebook_meta_label(entry.page_count, folder_title),
             META_SCALE,
-            &pages_label(entry.page_count),
-            BLACK,
+            text_w,
         );
+        c.text(text_x, card.y + card.h / 2 + 24, META_SCALE, &meta, BLACK);
     }
 
     let pages = vp.page_count(total);
@@ -1344,9 +1358,8 @@ mod tests {
         assert!(!notebook_title_matches("Work", "   "));
     }
 
-    #[test]
-    fn search_rows_keep_library_indices_and_include_foldered_notebooks() {
-        let cards = vec![
+    fn search_cards() -> Vec<HomeCard> {
+        vec![
             HomeCard {
                 notebook_id: "notebook-1".into(),
                 title: "Alpha".into(),
@@ -1362,7 +1375,12 @@ mod tests {
                 title: "alpha draft".into(),
                 page_count: Some(3),
             },
-        ];
+        ]
+    }
+
+    #[test]
+    fn search_rows_keep_library_indices_and_include_foldered_notebooks() {
+        let cards = search_cards();
         let folders = vec![FolderInfo {
             id: "folder-1".into(),
             title: "Projects".into(),
@@ -1371,8 +1389,24 @@ mod tests {
         let rows = home_rows(&cards, &folders, None, Some("ALPHA"));
         assert_eq!(
             rows,
-            vec![HomeRow::Folders(vec![0]), HomeRow::Notebook(0),],
-            "matching folder tile + matching root notebook; foldered draft is inside the folder"
+            vec![
+                HomeRow::Notebook(0),
+                HomeRow::Notebook(2),
+                HomeRow::Folders(vec![0]),
+            ],
+            "matching notebooks first (library order, including foldered), then folder tile"
+        );
+        let notebook_hits: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HomeRow::Notebook(i) => Some(*i),
+                HomeRow::Folders(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            notebook_hits,
+            vec![0, 2],
+            "each matching notebook appears once"
         );
         assert_eq!(folder_match_count(&folders[0], &cards, "ALPHA"), 1);
         assert!(home_rows(&cards, &folders, None, Some("zzz")).is_empty());
@@ -1381,6 +1415,136 @@ mod tests {
             vec![HomeRow::Notebook(2)],
             "folder drill-in keeps only that folder's matches"
         );
+        assert_eq!(
+            home_rows(&cards, &folders, None, None),
+            vec![
+                HomeRow::Folders(vec![0]),
+                HomeRow::Notebook(0),
+                HomeRow::Notebook(1)
+            ],
+            "unfiltered Home stays folders first, then unfiled notebooks"
+        );
+    }
+
+    #[test]
+    fn search_rows_list_every_match_in_a_folder_then_the_folder_tile() {
+        let mut cards = search_cards();
+        cards[1].title = "Alpha Work".into();
+        let folders = vec![FolderInfo {
+            id: "folder-1".into(),
+            title: "Projects".into(),
+            notebook_ids: vec!["notebook-2".into(), "notebook-3".into()],
+        }];
+        assert_eq!(
+            home_rows(&cards, &folders, None, Some("alpha")),
+            vec![
+                HomeRow::Notebook(0),
+                HomeRow::Notebook(1),
+                HomeRow::Notebook(2),
+                HomeRow::Folders(vec![0]),
+            ]
+        );
+        assert_eq!(folder_match_count(&folders[0], &cards, "alpha"), 2);
+    }
+
+    #[test]
+    fn search_rows_keep_matching_folders_in_order_and_chunked() {
+        let cards: Vec<HomeCard> = (1..=5)
+            .map(|i| HomeCard {
+                notebook_id: format!("notebook-{i}"),
+                title: format!("Alpha {i}"),
+                page_count: Some(i),
+            })
+            .collect();
+        let folders: Vec<FolderInfo> = (1..=4)
+            .map(|n| FolderInfo {
+                id: format!("folder-{n}"),
+                title: format!("Folder {n}"),
+                notebook_ids: vec![format!("notebook-{n}")],
+            })
+            .collect();
+        assert_eq!(
+            home_rows(&cards, &folders, None, Some("alpha")),
+            vec![
+                HomeRow::Notebook(0),
+                HomeRow::Notebook(1),
+                HomeRow::Notebook(2),
+                HomeRow::Notebook(3),
+                HomeRow::Notebook(4),
+                HomeRow::Folders(vec![0, 1, 2]),
+                HomeRow::Folders(vec![3]),
+            ]
+        );
+        assert_eq!(folder_match_count(&folders[0], &cards, "alpha"), 1);
+        assert_eq!(folder_match_count(&folders[3], &cards, "alpha"), 1);
+    }
+
+    #[test]
+    fn notebook_meta_label_keeps_page_count_and_adds_folder() {
+        assert_eq!(notebook_meta_label(Some(1), None), "1 page");
+        assert_eq!(notebook_meta_label(Some(3), None), "3 pages");
+        assert_eq!(notebook_meta_label(None, None), "? pages");
+        assert_eq!(
+            notebook_meta_label(Some(3), Some("Projects")),
+            "3 pages · Projects"
+        );
+        assert_eq!(
+            notebook_meta_label(Some(1), Some("Projects")),
+            "1 page · Projects"
+        );
+        assert_eq!(notebook_meta_label(Some(2), Some("")), "2 pages");
+    }
+
+    #[test]
+    fn notebook_meta_label_truncates_long_folder_names_to_card_width() {
+        let label = notebook_meta_label(
+            Some(12),
+            Some("A very long research folder name that will overflow a card"),
+        );
+        assert!(label.starts_with("12 pages · "));
+        let fitted = fit_text(&label, META_SCALE, 500);
+        assert!(fitted.ends_with("..."), "{fitted:?}");
+        assert!(fitted.starts_with("12 pages"), "{fitted:?}");
+        assert!(text_width(&fitted, META_SCALE) <= 500, "{fitted:?}");
+        assert_ne!(fitted, label);
+    }
+
+    #[test]
+    fn search_rows_on_a_large_library_keep_notebooks_first() {
+        let n = 2000usize;
+        let folder_count = 80usize;
+        let per_folder = n / folder_count;
+        let cards: Vec<HomeCard> = (0..n)
+            .map(|i| HomeCard {
+                notebook_id: format!("notebook-{i}"),
+                title: format!("Note {i:04} alpha"),
+                page_count: Some(1),
+            })
+            .collect();
+        let folders: Vec<FolderInfo> = (0..folder_count)
+            .map(|f| {
+                let start = f * per_folder;
+                FolderInfo {
+                    id: format!("folder-{f}"),
+                    title: format!("Folder {f}"),
+                    notebook_ids: (start..start + per_folder)
+                        .map(|i| format!("notebook-{i}"))
+                        .collect(),
+                }
+            })
+            .collect();
+
+        let rows = home_rows(&cards, &folders, None, Some("alpha"));
+        let expected_folders: Vec<HomeRow> = (0..folder_count)
+            .collect::<Vec<_>>()
+            .chunks(FOLDERS_PER_ROW)
+            .map(|c| HomeRow::Folders(c.to_vec()))
+            .collect();
+        let expected: Vec<HomeRow> = (0..n)
+            .map(HomeRow::Notebook)
+            .chain(expected_folders)
+            .collect();
+        assert_eq!(rows, expected);
     }
 
     #[test]
