@@ -357,9 +357,9 @@ Windows/WSL details, cleanup guarantees, and result fields.
 Releases are **promoted** from a hardware-tested CI run. Tag-push CI does **not**
 rebuild and publish. Full procedure: [`docs/release-packaging.md`](release-packaging.md).
 
-1. Set the release version in `ignite/VERSION`, the Rust workspace (`Cargo.toml` /
-   `Cargo.lock`) and `ignite/web` (`package.json` / `package-lock.json`), and merge
-   to `main`. `tools/ci/check_version_sync.py` must pass.
+1. Run `python tools/release/ignite_version.py set X.Y.Z` and merge to `main`.
+   `python tools/release/ignite_version.py check` (or
+   `tools/ci/check_version_sync.py`) must pass.
 2. From that commit’s successful **CI** workflow run on `main` (not a PR or
    another workflow), download `ignite-kindle-release` and
    `ignite-server-linux-release`. Record `{commit, run_id, sha256}`.

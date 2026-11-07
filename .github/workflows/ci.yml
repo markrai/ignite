@@ -73,8 +73,12 @@ jobs:
           python-version: "3.12"
       - name: Check VERSION / Cargo / web lockfiles
         run: python3 tools/ci/check_version_sync.py
+      - name: Standalone version tool check
+        run: python3 tools/release/ignite_version.py check
       - name: Version mismatch fixture fails closed
         run: python3 tools/ci/test_check_version_sync.py
+      - name: Version tool fixtures
+        run: python3 tools/release/test_ignite_version.py
 
   kindle-installer:
     name: Kindle installer pytest
@@ -397,8 +401,12 @@ jobs:
         run: bash tools/release/test-promote-release.sh
       - name: Version file synchronization
         run: python3 tools/ci/check_version_sync.py
+      - name: Standalone version tool check
+        run: python3 tools/release/ignite_version.py check
       - name: Version mismatch fixture fails closed
         run: python3 tools/ci/test_check_version_sync.py
+      - name: Version tool fixtures
+        run: python3 tools/release/test_ignite_version.py
       - name: Docker accept evidence/ownership safety
         run: bash deployment/linux/docker/test-accept-safety.sh
 

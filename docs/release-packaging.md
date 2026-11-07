@@ -44,9 +44,21 @@ production public-key pin is still `UNPROVISIONED`; **Promote release is intenti
 until the maintainer installs the genuine public key. Existing releases therefore still have the
 original four assets. No checksum sidecar is an independent publisher signature.
 
-Version authority: `ignite/VERSION`, kept in sync with the Cargo workspace,
-`Cargo.lock`, `ignite/web/package.json`, and `package-lock.json`
-(`tools/ci/check_version_sync.py`).
+Version authority: `ignite/VERSION`. Synchronize the applicable release-version
+fields in the Cargo workspace, `Cargo.lock`, `ignite/web/package.json`, and
+`package-lock.json` with the standalone tool (Windows PowerShell and Linux):
+
+```text
+python tools/release/ignite_version.py check
+python tools/release/ignite_version.py plan X.Y.Z
+python tools/release/ignite_version.py set X.Y.Z
+```
+
+Do not edit those version fields individually. The tool reuses
+`ship_lib.version_sync` and `tools/ci/check_version_sync.py`. It does not
+commit, tag, push, publish, sign, or write changelog entries. Changelog content
+stays maintainer-authored. The authenticated `ignite_ship.py` workflow still
+calls `apply_version()` during a live ship.
 
 ## Build ≠ publish (artifact promotion)
 
@@ -160,9 +172,9 @@ and firmware.
 
 1. Finish packaging, promote-publish, docs, Kindle-first README, and authentic
    screenshots on `main`. Any later source change invalidates the candidate.
-2. Bump `ignite/VERSION`, Cargo workspace version, `Cargo.lock`,
-   `ignite/web/package.json`, and `package-lock.json` together; CI version-sync
-   must pass.
+2. Preview with `python tools/release/ignite_version.py plan X.Y.Z`, then
+   `python tools/release/ignite_version.py set X.Y.Z`. CI version-sync must
+   pass. Do not invent changelog notes as part of version synchronization.
 3. From that commit’s CI run, download both artifacts; record identity.
 4. Optionally exercise the hardware table on those exact bytes to inform
    compatibility claims; capture screenshots if not already on the commit

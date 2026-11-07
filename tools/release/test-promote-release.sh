@@ -585,7 +585,9 @@ done <"$TEST_PRIVATE_KEY"
 pass "workflow token and private-key contents never appear in mocked GitHub argv"
 
 "$PYTHON_REAL" "$ROOT/tools/ci/check_version_sync.py" || fail "version sync on this tree"
+"$PYTHON_REAL" "$ROOT/tools/release/ignite_version.py" check || fail "standalone version tool check"
 "$PYTHON_REAL" "$ROOT/tools/ci/test_check_version_sync.py" || fail "version mismatch fixture"
+"$PYTHON_REAL" "$ROOT/tools/release/test_ignite_version.py" || fail "version tool fixtures"
 pass "version files agree; mismatch fixture fails closed"
 
 grep -vE '^\s*#' "$ROOT/scripts/kindle/package-release.sh" | grep -q SkipBuild \

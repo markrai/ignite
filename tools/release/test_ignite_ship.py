@@ -800,6 +800,7 @@ class ShipOrchestratorBoundaryTests(unittest.TestCase):
         self.assertEqual(
             "0.9.15", (self.repo / "ignite" / "VERSION").read_text().strip()
         )
+        self.assertEqual([], apply_version(self.repo, "0.9.15"))
 
 
 class ShipSigningPolicyTests(unittest.TestCase):

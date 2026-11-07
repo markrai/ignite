@@ -76,6 +76,10 @@ promoted from a hardware-tested CI run (exact bytes, no tag-push rebuild); see
 - Do not commit secrets, personal notebooks, device dumps, or real credentials
   (see `.gitignore`).
 - Keep Kindle-facing shell scripts LF line endings.
+- Do not edit release-version fields individually. Use
+  `python tools/release/ignite_version.py` (`check` / `plan` / `set`).
+  `ignite/VERSION` is the only authoritative version. Do not invent changelog
+  entries when synchronizing versions.
 
 ## Pull requests
 
