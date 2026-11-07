@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.22] - 2026-11-07
+
+### Improved
+
+- Kindle Home search now shows matching notebooks first, including
+  notebooks inside folders, followed by matching folder tiles.
+- Foldered notebook results show their parent folder alongside
+  the page count.
+
+### Internal
+
+- Stabilized concurrent sync adoption and recovery tests.
+- Added centralized version management with consistency checks
+  and rollback handling.
+
 ## [0.9.21] - 2026-11-06
 
 ### Fixed
