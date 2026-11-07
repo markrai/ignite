@@ -293,6 +293,9 @@ pub struct InvalidateHooks {
     pub before_session_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     /// After ordinary admission (inflight incremented, session lock released), before return.
     pub after_ordinary_admit: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// In [`hold_authoring_for_maintenance`], after observing `inflight_ordinary > 0` and
+    /// releasing the session lock, before waiting for those writers to finish.
+    pub before_hold_wait: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Page ledger (19B.3C): fail creating the ledger file.
     pub fail_ledger_create: bool,
     /// Page ledger: write only the first N bytes of the append, then fail (torn record).
@@ -823,6 +826,14 @@ pub fn hold_authoring_for_maintenance(library_root: &Path) -> Result<Maintenance
     let key = session_key(library_root);
     let cell = session_cell(&key);
     let mut g = cell.state.lock().unwrap_or_else(|p| p.into_inner());
+    #[cfg(test)]
+    if g.inflight_ordinary > 0 {
+        if let Some(f) = hooks().before_hold_wait {
+            drop(g);
+            f();
+            g = cell.state.lock().unwrap_or_else(|p| p.into_inner());
+        }
+    }
     while g.inflight_ordinary > 0 {
         g = cell.cv.wait(g).unwrap_or_else(|p| p.into_inner());
     }

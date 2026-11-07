@@ -23,7 +23,7 @@ use crate::profile::RenderProfile;
 use crate::store::{load_existing_page, write_page_links, write_page_texts, PageStore};
 use crate::sync_local::ensure_sync_identity;
 use crate::sync_verified::{
-    clear_registry, hold_authoring_for_maintenance, install_invalidate_hooks,
+    clear_registry_for, hold_authoring_for_maintenance, install_invalidate_hooks,
     note_library_mutation, read_mutation_gen, InvalidateHooks,
 };
 use crate::ui_gfx::paper_background;
@@ -114,6 +114,28 @@ fn is_held(err: &str) -> bool {
     err.contains("RECOVERY MAINTENANCE")
 }
 
+fn hold_entered() -> Arc<(Mutex<bool>, std::sync::Condvar)> {
+    Arc::new((Mutex::new(false), std::sync::Condvar::new()))
+}
+
+fn signal_hold_wait(at: &Arc<(Mutex<bool>, std::sync::Condvar)>) -> InvalidateHooks {
+    let at = Arc::clone(at);
+    InvalidateHooks {
+        before_hold_wait: Some(Arc::new(move || {
+            *at.0.lock().unwrap() = true;
+            at.1.notify_all();
+        })),
+        ..Default::default()
+    }
+}
+
+fn wait_hold_entered(at: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+    let mut g = at.0.lock().unwrap();
+    while !*g {
+        g = at.1.wait(g).unwrap();
+    }
+}
+
 #[test]
 fn writer_finishes_before_maintenance_is_in_snapshot() {
     let (lib, sync, cp) = lib_pair("before");
@@ -144,11 +166,14 @@ fn writer_finishes_before_maintenance_is_in_snapshot() {
     }
     let lib_p = lib.clone();
     let sync_p = sync.clone();
+    let hold_at = hold_entered();
+    let hold_at_p = Arc::clone(&hold_at);
     let prepared = std::thread::spawn(move || {
+        let _h = install_invalidate_hooks(signal_hold_wait(&hold_at_p));
         let spec = spec(&lib_p, &sync_p, &cp);
         prepare_recovery(&spec, &Default::default())
     });
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    wait_hold_entered(&hold_at);
     assert!(
         prepared.is_finished() == false,
         "prepare must wait for admitted writer"
@@ -248,7 +273,7 @@ fn multiple_ordinary_writers_refuse_without_partial_writes() {
 fn restart_with_intent_keeps_fence_without_network() {
     let (lib, sync, cp) = lib_pair("restart");
     prepare_recovery(&spec(&lib, &sync, &cp), &Default::default()).unwrap();
-    clear_registry();
+    clear_registry_for(&lib);
     let err = try_append(&lib).unwrap_err();
     assert!(is_held(&err), "{err}");
     assert!(read_intent(&sync).unwrap().is_some());
@@ -349,8 +374,13 @@ fn hold_waits_for_inflight_then_refuses_new_writers() {
         }
     }
     let lib_h = lib.clone();
-    let holder = std::thread::spawn(move || hold_authoring_for_maintenance(&lib_h));
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    let hold_at = hold_entered();
+    let hold_at_h = Arc::clone(&hold_at);
+    let holder = std::thread::spawn(move || {
+        let _h = install_invalidate_hooks(signal_hold_wait(&hold_at_h));
+        hold_authoring_for_maintenance(&lib_h)
+    });
+    wait_hold_entered(&hold_at);
     assert!(!holder.is_finished());
     *park.0.lock().unwrap() = true;
     park.1.notify_all();

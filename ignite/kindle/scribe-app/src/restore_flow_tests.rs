@@ -502,6 +502,9 @@ fn interruptions_around_the_commit_are_resolved_at_startup() {
     for point in ["after_verify", "after_plan", "after_publish_sync"] {
         let mut dev = Device::new("flow-crash", &a, &net);
         dev.linked_to(&a);
+        // Ordinary genesis upload is independent of adoption. Capture the live epoch only after
+        // it has settled so after_verify can assert the installation is otherwise unchanged.
+        dev.with_sync(|s| wait("genesis upload", || s.state().genesis_uploaded));
         let old = dev.k.state();
         let a_profile = dev.profile().unwrap();
         RESTORE_FAULTS
