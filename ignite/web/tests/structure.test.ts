@@ -209,4 +209,19 @@ describe("undo", () => {
     expect(out.changed).toEqual([true, true]);
     expect(out.strokes).toEqual([]);
   });
+
+  it("SetPageBackground projection replaces paper and keeps strokes", async () => {
+    const b = await bridge();
+    const s = validateSnapshot(clone(snapshotJson));
+    const nb = s.notebooks[0]!;
+    const pg = nb.pages[0]!;
+    const strokeN = pg.strokes.length;
+    const out = b.projectLibrary(s, [
+      { type: "set_page_background", notebook_id: nb.notebook_id, page_id: pg.page_id, background: { kind: "blank" } },
+    ]);
+    expect(out.changed).toEqual([true]);
+    const page = out.notebooks[0]!.pages[0]!;
+    expect(page.background).toEqual({ kind: "blank" });
+    expect(page.strokes).toHaveLength(strokeN);
+  });
 });

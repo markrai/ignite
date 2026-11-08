@@ -242,6 +242,11 @@ pub struct Store {
     /// history that older clients cannot decode. Already-accepted envelopes still retry as
     /// duplicates. Once any such operation is in the ledger, rolling the binary back is unsafe.
     pub accept_replace_stroke_lineages: AtomicBool,
+    /// Operator/test gate. Default **false**: new [`SyncOperationV1::SetPageBackground`]
+    /// submits are refused (`unsupported_operation`) so installing this binary cannot add
+    /// history that older clients cannot decode. Already-accepted envelopes still retry as
+    /// duplicates. Advertised on `GET /v1/libraries/{id}` so authors can refuse before journaling.
+    pub accept_set_page_background: AtomicBool,
 }
 
 /// `client_seq` storage: SQLite INTEGER is signed i64, but the S1 contract is the full u64
@@ -284,6 +289,7 @@ fn op_blob(op: &SyncOperationV1) -> Option<(String, u64)> {
     let bg = match op {
         SyncOperationV1::CreateNotebook { first_page, .. } => &first_page.background,
         SyncOperationV1::CreatePage { page, .. } => &page.background,
+        SyncOperationV1::SetPageBackground { background, .. } => background,
         _ => return None,
     };
     match bg {
@@ -324,6 +330,7 @@ impl Store {
             upload_seq: AtomicU64::new(0),
             hooks: FaultHooks::default(),
             accept_replace_stroke_lineages: AtomicBool::new(false),
+            accept_set_page_background: AtomicBool::new(false),
         };
         let mut conn = store.writer();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -851,14 +858,23 @@ impl Store {
                 });
                 continue;
             }
-            // New ReplaceStrokeLineages only when the operator/test gate is on. Dedup above
-            // still returns an already-accepted envelope so a later disable cannot strand retries.
+            // New ReplaceStrokeLineages / SetPageBackground only when the matching operator/test
+            // gate is on. Dedup above still returns an already-accepted envelope so a later
+            // disable cannot strand retries.
             if matches!(env.operation, SyncOperationV1::ReplaceStrokeLineages { .. })
                 && !self.accept_replace_stroke_lineages.load(Ordering::SeqCst)
             {
                 return Err(StoreError::bad(
                     "unsupported_operation",
                     format!("envelope {i}: ReplaceStrokeLineages is not accepted on this server"),
+                ));
+            }
+            if matches!(env.operation, SyncOperationV1::SetPageBackground { .. })
+                && !self.accept_set_page_background.load(Ordering::SeqCst)
+            {
+                return Err(StoreError::bad(
+                    "unsupported_operation",
+                    format!("envelope {i}: SetPageBackground is not accepted on this server"),
                 ));
             }
             // 2. (replica, client_seq) must not belong to another operation.

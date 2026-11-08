@@ -48,6 +48,19 @@ Outbound/inbound sync uses versioned operation envelopes. A self-hosted
 Server-side acceptance of destructive lineage-replacement operations is **off
 by default** and must not be enabled casually.
 
+`SetPageBackground` (wire tag `set_page_background`) replaces one live page’s
+paper (`BackgroundRef`) without touching strokes, text, links, or page identity.
+Kindle **Change Paper** and ignite-web **Change paper** journal that op after
+generating template bytes and publishing a blob when the template is patterned.
+Decoders that do not know the variant fail closed (`deny_unknown_fields`); do
+not skip unknown ops. Server acceptance is **off by default**
+(`--accept-set-page-background` / product `accept_set_page_background`);
+authors probe `GET /v1/libraries/{id}` and refuse to journal until the server
+advertises `accept_set_page_background: true` (Kindle: off the interactive UI
+thread; Web: required on every queue path). Every sync client for a library
+that uses Change Paper must be at least **0.9.23**. Home search parked-query
+behavior in 0.9.23 has no protocol impact.
+
 Pairing / discovery helpers live in `scribe-server` + `control-protocol`.
 
 ## ignite-web

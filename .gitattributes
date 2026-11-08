@@ -1,3 +1,5 @@
+# WSL/dash rejects CRLF (`set: Illegal option -`). Keep device and host shell scripts LF.
+*.sh text eol=lf
 tools/release/kindle-release-public-key.hex text eol=lf
 # Embedded into scribe-app via include_str!; CRLF breaks the OTA contract parser header match.
 deployment/kindle/publication_component_contract.v1 text eol=lf

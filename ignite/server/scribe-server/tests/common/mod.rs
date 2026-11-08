@@ -68,6 +68,7 @@ impl Env {
                 state_dir: self.dir.clone(),
                 web_root: None,
                 name: "Scribe Server on Testhost".into(),
+                accept_set_page_background: false,
             },
             discovery: DiscoverySection { advertise: false },
         }

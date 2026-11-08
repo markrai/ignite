@@ -923,6 +923,7 @@ fn product_config(state: &Path) -> Config {
             state_dir: state.to_path_buf(),
             web_root: None,
             name: "Adoption Test".into(),
+            accept_set_page_background: false,
         },
         discovery: DiscoverySection { advertise: false },
     }

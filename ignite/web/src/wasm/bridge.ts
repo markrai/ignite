@@ -4,7 +4,7 @@
 // EraseRegion envelopes and runs the reducer's own erase for local projection.
 
 import type { SnapshotFolder, SnapshotNotebook, SnapshotPage, SyncSnapshotV1, SyncStroke, SyncText } from "../model/types";
-import type { FolderIntent, StructureIntent } from "../replica/store";
+import type { FolderIntent, SetPageBackgroundIntent, StructureIntent } from "../replica/store";
 
 export type IdKind = "replica" | "operation" | "stroke" | "folder" | "text" | "notebook" | "page";
 export type BridgeStyle = "pressure-width-v1" | "legacy-fixed-v1";
@@ -155,6 +155,10 @@ export class ProtocolBridge {
     return this.must({ fn: "encode_structure_op", ...req });
   }
 
+  encodeSetPageBackground(req: SetPageBackgroundOpRequest): string {
+    return this.must({ fn: "encode_set_page_background", ...req });
+  }
+
   encodeDeleteStrokeLineage(req: DeleteStrokeLineageRequest): string {
     return this.must({ fn: "encode_delete_stroke_lineage", ...req });
   }
@@ -243,6 +247,14 @@ export interface StructureOpRequest {
   operation: StructureIntent;
 }
 
+export interface SetPageBackgroundOpRequest {
+  library_id: string;
+  replica_id: string;
+  client_seq: string;
+  operation_id: string;
+  operation: SetPageBackgroundIntent;
+}
+
 export interface DeleteStrokeLineageRequest {
   library_id: string;
   replica_id: string;
@@ -253,7 +265,7 @@ export interface DeleteStrokeLineageRequest {
   root_id: string;
 }
 
-export type LibraryOp = FolderIntent | StructureIntent;
+export type LibraryOp = FolderIntent | StructureIntent | SetPageBackgroundIntent;
 
 export interface LibraryProjection {
   notebooks: SnapshotNotebook[];

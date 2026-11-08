@@ -161,6 +161,7 @@ fn cases() -> Vec<Value> {
     out.extend(folder_cases(&i));
     out.extend(text_cases(&i));
     out.extend(structure_cases(&i));
+    out.extend(set_page_background_cases(&i));
     // ID minting (fixed inputs → exact v7 text).
     for kind in ["replica", "operation", "stroke", "text", "notebook", "page"] {
         out.push(json!({
@@ -999,6 +1000,92 @@ fn structure_cases(i: &Ids) -> Vec<Value> {
             },
         }]},
         "err": true,
+    }));
+    out
+}
+
+fn set_page_background_cases(i: &Ids) -> Vec<Value> {
+    use sync_engine::testkit::{self as tk, Author};
+    use sync_engine::{LibraryState, Outcome};
+
+    let native = |client_seq: u64, operation: SyncOperationV1| {
+        let env = SyncEnvelopeV1 {
+            v: ENVELOPE_VERSION,
+            operation_id: i.op,
+            library_id: i.lib,
+            replica_id: i.rep,
+            client_seq,
+            operation,
+        };
+        String::from_utf8(env.to_canonical_bytes().unwrap()).unwrap()
+    };
+    let request = |client_seq: &str, operation: &SyncOperationV1| {
+        json!({
+            "fn": "encode_set_page_background",
+            "library_id": i.lib.to_string(),
+            "replica_id": i.rep.to_string(),
+            "client_seq": client_seq,
+            "operation_id": i.op.to_string(),
+            "operation": operation,
+        })
+    };
+    let blank = SyncOperationV1::SetPageBackground {
+        notebook_id: i.nb,
+        page_id: i.pg,
+        background: BackgroundRef::Blank,
+    };
+    let (_, blob) = tk::blob_background();
+    let patterned = SyncOperationV1::SetPageBackground {
+        notebook_id: i.nb,
+        page_id: i.pg,
+        background: blob.clone(),
+    };
+    let mut out = vec![json!({
+        "name": "set page background: blank",
+        "request": request("1", &blank),
+        "ok": native(1, blank.clone()),
+    })];
+    out.push(json!({
+        "name": "set page background: blob",
+        "request": request("2", &patterned),
+        "ok": native(2, patterned.clone()),
+    }));
+    out.push(json!({
+        "name": "set page background: structure op refused",
+        "request": request("1", &SyncOperationV1::DeleteNotebook { notebook_id: i.nb }),
+        "err": true,
+    }));
+
+    let mut snap = tk::genesis();
+    snap.library_id = i.lib;
+    let mut author = Author::new(i.rep);
+    author.library = i.lib;
+    let op = SyncOperationV1::SetPageBackground {
+        notebook_id: tk::nb(1),
+        page_id: tk::pg(1),
+        background: blob,
+    };
+    let pending = vec![op.clone()];
+    let mut state = LibraryState::genesis(snap.clone()).unwrap();
+    let (next, outcome) = state.apply(&author.env(op)).unwrap();
+    assert!(matches!(outcome, Outcome::Applied));
+    state = next;
+    let stroke_n = state.snapshot.notebooks[0].pages[0].strokes.len();
+    assert!(stroke_n > 0);
+    #[derive(serde::Serialize)]
+    struct Expected<'a> {
+        notebooks: &'a [sync_protocol::SnapshotNotebook],
+        folders: &'a [SnapshotFolder],
+        changed: &'a [bool],
+    }
+    out.push(json!({
+        "name": "project library: set page background preserves strokes",
+        "request": {"fn": "project_library", "snapshot": snap, "ops": pending},
+        "ok": serde_json::to_string(&Expected {
+            notebooks: &state.snapshot.notebooks,
+            folders: &state.snapshot.folders,
+            changed: &[true],
+        }).unwrap(),
     }));
     out
 }

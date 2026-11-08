@@ -9,7 +9,8 @@
 //! ## Background immutability
 //!
 //! After a page is successfully created, imported, or materialized, `background.raw` is
-//! immutable except through [`install_background`] (today: chrome-scrub repair). Scribe is the
+//! immutable except through [`install_background`] (chrome-scrub repair, inbound
+//! `SetPageBackground` materialization, and journaled local Change Paper). Scribe is the
 //! only writer. Every legitimate replacement clears any persisted sync identity, writes the new
 //! bytes, then publishes checksum + identity in the same `page.meta` transaction. Sync snapshot
 //! and inbound verify therefore reconstruct a background's SHA-256 from `page.meta` without

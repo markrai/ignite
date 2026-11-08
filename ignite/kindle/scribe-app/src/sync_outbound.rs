@@ -28,11 +28,13 @@
 //!
 //! # Crash safety between the notebook and the outbox
 //!
-//! * **Write-ahead** (`EraseRegion`, `MoveStrokeLineages`, `AddPageLink`, `DeletePageLink`, all structural ops): a
+//! * **Write-ahead** (`EraseRegion`, `MoveStrokeLineages`, `AddPageLink`, `DeletePageLink`,
+//!   `SetPageBackground`, all structural ops): a
 //!   `prep` record holding the exact canonical envelope is fsynced *before* the local mutation,
 //!   then `commit` (or `abort` if the local operation is refused; the `client_seq` is then
 //!   reused). A crash before that `commit`/`abort` is settled at startup by which outcome
-//!   matches the local snapshot. Link differences are not re-derived.
+//!   matches the local snapshot. Link differences are not re-derived. An unjournaled
+//!   `background.raw` rewrite is still underivable and faults upload.
 //! * **Post-commit** (`AddStroke`, `DeleteStrokeLineage`): captured after the local durable
 //!   commit, persisted off the pen thread by the journal thread.
 //! * **Startup reconciliation** (the authority): `base-state + overlay` (accepted bridge +
@@ -120,6 +122,47 @@ const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(3);
+
+pub const PAPER_GATE_OFF: &str =
+    "This server does not accept Change Paper yet. Nothing was changed.";
+pub const PAPER_GATE_UNREACHABLE: &str =
+    "Change Paper needs a connection to a server that allows it. Nothing was changed.";
+
+/// Pairing identity a Change Paper activation probe was started against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaperGateIdentity {
+    pub server_base_url: String,
+    pub library_id: LibraryId,
+}
+
+/// True when a background probe result may still drive this UI session.
+pub fn paper_gate_result_applies(
+    job: &PaperGateIdentity,
+    job_generation: u64,
+    current: Option<&PaperGateIdentity>,
+    live_generation: u64,
+) -> bool {
+    live_generation == job_generation && current == Some(job)
+}
+
+/// GET `/v1/libraries/{id}` `accept_set_page_background`. Safe to call off the UI thread.
+pub fn probe_accept_set_page_background(
+    cfg: &SyncConfigV1,
+    library_id: &LibraryId,
+) -> Result<bool, String> {
+    let path = format!("/v1/libraries/{library_id}");
+    let (status, body) =
+        http_request(cfg, "GET", &path, b"").map_err(|_| PAPER_GATE_UNREACHABLE.to_string())?;
+    if status != 200 {
+        return Err(PAPER_GATE_UNREACHABLE.into());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    match v.get("accept_set_page_background") {
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        None => Ok(false),
+        _ => Err(PAPER_GATE_UNREACHABLE.into()),
+    }
+}
 
 fn log(msg: impl AsRef<str>) {
     println!("sync: {}", msg.as_ref());
@@ -896,6 +939,10 @@ struct Shared {
     /// D1 product mode: the server rejected the paired credential (401).
     auth_revoked: bool,
     uploaded_blobs: HashSet<String>,
+    /// Last observed GET `/v1/libraries/{id}` `accept_set_page_background`. `None` = not probed.
+    /// The UI path GETs only from a background worker; prepare uses this cache and must not
+    /// block the interactive thread. A later disable still refuses *new* prepares (`Some(false)`).
+    accept_set_page_background: Option<bool>,
     dropped_ack_once: bool,
     /// Test/diagnostic counters.
     pub_stats: SyncStats,
@@ -1364,6 +1411,7 @@ impl OutboundSync {
             product_mode: false,
             auth_revoked: false,
             uploaded_blobs: HashSet::new(),
+            accept_set_page_background: None,
             dropped_ack_once: false,
             pub_stats: SyncStats::default(),
             log: confirmed_log,
@@ -2298,6 +2346,112 @@ impl OutboundSync {
         );
     }
 
+    /// Server URL + library this replica is currently paired to. `None` if unpaired.
+    pub fn paper_gate_identity(&self) -> Option<PaperGateIdentity> {
+        let g = self.shared.lock().unwrap();
+        Some(PaperGateIdentity {
+            server_base_url: g.config.as_ref()?.server_base_url.clone(),
+            library_id: g.state.library_id,
+        })
+    }
+
+    /// Clone the request a background worker needs for [`probe_accept_set_page_background`].
+    pub fn paper_gate_probe_parts(&self) -> Option<(PaperGateIdentity, SyncConfigV1)> {
+        let g = self.shared.lock().unwrap();
+        let cfg = g.config.clone()?;
+        Some((
+            PaperGateIdentity {
+                server_base_url: cfg.server_base_url.clone(),
+                library_id: g.state.library_id,
+            },
+            cfg,
+        ))
+    }
+
+    pub fn remember_set_page_background_accepted(&self, accepted: bool) {
+        self.shared.lock().unwrap().accept_set_page_background = Some(accepted);
+    }
+
+    /// Fresh GET of `accept_set_page_background` on the library head.
+    ///
+    /// Offline / unpaired / old servers: error so the caller can refuse without journaling.
+    /// The Kindle UI must not call this on the interactive thread (60s production deadline).
+    pub fn require_set_page_background_accepted(&self) -> Result<(), String> {
+        let Some((identity, cfg)) = self.paper_gate_probe_parts() else {
+            return Err(PAPER_GATE_UNREACHABLE.into());
+        };
+        let accepted = probe_accept_set_page_background(&cfg, &identity.library_id)?;
+        self.remember_set_page_background_accepted(accepted);
+        if accepted {
+            Ok(())
+        } else {
+            Err(PAPER_GATE_OFF.into())
+        }
+    }
+
+    fn ensure_set_page_background_authoring(&self) -> Result<(), String> {
+        let cached = self.shared.lock().unwrap().accept_set_page_background;
+        match cached {
+            Some(true) => Ok(()),
+            Some(false) => Err(PAPER_GATE_OFF.into()),
+            // Direct/test callers may still GET. The UI path sets the cache from a worker first
+            // so prepare does not block the interactive thread on HTTP_REQUEST_DEADLINE.
+            None => self.require_set_page_background_accepted(),
+        }
+    }
+
+    /// Journal `SetPageBackground` before replacing durable `background.raw`.
+    ///
+    /// `pixels` are the bytes that will be installed (already chrome-scrubbed). Blob bytes are
+    /// staged under the sync dir at prepare time so upload can PUT them after commit.
+    /// Refuses (no journal) unless this replica has observed the server advertising
+    /// `accept_set_page_background`.
+    pub fn prepare_set_page_background(
+        &self,
+        notebook_dir: &Path,
+        notebook_local: &str,
+        page_local: &str,
+        pixels: &[u8],
+    ) -> Option<PrepTicket> {
+        if self.ensure_set_page_background_authoring().is_err() {
+            return None;
+        }
+        let Some((nb, pg)) = self.page_gid(notebook_local, page_local) else {
+            self.fail(format!(
+                "no sync identity for {notebook_local}/{page_local}"
+            ));
+            return None;
+        };
+        let dir = self.shared.lock().unwrap().dir.clone();
+        let operation = match (|| -> Result<SyncOperationV1, String> {
+            let page = crate::store::load_page_read_only(notebook_dir, page_local)?;
+            let background = crate::sync_local::background_ref_for(
+                pixels,
+                page.header.panel_width,
+                page.header.panel_height,
+                page.header.line_length,
+            )?;
+            if matches!(background, BackgroundRef::Blob { .. }) {
+                store_blob(&dir, pixels)?;
+            }
+            Ok(SyncOperationV1::SetPageBackground {
+                notebook_id: nb,
+                page_id: pg,
+                background,
+            })
+        })() {
+            Ok(op) => op,
+            Err(e) => {
+                self.fail(format!("prepare set page background: {e}"));
+                return None;
+            }
+        };
+        self.prepare_with(
+            OperationId::from_uuid(Uuid::now_v7()).unwrap(),
+            operation,
+        )
+    }
+
     pub fn prepare_rename_notebook(&self, notebook_local: &str, title: &str) -> Option<PrepTicket> {
         let Some(nb) = self.notebook_gid(notebook_local) else {
             self.fail(format!("no sync identity for {notebook_local}"));
@@ -2375,6 +2529,9 @@ impl OutboundSync {
         let root = self.shared.lock().unwrap().library_root.clone();
         self.stop_threads(budget);
         crate::sync_verified::clear_registry_for(&root);
+        // Release the exclusive flock before Drop so the next open is not racing
+        // a still-held fd under parallel test load (WSL/Linux WouldBlock).
+        let _ = self._lock.unlock();
     }
 
     fn stop_threads(&mut self, budget: Duration) {
@@ -3703,6 +3860,7 @@ fn op_kind(op: &SyncOperationV1) -> &'static str {
         SyncOperationV1::CreatePage { .. } => "create_page",
         SyncOperationV1::MovePage { .. } => "move_page",
         SyncOperationV1::DeletePage { .. } => "delete_page",
+        SyncOperationV1::SetPageBackground { .. } => "set_page_background",
         SyncOperationV1::AddStroke { .. } => "add_stroke",
         SyncOperationV1::EraseRegion { .. } => "erase_region",
         SyncOperationV1::DeleteStrokeLineage { .. } => "delete_stroke_lineage",
@@ -4288,12 +4446,8 @@ fn push_once(
         return Ok(false);
     }
     for op in &batch {
-        if let SyncOperationV1::CreateNotebook {
-            first_page: page, ..
-        }
-        | SyncOperationV1::CreatePage { page, .. } = &op.envelope.operation
-        {
-            put_blob_ref(shared, agent, cfg, &dir, &page.background)?;
+        if let Some(bg) = operation_background(&op.envelope.operation) {
+            put_blob_ref(shared, agent, cfg, &dir, bg)?;
         }
     }
     let mut body = b"{\"envelopes\":[".to_vec();
@@ -4423,6 +4577,15 @@ fn push_once(
         results.last().unwrap()["server_seq"]
     ));
     Ok(true)
+}
+
+fn operation_background(op: &SyncOperationV1) -> Option<&BackgroundRef> {
+    match op {
+        SyncOperationV1::CreateNotebook { first_page, .. } => Some(&first_page.background),
+        SyncOperationV1::CreatePage { page, .. } => Some(&page.background),
+        SyncOperationV1::SetPageBackground { background, .. } => Some(background),
+        _ => None,
+    }
 }
 
 fn put_blob_for(

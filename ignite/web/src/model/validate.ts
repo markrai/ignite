@@ -73,6 +73,11 @@ function int(v: unknown, where: string, min: number, max: number): number {
   return n;
 }
 
+function bool(v: unknown, where: string): boolean {
+  if (typeof v !== "boolean") fail(where, "expected a boolean");
+  return v;
+}
+
 // Text geometry is f32 in Rust (`SyncText`): operands are converted to f32 and the remaining
 // width is an f32 subtraction, whose correctly rounded result is `fround` of the exact
 // difference. Comparing in f64 instead refuses boxes Rust accepted (and Ignite authored).
@@ -391,12 +396,22 @@ export function validateLibraryList(v: unknown): LibrarySummary[] {
 }
 
 export function validateLibraryHead(v: unknown): LibraryHead {
-  const o = obj(v, "library", ["library_id", "genesis_sha256", "head_server_seq", "snapshot_sha256"]);
+  const o = obj(v, "library", ["library_id", "genesis_sha256", "head_server_seq", "snapshot_sha256"], [
+    "accept_set_page_background",
+  ]);
   return {
     library_id: uuid(o.library_id, "library.library_id"),
     genesis_sha256: sha256(o.genesis_sha256, "library.genesis_sha256"),
     head_server_seq: seq(o.head_server_seq, "library.head_server_seq"),
     snapshot_sha256: sha256(o.snapshot_sha256, "library.snapshot_sha256"),
+    ...(o.accept_set_page_background === undefined
+      ? {}
+      : {
+          accept_set_page_background: bool(
+            o.accept_set_page_background,
+            "library.accept_set_page_background",
+          ),
+        }),
   };
 }
 

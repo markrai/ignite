@@ -16,7 +16,9 @@ mod tests {
         CreateNotebookHooks, LibraryManifestWriteHooks,
     };
     use crate::notebook::{
-        create_page_files_from_template, insert_page_after_durable, open_or_create_notebook,
+        create_page_files_from_template, insert_page_after_durable, inspect_target_paper,
+        install_page_background, open_or_create_notebook, pages_include_custom_background,
+        paper_apply_after_durable, paper_change_incomplete_notice, template_background_bytes,
         InsertPageHooks,
     };
     use crate::paper_templates::{generate_page_background, PageTemplate, RULED_SPACING_PX};
@@ -381,6 +383,170 @@ mod tests {
         let y = RULED_SPACING_PX;
         let i = (y as usize) * (g.xres as usize);
         assert_ne!(bg[i], 0xFF, "expected a rule mark after durable create");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_page_background_replaces_paper_and_keeps_strokes() {
+        let (root, mut library) = fresh_library("change-paper");
+        create_notebook_durable_with_template(
+            &mut library,
+            &profile(),
+            &geo(),
+            PageTemplate::Dotted,
+            None,
+            &CreateNotebookHooks::default(),
+        )
+        .unwrap();
+        let nb = library.notebook_dir(library.active_notebook_id());
+        let mut store = {
+            let (store, _) = load_existing_page(&nb, DEFAULT_PAGE_ID).unwrap();
+            store
+        };
+        store.append_committed_stroke(&stroke("s-keep")).unwrap();
+        drop(store);
+        let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+        install_page_background(&nb, DEFAULT_PAGE_ID, &ruled).unwrap();
+        let (_, loaded) = load_existing_page(&nb, DEFAULT_PAGE_ID).unwrap();
+        assert_eq!(loaded.background, ruled);
+        assert_eq!(loaded.strokes.len(), 1);
+        assert_eq!(loaded.strokes[0].id.as_str(), "s-keep");
+        assert!(!pages_include_custom_background(
+            &nb,
+            &[DEFAULT_PAGE_ID.to_string()],
+            &geo()
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_notebook_wide_change_leaves_prefix_applied() {
+        let (root, mut library) = fresh_library("change-paper-prefix");
+        create_notebook_durable_with_template(
+            &mut library,
+            &profile(),
+            &geo(),
+            PageTemplate::Dotted,
+            None,
+            &CreateNotebookHooks::default(),
+        )
+        .unwrap();
+        let nb = library.notebook_dir(library.active_notebook_id());
+        let mut manifest = open_or_create_notebook(&nb, InkRequest::Default, &geo(), &paper())
+            .unwrap()
+            .manifest;
+        let page2 = insert_page_after_durable(
+            &nb,
+            &mut manifest,
+            DEFAULT_PAGE_ID,
+            &InsertPageHooks::default(),
+        )
+        .unwrap()
+        .inserted_page_id;
+        let page3 = insert_page_after_durable(
+            &nb,
+            &mut manifest,
+            &page2,
+            &InsertPageHooks::default(),
+        )
+        .unwrap()
+        .inserted_page_id;
+        let dotted = read_background_raw(&nb, DEFAULT_PAGE_ID);
+        assert_eq!(read_background_raw(&nb, &page2), dotted);
+        assert_eq!(read_background_raw(&nb, &page3), dotted);
+        let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+        install_page_background(&nb, DEFAULT_PAGE_ID, &ruled).unwrap();
+        assert_eq!(read_background_raw(&nb, DEFAULT_PAGE_ID), ruled);
+        assert_eq!(
+            read_background_raw(&nb, &page2),
+            dotted,
+            "cancelled all-pages run must not touch remaining pages"
+        );
+        assert_eq!(read_background_raw(&nb, &page3), dotted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inspect_target_paper_uses_identity_and_distinguishes_unreadable() {
+        let (root, mut library) = fresh_library("inspect-paper");
+        create_notebook_durable_with_template(
+            &mut library,
+            &profile(),
+            &geo(),
+            PageTemplate::Dotted,
+            None,
+            &CreateNotebookHooks::default(),
+        )
+        .unwrap();
+        let nb = library.notebook_dir(library.active_notebook_id());
+        let g = geo();
+        let ids = vec![DEFAULT_PAGE_ID.to_string()];
+        let known = inspect_target_paper(&nb, &ids, &g);
+        assert!(!known.custom_pages);
+        assert!(!known.unreadable_pages);
+
+        let mut custom = template_background_bytes(PageTemplate::Blank, &g).unwrap();
+        custom[0] = 0x10;
+        install_page_background(&nb, DEFAULT_PAGE_ID, &custom).unwrap();
+        let custom_i = inspect_target_paper(&nb, &ids, &g);
+        assert!(custom_i.custom_pages);
+        assert!(!custom_i.unreadable_pages);
+
+        let unread = inspect_target_paper(&nb, &["missing-page".into()], &g);
+        assert!(!unread.custom_pages);
+        assert!(unread.unreadable_pages);
+
+        assert_eq!(
+            paper_change_incomplete_notice(0, 3, false),
+            "No pages were changed."
+        );
+        let partial = paper_change_incomplete_notice(1, 3, false);
+        assert!(partial.contains("Changed 1 of 3 pages"));
+        assert!(partial.contains("stay changed"));
+        assert!(!partial.to_ascii_lowercase().contains("roll"));
+        let failed = paper_change_incomplete_notice(2, 4, true);
+        assert!(failed.contains("Changed 2 of 4 pages"));
+        assert!(failed.contains("could not be changed"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn display_failure_after_durable_paper_change_still_counts_as_applied() {
+        assert!(
+            paper_apply_after_durable(Ok(()), Err("reconstruct after paper change".into())).is_ok(),
+            "live display failure must not convert a durable write into a refused apply"
+        );
+        assert_eq!(
+            paper_apply_after_durable(
+                Err("local capture journal could not record this edit".into()),
+                Err("reconstruct".into())
+            )
+            .unwrap_err(),
+            "local capture journal could not record this edit"
+        );
+
+        let (root, mut library) = fresh_library("present-after-durable");
+        create_notebook_durable_with_template(
+            &mut library,
+            &profile(),
+            &geo(),
+            PageTemplate::Dotted,
+            None,
+            &CreateNotebookHooks::default(),
+        )
+        .unwrap();
+        let nb = library.notebook_dir(library.active_notebook_id());
+        let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+        install_page_background(&nb, DEFAULT_PAGE_ID, &ruled).unwrap();
+        paper_apply_after_durable(Ok(()), Err("reconstruct after paper change".into())).unwrap();
+        assert_eq!(
+            fs::read(nb.join(DEFAULT_PAGE_ID).join("background.raw")).unwrap(),
+            ruled,
+            "durable paper must remain even when reconstruct fails"
+        );
+        let notice = paper_change_incomplete_notice(1, 3, true);
+        assert!(notice.contains("Changed 1 of 3 pages"));
+        assert!(!notice.to_ascii_lowercase().contains("nothing was changed"));
         let _ = fs::remove_dir_all(root);
     }
 }

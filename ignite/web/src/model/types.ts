@@ -138,6 +138,8 @@ export interface LibraryHead {
   genesis_sha256: Sha256Hex;
   head_server_seq: bigint;
   snapshot_sha256: Sha256Hex;
+  /** Present on ≥0.9.23 servers. Missing or false: do not journal SetPageBackground. */
+  accept_set_page_background?: boolean;
 }
 
 /** `GET /v1/libraries/{id}/snapshot`. */
