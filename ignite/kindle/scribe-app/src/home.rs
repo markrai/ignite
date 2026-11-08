@@ -128,7 +128,13 @@ pub fn notebook_title_matches(title: &str, query: &str) -> bool {
     title.to_lowercase().contains(&q.to_lowercase())
 }
 
+/// Case-insensitive folder-title substring match (independent of child notebooks).
+pub fn folder_title_matches(title: &str, query: &str) -> bool {
+    notebook_title_matches(title, query)
+}
+
 /// How many notebooks in `folder` match `query` (original membership, library order).
+/// Used for in-folder search; global search folder tiles show full membership instead.
 pub fn folder_match_count(folder: &FolderInfo, cards: &[HomeCard], query: &str) -> usize {
     folder
         .notebook_ids
@@ -140,11 +146,15 @@ pub fn folder_match_count(folder: &FolderInfo, cards: &[HomeCard], query: &str) 
 
 /// Rows of the current view.
 ///
-/// - Main list + `query`: every matching notebook (library order), then folder tiles for
-///   folders with ≥1 match. Foldered notebooks appear as cards and again via their folder.
-/// - Open folder + `query`: matching notebooks in that folder only.
-/// - Main list, no query: folder rows first, then unfiled notebooks.
+/// - Main list + `query`: matching notebooks (library order, including foldered), then
+///   folder tiles whose *titles* match (stable folder order). A folder is not included
+///   merely because a child notebook matches.
+/// - Open folder + `query`: matching notebooks in that folder only (in-folder search).
 /// - Open folder, no query: that folder's notebooks in library order.
+/// - Main list, no query: folder rows first, then unfiled notebooks.
+///
+/// Global search parks the live query while a folder opened from results is browsed, so
+/// the open-folder path sees `query == None` (full membership) until Back restores it.
 pub fn home_rows(
     cards: &[HomeCard],
     folders: &[FolderInfo],
@@ -165,7 +175,7 @@ pub fn home_rows(
         let matching_folders: Vec<usize> = folders
             .iter()
             .enumerate()
-            .filter(|(_, f)| folder_match_count(f, cards, q) > 0)
+            .filter(|(_, f)| folder_title_matches(&f.title, q))
             .map(|(i, _)| i)
             .collect();
         return cards
@@ -924,8 +934,9 @@ impl<'a> HomePaintOpts<'a> {
 
 /// Home with folders: the main list (`open == None`) or one open folder.
 ///
-/// `search` filters both the main list (folders + root matches) and an open folder's
-/// notebooks. Folder chrome shows the folder title plus a filter hint when searching.
+/// On the main list, `search` matches notebook titles and folder titles independently.
+/// Inside an open folder, `search` filters that folder's notebooks (in-folder search).
+/// Folder chrome shows the folder title plus a filter hint when an in-folder filter is active.
 pub fn render_home_view(
     fb: &mut [u8],
     geo: &FbGeometry,
@@ -1053,11 +1064,8 @@ pub fn render_home_view_with(
             &title,
             BLACK,
         );
-        let count = if let Some(q) = query {
-            folder_match_count(f, cards, q)
-        } else {
-            f.notebook_ids.len()
-        };
+        // Search tiles that matched by folder title show full membership, not hit count.
+        let count = f.notebook_ids.len();
         let (meta, meta_scale) = folder_count_label(count, content.meta.w);
         let meta_y = content.meta.y + content.meta.h.saturating_sub(GLYPH_H * meta_scale) / 2;
         c.text(content.meta.x, meta_y, meta_scale, &meta, BLACK);
@@ -1356,6 +1364,8 @@ mod tests {
         assert!(notebook_title_matches("Café Notes", "café"));
         assert!(!notebook_title_matches("Work", "play"));
         assert!(!notebook_title_matches("Work", "   "));
+        assert!(folder_title_matches("Personal Projects", "per"));
+        assert!(!folder_title_matches("Journals", "per"));
     }
 
     fn search_cards() -> Vec<HomeCard> {
@@ -1379,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn search_rows_keep_library_indices_and_include_foldered_notebooks() {
+    fn search_rows_notebook_only_excludes_parent_folder() {
         let cards = search_cards();
         let folders = vec![FolderInfo {
             id: "folder-1".into(),
@@ -1389,31 +1399,19 @@ mod tests {
         let rows = home_rows(&cards, &folders, None, Some("ALPHA"));
         assert_eq!(
             rows,
-            vec![
-                HomeRow::Notebook(0),
-                HomeRow::Notebook(2),
-                HomeRow::Folders(vec![0]),
-            ],
-            "matching notebooks first (library order, including foldered), then folder tile"
+            vec![HomeRow::Notebook(0), HomeRow::Notebook(2)],
+            "matching notebooks first (library order, including foldered); parent folder excluded"
         );
-        let notebook_hits: Vec<_> = rows
-            .iter()
-            .filter_map(|r| match r {
-                HomeRow::Notebook(i) => Some(*i),
-                HomeRow::Folders(_) => None,
-            })
-            .collect();
-        assert_eq!(
-            notebook_hits,
-            vec![0, 2],
-            "each matching notebook appears once"
-        );
-        assert_eq!(folder_match_count(&folders[0], &cards, "ALPHA"), 1);
         assert!(home_rows(&cards, &folders, None, Some("zzz")).is_empty());
         assert_eq!(
             home_rows(&cards, &folders, Some("folder-1"), Some("ALPHA")),
             vec![HomeRow::Notebook(2)],
-            "folder drill-in keeps only that folder's matches"
+            "in-folder search keeps only that folder's matches"
+        );
+        assert_eq!(
+            home_rows(&cards, &folders, Some("folder-1"), None),
+            vec![HomeRow::Notebook(2)],
+            "open folder without a live filter shows full membership"
         );
         assert_eq!(
             home_rows(&cards, &folders, None, None),
@@ -1427,56 +1425,59 @@ mod tests {
     }
 
     #[test]
-    fn search_rows_list_every_match_in_a_folder_then_the_folder_tile() {
-        let mut cards = search_cards();
-        cards[1].title = "Alpha Work".into();
-        let folders = vec![FolderInfo {
-            id: "folder-1".into(),
-            title: "Projects".into(),
-            notebook_ids: vec!["notebook-2".into(), "notebook-3".into()],
-        }];
+    fn search_rows_folder_only_match_by_title_including_empty() {
+        let cards = search_cards();
+        let folders = vec![
+            FolderInfo {
+                id: "folder-1".into(),
+                title: "Alpha Archive".into(),
+                notebook_ids: vec!["notebook-2".into(), "notebook-3".into()],
+            },
+            FolderInfo {
+                id: "folder-2".into(),
+                title: "alpha empty".into(),
+                notebook_ids: vec![],
+            },
+        ];
         assert_eq!(
             home_rows(&cards, &folders, None, Some("alpha")),
             vec![
                 HomeRow::Notebook(0),
-                HomeRow::Notebook(1),
                 HomeRow::Notebook(2),
-                HomeRow::Folders(vec![0]),
-            ]
+                HomeRow::Folders(vec![0, 1]),
+            ],
+            "notebooks by title, then folders by title (including empty)"
         );
-        assert_eq!(folder_match_count(&folders[0], &cards, "alpha"), 2);
+        assert_eq!(folders[0].notebook_ids.len(), 2);
+        assert_eq!(folder_match_count(&folders[0], &cards, "alpha"), 1);
+        assert_eq!(
+            home_rows(&cards, &folders, None, Some("Archive")),
+            vec![HomeRow::Folders(vec![0])],
+            "folder-only title match with no notebook hits"
+        );
     }
 
     #[test]
-    fn search_rows_keep_matching_folders_in_order_and_chunked() {
+    fn search_rows_keep_title_matched_folders_in_order_and_chunked() {
         let cards: Vec<HomeCard> = (1..=5)
             .map(|i| HomeCard {
                 notebook_id: format!("notebook-{i}"),
-                title: format!("Alpha {i}"),
+                title: format!("Note {i}"),
                 page_count: Some(i),
             })
             .collect();
         let folders: Vec<FolderInfo> = (1..=4)
             .map(|n| FolderInfo {
                 id: format!("folder-{n}"),
-                title: format!("Folder {n}"),
+                title: format!("Alpha Folder {n}"),
                 notebook_ids: vec![format!("notebook-{n}")],
             })
             .collect();
         assert_eq!(
             home_rows(&cards, &folders, None, Some("alpha")),
-            vec![
-                HomeRow::Notebook(0),
-                HomeRow::Notebook(1),
-                HomeRow::Notebook(2),
-                HomeRow::Notebook(3),
-                HomeRow::Notebook(4),
-                HomeRow::Folders(vec![0, 1, 2]),
-                HomeRow::Folders(vec![3]),
-            ]
+            vec![HomeRow::Folders(vec![0, 1, 2]), HomeRow::Folders(vec![3]),],
+            "folder-title matches only, stable order, three per row"
         );
-        assert_eq!(folder_match_count(&folders[0], &cards, "alpha"), 1);
-        assert_eq!(folder_match_count(&folders[3], &cards, "alpha"), 1);
     }
 
     #[test]
@@ -1526,6 +1527,7 @@ mod tests {
                 let start = f * per_folder;
                 FolderInfo {
                     id: format!("folder-{f}"),
+                    // Titles do not match "alpha"; child notebooks do.
                     title: format!("Folder {f}"),
                     notebook_ids: (start..start + per_folder)
                         .map(|i| format!("notebook-{i}"))
@@ -1535,16 +1537,11 @@ mod tests {
             .collect();
 
         let rows = home_rows(&cards, &folders, None, Some("alpha"));
-        let expected_folders: Vec<HomeRow> = (0..folder_count)
-            .collect::<Vec<_>>()
-            .chunks(FOLDERS_PER_ROW)
-            .map(|c| HomeRow::Folders(c.to_vec()))
-            .collect();
-        let expected: Vec<HomeRow> = (0..n)
-            .map(HomeRow::Notebook)
-            .chain(expected_folders)
-            .collect();
-        assert_eq!(rows, expected);
+        let expected: Vec<HomeRow> = (0..n).map(HomeRow::Notebook).collect();
+        assert_eq!(
+            rows, expected,
+            "notebook-only matches; parent folders excluded without title hits"
+        );
     }
 
     #[test]

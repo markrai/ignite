@@ -44,8 +44,23 @@ mod tests {
         }]
     }
 
-    /// Global `"al"` / `"ALPHA"` projection for the default fixture: notebooks first.
-    fn alpha_search_rows() -> Vec<HomeRow> {
+    /// Folder whose title also matches `"al"` / `"alpha"` (independent of children).
+    /// Title length stays near `"Projects"` so search-tile compact layout thresholds hold.
+    fn folders_title_alpha() -> Vec<FolderInfo> {
+        vec![FolderInfo {
+            id: "folder-1".into(),
+            title: "Alphaes".into(),
+            notebook_ids: vec!["notebook-3".into()],
+        }]
+    }
+
+    /// Global `"al"` / `"ALPHA"` notebook-only projection for the default fixture.
+    fn alpha_notebook_rows() -> Vec<HomeRow> {
+        vec![HomeRow::Notebook(0), HomeRow::Notebook(2)]
+    }
+
+    /// Notebook hits plus a title-matched folder tile.
+    fn alpha_both_rows() -> Vec<HomeRow> {
         vec![
             HomeRow::Notebook(0),
             HomeRow::Notebook(2),
@@ -176,7 +191,7 @@ mod tests {
                 !tile.intersects(&kb.keys_area) && !menu.intersects(&kb.keys_area),
                 "folder tile/menu must not overlap the keyboard"
             );
-            assert_folder_tile_content_bounds(*tile, *menu, "Projects");
+            assert_folder_tile_content_bounds(*tile, *menu, "Alphaes");
         }
         // Key hit targets stay inside the keys band.
         for (_, r) in &kb.keys {
@@ -244,7 +259,7 @@ mod tests {
 
     fn assert_search_composer_no_overlap(g: &FbGeometry) {
         let c = cards();
-        let folders = folders();
+        let folders = folders_title_alpha();
         let rows = home_rows(&c, &folders, None, Some("al"));
         let geom0 = search_geom_on_page(g, &c, &folders, "al", 0);
         assert_layout_no_keyboard_overlap(g, &geom0);
@@ -287,8 +302,8 @@ mod tests {
         assert_eq!(ui.home_search.as_deref(), Some("al"));
         assert_eq!(
             ui.home_rows(&c),
-            alpha_search_rows(),
-            "matching notebooks first, then the folder tile"
+            alpha_notebook_rows(),
+            "matching notebooks only; parent folder title does not match"
         );
         assert_eq!(folder_match_count(&ui.folders[0], &c, "al"), 1);
 
@@ -386,15 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn folder_drill_in_keeps_query_and_back_restores_main_matches() {
+    fn folder_drill_in_parks_query_shows_full_membership_and_back_restores() {
         let g = panel_geo();
         let c = cards();
         let mut ui = UiState::launch_home(0, c.len());
-        ui.folders = folders();
+        ui.folders = folders_title_alpha();
+        // Add a non-matching member so full membership differs from filtered hits.
+        ui.folders[0].notebook_ids.push("notebook-2".into());
         ui.begin_home_search();
         for ch in ['a', 'l'] {
             tap_key(&mut ui, &g, &c, EditorKey::Char(ch));
         }
+        assert_eq!(ui.home_rows(&c), alpha_both_rows());
         let l = layout(&g, &ui, &c);
         assert_eq!(l.folders.len(), 1);
         assert_eq!(
@@ -405,9 +423,17 @@ mod tests {
             ui.search_editor.is_none(),
             "opening a folder dismisses keyboard"
         );
-        assert_eq!(ui.home_search.as_deref(), Some("al"));
+        assert!(
+            ui.home_search.is_none(),
+            "global query parked while browsing"
+        );
+        assert_eq!(ui.home_search_parked.as_deref(), Some("al"));
         assert_eq!(ui.home_folder.as_deref(), Some("folder-1"));
-        assert_eq!(ui.home_rows(&c), vec![HomeRow::Notebook(2)]);
+        assert_eq!(
+            ui.home_rows(&c),
+            vec![HomeRow::Notebook(1), HomeRow::Notebook(2)],
+            "title-matched folder opens with full membership"
+        );
 
         let l = layout(&g, &ui, &c);
         assert!(l.in_folder);
@@ -416,22 +442,25 @@ mod tests {
             UiCommand::Redraw(Redraw::Full)
         );
         assert!(ui.home_folder.is_none());
+        assert!(ui.home_search_parked.is_none());
         assert_eq!(ui.home_search.as_deref(), Some("al"));
-        assert_eq!(ui.home_rows(&c), alpha_search_rows());
+        assert_eq!(ui.home_rows(&c), alpha_both_rows());
     }
 
     #[test]
-    fn filtered_folder_title_area_is_not_a_search_opener() {
+    fn in_folder_search_still_filters_membership() {
         let g = panel_geo();
         let c = cards();
         let mut ui = UiState::launch_home(0, c.len());
         ui.folders = folders();
-        ui.set_home_search(Some("alpha".into()));
+        ui.folders[0].notebook_ids.push("notebook-2".into());
         ui.home_folder = Some("folder-1".into());
+        ui.set_home_search(Some("alpha".into()));
         assert_eq!(
             ui.home_rows(&c),
             home_rows(&c, &ui.folders, Some("folder-1"), Some("alpha"))
         );
+        assert_eq!(ui.home_rows(&c), vec![HomeRow::Notebook(2)]);
         let l = layout(&g, &ui, &c);
         assert!(l.in_folder);
         assert!(l.clear_search.is_none());
@@ -591,7 +620,7 @@ mod tests {
         );
         assert!(ui.search_editor.is_none());
         assert_eq!(ui.home_search.as_deref(), Some("al"));
-        assert_eq!(ui.home_rows(&c), alpha_search_rows());
+        assert_eq!(ui.home_rows(&c), alpha_notebook_rows());
 
         // Reopen → Clear → Done commits the cleared query (unfiltered library).
         let l = layout(&g, &ui, &c);
@@ -626,14 +655,14 @@ mod tests {
     fn folder_tile_content_uses_normal_layout_when_tall_and_compact_when_short() {
         let g = panel_geo();
         let c = cards();
-        let folders = folders();
+        let folders = folders_title_alpha();
         let rows = home_rows(&c, &folders, None, None);
         let state = HomeState::selecting(0, c.len());
         let tall =
             HomeLayout::for_rows(&g, &state, &rows, false, false, HomeViewport::standard(&g));
         assert!(!tall.folders.is_empty());
         for (_, tile, menu) in &tall.folders {
-            let content = folder_tile_content(*tile, menu.x, "Projects");
+            let content = folder_tile_content(*tile, menu.x, "Alphaes");
             assert!(
                 !content.compact,
                 "full-height Home tiles must keep the normal folder layout (h={})",
@@ -664,7 +693,7 @@ mod tests {
                 g.yres
             );
             for (_, tile, menu) in &geom.home.folders {
-                let content = folder_tile_content(*tile, menu.x, "Projects");
+                let content = folder_tile_content(*tile, menu.x, "Alphaes");
                 assert_folder_tile_content_safe(*tile, *menu, content);
                 // Short search tiles on these panels need the compact stack.
                 assert!(
@@ -679,7 +708,7 @@ mod tests {
     #[test]
     fn folder_count_label_fits_meta_width_on_search_tiles() {
         let c = cards();
-        let folders = folders();
+        let folders = folders_title_alpha();
         let state = HomeState::selecting(0, c.len());
         let counts = [1usize, 2, 128];
         for g in [
@@ -702,7 +731,7 @@ mod tests {
                 .first()
                 .copied()
                 .expect("matching folder tile");
-            let content = folder_tile_content(tile, menu.x, "Projects");
+            let content = folder_tile_content(tile, menu.x, "Alphaes");
             for n in counts {
                 let (label, scale) = folder_count_label(n, content.meta.w);
                 assert!(
@@ -730,7 +759,7 @@ mod tests {
                 HomeViewport::standard(&g),
             );
             if let Some((_, tile, menu)) = tall.folders.first() {
-                let tall_content = folder_tile_content(*tile, menu.x, "Projects");
+                let tall_content = folder_tile_content(*tile, menu.x, "Alphaes");
                 if !tall_content.compact {
                     let (one, scale_one) = folder_count_label(1, tall_content.meta.w);
                     let (many, scale_many) = folder_count_label(2, tall_content.meta.w);
@@ -752,7 +781,7 @@ mod tests {
         let mut ui = UiState::launch_home(0, c.len());
         ui.folders = folders();
         ui.set_home_search(Some("alpha".into()));
-        assert_eq!(ui.home_rows(&c), alpha_search_rows());
+        assert_eq!(ui.home_rows(&c), alpha_notebook_rows());
         ui.begin_home_search();
         let l = layout(&g, &ui, &c);
         let foldered = l
@@ -783,6 +812,12 @@ mod tests {
         );
         assert_eq!(notebook_meta_label(c[0].page_count, None), "1 page");
         assert_eq!(folder_match_count(&ui.folders[0], &c, "alpha"), 1);
+        assert!(
+            !ui.home_rows(&c)
+                .iter()
+                .any(|r| matches!(r, HomeRow::Folders(_))),
+            "parent folder must not appear solely because a child matches"
+        );
 
         let l = layout(&g, &ui, &c);
         let foldered_menu = l
@@ -806,56 +841,66 @@ mod tests {
     }
 
     #[test]
-    fn back_from_filtered_folder_pages_to_the_folder_tile() {
+    fn back_from_opened_search_folder_pages_to_the_folder_tile() {
         let g = panel_geo();
         let mut c: Vec<HomeCard> = (1..=6)
             .map(|i| HomeCard {
                 notebook_id: format!("notebook-{i}"),
-                title: format!("Match {i}"),
+                title: format!("Note {i}"),
                 page_count: Some(i),
             })
             .collect();
         c.push(HomeCard {
             notebook_id: "notebook-7".into(),
-            title: "Match foldered".into(),
+            title: "Other".into(),
             page_count: Some(7),
         });
         let folders = vec![FolderInfo {
             id: "folder-1".into(),
-            title: "Projects".into(),
-            notebook_ids: vec!["notebook-7".into()],
+            title: "Match Folder".into(),
+            notebook_ids: vec!["notebook-7".into(), "notebook-1".into()],
         }];
         let mut ui = UiState::launch_home(0, c.len());
         ui.folders = folders;
         ui.set_home_search(Some("Match".into()));
         let rows = ui.home_rows(&c);
-        assert_eq!(
-            rows,
-            (0..7)
-                .map(HomeRow::Notebook)
-                .chain(std::iter::once(HomeRow::Folders(vec![0])))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(rows, vec![HomeRow::Folders(vec![0])]);
+        // Pad with notebook hits so the folder tile sits past page 0 after a mixed query.
+        ui.set_home_search(Some("e".into()));
+        let rows = ui.home_rows(&c);
         let folder_row = rows
             .iter()
             .position(|r| matches!(r, HomeRow::Folders(_)))
-            .unwrap();
+            .expect("folder title Match Folder matches 'e'");
         assert!(
             folder_row >= ROWS_PER_PAGE,
             "folder tile must sit past the first page so Back has a viewport to restore"
         );
 
-        ui.home_folder = Some("folder-1".into());
-        ui.home.page = 0;
+        // Open via the real hit path so the global query is parked.
+        ui.home.page = folder_row / ROWS_PER_PAGE;
+        ui.settle_home(&g, &c);
+        let l = layout(&g, &ui, &c);
+        assert_eq!(l.folders.len(), 1);
+        assert_eq!(
+            ui.on_tap(&g, center(l.folders[0].1), &c, "Notebook 8", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert!(ui.home_search.is_none());
+        assert_eq!(ui.home_search_parked.as_deref(), Some("e"));
+        assert_eq!(
+            ui.home_rows(&c),
+            vec![HomeRow::Notebook(0), HomeRow::Notebook(6)],
+            "opened folder shows full membership, not only title hits"
+        );
         let l = layout(&g, &ui, &c);
         assert!(l.in_folder);
-        assert_eq!(ui.home_rows(&c), vec![HomeRow::Notebook(6)]);
         assert_eq!(
             ui.on_tap(&g, center(l.exit_hit), &c, "Notebook 8", None),
             UiCommand::Redraw(Redraw::Full)
         );
         assert!(ui.home_folder.is_none());
-        assert_eq!(ui.home_search.as_deref(), Some("Match"));
+        assert_eq!(ui.home_search.as_deref(), Some("e"));
         assert_eq!(ui.home_rows(&c), rows);
         assert_eq!(ui.home.page, folder_row / ROWS_PER_PAGE);
     }
@@ -872,12 +917,12 @@ mod tests {
             .collect();
         c.push(HomeCard {
             notebook_id: "notebook-7".into(),
-            title: "Match foldered".into(),
+            title: "Other".into(),
             page_count: Some(1),
         });
         let folders = vec![FolderInfo {
             id: "folder-1".into(),
-            title: "Projects".into(),
+            title: "Match Folder".into(),
             notebook_ids: vec!["notebook-7".into()],
         }];
         let mut ui = UiState::launch_home(0, c.len());
@@ -886,6 +931,14 @@ mod tests {
         ui.home.reveal = false;
         ui.home.page = 0;
         ui.settle_home(&g, &c);
+        assert_eq!(
+            ui.home_rows(&c),
+            (0..6)
+                .map(HomeRow::Notebook)
+                .chain(std::iter::once(HomeRow::Folders(vec![0])))
+                .collect::<Vec<_>>(),
+            "six notebook hits then the title-matched folder"
+        );
 
         let mut seen_notebooks = Vec::new();
         let mut seen_folders = Vec::new();
@@ -911,7 +964,7 @@ mod tests {
                 UiCommand::Redraw(Redraw::Full)
             );
         }
-        assert_eq!(seen_notebooks, (0..7).collect::<Vec<_>>());
+        assert_eq!(seen_notebooks, (0..6).collect::<Vec<_>>());
         assert_eq!(seen_folders, vec![0]);
         assert!(
             seen_notebooks
@@ -919,6 +972,266 @@ mod tests {
                 .zip(seen_notebooks.iter().skip(1))
                 .all(|(a, b)| a < b),
             "notebook cards keep library order across pages"
+        );
+    }
+
+    #[test]
+    fn personal_example_excludes_journals_parent_folder() {
+        let c = vec![
+            HomeCard {
+                notebook_id: "notebook-1".into(),
+                title: "Personal".into(),
+                page_count: Some(1),
+            },
+            HomeCard {
+                notebook_id: "notebook-2".into(),
+                title: "Work".into(),
+                page_count: Some(2),
+            },
+        ];
+        let folders = vec![
+            FolderInfo {
+                id: "folder-journals".into(),
+                title: "Journals".into(),
+                notebook_ids: vec!["notebook-1".into()],
+            },
+            FolderInfo {
+                id: "folder-personal-projects".into(),
+                title: "Personal Projects".into(),
+                notebook_ids: vec![],
+            },
+        ];
+        assert_eq!(
+            home_rows(&c, &folders, None, Some("per")),
+            vec![HomeRow::Notebook(0), HomeRow::Folders(vec![1]),],
+            "Personal journal + Personal Projects folder; Journals parent excluded"
+        );
+        assert_eq!(
+            folders[1].notebook_ids.len(),
+            0,
+            "empty matching folder keeps a zero membership count"
+        );
+    }
+
+    #[test]
+    fn open_notebook_from_search_folder_then_home_back_restores_query() {
+        let g = panel_geo();
+        let c = cards();
+        let mut ui = UiState::launch_home(0, c.len());
+        ui.folders = folders_title_alpha();
+        ui.folders[0].notebook_ids.push("notebook-2".into());
+        ui.set_home_search(Some("al".into()));
+        assert_eq!(ui.home_rows(&c), alpha_both_rows());
+
+        let l = layout(&g, &ui, &c);
+        assert_eq!(
+            ui.on_tap(&g, center(l.folders[0].1), &c, "Notebook 4", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert_eq!(ui.home_search_parked.as_deref(), Some("al"));
+        assert!(ui.home_search.is_none());
+
+        let l = layout(&g, &ui, &c);
+        let member = l
+            .cards
+            .iter()
+            .find(|(i, _, _)| *i == 2)
+            .copied()
+            .expect("folder member card");
+        assert_eq!(
+            ui.on_tap(&g, center(member.1), &c, "Notebook 4", None),
+            UiCommand::OpenNotebook("notebook-3".into())
+        );
+        assert!(ui.search_editor.is_none());
+        assert_eq!(
+            ui.home_search_parked.as_deref(),
+            Some("al"),
+            "OpenCard must not discard the parked global query"
+        );
+        assert_eq!(ui.home_folder.as_deref(), Some("folder-1"));
+
+        // Return from the notebook into Home while still inside the folder.
+        ui.enter_home(2, c.len());
+        assert_eq!(ui.home_folder.as_deref(), Some("folder-1"));
+        assert_eq!(
+            ui.home_search_parked.as_deref(),
+            Some("al"),
+            "enter_home must keep parked query while the folder is still open"
+        );
+
+        let l = layout(&g, &ui, &c);
+        assert_eq!(
+            ui.on_tap(&g, center(l.exit_hit), &c, "Notebook 4", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert!(ui.home_folder.is_none());
+        assert!(ui.home_search_parked.is_none());
+        assert_eq!(ui.home_search.as_deref(), Some("al"));
+        assert_eq!(ui.home_rows(&c), alpha_both_rows());
+    }
+
+    #[test]
+    fn in_folder_filter_leaves_parked_global_query_for_back() {
+        let g = panel_geo();
+        let c = cards();
+        let mut ui = UiState::launch_home(0, c.len());
+        ui.folders = folders_title_alpha();
+        ui.folders[0].notebook_ids.push("notebook-2".into());
+        ui.set_home_search(Some("al".into()));
+        let l = layout(&g, &ui, &c);
+        ui.on_tap(&g, center(l.folders[0].1), &c, "Notebook 4", None);
+        assert_eq!(ui.home_search_parked.as_deref(), Some("al"));
+        assert!(ui.home_search.is_none());
+
+        // In-folder filter is independent of the parked global query.
+        ui.set_home_search(Some("Beta".into()));
+        assert_eq!(ui.home_rows(&c), vec![HomeRow::Notebook(1)]);
+        assert_eq!(
+            ui.home_search_parked.as_deref(),
+            Some("al"),
+            "in-folder search must not overwrite the parked global query"
+        );
+
+        let l = layout(&g, &ui, &c);
+        assert_eq!(
+            ui.on_tap(&g, center(l.exit_hit), &c, "Notebook 4", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert_eq!(
+            ui.home_search.as_deref(),
+            Some("al"),
+            "Back prefers the parked global query over the in-folder filter"
+        );
+        assert!(ui.home_search_parked.is_none());
+        assert_eq!(ui.home_rows(&c), alpha_both_rows());
+    }
+
+    #[test]
+    fn clear_in_folder_filter_preserves_parked_global_for_back() {
+        let g = panel_geo();
+        let c = cards();
+        let mut ui = UiState::launch_home(0, c.len());
+        ui.folders = folders_title_alpha();
+        ui.folders[0].notebook_ids.push("notebook-2".into());
+        ui.set_home_search(Some("al".into()));
+        let l = layout(&g, &ui, &c);
+        ui.on_tap(&g, center(l.folders[0].1), &c, "Notebook 4", None);
+        assert_eq!(ui.home_search_parked.as_deref(), Some("al"));
+
+        ui.set_home_search(Some("Beta".into()));
+        assert_eq!(ui.home_rows(&c), vec![HomeRow::Notebook(1)]);
+        ui.clear_home_search();
+        assert!(ui.home_search.is_none());
+        assert_eq!(
+            ui.home_search_parked.as_deref(),
+            Some("al"),
+            "clearing an in-folder filter must keep the parked global query"
+        );
+        assert_eq!(
+            ui.home_rows(&c),
+            vec![HomeRow::Notebook(1), HomeRow::Notebook(2)],
+            "cleared in-folder filter restores full folder membership"
+        );
+
+        let l = layout(&g, &ui, &c);
+        assert_eq!(
+            ui.on_tap(&g, center(l.exit_hit), &c, "Notebook 4", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert_eq!(ui.home_search.as_deref(), Some("al"));
+        assert!(ui.home_search_parked.is_none());
+        assert_eq!(ui.home_rows(&c), alpha_both_rows());
+    }
+
+    #[test]
+    fn clear_discards_parked_query_and_missing_folder_restores_safely() {
+        let g = panel_geo();
+        let c = cards();
+        let mut ui = UiState::launch_home(0, c.len());
+        ui.folders = folders_title_alpha();
+        ui.set_home_search(Some("al".into()));
+        let l = layout(&g, &ui, &c);
+        ui.on_tap(&g, center(l.folders[0].1), &c, "Notebook 4", None);
+        assert_eq!(ui.home_search_parked.as_deref(), Some("al"));
+
+        // Back restores the global query; clearing on the main list discards park state.
+        let l = layout(&g, &ui, &c);
+        ui.on_tap(&g, center(l.exit_hit), &c, "Notebook 4", None);
+        assert_eq!(ui.home_search.as_deref(), Some("al"));
+        assert!(ui.home_search_parked.is_none());
+        let l = layout(&g, &ui, &c);
+        let clear = l.clear_search.expect("clear on main search results");
+        assert_eq!(
+            ui.on_tap(&g, center(clear), &c, "Notebook 4", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert!(ui.home_search.is_none());
+        assert!(ui.home_search_parked.is_none());
+
+        // Missing open folder restores a still-parked query once, then leaves no stale park.
+        ui.set_home_search(Some("al".into()));
+        let l = layout(&g, &ui, &c);
+        ui.on_tap(&g, center(l.folders[0].1), &c, "Notebook 4", None);
+        assert_eq!(ui.home_search_parked.as_deref(), Some("al"));
+        ui.folders.clear();
+        ui.settle_home(&g, &c);
+        assert!(ui.home_folder.is_none());
+        assert_eq!(ui.home_search.as_deref(), Some("al"));
+        assert!(ui.home_search_parked.is_none());
+        ui.settle_home(&g, &c);
+        assert_eq!(
+            ui.home_search.as_deref(),
+            Some("al"),
+            "settle must not clear a restored live query"
+        );
+        assert!(ui.home_search_parked.is_none());
+    }
+
+    #[test]
+    fn cancel_while_editing_does_not_invent_parked_query() {
+        let g = panel_geo();
+        let c = cards();
+        let mut ui = UiState::launch_home(0, c.len());
+        ui.folders = folders();
+        ui.begin_home_search();
+        tap_key(&mut ui, &g, &c, EditorKey::Char('z'));
+        assert_eq!(
+            tap_key(&mut ui, &g, &c, EditorKey::Cancel),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert!(ui.home_search.is_none());
+        assert!(ui.home_search_parked.is_none());
+        assert!(ui.home_search_backup.is_none());
+    }
+
+    #[test]
+    fn unfiltered_folder_open_and_back_leaves_search_clear() {
+        let g = panel_geo();
+        let c = cards();
+        let mut ui = UiState::launch_home(0, c.len());
+        ui.folders = folders();
+        let l = layout(&g, &ui, &c);
+        assert!(l.folders.len() >= 1);
+        assert_eq!(
+            ui.on_tap(&g, center(l.folders[0].1), &c, "Notebook 4", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert_eq!(ui.home_folder.as_deref(), Some("folder-1"));
+        assert!(ui.home_search.is_none());
+        assert!(ui.home_search_parked.is_none());
+        let l = layout(&g, &ui, &c);
+        assert_eq!(
+            ui.on_tap(&g, center(l.exit_hit), &c, "Notebook 4", None),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert!(ui.home_folder.is_none());
+        assert!(ui.home_search.is_none());
+        assert!(ui.home_search_parked.is_none());
+        assert!(
+            ui.home_rows(&c)
+                .iter()
+                .any(|r| matches!(r, HomeRow::Folders(_))),
+            "ordinary library folders return after Back"
         );
     }
 }

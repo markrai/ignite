@@ -196,11 +196,15 @@ pub struct UiState {
     pub next_folder_title: String,
     /// Home shows this folder's notebooks (transient; never durable).
     pub home_folder: Option<String>,
-    /// Live case-insensitive title filter (`None` = no filter). Applies on the main list and
-    /// inside an open folder. Never written to library metadata, folders, or sync.
+    /// Live case-insensitive title filter (`None` = no filter). On the main list this is
+    /// global search; inside an open folder it is an in-folder title filter. Never written
+    /// to library metadata, folders, or sync.
     pub home_search: Option<String>,
     /// Snapshot of [`Self::home_search`] when the docked search keyboard opened (Cancel restores).
     pub home_search_backup: Option<String>,
+    /// Global search query parked while browsing a folder opened from search results.
+    /// Restored on Back so the folder shows full membership while open.
+    pub home_search_parked: Option<String>,
     /// Docked Home search keyboard (`Some` = composing over filtered results).
     pub search_editor: Option<TitleEditor>,
 }
@@ -224,6 +228,7 @@ impl UiState {
             home_folder: None,
             home_search: None,
             home_search_backup: None,
+            home_search_parked: None,
             search_editor: None,
         }
     }
@@ -234,7 +239,7 @@ impl UiState {
         self.folders.iter().find(|f| f.id == id)
     }
 
-    /// Active title filter for row construction (also applies inside an open folder).
+    /// Active title filter for row construction (main-list global search, or in-folder filter).
     pub fn home_search_query(&self) -> Option<&str> {
         self.home_search.as_deref()
     }
@@ -299,7 +304,11 @@ impl UiState {
         self.home.reveal = false;
     }
 
-    /// Drop any open search editor / backup (query already live or irrelevant after navigation).
+    /// Drop the docked search editor and Cancel backup.
+    ///
+    /// Does **not** discard [`Self::home_search_parked`]: opening a notebook from a
+    /// search-entered folder must keep the global query available for Back after
+    /// returning to Home.
     pub fn clear_search_session(&mut self) {
         self.search_editor = None;
         self.home_search_backup = None;
@@ -308,9 +317,14 @@ impl UiState {
     /// Clear the live filter and any open editor draft.
     ///
     /// While a search session is open, the Cancel backup is preserved so Cancel can still
-    /// restore the query that was committed when the keyboard opened.
+    /// restore the query that was committed when the keyboard opened. Clearing on the main
+    /// list also drops any parked global query so Back cannot resurrect a discarded search.
+    /// Clearing an in-folder filter leaves [`Self::home_search_parked`] intact for Back.
     pub fn clear_home_search(&mut self) {
         self.home_search = None;
+        if self.home_folder.is_none() {
+            self.home_search_parked = None;
+        }
         if self.search_editor.is_none() {
             self.home_search_backup = None;
         }
@@ -319,6 +333,14 @@ impl UiState {
         }
         self.home.page = 0;
         self.home.reveal = false;
+    }
+
+    /// Restore a parked global query onto the main list, preferring it over any live
+    /// in-folder filter so Back returns to the original search results.
+    fn restore_parked_home_search(&mut self) {
+        if let Some(parked) = self.home_search_parked.take() {
+            self.home_search = Some(parked);
+        }
     }
 
     /// Rows of the Home view currently shown.
@@ -336,6 +358,7 @@ impl UiState {
         if self.home_folder.is_some() && self.open_folder().is_none() {
             self.home_folder = None;
             self.home.reveal = true;
+            self.restore_parked_home_search();
         }
         let rows = self.home_rows(cards);
         let vp = self.home_viewport(geo);
@@ -439,6 +462,9 @@ impl UiState {
 
     /// Enter Home selecting `active_index` (the durable active notebook). Selection is
     /// transient; entering Home never changes `active_notebook_id`.
+    ///
+    /// A parked global query is kept when returning into an open folder (so Back can
+    /// restore search results). Stale park state is dropped when not inside a folder.
     pub fn enter_home(&mut self, active_index: usize, total: usize) {
         self.view = AppView::Home;
         self.modal = None;
@@ -447,6 +473,11 @@ impl UiState {
         self.chrome = NotebookChromeState::default();
         self.link_picker = None;
         self.clear_search_session();
+        // Keep parked while a folder browse context remains (even if the folder was
+        // deleted — settle_home restores). Drop only when Home is not inside a folder.
+        if self.home_folder.is_none() {
+            self.home_search_parked = None;
+        }
     }
 
     /// Normal notebook entry: fullscreen writing (chrome hidden).
@@ -750,8 +781,10 @@ impl UiState {
                 }
             }
             Some(HomeHit::Back) => {
-                // Back to the main list, showing the folder just left. Query is retained.
+                // Back to the main list, showing the folder just left. Prefer the parked
+                // global query over any live in-folder filter so results match drill-in.
                 self.home_folder = None;
+                self.restore_parked_home_search();
                 let vp = self.home_viewport(geo);
                 let main = self.home_rows(cards);
                 if let Some(fi) = open
@@ -769,8 +802,13 @@ impl UiState {
             }
             Some(HomeHit::OpenFolder(fi)) => {
                 if composing {
-                    // Commit draft, dismiss keyboard, keep the query for filtered drill-in.
+                    // Commit draft and dismiss keyboard before parking the query.
                     self.finish_home_search(true);
+                }
+                // Park global search so the folder opens with full membership; Back restores it.
+                // An in-folder search can still set `home_search` while the folder is open.
+                if let Some(q) = self.home_search.take() {
+                    self.home_search_parked = Some(q);
                 }
                 self.home_folder = Some(self.folders[fi].id.clone());
                 self.home.page = 0;
