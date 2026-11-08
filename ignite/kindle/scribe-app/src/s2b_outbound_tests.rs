@@ -303,9 +303,13 @@ pub(super) struct Server {
 pub(super) fn server(label: &str) -> Server {
     let dir = tmp(&format!("{label}-server"));
     let token = generate_token().unwrap();
+    let store = Store::open(&dir).unwrap();
+    store
+        .accept_set_page_background
+        .store(true, AtomicOrdering::SeqCst);
     let handle = ServerHandle::start_with(
         "127.0.0.1:0".parse().unwrap(),
-        Store::open(&dir).unwrap(),
+        store,
         ServerConfig {
             auth: Some(TokenVerifier::for_token(&token)),
             web_root: None,

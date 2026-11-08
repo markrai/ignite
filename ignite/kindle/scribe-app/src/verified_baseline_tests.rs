@@ -4,16 +4,18 @@
 //! the reader, baseline parser and comparison are also tested directly.
 
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use notebook_core::{new_stroke_id, Point, Stroke};
 use sync_protocol::{LibraryId, ReplicaId};
 use uuid::Uuid;
 
 use super::confirmed_tests::{apply_all_staged, stage_remote};
-use super::tests::{append_stroke, env, geo, local_snapshot, nb_dir, stop, Env};
+use super::tests::{append_stroke, env, geo, local_snapshot, nb_dir, stop, wait_until, Env};
 use super::*;
 use crate::library::{
     create_notebook_durable, delete_notebook_durable, open_library_read_only,
@@ -43,9 +45,30 @@ const NB: &str = "notebook-1";
 
 // ------------------------------------------------------------------ helpers
 
+fn sync_lock_free(sync: &Path) -> bool {
+    let path = sync.join(crate::sync_outbound::LOCK_FILE);
+    let Ok(f) = OpenOptions::new().read(true).write(true).open(&path) else {
+        return true;
+    };
+    match f.try_lock() {
+        Ok(()) => {
+            let _ = f.unlock();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn open_sync(e: &Env) -> OutboundSync {
+    wait_until("sync.lock released", Duration::from_secs(2), || {
+        sync_lock_free(&e.sync)
+    });
+    OutboundSync::open(&e.lib, &e.sync).unwrap()
+}
+
 /// One full open + clean stop. Returns (fast path?, shadow line, baseline line).
 fn cycle(e: &Env) -> (bool, String, String) {
-    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let s = open_sync(e);
     assert!(s.fault().is_none(), "{:?}", s.fault());
     let fast = s.reconcile_path().is_some_and(|r| r.is_fast());
     stop(s);
@@ -257,7 +280,7 @@ fn page_and_notebook_structure_changes_are_covered() {
     // Rename and delete are captured operations (offline they are not derivable by today's
     // reconcile, as is an offline notebook reorder — covered by the ledger tests and
     // `comparison_flags_each_uncovered_class`). Drive them as the runtime does.
-    let s = OutboundSync::open(lib, &e.sync).unwrap();
+    let s = open_sync(&e);
     let t = s.prepare_rename_notebook(&nb2, "Renamed").unwrap();
     let mut repo = open_library_read_only(lib).unwrap();
     rename_notebook_durable(&mut repo, &nb2, "Renamed", &RenameNotebookHooks::default()).unwrap();
@@ -266,7 +289,7 @@ fn page_and_notebook_structure_changes_are_covered() {
     let (_, sh, _) = cycle(&e);
     assert_complete(&sh);
     assert!(n(&sh, "actual_notebook_meta") >= 1, "{sh}");
-    let s = OutboundSync::open(lib, &e.sync).unwrap();
+    let s = open_sync(&e);
     let t = s.prepare_delete_notebook(&nb2).unwrap();
     let mut repo = open_library_read_only(lib).unwrap();
     delete_notebook_durable(&mut repo, &nb2, &DeleteNotebookHooks::default()).unwrap();
@@ -304,7 +327,7 @@ fn folder_and_identity_changes_are_structure_changes() {
 #[test]
 fn inbound_materialization_is_covered() {
     let e = baselined("bl-inbound");
-    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let s = open_sync(&e);
     let replica = ReplicaId::from_uuid(Uuid::now_v7()).unwrap();
     let mut client = 0;
     stage_remote(&s, replica, &mut client, 2);
@@ -599,7 +622,7 @@ fn missing_stale_corrupt_unsupported_and_foreign_baselines_are_refused() {
     let e = baselined("bl-baseline-refusals");
     let bp = baseline_path(&e.sync);
     let good = fs::read(&bp).unwrap();
-    let st = OutboundSync::open(&e.lib, &e.sync).unwrap().state();
+    let st = open_sync(&e).state();
     let (lid, rid) = (st.library_id, st.replica_id);
     // (cycle-free direct reads)
     assert!(read_baseline(&e.sync, lid, rid).is_ok());
@@ -827,7 +850,7 @@ fn startup_paths_and_sync_output_are_unchanged_by_the_shadow_check() {
     let outs: Vec<_> = [&e, &f]
         .iter()
         .map(|x| {
-            let s = OutboundSync::open(&x.lib, &x.sync).unwrap();
+            let s = open_sync(x);
             let r = (
                 s.reconcile_path(),
                 s.fault(),

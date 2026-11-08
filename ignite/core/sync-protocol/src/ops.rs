@@ -49,6 +49,32 @@
 //! replacement is out of scope. Old decoders that do not know this variant fail closed
 //! (`unknown variant`); they must not skip it.
 //!
+//! # Page background replacement
+//! [`SyncOperationV1::SetPageBackground`] replaces only a live page's [`BackgroundRef`]. It does
+//! not touch strokes, text, links, render profile, page identity, or ordering. Blob bytes are
+//! referenced by content hash; existence is enforced at the server submit boundary, not by
+//! `validate()`. Whole-object last-write-wins follows canonical server operation order.
+//!
+//! ## Compatibility with v0.9.22 and earlier
+//! Wire tag: `set_page_background`. Decoders that do not know this variant fail closed on
+//! parse (`unknown variant` / deny-unknown on the tagged op enum) and **must not skip** it.
+//! A parse refusal happens before reducer apply, so local notebook data is not partially
+//! updated by that envelope.
+//!
+//! - **Kindle / Web through server history:** pulling a tail that contains this op fails at
+//!   envelope parse / tail verification. Sync stops; confirmed state is not advanced past the
+//!   opaque envelope. Clients must not continue as if the background change never happened.
+//! - **Server activation:** once any `SetPageBackground` is accepted into a library ledger,
+//!   every sync peer for that library must be ≥0.9.23. A server-side activation gate
+//!   (same class as `accept_replace_stroke_lineages`, flag `--accept-set-page-background`,
+//!   default off) must be on before new submits are sequenced. Authors (Kindle / Web) also
+//!   require `GET /v1/libraries/{id}` to advertise `accept_set_page_background: true`
+//!   before journaling; they do not journal into an unactivated or unreachable server.
+//!   Retries of an already-accepted envelope still dedup after the gate is later disabled.
+//! - **Upgrade recovery:** after upgrading to ≥0.9.23, replaying the same history applies
+//!   the op deterministically; no separate protocol migration is required. Kindle durable
+//!   `background.raw` materialization for mid-life background changes remains an S3 concern.
+//!
 //! # Move stroke lineages
 //! [`SyncOperationV1::MoveStrokeLineages`] translates the visible geometry of one or more
 //! authored lineages without changing any stroke or lineage identity. `root_ids` is sorted and
@@ -143,6 +169,13 @@ pub enum SyncOperationV1 {
     DeletePage {
         notebook_id: NotebookId,
         page_id: PageId,
+    },
+    /// Replace the background of an existing page. Strokes, text, links, render profile, page
+    /// identity, and ordering are unchanged. Whole-object last-write-wins by canonical order.
+    SetPageBackground {
+        notebook_id: NotebookId,
+        page_id: PageId,
+        background: BackgroundRef,
     },
     /// A completed, durable stroke (never streamed point-by-point). A new authored stroke is its
     /// own lineage root.
@@ -249,6 +282,7 @@ impl SyncOperationV1 {
             }
             Self::RenameNotebook { title, .. } => validate_title(title),
             Self::DeleteNotebook { .. } | Self::DeletePage { .. } => Ok(()),
+            Self::SetPageBackground { background, .. } => background.validate(),
             Self::CreatePage {
                 page,
                 after_page_id,

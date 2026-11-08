@@ -117,6 +117,12 @@ pub fn serve_with_limits(
     let ledger_dir = config.ledger_dir();
     fsutil::ensure_private_dir(&ledger_dir)?;
     let ledger = Store::open(&ledger_dir).map_err(|e| format!("ledger: {e:?}"))?;
+    if config.server.accept_set_page_background {
+        ledger
+            .accept_set_page_background
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        events("scribe-server event=accept_set_page_background on");
+    }
     // Abandoned restore staging (a crash, or prepared jobs of the previous process). Safe only
     // here: `Store::open` holds the ledger's exclusive process lock and nothing is served yet.
     let removed = backup_restore::remove_restore_staging(&ledger)

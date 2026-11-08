@@ -21,6 +21,7 @@ import { fromSeq20, REPLICA_SEQUENCE_EXHAUSTED, toSeq20 } from "./seq";
 import {
   isErase,
   isFolder,
+  isSetPageBackground,
   isStructure,
   isTextAdd,
   isTextDelete,
@@ -34,6 +35,7 @@ import {
   type OpDraft,
   type PendingOp,
   type ReplicaStore,
+  type SetPageBackgroundIntent,
   type StructureIntent,
 } from "./store";
 
@@ -59,6 +61,7 @@ export type OverlayOp =
   | (OverlayBase & { kind: "erase"; erase: EraseIntent })
   | (OverlayBase & { kind: "folder"; folder: FolderIntent })
   | (OverlayBase & { kind: "structure"; structure: StructureIntent })
+  | (OverlayBase & { kind: "set_page_background"; set_page_background: SetPageBackgroundIntent })
   | (OverlayBase & { kind: "undo"; root_id: string })
   | (OverlayBase & { kind: "add_text"; text: SyncText })
   | (OverlayBase & { kind: "update_text"; text: SyncText })
@@ -128,6 +131,7 @@ function toOverlay(rows: (PendingOp & { server_seq?: string })[]): OverlayOp[] {
     };
     if (isFolder(r)) return { ...base, kind: "folder", folder: r.folder };
     if (isStructure(r)) return { ...base, kind: "structure", structure: r.structure };
+    if (isSetPageBackground(r)) return { ...base, kind: "set_page_background", set_page_background: r.set_page_background };
     if (isUndo(r)) return { ...base, kind: "undo", root_id: r.root_id };
     if (isTextAdd(r)) return { ...base, kind: "add_text", text: r.text };
     if (isTextUpdate(r)) return { ...base, kind: "update_text", text: r.text };
@@ -262,6 +266,8 @@ export class SyncCoordinator {
             ? "Couldn’t save that folder change on this device. Nothing was changed."
             : draft.kind === "structure"
             ? "Couldn’t save that library change on this device. Nothing was changed."
+            : draft.kind === "set_page_background"
+            ? "Couldn’t change the paper on this device. Nothing was changed."
             : draft.kind === "undo"
             ? "Couldn’t undo on this device. Nothing was changed."
             : "Couldn’t save that stroke on this device. It was not added.";

@@ -297,9 +297,22 @@ export function PageView({
     }
   }, [shown]);
 
+  const [, setBgTick] = useState(0);
   const bg = page.background.kind === "blob" ? blobs.get(page.background.sha256) ?? null : null;
   const bgError = page.background.kind === "blob" && !bg ? blobs.error(page.background.sha256) ?? null : null;
   const bgLoading = page.background.kind === "blob" && !bg && !bgError;
+  useEffect(() => {
+    if (page.background.kind !== "blob") return;
+    const ref = page.background;
+    if (blobs.get(ref.sha256) || blobs.error(ref.sha256)) return;
+    let alive = true;
+    void blobs.load(ref).finally(() => {
+      if (alive) setBgTick((n) => n + 1);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [blobs, page.background]);
   const pageError = planned.error ?? (bgError ? `Background unavailable: ${bgError}` : null);
 
   const lay = useMemo(() => (avail.width > 0 ? layout(avail, pageSize, mode) : null), [avail, pageSize, mode]);

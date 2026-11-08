@@ -192,6 +192,18 @@ fn bootstrapped(label: &str) -> (PathBuf, ServerHandle, Http) {
     (dir, h, http)
 }
 
+fn enable_set_page_background(h: &ServerHandle) {
+    h.store
+        .accept_set_page_background
+        .store(true, Ordering::SeqCst);
+}
+
+fn bootstrapped_accepting_paper(label: &str) -> (PathBuf, ServerHandle, Http) {
+    let t = bootstrapped(label);
+    enable_set_page_background(&t.1);
+    t
+}
+
 /// Independent replay of fetched genesis + fetched tail must equal the server snapshot.
 fn assert_replay_matches(http: &Http) -> String {
     let genesis = SyncSnapshotV1::parse(&http.genesis()).unwrap();
@@ -713,7 +725,7 @@ fn blobs_are_content_addressed_and_verified() {
         (b, r)
     };
     let mut spec = page_spec(pg(40));
-    spec.background = blob_ref;
+    spec.background = blob_ref.clone();
     let mut a = Author::new(replica(1));
     let (s, v) = http.submit(&[a.env(Op::CreatePage {
         notebook_id: nb(1),
@@ -722,6 +734,123 @@ fn blobs_are_content_addressed_and_verified() {
     })]);
     assert_eq!((s, v["error"].as_str()), (422, Some("missing_blobs")));
     assert_eq!(http.snapshot().0, 0);
+
+    // SetPageBackground with an absent blob is refused the same way before sequencing.
+    // Fresh author: a refused submit must not advance the replica's accepted client_seq.
+    enable_set_page_background(&h);
+    let mut a2 = Author::new(replica(1));
+    let (s, v) = http.submit(&[a2.env(Op::SetPageBackground {
+        notebook_id: nb(1),
+        page_id: pg(1),
+        background: blob_ref,
+    })]);
+    assert_eq!((s, v["error"].as_str()), (422, Some("missing_blobs")));
+    assert_eq!(http.snapshot().0, 0);
+}
+
+#[test]
+fn set_page_background_succeeds_when_blob_is_present() {
+    let (_dir, _h, http) = bootstrapped_accepting_paper("set-bg-ok");
+    let (_, blob) = testkit::blob_background();
+    let genesis = SyncSnapshotV1::parse(&http.snapshot().1).unwrap();
+    let before_page = genesis.notebooks[0].pages[0].clone();
+    assert_eq!(before_page.background, sync_protocol::BackgroundRef::Blank);
+    assert!(!before_page.strokes.is_empty());
+
+    let mut a = Author::new(replica(1));
+    let (s, v) = http.submit(&[a.env(Op::SetPageBackground {
+        notebook_id: nb(1),
+        page_id: pg(1),
+        background: blob.clone(),
+    })]);
+    assert_eq!(s, 200, "{v}");
+
+    let snap = SyncSnapshotV1::parse(&http.snapshot().1).unwrap();
+    let page = &snap.notebooks[0].pages[0];
+    assert_eq!(page.background, blob);
+    assert_eq!(page.page_id, before_page.page_id);
+    assert_eq!(page.render, before_page.render);
+    assert_eq!(page.strokes, before_page.strokes);
+    assert_eq!(page.texts, before_page.texts);
+    assert_eq!(page.links, before_page.links);
+    assert_eq!(
+        snap.notebooks[0]
+            .pages
+            .iter()
+            .map(|p| p.page_id)
+            .collect::<Vec<_>>(),
+        genesis.notebooks[0]
+            .pages
+            .iter()
+            .map(|p| p.page_id)
+            .collect::<Vec<_>>()
+    );
+
+    // Patterned → Blank is accepted without a blob upload.
+    let (s, v) = http.submit(&[a.env(Op::SetPageBackground {
+        notebook_id: nb(1),
+        page_id: pg(1),
+        background: sync_protocol::BackgroundRef::Blank,
+    })]);
+    assert_eq!(s, 200, "{v}");
+    let snap = SyncSnapshotV1::parse(&http.snapshot().1).unwrap();
+    assert_eq!(
+        snap.notebooks[0].pages[0].background,
+        sync_protocol::BackgroundRef::Blank
+    );
+    assert_eq!(snap.notebooks[0].pages[0].strokes, before_page.strokes);
+}
+
+#[test]
+fn set_page_background_is_refused_until_operator_enables_the_gate() {
+    let (_dir, h, http) = bootstrapped("set-bg-gate-off");
+    let lib = testkit::library().to_string();
+    let head = http.json("GET", &format!("/v1/libraries/{lib}"), None).1;
+    assert_ne!(head["accept_set_page_background"], true);
+
+    let mut a = Author::new(replica(1));
+    let env = a.env(Op::SetPageBackground {
+        notebook_id: nb(1),
+        page_id: pg(1),
+        background: sync_protocol::BackgroundRef::Blank,
+    });
+    let (s, v) = http.submit(std::slice::from_ref(&env));
+    assert_eq!(s, 400, "{v}");
+    assert_eq!(v["error"], "unsupported_operation");
+    assert_eq!(http.snapshot().0, 0);
+
+    enable_set_page_background(&h);
+    let head = http.json("GET", &format!("/v1/libraries/{lib}"), None).1;
+    assert_eq!(head["accept_set_page_background"], true);
+    assert_eq!(http.submit(std::slice::from_ref(&env)).0, 200);
+}
+
+#[test]
+fn set_page_background_gate_can_be_disabled_after_accept_and_retries_still_dedup() {
+    let (_dir, h, http) = bootstrapped_accepting_paper("set-bg-gate-later");
+    let mut a = Author::new(replica(1));
+    let env = a.env(Op::SetPageBackground {
+        notebook_id: nb(1),
+        page_id: pg(1),
+        background: sync_protocol::BackgroundRef::Blank,
+    });
+    assert_eq!(http.submit(std::slice::from_ref(&env)).0, 200);
+    h.store
+        .accept_set_page_background
+        .store(false, Ordering::SeqCst);
+    let (s, v) = http.submit(std::slice::from_ref(&env));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["results"][0]["duplicate"], true);
+    let mut b = Author::new(replica(2));
+    let fresh = b.env(Op::SetPageBackground {
+        notebook_id: nb(1),
+        page_id: pg(1),
+        background: sync_protocol::BackgroundRef::Blank,
+    });
+    let (s, v) = http.submit(&[fresh]);
+    assert_eq!(s, 400, "{v}");
+    assert_eq!(v["error"], "unsupported_operation");
+    assert_eq!(http.tail(50).len(), 1);
 }
 
 // ------------------------------------------------------------------ 16 failures

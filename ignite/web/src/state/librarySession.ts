@@ -66,6 +66,11 @@ export class LibrarySession {
     this.onSnapshot = onSnapshot;
   }
 
+  /** Library poll head (includes optional Change-paper activation). */
+  libraryHead(): Promise<import("../model/types").LibraryHead> {
+    return this.api.libraryHead(this.libraryId);
+  }
+
   constructor(
     private readonly api: ReadOnlyApi,
     readonly libraryId: string,

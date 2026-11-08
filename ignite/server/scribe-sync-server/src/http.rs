@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! POST /v1/libraries                                   canonical SyncSnapshotV1 genesis
-//! GET  /v1/libraries/{id}                              {library_id, genesis_sha256, head_server_seq}
+//! GET  /v1/libraries/{id}                              {library_id, genesis_sha256, head_server_seq, snapshot_sha256, accept_set_page_background}
 //! GET  /v1/libraries/{id}/genesis                      {library_id, genesis_sha256, snapshot}
 //! POST /v1/libraries/{id}/operations                   {"envelopes":[SyncEnvelopeV1…]} (≤ MAX_BATCH)
 //! GET  /v1/libraries/{id}/operations?after=N&limit=M   {library_id, head_server_seq, operations:[{server_seq, envelope}], next_after}
@@ -25,6 +25,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -191,16 +192,20 @@ pub fn route(store: &Store, method: &str, url: &str, body: &[u8]) -> Reply {
             Err(e) => store_error(e),
         },
         (["v1", "libraries", id], "GET") => match (store.library(id), store.snapshot(id)) {
-            (Ok(info), Ok(cur)) => json(
-                200,
-                serde_json::to_vec(&serde_json::json!({
+            (Ok(info), Ok(cur)) => {
+                // Omit the field while the gate is off so v0.9.22 Web (deny-unknown LibraryHead)
+                // can keep polling. Include `true` only after the operator activates Change Paper.
+                let mut body = serde_json::json!({
                     "library_id": info.library_id.to_string(),
                     "genesis_sha256": info.genesis_sha256,
                     "head_server_seq": info.head_server_seq,
                     "snapshot_sha256": cur.snapshot_sha256,
-                }))
-                .unwrap(),
-            ),
+                });
+                if store.accept_set_page_background.load(Ordering::SeqCst) {
+                    body["accept_set_page_background"] = serde_json::Value::Bool(true);
+                }
+                json(200, serde_json::to_vec(&body).unwrap())
+            }
             (Err(e), _) | (_, Err(e)) => store_error(e),
         },
         (["v1", "libraries", id, "genesis"], "GET") => {

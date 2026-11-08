@@ -200,6 +200,7 @@ mod tests {
         let paper = Modal::PaperChooser {
             notebook_title: "Notebook 3".into(),
             folder_id: None,
+            change_page: None,
         };
         assert_eq!(
             labels(&paper),
@@ -276,6 +277,7 @@ mod tests {
             Modal::PaperChooser {
                 folder_id: Some(id),
                 notebook_title,
+                change_page: None,
             } => {
                 assert_eq!(id, "folder-1");
                 assert_eq!(notebook_title, "Notebook 4");
@@ -450,6 +452,30 @@ mod tests {
     }
 
     #[test]
+    fn change_paper_picker_does_not_open_title_entry() {
+        let g = panel_geo();
+        let c = cards(2);
+        let mut ui = UiState::launch_home(0, 2);
+        ui.enter_notebook();
+        ui.show_modal(Modal::PaperChooser {
+            notebook_title: String::new(),
+            folder_id: None,
+            change_page: Some((1, 2)),
+        });
+        let paper = ui.modal.clone().unwrap();
+        let cmd = ui.on_tap(&g, dialog_button(&g, &paper, "GRID"), &c, "x", None);
+        assert_eq!(cmd, UiCommand::Redraw(Redraw::Full));
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::PaperScope {
+                template: PageTemplate::Grid,
+                page_number: 1,
+                page_count: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn modal_outside_tap_does_not_create_or_dismiss_paper_chooser() {
         let g = panel_geo();
         let c = cards(2);
@@ -457,6 +483,7 @@ mod tests {
         ui.show_modal(Modal::PaperChooser {
             notebook_title: "Notebook 3".into(),
             folder_id: None,
+            change_page: None,
         });
         let cmd = ui.on_tap(&g, UiPoint { x: 5, y: 5 }, &c, "x", None);
         assert_eq!(cmd, UiCommand::None);

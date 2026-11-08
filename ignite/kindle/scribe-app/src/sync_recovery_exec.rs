@@ -572,6 +572,7 @@ fn page_ids_in_operation(op: &SyncOperationV1) -> Vec<PageId> {
         | SyncOperationV1::AddText { page_id, .. }
         | SyncOperationV1::UpdateText { page_id, .. }
         | SyncOperationV1::DeleteText { page_id, .. }
+        | SyncOperationV1::SetPageBackground { page_id, .. }
         | SyncOperationV1::AddPageLink { page_id, .. }
         | SyncOperationV1::DeletePageLink { page_id, .. } => vec![*page_id],
         _ => Vec::new(),

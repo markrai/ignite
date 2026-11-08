@@ -63,10 +63,34 @@ pub enum Modal {
         notebook_title: String,
         folder_title: String,
     },
-    /// Paper style for a new notebook. `folder_id` is set when creating inside a folder.
+    /// Paper style for a new notebook, or Change Paper on an existing page.
+    /// `change_page` is `Some((page_number, page_count))` when opened from PageMenu.
     PaperChooser {
         notebook_title: String,
         folder_id: Option<String>,
+        change_page: Option<(usize, usize)>,
+    },
+    /// After picking paper for Change Paper: this page or all pages.
+    PaperScope {
+        template: PageTemplate,
+        page_number: usize,
+        page_count: usize,
+    },
+    /// Confirm a background replacement. `custom_pages` is true when any target is not a
+    /// known template SHA (handwriting is kept either way). `unreadable_pages` is a separate
+    /// warning: those pages could not be inspected and are not treated as custom templates.
+    ConfirmChangePaper {
+        template: PageTemplate,
+        scope: PaperChangeScope,
+        page_number: usize,
+        page_count: usize,
+        custom_pages: bool,
+        unreadable_pages: bool,
+    },
+    /// All-pages Change Paper in progress. Cancel leaves already-applied pages changed.
+    ChangePaperProgress {
+        done: usize,
+        total: usize,
     },
     FolderMenu {
         folder_id: String,
@@ -167,6 +191,12 @@ impl Modal {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaperChangeScope {
+    ThisPage,
+    AllPages,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonId {
     Rename,
     DeleteNotebook,
@@ -191,6 +221,10 @@ pub enum ButtonId {
     PickerNext,
     Jump,
     RemoveLink,
+    ChangePaper,
+    ThisPage,
+    AllPages,
+    CancelPaperChange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,9 +383,67 @@ pub fn dialog_spec(modal: &Modal) -> Option<DialogSpec> {
                     enabled: page_number < page_count,
                     ..button(ButtonId::MovePageRight, "MOVE PAGE RIGHT")
                 },
+                button(ButtonId::ChangePaper, "CHANGE PAPER"),
                 button(ButtonId::DeletePage, "DELETE PAGE"),
                 button(ButtonId::Cancel, "CANCEL"),
             ],
+            vertical: true,
+        },
+        Modal::PaperScope { template, .. } => DialogSpec {
+            heading: format!("Change paper to {}", template.dialog_label()),
+            body: vec!["Handwriting, text, and links stay on the page.".into()],
+            buttons: vec![
+                button(ButtonId::ThisPage, "THIS PAGE"),
+                button(ButtonId::AllPages, "ALL PAGES"),
+                button(ButtonId::Cancel, "CANCEL"),
+            ],
+            vertical: true,
+        },
+        Modal::ConfirmChangePaper {
+            template,
+            scope,
+            page_count,
+            custom_pages,
+            unreadable_pages,
+            ..
+        } => {
+            let heading = match scope {
+                PaperChangeScope::ThisPage => {
+                    format!("Change this page to {}?", template.dialog_label())
+                }
+                PaperChangeScope::AllPages => format!(
+                    "Change all {page_count} pages to {}?",
+                    template.dialog_label()
+                ),
+            };
+            let mut body = vec!["Handwriting, text, and links are not changed.".into()];
+            if *unreadable_pages {
+                body.push(
+                    "At least one page could not be read. It is not treated as a standard template.".into(),
+                );
+            }
+            if *custom_pages {
+                body.push(
+                    "At least one page is not a standard template. Its drawing stays; only the paper changes.".into(),
+                );
+            }
+            DialogSpec {
+                heading,
+                body,
+                buttons: vec![
+                    button(ButtonId::Cancel, "CANCEL"),
+                    DialogButton {
+                        emphasized: true,
+                        ..button(ButtonId::ConfirmDelete, "CHANGE")
+                    },
+                ],
+                vertical: false,
+            }
+        }
+        Modal::ChangePaperProgress { done, total } => DialogSpec {
+            heading: format!("Changing paper {done} of {total}"),
+            body: vec!["Already-changed pages stay changed if you cancel.".into()],
+            buttons: vec![button(ButtonId::CancelPaperChange, "CANCEL")],
             vertical: true,
         },
         Modal::ConfirmDeletePage { page_number } => DialogSpec {

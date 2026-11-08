@@ -183,3 +183,32 @@ export async function generateTemplateBackground(template: PageTemplate): Promis
   }
   return { bytes, sha256, background: backgroundBlobRef(bytes, sha256) };
 }
+
+let knownBlobShas: Promise<Set<string>> | null = null;
+
+/** Content hashes of Ruled/Grid/Dotted Scribe-panel templates (Blank is not a blob). */
+export function knownTemplateBlobShas(): Promise<Set<string>> {
+  if (!knownBlobShas) {
+    knownBlobShas = (async () => {
+      const out = new Set<string>();
+      for (const t of PAGE_TEMPLATE_CHOICES) {
+        if (t === "blank") continue;
+        out.add((await generateTemplateBackground(t)).sha256);
+      }
+      return out;
+    })();
+  }
+  return knownBlobShas;
+}
+
+export function backgroundIsKnownTemplate(background: BackgroundRef, known: ReadonlySet<string>): boolean {
+  if (background.kind === "blank") return true;
+  return known.has(background.sha256);
+}
+
+export function pagesIncludeCustomBackground(
+  pages: readonly { background: BackgroundRef }[],
+  known: ReadonlySet<string>,
+): boolean {
+  return pages.some((p) => !backgroundIsKnownTemplate(p.background, known));
+}

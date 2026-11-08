@@ -4,9 +4,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use sync_protocol::{snapshot_sha256, BackgroundEncoding, BackgroundRef, SyncOperationV1};
+use sync_protocol::{
+    snapshot_sha256, BackgroundEncoding, BackgroundRef, LibraryId, SyncOperationV1,
+};
 
 use super::tests::{
     env, geo, local_snapshot, nb_dir, pending_seqs, replay_local, server, stop, wait_until, write,
@@ -16,7 +19,13 @@ use super::*;
 use crate::library::{
     create_notebook_durable_with_template, open_library_read_only, CreateNotebookHooks,
 };
-use crate::notebook::{insert_page_after_durable, InsertPageHooks};
+use crate::app_ui::{UiCommand, UiState};
+use crate::modal::{dialog_spec, DialogLayout, Modal, PaperChangeScope};
+use crate::notebook::{
+    apply_page_background_on, insert_page_after_durable, install_page_background,
+    template_background_bytes, InsertPageHooks,
+};
+use crate::ui_gfx::{panel_geo, UiPoint};
 use crate::paper_templates::{generate_page_background, PageTemplate, PAPER_WHITE};
 use crate::profile::RenderProfile;
 use crate::store::{install_background, load_existing_page, BackgroundIdentityV1};
@@ -397,6 +406,139 @@ fn unjournaled_background_replacement_faults_as_underivable() {
 }
 
 #[test]
+fn journaled_background_replacement_uploads_and_preserves_content() {
+    let srv = server("tmpl-set-bg");
+    let e = env("tmpl-set-bg");
+    write_config(&e.sync, &srv.url(), &srv.token, false);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let (nb_id, dotted) = create_templated(
+        &s,
+        &e.lib,
+        PageTemplate::Dotted,
+        "Change-Paper",
+        Some("notebook-1"),
+    );
+    wait_until("create", Duration::from_secs(20), || {
+        s.pending() == 0 && s.state().acked_client_seq >= 1
+    });
+    let stroke = write(&s, &e.lib, &nb_id, "page-1", &[(10.0, 10.0), (40.0, 50.0)]);
+    wait_until("stroke", Duration::from_secs(20), || s.pending() == 0);
+    let before = local_snapshot(&e.lib);
+    let before_strokes = before.notebooks.iter().find(|n| {
+        // local snapshot uses global ids; compare stroke count on first matching page
+        !n.pages.is_empty()
+    });
+    assert!(before_strokes.is_some());
+
+    let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+    assert_ne!(ruled, dotted);
+    let acked0 = s.state().acked_client_seq;
+    let ticket = s
+        .prepare_set_page_background(&nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
+        .expect("prepare SetPageBackground");
+    install_page_background(&nb_dir(&e.lib, &nb_id), "page-1", &ruled).unwrap();
+    s.commit(ticket);
+    wait_until("set_bg journaled", Duration::from_secs(5), || {
+        fs::read(e.sync.join(OUTBOX_FILE))
+            .ok()
+            .and_then(|b| parse_journal(&b).ok())
+            .map(|j| {
+                j.committed
+                    .iter()
+                    .filter(|o| {
+                        matches!(o.envelope.operation, SyncOperationV1::SetPageBackground { .. })
+                    })
+                    .count()
+            })
+            == Some(1)
+    });
+    wait_until("upload", Duration::from_secs(30), || {
+        s.state().acked_client_seq > acked0 && s.pending() == 0 && s.fault().is_none()
+    });
+    assert!(s.fault().is_none(), "{:?}", s.fault());
+    let lid = library_id(&e.sync);
+    wait_until("echo apply", Duration::from_secs(30), || {
+        s.fault().is_none()
+            && srv.snapshot_hash(&lid) == snapshot_sha256(&local_snapshot(&e.lib)).unwrap().as_str()
+    });
+
+    let after_bytes = fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
+    assert_eq!(after_bytes, ruled);
+    let after = local_snapshot(&e.lib);
+    let page = &after.notebooks.iter().find(|n| n.title == "Change-Paper").unwrap().pages[0];
+    assert!(matches!(page.background, BackgroundRef::Blob { .. }));
+    assert_eq!(page.strokes.len(), 1);
+    assert_eq!(page.texts.len(), 0);
+    assert_eq!(page.links.len(), 0);
+    stop(s);
+    let _ = stroke;
+}
+
+#[test]
+fn set_page_background_prep_without_commit_leaves_files_and_is_settled() {
+    let srv = server("tmpl-set-bg-prep");
+    let e = env("tmpl-set-bg-prep");
+    write_config(&e.sync, &srv.url(), &srv.token, false);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let (nb_id, dotted) = create_templated(
+        &s,
+        &e.lib,
+        PageTemplate::Dotted,
+        "Prep-Only",
+        Some("notebook-1"),
+    );
+    wait_until("create", Duration::from_secs(20), || s.pending() == 0);
+    let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+    let _ticket = s
+        .prepare_set_page_background(&nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
+        .expect("prep");
+    // Crash before install and commit: durable files unchanged.
+    stop(s);
+    let still = fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
+    assert_eq!(still, dotted);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    assert!(s.fault().is_none(), "{:?}", s.fault());
+    assert!(s.upload_permitted());
+    stop(s);
+}
+
+#[test]
+fn set_page_background_install_then_crash_before_commit_is_recovered() {
+    let srv = server("tmpl-set-bg-crash");
+    let e = env("tmpl-set-bg-crash");
+    write_config(&e.sync, &srv.url(), &srv.token, false);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let (nb_id, _dotted) = create_templated(
+        &s,
+        &e.lib,
+        PageTemplate::Dotted,
+        "Crash-Commit",
+        Some("notebook-1"),
+    );
+    wait_until("create", Duration::from_secs(20), || s.pending() == 0);
+    let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+    let _ticket = s
+        .prepare_set_page_background(&nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
+        .expect("prep");
+    install_page_background(&nb_dir(&e.lib, &nb_id), "page-1", &ruled).unwrap();
+    // Durable files match the prep envelope; drop the handle without commit.
+    stop(s);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    assert!(s.fault().is_none(), "{:?}", s.fault());
+    wait_until("recover-upload", Duration::from_secs(30), || {
+        s.pending() == 0 && s.fault().is_none()
+    });
+    let lid = library_id(&e.sync);
+    wait_until("recover-echo", Duration::from_secs(30), || {
+        s.fault().is_none()
+            && srv.snapshot_hash(&lid) == snapshot_sha256(&local_snapshot(&e.lib)).unwrap().as_str()
+    });
+    let after = fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
+    assert_eq!(after, ruled);
+    stop(s);
+}
+
+#[test]
 fn server_rejects_wrong_blob_hash_for_template_bytes() {
     let srv = server("tmpl-badblob");
     let e = env("tmpl-badblob");
@@ -437,4 +579,207 @@ fn server_rejects_wrong_blob_hash_for_template_bytes() {
     };
     assert!(st_ok < 300, "correct sha PUT must succeed ({st_ok})");
     let _ = lid;
+}
+
+fn paper_scope_center(g: &kindle_platform::FbGeometry, modal: &Modal, label: &str) -> UiPoint {
+    let spec = dialog_spec(modal).unwrap();
+    let layout = DialogLayout::new(g, &spec);
+    let (_, r) = layout
+        .buttons
+        .iter()
+        .find(|(b, _)| b.label == label)
+        .unwrap_or_else(|| panic!("no button {label}"));
+    UiPoint {
+        x: r.x + r.w / 2,
+        y: r.y + r.h / 2,
+    }
+}
+
+#[test]
+fn this_page_confirmation_journals_once_dismisses_and_presents() {
+    let srv = server("tmpl-this-page-confirm");
+    let e = env("tmpl-this-page-confirm");
+    write_config(&e.sync, &srv.url(), &srv.token, false);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let (nb_id, dotted) = create_templated(
+        &s,
+        &e.lib,
+        PageTemplate::Dotted,
+        "This-Page",
+        Some("notebook-1"),
+    );
+    wait_until("create", Duration::from_secs(20), || s.pending() == 0);
+    let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+    assert_ne!(ruled, dotted);
+
+    let g = panel_geo();
+    let cards: &[crate::home::HomeCard] = &[];
+    let mut ui = UiState::launch_home(0, 1);
+    ui.enter_notebook();
+    ui.show_modal(Modal::ConfirmChangePaper {
+        template: PageTemplate::Ruled,
+        scope: PaperChangeScope::ThisPage,
+        page_number: 1,
+        page_count: 1,
+        custom_pages: false,
+        unreadable_pages: false,
+    });
+    let cmd = ui.on_tap(
+        &g,
+        paper_scope_center(&g, ui.modal.as_ref().unwrap(), "CHANGE"),
+        cards,
+        "x",
+        None,
+    );
+    assert_eq!(
+        cmd,
+        UiCommand::ApplyPageTemplate {
+            template: PageTemplate::Ruled,
+            scope: PaperChangeScope::ThisPage,
+        }
+    );
+    apply_page_background_on(
+        Some(&s),
+        &nb_dir(&e.lib, &nb_id),
+        &nb_id,
+        "page-1",
+        &ruled,
+    )
+    .expect("ThisPage apply");
+    ui.dismiss_change_paper_confirm();
+    assert!(ui.modal.is_none());
+    assert_eq!(
+        fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap(),
+        ruled
+    );
+    wait_until("set_bg journaled", Duration::from_secs(5), || {
+        fs::read(e.sync.join(OUTBOX_FILE))
+            .ok()
+            .and_then(|b| parse_journal(&b).ok())
+            .map(|j| {
+                j.committed
+                    .iter()
+                    .filter(|o| {
+                        matches!(o.envelope.operation, SyncOperationV1::SetPageBackground { .. })
+                    })
+                    .count()
+            })
+            == Some(1)
+    });
+    let again = ui.on_tap(
+        &g,
+        UiPoint {
+            x: g.xres / 2,
+            y: g.yres / 2,
+        },
+        cards,
+        "x",
+        None,
+    );
+    match again {
+        UiCommand::ApplyPageTemplate { .. } => {
+            panic!("successful ThisPage must not leave CHANGE able to journal again")
+        }
+        _ => {}
+    }
+    stop(s);
+}
+
+#[test]
+fn paper_gate_result_applies_requires_matching_server_library_and_session() {
+    let a = crate::sync_outbound::PaperGateIdentity {
+        server_base_url: "http://a".into(),
+        library_id: library_id_for_gate(),
+    };
+    let b = crate::sync_outbound::PaperGateIdentity {
+        server_base_url: "http://b".into(),
+        library_id: a.library_id,
+    };
+    let other_lib = crate::sync_outbound::PaperGateIdentity {
+        server_base_url: a.server_base_url.clone(),
+        library_id: LibraryId::from_uuid(uuid::Uuid::from_u128(
+            0x01900000_0000_7000_8000_0000000000bb,
+        ))
+        .unwrap(),
+    };
+    assert!(crate::sync_outbound::paper_gate_result_applies(
+        &a, 3, Some(&a), 3
+    ));
+    assert!(!crate::sync_outbound::paper_gate_result_applies(
+        &a, 3, Some(&a), 4
+    ));
+    assert!(!crate::sync_outbound::paper_gate_result_applies(
+        &a, 3, Some(&b), 3
+    ));
+    assert!(!crate::sync_outbound::paper_gate_result_applies(
+        &a, 3, Some(&other_lib), 3
+    ));
+    assert!(!crate::sync_outbound::paper_gate_result_applies(&a, 3, None, 3));
+}
+
+fn library_id_for_gate() -> LibraryId {
+    LibraryId::from_uuid(uuid::Uuid::from_u128(0x01900000_0000_7000_8000_0000000000aa)).unwrap()
+}
+
+#[test]
+fn probe_accept_set_page_background_follows_the_server_gate() {
+    let srv = server("paper-gate-probe");
+    srv.handle
+        .store
+        .accept_set_page_background
+        .store(false, Ordering::SeqCst);
+    let e = env("paper-gate-probe");
+    write_config(&e.sync, &srv.url(), &srv.token, false);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    wait_until("genesis", Duration::from_secs(20), || {
+        s.state().genesis_uploaded
+    });
+    let cfg = read_config(&e.sync).unwrap();
+    let lid = s.state().library_id;
+    assert!(
+        !probe_accept_set_page_background(&cfg, &lid).unwrap(),
+        "gate off must not advertise acceptance"
+    );
+    srv.handle
+        .store
+        .accept_set_page_background
+        .store(true, Ordering::SeqCst);
+    assert!(probe_accept_set_page_background(&cfg, &lid).unwrap());
+    stop(s);
+}
+
+#[test]
+fn set_page_background_prepare_refuses_when_server_gate_is_off() {
+    let srv = server("tmpl-set-bg-gate-off");
+    srv.handle
+        .store
+        .accept_set_page_background
+        .store(false, Ordering::SeqCst);
+    let e = env("tmpl-set-bg-gate-off");
+    write_config(&e.sync, &srv.url(), &srv.token, false);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let (nb_id, dotted) = create_templated(
+        &s,
+        &e.lib,
+        PageTemplate::Dotted,
+        "Gate-Off",
+        Some("notebook-1"),
+    );
+    wait_until("create", Duration::from_secs(20), || s.pending() == 0);
+    let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
+    assert!(
+        s.prepare_set_page_background(&nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
+            .is_none()
+    );
+    assert!(s.fault().is_none(), "{:?}", s.fault());
+    let still = fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
+    assert_eq!(still, dotted, "refused authoring must not change paper");
+    let set_bg = parse_journal(&fs::read(e.sync.join(OUTBOX_FILE)).unwrap())
+        .unwrap()
+        .committed
+        .iter()
+        .filter(|o| matches!(o.envelope.operation, SyncOperationV1::SetPageBackground { .. }))
+        .count();
+    assert_eq!(set_bg, 0);
+    stop(s);
 }

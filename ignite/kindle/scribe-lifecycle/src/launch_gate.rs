@@ -1105,6 +1105,13 @@ mod tests {
         assert!(confirm_host_generation(&tree.paths, &generation).is_ok());
 
         drop(first);
+        // Parallel workspace tests can keep a fork/exec copy of the host-lease fd, so Drop is
+        // not instantly visible. Wait until the lease is free, then start the successor once.
+        drop(acquire_after_release(
+            &tree.paths.host,
+            LockMode::Exclusive,
+            "lifecycle host lease",
+        ));
         let restarted = HostLaunchCoordination::start_at(tree.paths.clone()).unwrap();
         restarted.begin_launch(launch);
         restarted.evidence_report(&report(launch, true));

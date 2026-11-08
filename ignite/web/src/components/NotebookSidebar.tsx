@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { orderLibrary, SORT_LABELS, type SortMode } from "../model/librarySort";
 import type { SnapshotFolder, SnapshotNotebook } from "../model/types";
 import { ProtocolViolation, validateTitle } from "../model/validate";
+import { changePaperTargets, PaperChangeRun, targetsIncludeCustomPaper, type PaperChangeScope } from "../paper/changePaperPublish";
 import { PAGE_TEMPLATE_CHOICES, pageTemplateLabel, type PageTemplate } from "../paper/paperTemplates";
 import type { FolderIntent } from "../replica/store";
 import { FolderIcon, ListSortDescendingIcon, NotebookIcon } from "./Icons";
@@ -20,6 +21,7 @@ interface Props {
   /** notebook_id → folder_id (projected). */
   membership: ReadonlyMap<string, string>;
   selectedId: string;
+  currentPageId: string;
   onSelect: (n: SnapshotNotebook) => void;
   /** Null when folders can be edited; otherwise why not (shown as a tooltip). */
   readOnlyReason: string | null;
@@ -27,6 +29,13 @@ interface Props {
   /** Queue one folder operation; resolves false when nothing was queued. */
   commit: (intent: FolderIntent) => Promise<boolean>;
   createNotebook: (title: string, folderId: string | null, template: PageTemplate) => Promise<boolean>;
+  changePaper: (args: {
+    notebook: SnapshotNotebook;
+    template: PageTemplate;
+    scope: PaperChangeScope;
+    onProgress?: (done: number, total: number) => void;
+    isCancelled?: () => boolean;
+  }) => Promise<boolean>;
   renameNotebook: (notebookId: string, title: string) => Promise<boolean>;
   deleteNotebook: (notebookId: string) => Promise<boolean>;
   canDeleteNotebook: boolean;
@@ -44,7 +53,11 @@ type Dialog =
   | { kind: "select-paper"; folderId: string | null; titleDefault: string }
   | { kind: "notebook-name"; heading: string; submit: string; initial: string; notebookId: string | null; folderId: string | null; template?: PageTemplate }
   | { kind: "confirm-delete"; folder: SnapshotFolder }
-  | { kind: "confirm-delete-notebook"; notebook: SnapshotNotebook };
+  | { kind: "confirm-delete-notebook"; notebook: SnapshotNotebook }
+  | { kind: "change-paper-select"; notebook: SnapshotNotebook }
+  | { kind: "change-paper-scope"; notebook: SnapshotNotebook; template: PageTemplate }
+  | { kind: "change-paper-confirm"; notebook: SnapshotNotebook; template: PageTemplate; scope: PaperChangeScope; customPages: boolean }
+  | { kind: "change-paper-progress"; done: number; total: number };
 
 function pages(n: SnapshotNotebook): string {
   return `${n.pages.length} ${n.pages.length === 1 ? "page" : "pages"}`;
@@ -55,11 +68,13 @@ export function NotebookSidebar({
   folders,
   membership,
   selectedId,
+  currentPageId,
   onSelect,
   readOnlyReason,
   mintFolderId,
   commit,
   createNotebook,
+  changePaper,
   renameNotebook,
   deleteNotebook,
   canDeleteNotebook,
@@ -71,7 +86,40 @@ export function NotebookSidebar({
   // Per-folder expand/collapse chosen by the user; otherwise a folder is expanded only while it
   // holds the selected notebook (so the selection is visible).
   const [expandedBy, setExpandedBy] = useState<ReadonlyMap<string, boolean>>(new Map());
+  const paperRun = useRef(new PaperChangeRun());
   const editable = readOnlyReason === null;
+
+  const pageForNotebook = (notebook: SnapshotNotebook) =>
+    notebook.notebook_id === selectedId ? currentPageId : (notebook.pages[0]?.page_id ?? null);
+
+  const applyChangePaper = async (notebook: SnapshotNotebook, template: PageTemplate, scope: PaperChangeScope) => {
+    if (!paperRun.current.tryBegin()) return;
+    const total = changePaperTargets(notebook, scope, pageForNotebook(notebook)).length;
+    if (scope === "all" && total > 1) {
+      setDialog({ kind: "change-paper-progress", done: 0, total });
+    } else {
+      setDialog(null);
+    }
+    try {
+      await changePaper({
+        notebook,
+        template,
+        scope,
+        onProgress: (done, progressTotal) => setDialog({ kind: "change-paper-progress", done, total: progressTotal }),
+        isCancelled: () => paperRun.current.isCancelled(),
+      });
+    } finally {
+      paperRun.current.finish();
+      setDialog(null);
+    }
+  };
+
+  const openChangePaperConfirm = async (notebook: SnapshotNotebook, template: PageTemplate, scope: PaperChangeScope) => {
+    if (paperRun.current.busy) return;
+    const targets = changePaperTargets(notebook, scope, pageForNotebook(notebook));
+    const customPages = await targetsIncludeCustomPaper(targets);
+    setDialog({ kind: "change-paper-confirm", notebook, template, scope, customPages });
+  };
 
   const members = useMemo(
     () => orderLibrary(notebooks, folders, membership, sortMode, access),
@@ -232,8 +280,19 @@ export function NotebookSidebar({
         <SidebarDialog
           dialog={dialog}
           folders={folders}
-          onClose={() => setDialog(null)}
+          onClose={() => {
+            if (dialog.kind === "change-paper-progress") {
+              paperRun.current.cancel();
+              return;
+            }
+            setDialog(null);
+          }}
           onOpen={setDialog}
+          onChangePaperConfirm={(notebook, template, scope) => void openChangePaperConfirm(notebook, template, scope)}
+          onChangePaperApply={(notebook, template, scope) => void applyChangePaper(notebook, template, scope)}
+          onCancelPaperChange={() => {
+            paperRun.current.cancel();
+          }}
           onSubmitName={async (title, folderId) => {
             if (folderId !== null) return run({ type: "rename_folder", folder_id: folderId, title });
             let id: string;
@@ -275,6 +334,9 @@ function SidebarDialog({
   onDeleteNotebook,
   canDeleteNotebook,
   run,
+  onChangePaperConfirm,
+  onChangePaperApply,
+  onCancelPaperChange,
 }: {
   dialog: Dialog;
   folders: readonly SnapshotFolder[];
@@ -285,6 +347,9 @@ function SidebarDialog({
   onDeleteNotebook: (notebookId: string) => Promise<void>;
   canDeleteNotebook: boolean;
   run: (intent: FolderIntent) => Promise<void>;
+  onChangePaperConfirm: (notebook: SnapshotNotebook, template: PageTemplate, scope: PaperChangeScope) => void;
+  onChangePaperApply: (notebook: SnapshotNotebook, template: PageTemplate, scope: PaperChangeScope) => void;
+  onCancelPaperChange: () => void;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -346,6 +411,9 @@ function SidebarDialog({
             }
           >
             Rename
+          </button>
+          <button className="btn" data-testid="action-change-paper" onClick={() => onOpen({ kind: "change-paper-select", notebook })}>
+            Change paper
           </button>
           <button
             className="btn"
@@ -486,12 +554,101 @@ function SidebarDialog({
         </>
       );
       break;
+    case "change-paper-select":
+      heading = "Change paper";
+      body = (
+        <div className="dialog-actions vertical" data-testid="change-paper">
+          {PAGE_TEMPLATE_CHOICES.map((template) => (
+            <button
+              key={template}
+              type="button"
+              className="btn"
+              data-testid={`paper-${template}`}
+              onClick={() => onOpen({ kind: "change-paper-scope", notebook: dialog.notebook, template })}
+            >
+              {pageTemplateLabel(template)}
+            </button>
+          ))}
+          <button type="button" className="btn subtle" data-testid="paper-cancel" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
+      );
+      break;
+    case "change-paper-scope":
+      heading = `Change paper to ${pageTemplateLabel(dialog.template)}`;
+      body = (
+        <div className="dialog-actions vertical" data-testid="change-paper-scope">
+          <p className="dialog-text">Handwriting, text, and links stay on the page.</p>
+          <button
+            type="button"
+            className="btn"
+            data-testid="paper-this-page"
+            onClick={() => onChangePaperConfirm(dialog.notebook, dialog.template, "this")}
+          >
+            This page
+          </button>
+          <button
+            type="button"
+            className="btn"
+            data-testid="paper-all-pages"
+            onClick={() => onChangePaperConfirm(dialog.notebook, dialog.template, "all")}
+          >
+            All pages
+          </button>
+          <button type="button" className="btn subtle" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
+      );
+      break;
+    case "change-paper-confirm": {
+      const all = dialog.scope === "all";
+      heading = all
+        ? `Change all ${dialog.notebook.pages.length} pages to ${pageTemplateLabel(dialog.template)}?`
+        : `Change this page to ${pageTemplateLabel(dialog.template)}?`;
+      body = (
+        <>
+          <p className="dialog-text">Handwriting, text, and links are not changed.</p>
+          {dialog.customPages && (
+            <p className="dialog-text" data-testid="change-paper-custom">
+              At least one page is not a standard template. Its drawing stays; only the paper changes.
+            </p>
+          )}
+          <div className="dialog-actions">
+            <button className="btn subtle" onClick={onClose}>
+              Cancel
+            </button>
+            <button
+              className="btn primary"
+              data-testid="confirm-change-paper"
+              onClick={() => onChangePaperApply(dialog.notebook, dialog.template, dialog.scope)}
+            >
+              Change
+            </button>
+          </div>
+        </>
+      );
+      break;
+    }
+    case "change-paper-progress":
+      heading = `Changing paper ${dialog.done} of ${dialog.total}`;
+      body = (
+        <div className="dialog-actions vertical" data-testid="change-paper-progress">
+          <p className="dialog-text">Already-changed pages stay changed if you cancel.</p>
+          <button type="button" className="btn subtle" data-testid="cancel-paper-change" onClick={onCancelPaperChange}>
+            Cancel
+          </button>
+        </div>
+      );
+      break;
   }
   const dialogTestId =
     dialog.kind === "notebook-name" ||
     dialog.kind === "select-paper" ||
     dialog.kind === "confirm-delete-notebook" ||
-    dialog.kind === "notebook-menu"
+    dialog.kind === "notebook-menu" ||
+    dialog.kind.startsWith("change-paper")
       ? "notebook-dialog"
       : "folder-dialog";
   return (
