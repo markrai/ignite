@@ -28,6 +28,21 @@ pub fn hardware_complement(grayscale: u32) -> bool {
     grayscale == ACCEPTED_GRAYSCALE_LINUX_GRAY
 }
 
+/// Optional developer/tester override of the polarity decision, for firmware whose reported
+/// `grayscale` does not match its real panel polarity (observed: a 1st-gen Scribe on 5.18.3
+/// reports `grayscale=1` yet displays complemented ink as white-on-dark).
+///
+/// `text` is the content of the override file: `identity` (never complement) or `complement`
+/// (always complement), surrounding whitespace ignored. Anything else, or no file, falls back
+/// to [`hardware_complement`], so devices without the file behave exactly as before.
+pub fn resolve_complement(grayscale: u32, override_text: Option<&str>) -> bool {
+    match override_text.map(str::trim) {
+        Some("identity") => false,
+        Some("complement") => true,
+        _ => hardware_complement(grayscale),
+    }
+}
+
 /// Map one logical gray byte to the hardware mmap byte for this `grayscale` field.
 pub fn encode_panel_gray(logical: u8, grayscale: u32) -> u8 {
     encode_panel_gray_complement(logical, hardware_complement(grayscale))
@@ -123,6 +138,21 @@ mod tests {
         assert_eq!(encode_panel_gray(LOGICAL_WHITE, 1), 0x00);
         assert_eq!(encode_panel_gray(0x7F, 1), 0x80);
         assert_eq!(encode_panel_gray(0x80, 1), 0x7F);
+    }
+
+    #[test]
+    fn override_wins_and_default_is_unchanged() {
+        // No file / unknown text: exactly the old behavior.
+        for g in [1u32, 2] {
+            assert_eq!(resolve_complement(g, None), hardware_complement(g));
+            assert_eq!(resolve_complement(g, Some("")), hardware_complement(g));
+            assert_eq!(resolve_complement(g, Some("bogus")), hardware_complement(g));
+        }
+        // Explicit override in both directions, whitespace tolerated.
+        assert!(!resolve_complement(1, Some("identity\n")));
+        assert!(resolve_complement(2, Some("  complement ")));
+        assert!(!resolve_complement(2, Some("identity")));
+        assert!(resolve_complement(1, Some("complement")));
     }
 
     #[test]
