@@ -132,7 +132,7 @@ test("change paper this page publishes patterned blob then SetPageBackground", a
   });
 
   await sidebar.getByTestId("new-notebook").click();
-  let dialog = page.getByTestId("notebook-dialog");
+  const dialog = page.getByTestId("notebook-dialog");
   await dialog.getByTestId("paper-blank").click();
   await dialog.getByTestId("notebook-name-input").fill("Paper book");
   await dialog.getByTestId("dialog-submit").click();
