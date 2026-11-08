@@ -63,27 +63,25 @@ use crate::library::{
     DEV_LIBRARY_OPEN_TRIGGER, DEV_LIBRARY_PREV_TRIGGER,
 };
 use crate::link_picker::{LinkPickerState, PendingLink};
-use crate::modal::{
-    dialog_spec, render_dialog, DialogSpec, Modal, PaperChangeScope, TitlePurpose,
-};
+use crate::modal::{dialog_spec, render_dialog, DialogSpec, Modal, PaperChangeScope, TitlePurpose};
 use crate::nav::{dispatch_side_button, NavDownAction, NavGestureState, SideButtonDispatch};
 use crate::notebook::{
-    allocate_page_id, commit_new_page_to_manifest, consume_dev_notebook_op,
-    create_page_files_from_template, delete_page_durable, insert_page_after_durable,
-    apply_page_background_tracked, inspect_target_paper, load_page_for_switch, move_page_durable,
-    paper_apply_after_durable,
-    page_index, paper_change_incomplete_notice, peek_dev_notebook_op, persist_active_page,
-    template_background_bytes, DeletePageHooks, DevNotebookOp, InsertPageHooks, MovePageDirection,
-    MovePageHooks, NotebookOpen, PageSwitchDirection, PersistedNotebookManifestV1,
-    QuarantineOutcome, DEV_DELETE_CURRENT_PAGE_TRIGGER, DEV_INSERT_PAGE_AFTER_TRIGGER,
-    DEV_MOVE_PAGE_LEFT_TRIGGER, DEV_MOVE_PAGE_RIGHT_TRIGGER, NOTEBOOK_MANIFEST_VERSION,
+    allocate_page_id, apply_page_background_tracked, commit_new_page_to_manifest,
+    consume_dev_notebook_op, create_page_files_from_template, delete_page_durable,
+    insert_page_after_durable, inspect_target_paper, load_page_for_switch, move_page_durable,
+    page_index, paper_apply_after_durable, paper_change_incomplete_notice, peek_dev_notebook_op,
+    persist_active_page, template_background_bytes, DeletePageHooks, DevNotebookOp,
+    InsertPageHooks, MovePageDirection, MovePageHooks, NotebookOpen, PageSwitchDirection,
+    PersistedNotebookManifestV1, QuarantineOutcome, DEV_DELETE_CURRENT_PAGE_TRIGGER,
+    DEV_INSERT_PAGE_AFTER_TRIGGER, DEV_MOVE_PAGE_LEFT_TRIGGER, DEV_MOVE_PAGE_RIGHT_TRIGGER,
+    NOTEBOOK_MANIFEST_VERSION,
 };
-use crate::paper_templates::PageTemplate;
 use crate::open_page::BoundPageKey;
 use crate::orch::{
     dirty_to_send_rect, input_kernel_for_du_timing, require_eviocgrab, CtrlError, DuSendResult,
     InkTransport, StrokeController, UndoResult, WaitResult,
 };
+use crate::paper_templates::PageTemplate;
 use crate::prefs::{self, SideButtonAction};
 use crate::pressure::PressureStrokeSummary;
 use crate::profile::RenderProfile;
@@ -2495,10 +2493,8 @@ fn start_paper_gate_job(
             match std::thread::Builder::new()
                 .name("ignite-paper-gate".into())
                 .spawn(move || {
-                    let result = crate::sync_outbound::probe_accept_set_page_background(
-                        &cfg,
-                        &library_id,
-                    );
+                    let result =
+                        crate::sync_outbound::probe_accept_set_page_background(&cfg, &library_id);
                     let _ = tx.send(result);
                 }) {
                 Ok(_) => {

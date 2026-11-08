@@ -27,13 +27,12 @@ mod tests {
     use crate::library::{
         create_notebook_durable, create_notebook_durable_with_template, delete_notebook_durable,
         open_or_create_library, read_library_manifest_for_test, rename_notebook_durable,
-        CreateNotebookHooks,
-        DeleteNotebookHooks, LibraryManifestWriteHooks, LibraryRepository, RenameNotebookHooks,
-        MAX_TITLE_CHARS, NOTEBOOK_INFO_FILE,
+        CreateNotebookHooks, DeleteNotebookHooks, LibraryManifestWriteHooks, LibraryRepository,
+        RenameNotebookHooks, MAX_TITLE_CHARS, NOTEBOOK_INFO_FILE,
     };
     use crate::modal::{
-    dialog_spec, render_dialog, DialogLayout, Modal, PaperChangeScope, TitlePurpose,
-};
+        dialog_spec, render_dialog, DialogLayout, Modal, PaperChangeScope, TitlePurpose,
+    };
     use crate::notebook::{
         apply_page_background_tracked, insert_page_after_durable, open_or_create_notebook,
         template_background_bytes, InsertPageHooks,
@@ -1015,7 +1014,10 @@ mod tests {
             page_number: 2,
             page_count: 3,
         });
-        assert_eq!(tap(&mut ui, "CHANGE PAPER"), UiCommand::Redraw(Redraw::Full));
+        assert_eq!(
+            tap(&mut ui, "CHANGE PAPER"),
+            UiCommand::Redraw(Redraw::Full)
+        );
         match &ui.modal {
             Some(Modal::PaperChooser {
                 change_page: Some((2, 3)),
@@ -1114,14 +1116,15 @@ mod tests {
                 scope: PaperChangeScope::ThisPage,
             }
         );
-        let ruled = template_background_bytes(
-            crate::paper_templates::PageTemplate::Ruled,
-            &store_geo(),
-        )
-        .unwrap();
+        let ruled =
+            template_background_bytes(crate::paper_templates::PageTemplate::Ruled, &store_geo())
+                .unwrap();
         apply_page_background_tracked(&nb, &nb_id, "page-1", &ruled).unwrap();
         ui.dismiss_change_paper_confirm();
-        assert!(ui.modal.is_none(), "successful ThisPage must close ConfirmChangePaper");
+        assert!(
+            ui.modal.is_none(),
+            "successful ThisPage must close ConfirmChangePaper"
+        );
         assert_eq!(
             fs::read(nb.join("page-1").join("background.raw")).unwrap(),
             ruled,

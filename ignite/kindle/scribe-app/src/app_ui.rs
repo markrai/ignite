@@ -1250,9 +1250,12 @@ impl UiState {
                 template,
                 scope: PaperChangeScope::AllPages,
             },
-            (Modal::ConfirmChangePaper { template, scope, .. }, ButtonId::ConfirmDelete) => {
-                UiCommand::ApplyPageTemplate { template, scope }
-            }
+            (
+                Modal::ConfirmChangePaper {
+                    template, scope, ..
+                },
+                ButtonId::ConfirmDelete,
+            ) => UiCommand::ApplyPageTemplate { template, scope },
             (Modal::PaperScope { .. }, ButtonId::Cancel)
             | (Modal::ConfirmChangePaper { .. }, ButtonId::Cancel)
             | (Modal::ChangePaperProgress { .. }, ButtonId::CancelPaperChange) => {

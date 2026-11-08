@@ -16,19 +16,19 @@ use super::tests::{
     write_config,
 };
 use super::*;
+use crate::app_ui::{UiCommand, UiState};
 use crate::library::{
     create_notebook_durable_with_template, open_library_read_only, CreateNotebookHooks,
 };
-use crate::app_ui::{UiCommand, UiState};
 use crate::modal::{dialog_spec, DialogLayout, Modal, PaperChangeScope};
 use crate::notebook::{
     apply_page_background_on, insert_page_after_durable, install_page_background,
     template_background_bytes, InsertPageHooks,
 };
-use crate::ui_gfx::{panel_geo, UiPoint};
 use crate::paper_templates::{generate_page_background, PageTemplate, PAPER_WHITE};
 use crate::profile::RenderProfile;
 use crate::store::{install_background, load_existing_page, BackgroundIdentityV1};
+use crate::ui_gfx::{panel_geo, UiPoint};
 
 fn profile() -> RenderProfile {
     RenderProfile::sealed_v2_pressure(0x00).unwrap()
@@ -446,7 +446,10 @@ fn journaled_background_replacement_uploads_and_preserves_content() {
                 j.committed
                     .iter()
                     .filter(|o| {
-                        matches!(o.envelope.operation, SyncOperationV1::SetPageBackground { .. })
+                        matches!(
+                            o.envelope.operation,
+                            SyncOperationV1::SetPageBackground { .. }
+                        )
                     })
                     .count()
             })
@@ -462,10 +465,16 @@ fn journaled_background_replacement_uploads_and_preserves_content() {
             && srv.snapshot_hash(&lid) == snapshot_sha256(&local_snapshot(&e.lib)).unwrap().as_str()
     });
 
-    let after_bytes = fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
+    let after_bytes =
+        fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
     assert_eq!(after_bytes, ruled);
     let after = local_snapshot(&e.lib);
-    let page = &after.notebooks.iter().find(|n| n.title == "Change-Paper").unwrap().pages[0];
+    let page = &after
+        .notebooks
+        .iter()
+        .find(|n| n.title == "Change-Paper")
+        .unwrap()
+        .pages[0];
     assert!(matches!(page.background, BackgroundRef::Blob { .. }));
     assert_eq!(page.strokes.len(), 1);
     assert_eq!(page.texts.len(), 0);
@@ -638,14 +647,8 @@ fn this_page_confirmation_journals_once_dismisses_and_presents() {
             scope: PaperChangeScope::ThisPage,
         }
     );
-    apply_page_background_on(
-        Some(&s),
-        &nb_dir(&e.lib, &nb_id),
-        &nb_id,
-        "page-1",
-        &ruled,
-    )
-    .expect("ThisPage apply");
+    apply_page_background_on(Some(&s), &nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
+        .expect("ThisPage apply");
     ui.dismiss_change_paper_confirm();
     assert!(ui.modal.is_none());
     assert_eq!(
@@ -660,7 +663,10 @@ fn this_page_confirmation_journals_once_dismisses_and_presents() {
                 j.committed
                     .iter()
                     .filter(|o| {
-                        matches!(o.envelope.operation, SyncOperationV1::SetPageBackground { .. })
+                        matches!(
+                            o.envelope.operation,
+                            SyncOperationV1::SetPageBackground { .. }
+                        )
                     })
                     .count()
             })
@@ -703,22 +709,39 @@ fn paper_gate_result_applies_requires_matching_server_library_and_session() {
         .unwrap(),
     };
     assert!(crate::sync_outbound::paper_gate_result_applies(
-        &a, 3, Some(&a), 3
+        &a,
+        3,
+        Some(&a),
+        3
     ));
     assert!(!crate::sync_outbound::paper_gate_result_applies(
-        &a, 3, Some(&a), 4
+        &a,
+        3,
+        Some(&a),
+        4
     ));
     assert!(!crate::sync_outbound::paper_gate_result_applies(
-        &a, 3, Some(&b), 3
+        &a,
+        3,
+        Some(&b),
+        3
     ));
     assert!(!crate::sync_outbound::paper_gate_result_applies(
-        &a, 3, Some(&other_lib), 3
+        &a,
+        3,
+        Some(&other_lib),
+        3
     ));
-    assert!(!crate::sync_outbound::paper_gate_result_applies(&a, 3, None, 3));
+    assert!(!crate::sync_outbound::paper_gate_result_applies(
+        &a, 3, None, 3
+    ));
 }
 
 fn library_id_for_gate() -> LibraryId {
-    LibraryId::from_uuid(uuid::Uuid::from_u128(0x01900000_0000_7000_8000_0000000000aa)).unwrap()
+    LibraryId::from_uuid(uuid::Uuid::from_u128(
+        0x01900000_0000_7000_8000_0000000000aa,
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -767,10 +790,9 @@ fn set_page_background_prepare_refuses_when_server_gate_is_off() {
     );
     wait_until("create", Duration::from_secs(20), || s.pending() == 0);
     let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
-    assert!(
-        s.prepare_set_page_background(&nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
-            .is_none()
-    );
+    assert!(s
+        .prepare_set_page_background(&nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
+        .is_none());
     assert!(s.fault().is_none(), "{:?}", s.fault());
     let still = fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap();
     assert_eq!(still, dotted, "refused authoring must not change paper");
@@ -778,7 +800,12 @@ fn set_page_background_prepare_refuses_when_server_gate_is_off() {
         .unwrap()
         .committed
         .iter()
-        .filter(|o| matches!(o.envelope.operation, SyncOperationV1::SetPageBackground { .. }))
+        .filter(|o| {
+            matches!(
+                o.envelope.operation,
+                SyncOperationV1::SetPageBackground { .. }
+            )
+        })
         .count();
     assert_eq!(set_bg, 0);
     stop(s);

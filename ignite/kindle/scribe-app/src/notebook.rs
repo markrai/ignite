@@ -305,11 +305,8 @@ pub fn template_background_bytes(
     template: crate::paper_templates::PageTemplate,
     fb_geo: &FbGeometry,
 ) -> Result<Vec<u8>, String> {
-    let mut bg = crate::paper_templates::generate_page_background(
-        template,
-        fb_geo.xres,
-        fb_geo.yres,
-    )?;
+    let mut bg =
+        crate::paper_templates::generate_page_background(template, fb_geo.xres, fb_geo.yres)?;
     let _ = scrub_chrome_band(&mut bg, fb_geo)?;
     Ok(bg)
 }
@@ -337,11 +334,12 @@ pub fn apply_page_background_on(
 ) -> Result<(), String> {
     let ticket = match sync {
         None => None,
-        Some(s) => match s.prepare_set_page_background(notebook_dir, notebook_id, page_id, pixels)
-        {
-            None => return Err("local capture journal could not record this edit".into()),
-            Some(t) => Some(t),
-        },
+        Some(s) => {
+            match s.prepare_set_page_background(notebook_dir, notebook_id, page_id, pixels) {
+                None => return Err("local capture journal could not record this edit".into()),
+                Some(t) => Some(t),
+            }
+        }
     };
     let result = install_page_background(notebook_dir, page_id, pixels);
     if let Some(t) = ticket {
