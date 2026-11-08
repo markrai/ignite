@@ -8,12 +8,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use sync_protocol::{
-    snapshot_sha256, BackgroundEncoding, BackgroundRef, LibraryId, SyncOperationV1,
+    snapshot_sha256, BackgroundEncoding, BackgroundRef, LibraryId, SyncEnvelopeV1, SyncOperationV1,
 };
 
 use super::tests::{
     env, geo, local_snapshot, nb_dir, pending_seqs, replay_local, server, stop, wait_until, write,
-    write_config,
+    write_config, Server,
 };
 use super::*;
 use crate::app_ui::{UiCommand, UiState};
@@ -28,6 +28,7 @@ use crate::notebook::{
 use crate::paper_templates::{generate_page_background, PageTemplate, PAPER_WHITE};
 use crate::profile::RenderProfile;
 use crate::store::{install_background, load_existing_page, BackgroundIdentityV1};
+use crate::sync_local::{background_ref_for, read_identity};
 use crate::ui_gfx::{panel_geo, UiPoint};
 
 fn profile() -> RenderProfile {
@@ -126,6 +127,92 @@ fn assert_blob_ref_matches(bg: &BackgroundRef, bytes: &[u8], w: u32, h: u32) {
             assert_eq!(format.stride * format.height, *byte_len as u32);
         }
     }
+}
+
+/// Server-accepted `SetPageBackground` ops after `after` (not the compactable outbox).
+fn set_page_background_ops_after(
+    srv: &Server,
+    lib: &LibraryId,
+    after: i64,
+) -> Vec<(u64, SyncEnvelopeV1)> {
+    srv.ops_after(lib, after)
+        .into_iter()
+        .filter(|(_, env)| matches!(env.operation, SyncOperationV1::SetPageBackground { .. }))
+        .collect()
+}
+
+fn expected_set_page_background(
+    library_root: &Path,
+    notebook_local: &str,
+    page_local: &str,
+    pixels: &[u8],
+) -> (
+    sync_protocol::NotebookId,
+    sync_protocol::PageId,
+    BackgroundRef,
+) {
+    let identity = read_identity(library_root).unwrap().unwrap();
+    let want_nb = identity.notebook_id(notebook_local).unwrap();
+    let want_pg = identity.page_id(notebook_local, page_local).unwrap();
+    let page = crate::store::load_page_read_only(&nb_dir(library_root, notebook_local), page_local)
+        .unwrap();
+    let want_bg = background_ref_for(
+        pixels,
+        page.header.panel_width,
+        page.header.panel_height,
+        page.header.line_length,
+    )
+    .unwrap();
+    (want_nb, want_pg, want_bg)
+}
+
+fn matching_set_page_background(
+    srv: &Server,
+    lib: &LibraryId,
+    after: i64,
+    want_nb: &sync_protocol::NotebookId,
+    want_pg: &sync_protocol::PageId,
+    want_bg: &BackgroundRef,
+) -> Option<SyncEnvelopeV1> {
+    let set_bgs = set_page_background_ops_after(srv, lib, after);
+    if set_bgs.len() != 1 {
+        return None;
+    }
+    let (_seq, env) = &set_bgs[0];
+    match &env.operation {
+        SyncOperationV1::SetPageBackground {
+            notebook_id,
+            page_id,
+            background,
+        } if notebook_id == want_nb && page_id == want_pg && background == want_bg => {
+            Some(env.clone())
+        }
+        _ => None,
+    }
+}
+
+fn expect_one_set_page_background(
+    srv: &Server,
+    lib: &LibraryId,
+    after: i64,
+    notebook_local: &str,
+    page_local: &str,
+    library_root: &Path,
+    pixels: &[u8],
+) -> SyncEnvelopeV1 {
+    let (want_nb, want_pg, want_bg) =
+        expected_set_page_background(library_root, notebook_local, page_local, pixels);
+    matching_set_page_background(srv, lib, after, &want_nb, &want_pg, &want_bg).unwrap_or_else(
+        || {
+            panic!(
+                "expected exactly one matching SetPageBackground after server_seq {after}; got {:?}",
+                set_page_background_ops_after(srv, lib, after)
+                    .into_iter()
+                    .map(|(seq, env)| (seq, env.operation))
+                    .collect::<Vec<_>>()
+            )
+        },
+    )
 }
 
 #[test]
@@ -421,8 +508,11 @@ fn journaled_background_replacement_uploads_and_preserves_content() {
     wait_until("create", Duration::from_secs(20), || {
         s.pending() == 0 && s.state().acked_client_seq >= 1
     });
+    let acked_before_stroke = s.state().acked_client_seq;
     let stroke = write(&s, &e.lib, &nb_id, "page-1", &[(10.0, 10.0), (40.0, 50.0)]);
-    wait_until("stroke", Duration::from_secs(20), || s.pending() == 0);
+    wait_until("stroke", Duration::from_secs(20), || {
+        s.state().acked_client_seq > acked_before_stroke && s.pending() == 0 && s.fault().is_none()
+    });
     let before = local_snapshot(&e.lib);
     let before_strokes = before.notebooks.iter().find(|n| {
         // local snapshot uses global ids; compare stroke count on first matching page
@@ -432,34 +522,27 @@ fn journaled_background_replacement_uploads_and_preserves_content() {
 
     let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
     assert_ne!(ruled, dotted);
+    let lid = library_id(&e.sync);
     let acked0 = s.state().acked_client_seq;
+    let head0 = srv.head_seq(&lid);
+    let (want_nb, want_pg, want_bg) =
+        expected_set_page_background(&e.lib, &nb_id, "page-1", &ruled);
     let ticket = s
         .prepare_set_page_background(&nb_dir(&e.lib, &nb_id), &nb_id, "page-1", &ruled)
         .expect("prepare SetPageBackground");
     install_page_background(&nb_dir(&e.lib, &nb_id), "page-1", &ruled).unwrap();
     s.commit(ticket);
-    wait_until("set_bg journaled", Duration::from_secs(5), || {
-        fs::read(e.sync.join(OUTBOX_FILE))
-            .ok()
-            .and_then(|b| parse_journal(&b).ok())
-            .map(|j| {
-                j.committed
-                    .iter()
-                    .filter(|o| {
-                        matches!(
-                            o.envelope.operation,
-                            SyncOperationV1::SetPageBackground { .. }
-                        )
-                    })
-                    .count()
-            })
-            == Some(1)
-    });
-    wait_until("upload", Duration::from_secs(30), || {
-        s.state().acked_client_seq > acked0 && s.pending() == 0 && s.fault().is_none()
+    // Outbox compaction may drop the committed record as soon as it is ACK'd; wait on the
+    // durable server ledger (not OUTBOX_FILE) for exactly-once acceptance.
+    wait_until("set_bg accepted", Duration::from_secs(30), || {
+        s.fault().is_none()
+            && s.pending() == 0
+            && s.state().acked_client_seq > acked0
+            && matching_set_page_background(&srv, &lid, head0, &want_nb, &want_pg, &want_bg)
+                .is_some()
     });
     assert!(s.fault().is_none(), "{:?}", s.fault());
-    let lid = library_id(&e.sync);
+    expect_one_set_page_background(&srv, &lid, head0, &nb_id, "page-1", &e.lib, &ruled);
     wait_until("echo apply", Duration::from_secs(30), || {
         s.fault().is_none()
             && srv.snapshot_hash(&lid) == snapshot_sha256(&local_snapshot(&e.lib)).unwrap().as_str()
@@ -617,9 +700,16 @@ fn this_page_confirmation_journals_once_dismisses_and_presents() {
         "This-Page",
         Some("notebook-1"),
     );
-    wait_until("create", Duration::from_secs(20), || s.pending() == 0);
+    wait_until("create", Duration::from_secs(20), || {
+        s.pending() == 0 && s.state().acked_client_seq >= 1 && s.fault().is_none()
+    });
     let ruled = template_background_bytes(PageTemplate::Ruled, &geo()).unwrap();
     assert_ne!(ruled, dotted);
+    let lid = library_id(&e.sync);
+    let acked0 = s.state().acked_client_seq;
+    let head0 = srv.head_seq(&lid);
+    let (want_nb, want_pg, want_bg) =
+        expected_set_page_background(&e.lib, &nb_id, "page-1", &ruled);
 
     let g = panel_geo();
     let cards: &[crate::home::HomeCard] = &[];
@@ -655,22 +745,17 @@ fn this_page_confirmation_journals_once_dismisses_and_presents() {
         fs::read(nb_dir(&e.lib, &nb_id).join("page-1").join("background.raw")).unwrap(),
         ruled
     );
-    wait_until("set_bg journaled", Duration::from_secs(5), || {
-        fs::read(e.sync.join(OUTBOX_FILE))
-            .ok()
-            .and_then(|b| parse_journal(&b).ok())
-            .map(|j| {
-                j.committed
-                    .iter()
-                    .filter(|o| {
-                        matches!(
-                            o.envelope.operation,
-                            SyncOperationV1::SetPageBackground { .. }
-                        )
-                    })
-                    .count()
-            })
-            == Some(1)
+    wait_until("set_bg accepted", Duration::from_secs(30), || {
+        s.fault().is_none()
+            && s.pending() == 0
+            && s.state().acked_client_seq > acked0
+            && matching_set_page_background(&srv, &lid, head0, &want_nb, &want_pg, &want_bg)
+                .is_some()
+    });
+    let first = expect_one_set_page_background(&srv, &lid, head0, &nb_id, "page-1", &e.lib, &ruled);
+    wait_until("echo apply", Duration::from_secs(30), || {
+        s.fault().is_none()
+            && srv.snapshot_hash(&lid) == snapshot_sha256(&local_snapshot(&e.lib)).unwrap().as_str()
     });
     let again = ui.on_tap(
         &g,
@@ -688,6 +773,11 @@ fn this_page_confirmation_journals_once_dismisses_and_presents() {
         }
         _ => {}
     }
+    // Repeated UI interaction must not accept a second SetPageBackground.
+    assert!(s.state().acked_client_seq > acked0);
+    assert_eq!(s.pending(), 0);
+    let still = expect_one_set_page_background(&srv, &lid, head0, &nb_id, "page-1", &e.lib, &ruled);
+    assert_eq!(still.operation_id, first.operation_id);
     stop(s);
 }
 

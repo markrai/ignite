@@ -13,7 +13,7 @@ use kindle_platform::FbGeometry;
 use notebook_core::{new_stroke_id, PagePoint, Point, Stroke};
 use scribe_sync_server::{generate_token, ServerConfig, ServerHandle, Store, TokenVerifier};
 use sync_engine::LibraryState;
-use sync_protocol::{snapshot_sha256, LinkId, SyncPageLink, SyncSnapshotV1};
+use sync_protocol::{snapshot_sha256, LinkId, SyncEnvelopeV1, SyncPageLink, SyncSnapshotV1};
 use uuid::Uuid;
 
 use super::*;
@@ -357,6 +357,25 @@ impl Server {
         let (s, v) = self.get(&format!("/v1/libraries/{lib}/snapshot"));
         assert_eq!(s, 200, "{v}");
         v["snapshot_sha256"].as_str().unwrap().to_string()
+    }
+
+    /// Persistent server ledger after `after` (survives client outbox compaction).
+    pub(super) fn ops_after(&self, lib: &LibraryId, after: i64) -> Vec<(u64, SyncEnvelopeV1)> {
+        let (s, v) = self.get(&format!(
+            "/v1/libraries/{lib}/operations?after={after}&limit=500"
+        ));
+        assert_eq!(s, 200, "{v}");
+        v["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| {
+                (
+                    o["server_seq"].as_u64().unwrap(),
+                    serde_json::from_value(o["envelope"].clone()).unwrap(),
+                )
+            })
+            .collect()
     }
 }
 
