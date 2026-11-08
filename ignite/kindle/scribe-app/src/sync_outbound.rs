@@ -2446,10 +2446,7 @@ impl OutboundSync {
                 return None;
             }
         };
-        self.prepare_with(
-            OperationId::from_uuid(Uuid::now_v7()).unwrap(),
-            operation,
-        )
+        self.prepare_with(OperationId::from_uuid(Uuid::now_v7()).unwrap(), operation)
     }
 
     pub fn prepare_rename_notebook(&self, notebook_local: &str, title: &str) -> Option<PrepTicket> {

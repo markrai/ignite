@@ -1474,11 +1474,7 @@ fn set_page_background_unknown_and_deleted_targets() {
     );
     assert_eq!(o, Outcome::NoOp("page or notebook deleted"));
 
-    let (s, _) = apply(
-        &s,
-        &mut a,
-        Op::DeleteNotebook { notebook_id: nb(2) },
-    );
+    let (s, _) = apply(&s, &mut a, Op::DeleteNotebook { notebook_id: nb(2) });
     let (s, o) = apply(
         &s,
         &mut a,

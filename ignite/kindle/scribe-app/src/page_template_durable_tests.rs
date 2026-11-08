@@ -443,14 +443,10 @@ mod tests {
         )
         .unwrap()
         .inserted_page_id;
-        let page3 = insert_page_after_durable(
-            &nb,
-            &mut manifest,
-            &page2,
-            &InsertPageHooks::default(),
-        )
-        .unwrap()
-        .inserted_page_id;
+        let page3 =
+            insert_page_after_durable(&nb, &mut manifest, &page2, &InsertPageHooks::default())
+                .unwrap()
+                .inserted_page_id;
         let dotted = read_background_raw(&nb, DEFAULT_PAGE_ID);
         assert_eq!(read_background_raw(&nb, &page2), dotted);
         assert_eq!(read_background_raw(&nb, &page3), dotted);

@@ -23,10 +23,10 @@ use super::*;
 use crate::eraser::EraserGestureState;
 use crate::ink::InkRequest;
 use crate::library::open_or_create_library;
+use crate::paper_templates::PageTemplate;
 use crate::pressure_curve::STYLE_PRESSURE_WIDTH_V1;
 use crate::store::{load_existing_page, load_page_texts, PageStore};
 use crate::sync_local::{build_snapshot, local_stroke_id_for_global, read_identity};
-use crate::paper_templates::PageTemplate;
 use crate::ui_gfx::paper_background;
 
 // ------------------------------------------------------------------ fixtures
