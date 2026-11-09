@@ -4760,6 +4760,14 @@ pub fn run_page_session(
         input_clock,
         RuntimeStore::Unbound,
     );
+    // Developer switch: pen linger only when the switch file says `on` (see orch.rs).
+    let pen_linger = crate::orch::pen_linger_from_switch(
+        std::fs::read_to_string(crate::orch::PEN_LINGER_SWITCH_PATH)
+            .ok()
+            .as_deref(),
+    );
+    ctrl.set_pen_linger(pen_linger);
+    println!("pen_linger enabled={pen_linger}");
 
     let mut cal = portrait_wacom_calibration();
     // Proven rotate=3 → Portrait0; reported rotate=1 → Portrait180 (same 180° policy as touch).
