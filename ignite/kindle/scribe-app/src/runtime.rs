@@ -532,6 +532,99 @@ impl KindleTransport {
         Ok(())
     }
 
+    /// Show or hide the chrome without a full-screen flash: recompose the page (durable
+    /// background + strokes + text + live chrome) and refresh only the two bands, the only
+    /// pixels that differ between chrome on and off.
+    fn present_chrome_bands(
+        &mut self,
+        background: &[u8],
+        strokes: &[Stroke],
+        chrome: PageChrome,
+    ) -> Result<(), String> {
+        let t0 = Instant::now();
+        self.compose_page(background, strokes, Some(chrome))?;
+        let layout = crate::chrome::ChromeLayout::new(&self.geometry);
+        // Send both bands, then wait for both: one waveform period instead of two.
+        let mut markers = Vec::with_capacity(2);
+        for band in [layout.top_band, layout.bottom_band] {
+            let Some(r) = band.clamp_to(&self.geometry) else {
+                continue;
+            };
+            let mx = MxcfbRect {
+                top: r.y,
+                left: r.x,
+                width: r.w,
+                height: r.h,
+            };
+            markers.push(
+                self.fb
+                    .send_update_gc16(mx)
+                    .map_err(|e| e.to_string())?
+                    .marker,
+            );
+        }
+        for marker in markers {
+            self.fb.wait_for_update(marker).map_err(|e| e.to_string())?;
+        }
+        println!(
+            "chrome_bands_presented visible={} page=\"{}\" elapsed_us={}",
+            self.chrome_on_panel,
+            chrome.label(),
+            t0.elapsed().as_micros()
+        );
+        Ok(())
+    }
+
+    /// Panel rectangle covering `strokes` (ink radius + antialiasing padded), or `None` when
+    /// nothing maps to the panel.
+    fn strokes_panel_rect(&self, strokes: &[&Stroke], pad: u32) -> Option<Rect> {
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for stroke in strokes {
+            for p in &stroke.points {
+                let Some((x, y)) = self.to_panel(PagePoint::new(p.x, p.y)) else {
+                    continue;
+                };
+                bounds = Some(match bounds {
+                    None => (x, y, x, y),
+                    Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x), d.max(y)),
+                });
+            }
+        }
+        let (x0, y0, x1, y1) = bounds?;
+        let pad = pad as i32;
+        let x0 = (x0 - pad).max(0) as u32;
+        let y0 = (y0 - pad).max(0) as u32;
+        Rect::new(
+            x0,
+            y0,
+            (x1 + pad) as u32 - x0 + 1,
+            (y1 + pad) as u32 - y0 + 1,
+        )
+        .clamp_to(&self.geometry)
+    }
+
+    /// Recompose the page and refresh only `region` (partial GC16, waited): e.g. the area an
+    /// erase gesture changed, instead of a full-screen flash.
+    fn present_region(
+        &mut self,
+        background: &[u8],
+        strokes: &[Stroke],
+        chrome: PageChrome,
+        region: Rect,
+    ) -> Result<(u64, u64), String> {
+        let t0 = Instant::now();
+        self.compose_page(background, strokes, Some(chrome))?;
+        let reconstruct_us = t0.elapsed().as_micros() as u64;
+        let t1 = Instant::now();
+        self.refresh_rect(region)?;
+        let refresh_us = t1.elapsed().as_micros() as u64;
+        println!(
+            "region_present x={} y={} w={} h={} reconstruct_us={reconstruct_us} refresh_us={refresh_us}",
+            region.x, region.y, region.w, region.h
+        );
+        Ok((reconstruct_us, refresh_us))
+    }
+
     /// Repaint chrome bands after live ink crossed them (idle + disarmed only).
     fn repair_chrome(&mut self, chrome: PageChrome) -> Result<(), String> {
         if !self.chrome_on_panel {
@@ -1223,6 +1316,22 @@ fn eraser_commit_gesture(
         return Ok(());
     }
     let t0 = Instant::now();
+    // Panel area the gesture changes: the touched strokes as they were (fragments lie inside).
+    let region = {
+        let targets: HashSet<&str> = commit
+            .replacements
+            .iter()
+            .map(|r| r.target_stroke_id.as_str())
+            .collect();
+        let touched: Vec<&Stroke> = ctrl
+            .session
+            .committed_strokes()
+            .iter()
+            .filter(|s| targets.contains(s.id.as_str()))
+            .collect();
+        // Widest pen radius is 4 px; leave room for antialiasing and ghosting.
+        ctrl.transport().strokes_panel_rect(&touched, 16)
+    };
     let timing = ctrl
         .durable_replace_strokes(&commit.replacements)
         .map_err(|e| {
@@ -1239,13 +1348,20 @@ fn eraser_commit_gesture(
     ctrl.totals.partial_erase_fragments_created += commit.stats.fragments_created;
 
     let remaining: Vec<Stroke> = ctrl.session.committed_strokes().to_vec();
-    match ctrl
-        .transport_mut()
-        .reconstruct_page(current_bg, &remaining, Some(chrome))
-    {
+    let presented = match region {
+        Some(r) => ctrl
+            .transport_mut()
+            .present_region(current_bg, &remaining, chrome, r),
+        None => ctrl
+            .transport_mut()
+            .reconstruct_page(current_bg, &remaining, Some(chrome)),
+    };
+    match presented {
         Ok((reconstruct_us, gc16_us)) => {
             ctrl.totals.eraser_reconstructs += 1;
-            ctrl.clear_pending_clean();
+            if region.is_none() {
+                ctrl.clear_pending_clean();
+            }
             let _ = t0;
             println!(
                 "partial_erase_gesture sweeps={} source_strokes_touched={} \
@@ -1279,6 +1395,8 @@ fn navigate(
     current_bg: &mut Vec<u8>,
     action: NavDownAction,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         // Mid-stroke: ignore navigation.
         return Ok(false);
@@ -1471,6 +1589,8 @@ fn delete_current_page(
     notebook_profile: &RenderProfile,
     current_bg: &mut Vec<u8>,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_delete_ignored reason=not_idle");
         return Ok(false);
@@ -1571,6 +1691,8 @@ fn move_current_page(
     current_bg: &[u8],
     direction: MovePageDirection,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_move_ignored reason=not_idle");
         return Ok(false);
@@ -1638,6 +1760,8 @@ fn insert_page_after_current(
     notebook_profile: &RenderProfile,
     current_bg: &mut Vec<u8>,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_insert_ignored reason=not_idle");
         return Ok(false);
@@ -2140,6 +2264,8 @@ fn handle_lasso_action(
     cached_move_ids: &mut Option<HashSet<String>>,
     frame_diag: Option<TouchFrameDiag>,
 ) -> Result<bool, String> {
+    // A lingering wet path (see `orch::LINGER_SETTLE_US`) settles before any other action.
+    ctrl.settle().map_err(|e| format!("settle: {e}"))?;
     match action {
         FingerAction::Tap(_) | FingerAction::NextPage | FingerAction::PreviousPage => {
             return Ok(false)
@@ -4750,6 +4876,14 @@ pub fn run_page_session(
         input_clock,
         RuntimeStore::Unbound,
     );
+    // Developer switch: pen linger only when the switch file says `on` (see orch.rs).
+    let pen_linger = crate::orch::pen_linger_from_switch(
+        std::fs::read_to_string(crate::orch::PEN_LINGER_SWITCH_PATH)
+            .ok()
+            .as_deref(),
+    );
+    ctrl.set_pen_linger(pen_linger);
+    println!("pen_linger enabled={pen_linger}");
 
     let mut cal = portrait_wacom_calibration();
     // Proven rotate=3 → Portrait0; reported rotate=1 → Portrait180 (same 180° policy as touch).
@@ -5007,7 +5141,9 @@ pub fn run_page_session(
             && matches!(lasso, LassoState::Idle)
         {
             let now_ms = ms_since_start(Instant::now());
-            if ui.chrome.timeout_due(now_ms) {
+            // Erase mode keeps the bar up: its ERASE state stays visible and no hide/show
+            // refresh interrupts erasing.
+            if ui.chrome.timeout_due(now_ms) && !crate::chrome::erase_mode() {
                 ui.chrome.hide();
                 println!(
                     "chrome_auto_hide after_ms={}",
@@ -5017,9 +5153,14 @@ pub fn run_page_session(
             let want = ui.chrome_overlay_visible();
             if ctrl.transport().chrome_on_panel() != want {
                 ctrl.transport_mut().set_chrome_visible(want);
-                if let Err(e) =
-                    execute_ui_command(UiCommand::Redraw(Redraw::Full), &mut ui_exec!(), &mut ctrl)
-                {
+                // Notebook page, no modal: only the bands change, so only they are refreshed.
+                let strokes = ctrl.session.committed_strokes().to_vec();
+                let presented =
+                    chrome_for_page(&manifest, ctrl.session.page_id()).and_then(|chrome| {
+                        ctrl.transport_mut()
+                            .present_chrome_bands(&current_bg, &strokes, chrome)
+                    });
+                if let Err(e) = presented {
                     eprintln!("error: chrome present: {e}");
                     let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
                     shutdown_safe = safe;
@@ -5726,6 +5867,15 @@ pub fn run_page_session(
                 }
             };
             if consumed {
+                if ev.kind == StylusEventKind::Down && ctrl.is_lingering() {
+                    if let Err(e) = ctrl.settle() {
+                        eprintln!("error: settle before ui tap: {e}");
+                        let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                        shutdown_safe = safe;
+                        stylus_mode_disarm_failed = disarm_fail;
+                        break 1;
+                    }
+                }
                 continue;
             }
             // On-screen Erase mode: the router left this Down to the page, so the pen tip erases.
@@ -5747,6 +5897,13 @@ pub fn run_page_session(
                 StylusEventKind::Down if ev.tool == StylusTool::Eraser => {
                     if nav.is_active() || eraser.is_active() {
                         continue;
+                    }
+                    if let Err(e) = ctrl.settle() {
+                        eprintln!("error: settle before erase: {e}");
+                        let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                        shutdown_safe = safe;
+                        stylus_mode_disarm_failed = disarm_fail;
+                        break 1;
                     }
                     if !ctrl.is_idle() || ctrl.is_armed() {
                         // Never interrupt an active pen stroke / armed wet path.
@@ -5774,16 +5931,27 @@ pub fn run_page_session(
                     // same contact* proceeds to ink. The page is reconstructed from durable
                     // state (GC16 FULL, waited) before the wet stroke arms, so the reconstruct
                     // can never erase the beginning of the stroke; queued Moves replay after.
+                    if ctrl.is_lingering() && ui.chrome_overlay_visible() {
+                        if let Err(e) = ctrl.settle() {
+                            eprintln!("error: settle before chrome dismiss: {e}");
+                            let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                            shutdown_safe = safe;
+                            stylus_mode_disarm_failed = disarm_fail;
+                            break 1;
+                        }
+                    }
                     if !ctrl.is_armed() && ui.chrome.pen_content_down() {
                         ctrl.transport_mut()
                             .set_chrome_visible(ui.chrome_overlay_visible());
                         let strokes = ctrl.session.committed_strokes().to_vec();
+                        // Only the bands change; refreshing them (waited) before the stroke arms
+                        // keeps the start of the stroke safe without a full-screen flash.
                         let presented = chrome_for_page(&manifest, ctrl.session.page_id())
                             .and_then(|chrome| {
-                                ctrl.transport_mut().reconstruct_page(
+                                ctrl.transport_mut().present_chrome_bands(
                                     &current_bg,
                                     &strokes,
-                                    Some(chrome),
+                                    chrome,
                                 )
                             });
                         if let Err(e) = presented {
@@ -5793,7 +5961,6 @@ pub fn run_page_session(
                             stylus_mode_disarm_failed = disarm_fail;
                             break 1;
                         }
-                        ctrl.clear_pending_clean();
                         println!("chrome_hidden reason=pen_content_down");
                     }
                     let page = device_to_page(&cal, ev.device.x, ev.device.y);
@@ -5840,6 +6007,14 @@ pub fn run_page_session(
                                     }
                                     NavDownAction::UndoLastStroke => {
                                         ctrl.totals.undo_gestures += 1;
+                                        if let Err(e) = ctrl.settle() {
+                                            eprintln!("error: settle before undo: {e}");
+                                            let (_c, safe, disarm_fail) =
+                                                finish_shutdown(&mut ctrl, false);
+                                            shutdown_safe = safe;
+                                            stylus_mode_disarm_failed = disarm_fail;
+                                            break 1;
+                                        }
                                         if !ctrl.is_idle() || ctrl.is_armed() {
                                             // Never interrupt wet stroke / armed stylus mode.
                                             continue;
@@ -6146,6 +6321,14 @@ pub fn run_page_session(
             Ok(SourcePoll::WouldBlock) => {
                 ctrl.totals.max_input_backlog =
                     ctrl.totals.max_input_backlog.max(src.backlog() as u64);
+                // End a linger once input is quiet (WAIT → disarm → durable append).
+                if let Err(e) = ctrl.maybe_settle(src.backlog() == 0) {
+                    eprintln!("error: settle: {e}");
+                    let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                    shutdown_safe = safe;
+                    stylus_mode_disarm_failed = disarm_fail;
+                    break 1;
+                }
                 // No partial refresh may land on a panel the screensaver owns.
                 let idle_clean = if router.display_valid() {
                     ctrl.maybe_idle_clean(src.backlog() == 0)
