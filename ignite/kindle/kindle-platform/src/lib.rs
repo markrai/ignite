@@ -57,7 +57,8 @@ pub use evdev_abi::{
 pub use evdev_state::{DeviceSnapshot, EvdevStateMachine, FeedResult, StreamIntegrity};
 pub use fb_polarity::{
     copy_logical_rect_to_hw, decode_panel_gray, encode_panel_gray, hardware_complement,
-    LOGICAL_BLACK, LOGICAL_WHITE,
+    load_override_text, override_text_from_bytes, resolve_complement, LOGICAL_BLACK, LOGICAL_WHITE,
+    POLARITY_OVERRIDE_MAX_BYTES,
 };
 pub use fb_sample::{
     sample_visible_grid, visible_grid_coords, FbGridSample, FbSamplePoint, FlushCopyStats,
