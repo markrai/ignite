@@ -62,6 +62,8 @@ pub enum UiCommand {
     /// Leave Scribe cleanly (Home exit icon).
     ExitApp,
     Undo,
+    /// Toggle the on-screen Erase mode (chrome button).
+    ToggleEraser,
     PreviousPage,
     NextPage,
     InsertPageAfter,
@@ -1016,6 +1018,7 @@ impl UiState {
             None | Some(ChromeHit::Inert) => UiCommand::None,
             Some(ChromeHit::Home) => UiCommand::GoHome,
             Some(ChromeHit::Undo) => UiCommand::Undo,
+            Some(ChromeHit::Erase) => UiCommand::ToggleEraser,
             Some(ChromeHit::PreviousPage) => {
                 if ctx.page.can_previous() {
                     UiCommand::PreviousPage

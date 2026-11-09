@@ -3489,7 +3489,12 @@ fn open_notebook_from_ui(
         }
     } else {
         match switch_notebook_durable(x.library, notebook_id, &SwitchNotebookHooks::default()) {
-            Ok(c) => c,
+            Ok(c) => {
+                // Only after a durable cross-notebook switch: failed opens keep Erase mode.
+                // Clear before bind/present so the destination never inherits remapped pen.
+                crate::chrome::clear_erase_mode();
+                c
+            }
             Err(e) => {
                 eprintln!("notebook_open_failed notebook={notebook_id} detail={e}");
                 x.ui.show_error("This notebook couldn't be opened.");
@@ -4021,6 +4026,7 @@ fn execute_ui_command(
             Ok(())
         }
         UiCommand::GoHome => {
+            crate::chrome::clear_erase_mode();
             if x.ui.view == AppView::Sync {
                 crate::server_link::with_global(|l| {
                     l.send(crate::server_link::LinkCmd::LeaveSyncScreen)
@@ -4136,6 +4142,8 @@ fn execute_ui_command(
                             commit.notebook_id
                         ),
                     }
+                    // Durable create left the prior notebook; clear before present/bind.
+                    crate::chrome::clear_erase_mode();
                     x.ui.enter_notebook();
                     install_active_notebook(x, ctrl).map_err(|e| {
                         format!("FATAL: notebook create committed but open failed: {e}")
@@ -4168,6 +4176,8 @@ fn execute_ui_command(
                         commit.manifest_persist_us,
                         x.library.active_notebook_id()
                     );
+                    // Durable create left the prior notebook; clear before present/bind.
+                    crate::chrome::clear_erase_mode();
                     x.ui.enter_notebook();
                     install_active_notebook(x, ctrl).map_err(|e| {
                         format!("FATAL: notebook create committed but open failed: {e}")
@@ -4250,6 +4260,8 @@ fn execute_ui_command(
                         commit.manifest_persist_us
                     );
                     let total = x.library.manifest().notebook_ids.len();
+                    // Successful delete enters Home without GoHome; clear Erase mode here.
+                    crate::chrome::clear_erase_mode();
                     x.ui.enter_home(active_notebook_index(x.library), total);
                     present_ui(x, ctrl, None).map_err(|e| {
                         format!("FATAL: notebook delete committed but Home redraw failed: {e}")
@@ -4265,6 +4277,14 @@ fn execute_ui_command(
                     present_ui(x, ctrl, None)
                 }
             }
+        }
+        UiCommand::ToggleEraser => {
+            let on = !crate::chrome::erase_mode();
+            crate::chrome::set_erase_mode(on);
+            println!("erase_mode on={on}");
+            let chrome = chrome_for_page(&*x.manifest, ctrl.session.page_id())?;
+            // Band-only repaint (no full-panel flash); chrome is visible whenever it was tapped.
+            ctrl.transport_mut().repair_chrome(chrome)
         }
         UiCommand::Undo => {
             ctrl.totals.undo_gestures += 1;
@@ -5595,7 +5615,7 @@ pub fn run_page_session(
             break 1;
         }
 
-        let polled = src.poll_event();
+        let mut polled = src.poll_event();
         match &polled {
             Ok(SourcePoll::Event(ev)) => {
                 last_stylus_us = ctrl.transport().now_us();
@@ -5664,6 +5684,7 @@ pub fn run_page_session(
                 move_coalesce.moves_seen, move_coalesce.previews_rendered, move_coalesce.coalesced,
             );
         }
+        let mut remap_pen_to_eraser = false;
         if let Ok(SourcePoll::Event(ev)) = &polled {
             if ev.kind == StylusEventKind::Down {
                 // Pen remains drawing-only. It also supersedes an old move in the narrow undo
@@ -5706,6 +5727,18 @@ pub fn run_page_session(
             };
             if consumed {
                 continue;
+            }
+            // On-screen Erase mode: the router left this Down to the page, so the pen tip erases.
+            remap_pen_to_eraser = crate::eraser::pen_down_acts_as_eraser(
+                crate::chrome::erase_mode(),
+                ev.kind,
+                ev.tool,
+            );
+        }
+        if remap_pen_to_eraser {
+            if let Ok(SourcePoll::Event(ev)) = polled.as_mut() {
+                ev.tool = StylusTool::Eraser;
+                println!("erase_mode pen_down_as_eraser=true");
             }
         }
         match polled {

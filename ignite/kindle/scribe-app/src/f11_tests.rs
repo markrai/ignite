@@ -866,6 +866,7 @@ mod tests {
         let c = ChromeLayout::new(&g);
         assert_eq!(c.hit(center(c.home)), Some(ChromeHit::Home));
         assert_eq!(c.hit(center(c.undo)), Some(ChromeHit::Undo));
+        assert_eq!(c.hit(center(c.erase)), Some(ChromeHit::Erase));
         assert_eq!(c.hit(center(c.menu)), Some(ChromeHit::PageMenu));
         assert_eq!(c.hit(center(c.previous)), Some(ChromeHit::PreviousPage));
         assert_eq!(c.hit(center(c.next)), Some(ChromeHit::NextPage));
@@ -886,13 +887,13 @@ mod tests {
             None
         );
         assert_eq!(c.hit(UiPoint { x: 900, y: 1200 }), None);
-        for r in [c.home, c.undo, c.menu, c.previous, c.next] {
+        for r in [c.home, c.undo, c.erase, c.menu, c.previous, c.next] {
             assert!(r.w >= 200 && r.h >= 80, "{r:?}");
         }
     }
 
     #[test]
-    fn chrome_taps_map_to_home_undo_navigation_and_page_menu() {
+    fn chrome_taps_map_to_home_undo_erase_navigation_and_page_menu() {
         let g = panel_geo();
         let c = ChromeLayout::new(&g);
         let mut ui = notebook_ui();
@@ -904,6 +905,10 @@ mod tests {
         assert_eq!(
             ui.on_tap(&g, center(c.undo), &none, "x", nb_ctx(2, 3)),
             UiCommand::Undo
+        );
+        assert_eq!(
+            ui.on_tap(&g, center(c.erase), &none, "x", nb_ctx(2, 3)),
+            UiCommand::ToggleEraser
         );
         assert_eq!(
             ui.on_tap(&g, center(c.previous), &none, "x", nb_ctx(2, 3)),
@@ -1286,6 +1291,30 @@ mod tests {
         let taps = drive(&mut ui, &mut router, &mut c, &scribble(1000.0));
         assert_eq!(taps, 0);
         assert_eq!(c.session.committed_count(), 1);
+    }
+
+    #[test]
+    fn erase_mode_survives_in_notebook_page_navigation_commands() {
+        // Same-notebook page chrome never calls clear_erase_mode(); GoHome / durable
+        // cross-notebook switch / create do (after success only).
+        crate::chrome::set_erase_mode(true);
+        let g = panel_geo();
+        let c = ChromeLayout::new(&g);
+        let mut ui = notebook_ui();
+        let none = cards(1);
+        assert_eq!(
+            ui.on_tap(&g, center(c.next), &none, "x", nb_ctx(1, 3)),
+            UiCommand::NextPage
+        );
+        assert_eq!(
+            ui.on_tap(&g, center(c.previous), &none, "x", nb_ctx(2, 3)),
+            UiCommand::PreviousPage
+        );
+        assert!(
+            crate::chrome::erase_mode(),
+            "in-notebook page chrome must not clear erase mode"
+        );
+        crate::chrome::clear_erase_mode();
     }
 
     #[test]
