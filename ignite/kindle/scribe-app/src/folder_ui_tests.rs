@@ -192,6 +192,7 @@ mod tests {
             Some(Modal::PaperChooser {
                 notebook_title,
                 folder_id: Some(folder_id),
+                change_page: None,
             }) => {
                 assert_eq!(folder_id, "folder-1");
                 assert_eq!(notebook_title, "Notebook 5");

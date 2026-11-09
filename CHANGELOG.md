@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.23] - 2026-11-08
+
+### Added
+
+- Synchronized **Change Paper** across Kindle, Server, and Web: replace the
+  paper on the current page or every page in a notebook (Blank / Ruled / Grid /
+  Dotted) without touching handwriting, text, links, or page identity. Patterned
+  papers publish as ordinary Gray8 background blobs; notebook-wide runs keep an
+  already-applied prefix durable if interrupted and support cancellation.
+- Server gate for `SetPageBackground` (`--accept-set-page-background` /
+  `accept_set_page_background`), off by default. Authors probe
+  `GET /v1/libraries/{id}` and refuse to journal until the server advertises
+  acceptance so older peers stay fail-closed.
+- Reusable release qualification and Kindle preflight tooling under `tools/qa`
+  (`qualify`, `preflight`, `status`): Rust, ARMv7, WASM, Web, and Chromium
+  verification with artifact provenance, evidence integrity (content-aware
+  source fingerprints, physical SHA-256 match, fail-closed data-compatibility),
+  and production-slot physical QA isolation.
+
+### Internal
+
+- Stabilized sync outbound lock release, recovery loopback harness timing, and
+  lifecycle host-lease tests under parallel workloads.
+
 ## [0.9.22] - 2026-11-07
 
 ### Improved

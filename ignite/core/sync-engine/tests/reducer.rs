@@ -1325,3 +1325,198 @@ fn page_link_survives_notebook_rename_and_source_delete_retires_id() {
     );
     assert!(s.history.deleted_links.contains(&lk(1)));
 }
+
+// ------------------------------------------------------------------ page background
+
+#[test]
+fn set_page_background_lww_preserves_unrelated_page_content() {
+    let mut a = Author::new(replica(1));
+    let s = st();
+    let (s, _) = apply(
+        &s,
+        &mut a,
+        Op::AddStroke {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            stroke: line(sk(11), sk(11), (100.0, 100.0), (400.0, 100.0), 5, false),
+        },
+    );
+    let (s, _) = apply(
+        &s,
+        &mut a,
+        Op::AddText {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            text: text_obj(21, "keep me"),
+        },
+    );
+    let (s, _) = apply(
+        &s,
+        &mut a,
+        Op::AddPageLink {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            link: page_link(31, nb(1), pg(1), nb(2), pg(3)),
+        },
+    );
+    let before_render = s.snapshot.notebooks[0].pages[0].render.clone();
+    let before_page_id = s.snapshot.notebooks[0].pages[0].page_id;
+    let before_order = page_ids(&s, 0);
+    let stroke_count = strokes(&s, 0, 0).len();
+    let text_count = s.snapshot.notebooks[0].pages[0].texts.len();
+    let link_count = s.snapshot.notebooks[0].pages[0].links.len();
+
+    let (_bytes, blob) = testkit::blob_background();
+    let (s, o) = apply(
+        &s,
+        &mut a,
+        Op::SetPageBackground {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            background: blob.clone(),
+        },
+    );
+    assert_eq!(o, Outcome::Applied);
+    assert_eq!(s.snapshot.notebooks[0].pages[0].background, blob);
+
+    // Identical reapply is Applied and deterministic.
+    let (s, o) = apply(
+        &s,
+        &mut a,
+        Op::SetPageBackground {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            background: blob.clone(),
+        },
+    );
+    assert_eq!(o, Outcome::Applied);
+    assert_eq!(s.snapshot.notebooks[0].pages[0].background, blob);
+
+    // Successive change: Blank wins by canonical order (LWW).
+    let (s, o) = apply(
+        &s,
+        &mut a,
+        Op::SetPageBackground {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            background: BackgroundRef::Blank,
+        },
+    );
+    assert_eq!(o, Outcome::Applied);
+    assert_eq!(
+        s.snapshot.notebooks[0].pages[0].background,
+        BackgroundRef::Blank
+    );
+
+    assert_eq!(s.snapshot.notebooks[0].pages[0].render, before_render);
+    assert_eq!(s.snapshot.notebooks[0].pages[0].page_id, before_page_id);
+    assert_eq!(page_ids(&s, 0), before_order);
+    assert_eq!(strokes(&s, 0, 0).len(), stroke_count);
+    assert_eq!(s.snapshot.notebooks[0].pages[0].texts.len(), text_count);
+    assert_eq!(s.snapshot.notebooks[0].pages[0].links.len(), link_count);
+    assert_eq!(s.snapshot.notebooks[0].pages[0].texts[0].content, "keep me");
+}
+
+#[test]
+fn set_page_background_unknown_and_deleted_targets() {
+    let mut a = Author::new(replica(1));
+    let s = st();
+    assert_eq!(
+        refuse(
+            &s,
+            &mut a,
+            Op::SetPageBackground {
+                notebook_id: nb(99),
+                page_id: pg(1),
+                background: BackgroundRef::Blank,
+            },
+        ),
+        C::UnknownNotebook
+    );
+    assert_eq!(
+        refuse(
+            &s,
+            &mut a,
+            Op::SetPageBackground {
+                notebook_id: nb(1),
+                page_id: pg(99),
+                background: BackgroundRef::Blank,
+            },
+        ),
+        C::UnknownPage
+    );
+
+    let (s, _) = apply(
+        &s,
+        &mut a,
+        Op::CreatePage {
+            notebook_id: nb(1),
+            page: page_spec(pg(50)),
+            after_page_id: Some(pg(1)),
+        },
+    );
+    let (s, _) = apply(
+        &s,
+        &mut a,
+        Op::DeletePage {
+            notebook_id: nb(1),
+            page_id: pg(50),
+        },
+    );
+    let (s, o) = apply(
+        &s,
+        &mut a,
+        Op::SetPageBackground {
+            notebook_id: nb(1),
+            page_id: pg(50),
+            background: BackgroundRef::Blank,
+        },
+    );
+    assert_eq!(o, Outcome::NoOp("page or notebook deleted"));
+
+    let (s, _) = apply(&s, &mut a, Op::DeleteNotebook { notebook_id: nb(2) });
+    let (s, o) = apply(
+        &s,
+        &mut a,
+        Op::SetPageBackground {
+            notebook_id: nb(2),
+            page_id: pg(3),
+            background: BackgroundRef::Blank,
+        },
+    );
+    assert_eq!(o, Outcome::NoOp("page or notebook deleted"));
+    let _ = s;
+}
+
+#[test]
+fn set_page_background_replay_matches_stepwise() {
+    let mut a = Author::new(replica(1));
+    let (_bytes, blob) = testkit::blob_background();
+    let envs = vec![
+        a.env(Op::SetPageBackground {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            background: blob.clone(),
+        }),
+        a.env(Op::SetPageBackground {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            background: BackgroundRef::Blank,
+        }),
+        a.env(Op::SetPageBackground {
+            notebook_id: nb(1),
+            page_id: pg(1),
+            background: blob,
+        }),
+    ];
+    let mut step = st();
+    for e in &envs {
+        step = step.apply(e).unwrap().0;
+    }
+    let fresh = replay(genesis(), &envs).unwrap();
+    assert_eq!(fresh, step);
+    assert!(matches!(
+        fresh.snapshot.notebooks[0].pages[0].background,
+        BackgroundRef::Blob { .. }
+    ));
+}

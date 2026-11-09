@@ -6,6 +6,7 @@
 //! state_dir = "/var/lib/scribe-server"            # ServerId, control.sqlite, ledger/
 //! web_root  = "/usr/share/scribe-server/web"      # built ignite-web bundle
 //! name      = ""                                  # "" → "Ignite Server on <Hostname>"
+//! accept_set_page_background = false              # opt-in Change Paper (SetPageBackground)
 //!
 //! [discovery]
 //! advertise = true                                # DNS-SD _scribe._tcp on the LAN
@@ -35,6 +36,10 @@ pub struct ServerSection {
     pub web_root: Option<PathBuf>,
     #[serde(default)]
     pub name: String,
+    /// Opt-in: persist new `SetPageBackground` envelopes (Change Paper). Default off so
+    /// installing this binary cannot add history older clients cannot decode.
+    #[serde(default)]
+    pub accept_set_page_background: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -109,6 +114,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.server.listen.port(), 80);
         assert!(c.discovery.advertise);
+        assert!(!c.server.accept_set_page_background);
         assert_eq!(
             c.ledger_dir(),
             PathBuf::from("/var/lib/scribe-server/ledger")
@@ -117,5 +123,10 @@ mod tests {
             Config::parse("[server]\nlisten=\"0.0.0.0:80\"\nstate_dir=\"/x\"\ntoken=\"s\"\n")
                 .is_err()
         );
+        let on = Config::parse(
+            "[server]\nlisten = \"0.0.0.0:80\"\nstate_dir = \"/x\"\naccept_set_page_background = true\n",
+        )
+        .unwrap();
+        assert!(on.server.accept_set_page_background);
     }
 }

@@ -50,6 +50,7 @@ fn serve_labelled(
             state_dir: dir.clone(),
             web_root: None,
             name: "Scribe Server on Test".into(),
+            accept_set_page_background: false,
         },
         discovery: DiscoverySection { advertise: false },
     };

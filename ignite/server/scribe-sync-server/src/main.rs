@@ -12,6 +12,7 @@ scribe-sync-server — Scribe sync ledger (S2A/S2B/S3A)
 Usage:
   scribe-sync-server --data-dir <dir> [--bind 127.0.0.1:8787] [--token-verifier-file <file>]
                      [--web-root <ignite/web/dist>] [--accept-replace-stroke-lineages]
+                     [--accept-set-page-background]
   scribe-sync-server new-token --verifier-out <file>
 
 serve       default bind is loopback. A non-loopback bind (e.g. --bind 0.0.0.0:8787) REFUSES to
@@ -24,6 +25,12 @@ serve       default bind is loopback. A non-loopback bind (e.g. --bind 0.0.0.0:8
             this binary cannot add history older clients cannot decode. Once any such
             operation is accepted, rolling the server or clients back is unsafe. Do not
             enable until every active replica can decode the type.
+--accept-set-page-background
+            opt-in: persist new SetPageBackground envelopes (Change Paper). Default off.
+            Advertised on GET /v1/libraries/{id} so Kindle and Web refuse to journal the
+            op until this flag is on. Once any such operation is accepted, rolling the
+            server or clients back is unsafe. Do not enable until every active replica
+            is ≥0.9.23.
 new-token   prints a fresh 256-bit token ONCE (give it to the Kindle sync config) and writes
             only its SHA-256 verifier to <file> for the server.
 ";
@@ -121,6 +128,11 @@ fn main() -> ExitCode {
             .accept_replace_stroke_lineages
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    if args.iter().any(|a| a == "--accept-set-page-background") {
+        store
+            .accept_set_page_background
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     match ServerHandle::start_with(
         bind,
         store,
@@ -132,7 +144,7 @@ fn main() -> ExitCode {
     ) {
         Ok(h) => {
             println!(
-                "scribe-sync-server listening on {} data_dir={} web_root={web_s} auth={} accept_replace_stroke_lineages={}",
+                "scribe-sync-server listening on {} data_dir={} web_root={web_s} auth={} accept_replace_stroke_lineages={} accept_set_page_background={}",
                 h.base_url(),
                 data_dir.display(),
                 if authed {
@@ -142,6 +154,9 @@ fn main() -> ExitCode {
                 },
                 h.store
                     .accept_replace_stroke_lineages
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                h.store
+                    .accept_set_page_background
                     .load(std::sync::atomic::Ordering::SeqCst)
             );
             h.join()

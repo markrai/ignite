@@ -72,7 +72,7 @@ export interface SnapshotDoc {
   };
 }
 
-async function start(): Promise<{ server: SyncServer; stop: () => Promise<void> }> {
+async function start(opts: { acceptSetPageBackground?: boolean } = {}): Promise<{ server: SyncServer; stop: () => Promise<void> }> {
   const dir = mkdtempSync(join(tmpdir(), "scribe-s3a-e2e-"));
   const verifier = join(dir, "verifier");
   const token = execFileSync(serverBin(), ["new-token", "--verifier-out", verifier], {
@@ -81,7 +81,18 @@ async function start(): Promise<{ server: SyncServer; stop: () => Promise<void> 
   }).trim();
   let child: ChildProcessWithoutNullStreams;
   const launch = (bind: string) => {
-    child = spawn(serverBin(), ["--data-dir", join(dir, "ledger"), "--bind", bind, "--token-verifier-file", verifier, "--web-root", WEB_DIST]);
+    const args = [
+      "--data-dir",
+      join(dir, "ledger"),
+      "--bind",
+      bind,
+      "--token-verifier-file",
+      verifier,
+      "--web-root",
+      WEB_DIST,
+    ];
+    if (opts.acceptSetPageBackground !== false) args.push("--accept-set-page-background");
+    child = spawn(serverBin(), args);
     const c = child;
     return new Promise<string>((ok, fail) => {
       let out = "";
@@ -212,21 +223,36 @@ export interface Traffic {
   consoleErrors: string[];
 }
 
+async function collectTraffic(
+  page: Page,
+  use: (t: Traffic) => Promise<void>,
+): Promise<void> {
+  const t: Traffic = { requests: [], consoleErrors: [] };
+  page.on("request", (r: Request) => t.requests.push({ method: r.method(), url: r.url() }));
+  page.on("console", (m) => {
+    if (m.type() === "error") t.consoleErrors.push(m.text());
+  });
+  page.on("pageerror", (e) => t.consoleErrors.push(String(e)));
+  await use(t);
+}
+
 export const test = base.extend<{ server: SyncServer; traffic: Traffic }>({
   server: async ({}, use) => {
     const s = await start();
     await use(s.server);
     await s.stop();
   },
-  traffic: async ({ page }, use) => {
-    const t: Traffic = { requests: [], consoleErrors: [] };
-    page.on("request", (r: Request) => t.requests.push({ method: r.method(), url: r.url() }));
-    page.on("console", (m) => {
-      if (m.type() === "error") t.consoleErrors.push(m.text());
-    });
-    page.on("pageerror", (e) => t.consoleErrors.push(String(e)));
-    await use(t);
+  traffic: async ({ page }, use) => collectTraffic(page, use),
+});
+
+/** Disposable server with Change Paper gate off (default-disabled product binary). */
+export const testPaperGateOff = base.extend<{ server: SyncServer; traffic: Traffic }>({
+  server: async ({}, use) => {
+    const s = await start({ acceptSetPageBackground: false });
+    await use(s.server);
+    await s.stop();
   },
+  traffic: async ({ page }, use) => collectTraffic(page, use),
 });
 
 export { expect };

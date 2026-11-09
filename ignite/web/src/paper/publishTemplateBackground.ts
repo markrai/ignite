@@ -1,7 +1,7 @@
-// Publish a patterned template background before CreateNotebook (Slice 6B).
+// Publish a patterned template background before CreateNotebook or SetPageBackground.
 //
 // Blank → no network. Patterned → generate Gray8 → PUT /v1/blobs/{sha} → return Blob ref.
-// Does not queue CreateNotebook; callers must not submit the op until this resolves.
+// Does not queue the follow-on op; callers must not submit until this resolves.
 
 import type { BackgroundRef } from "../model/types";
 import type { BlobApi } from "../api/blobApi";
@@ -18,6 +18,12 @@ export class TemplatePublishError extends Error {
 
 export type OnlineProbe = () => boolean;
 
+export type TemplatePublishPurpose = "create" | "change";
+
+function closed(purpose: TemplatePublishPurpose): string {
+  return purpose === "change" ? "Nothing was changed." : "Nothing was created.";
+}
+
 /** Default: browser `navigator.onLine` when available; otherwise assume online. */
 export function browserOnline(): boolean {
   return typeof navigator === "undefined" || navigator.onLine !== false;
@@ -33,6 +39,7 @@ export async function publishTemplateBackground(
   template: PageTemplate,
   blobs: BlobApi,
   isOnline: OnlineProbe = browserOnline,
+  purpose: TemplatePublishPurpose = "create",
 ): Promise<{ background: BackgroundRef; sha256: string | null }> {
   if (template === "blank") {
     return { background: { kind: "blank" }, sha256: null };
@@ -40,11 +47,11 @@ export async function publishTemplateBackground(
   const { bytes, sha256, background } = await paperTemplates.generateTemplateBackground(template);
   if (background.kind === "blank") {
     // Nonblank generator path should never yield Blank; refuse rather than skip the PUT.
-    throw new TemplatePublishError("Couldn’t prepare the paper background. Nothing was created.");
+    throw new TemplatePublishError(`Couldn’t prepare the paper background. ${closed(purpose)}`);
   }
   if (!isOnline()) {
     throw new TemplatePublishError(
-      "Patterned paper needs a network connection to publish its background. Nothing was created.",
+      `Patterned paper needs a network connection to publish its background. ${closed(purpose)}`,
     );
   }
   try {
@@ -52,12 +59,10 @@ export async function publishTemplateBackground(
   } catch (e) {
     if (e instanceof TransientError) {
       throw new TemplatePublishError(
-        "Couldn’t upload the paper background. Check the connection and try again. Nothing was created.",
+        `Couldn’t upload the paper background. Check the connection and try again. ${closed(purpose)}`,
       );
     }
-    throw new TemplatePublishError(
-      "Couldn’t publish the paper background. Nothing was created.",
-    );
+    throw new TemplatePublishError(`Couldn’t publish the paper background. ${closed(purpose)}`);
   }
   return { background, sha256 };
 }

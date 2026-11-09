@@ -126,6 +126,24 @@ interfaces. Pairing and credentials are control-plane concepts; notebook sync us
 
 Back up `/var/lib/scribe-server` (and `/etc/scribe-server`) before major host changes.
 
+### Change Paper (`SetPageBackground`)
+
+Acceptance is **off by default**. Kindle and Web will refuse to journal Change Paper
+until the server advertises `accept_set_page_background: true` on
+`GET /v1/libraries/{id}`. Local paper is not changed in that case (nothing to
+discard). Enable only after every replica for that library is ≥0.9.23:
+
+```toml
+# /etc/scribe-server/config.toml
+[server]
+accept_set_page_background = true
+```
+
+Developer `scribe-sync-server` uses `--accept-set-page-background` (same default
+off). Once any such operation is in the ledger, rolling the server or clients
+back is unsafe. Disabling the flag later still deduplicates retries of envelopes
+that were already accepted.
+
 ## Updating
 
 ```bash

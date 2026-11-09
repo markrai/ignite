@@ -40,14 +40,16 @@
 //! * `encode_structure_op {library_id, replica_id, client_seq, operation_id, operation}` →
 //!   canonical envelope text. `operation` must be `create_notebook` | `rename_notebook` |
 //!   `delete_notebook` | `create_page` | `delete_page` (not `move_page`).
+//! * `encode_set_page_background {library_id, replica_id, client_seq, operation_id, operation}` →
+//!   canonical `SetPageBackground` envelope. `operation` must be `set_page_background`.
 //! * `encode_delete_stroke_lineage {library_id, replica_id, client_seq, operation_id,
 //!   notebook_id, page_id, root_id}` → canonical undo envelope. `root_id` is the lineage root,
 //!   which may differ from a visible fragment id.
 //! * `project_library {snapshot: SyncSnapshotV1, ops:[library-scoped SyncOperationV1]}` →
 //!   `{"notebooks":[…],"folders":[…],"changed":[bool…]}`: `LibraryState::genesis` then apply each
-//!   op in order. Folder and structure ops share this one projection. An op the reducer would
-//!   refuse is skipped. Page-content ops (ink/erase/text/undo) are refused here — they go
-//!   through `project_page` / `project_texts`. Page links (`AddPageLink` /
+//!   op in order. Folder, structure, and `SetPageBackground` ops share this one projection. An
+//!   op the reducer would refuse is skipped. Page-content ops (ink/erase/text/undo) are refused
+//!   here — they go through `project_page` / `project_texts`. Page links (`AddPageLink` /
 //!   `DeletePageLink`) are Kindle-authored; the browser reconstructs them from
 //!   `SyncSnapshotV1` only.
 //! * `create_notebook_render` → sealed Kindle `scribe-raster-v2-pressure` `RenderProfileRef`
@@ -184,9 +186,16 @@ fn is_structure_op(op: &SyncOperationV1) -> bool {
     )
 }
 
-/// Library chrome (notebooks, pages, folders). Not page-content mutations.
+fn is_set_page_background(op: &SyncOperationV1) -> bool {
+    matches!(op, SyncOperationV1::SetPageBackground { .. })
+}
+
+/// Library chrome (notebooks, pages, folders, page paper). Not page-content mutations.
 fn is_library_op(op: &SyncOperationV1) -> bool {
-    is_folder_op(op) || is_structure_op(op) || matches!(op, SyncOperationV1::MovePage { .. })
+    is_folder_op(op)
+        || is_structure_op(op)
+        || is_set_page_background(op)
+        || matches!(op, SyncOperationV1::MovePage { .. })
 }
 
 #[derive(Deserialize)]
@@ -235,6 +244,13 @@ enum Request {
         ops: Vec<SyncOperationV1>,
     },
     EncodeStructureOp {
+        library_id: String,
+        replica_id: String,
+        client_seq: String,
+        operation_id: String,
+        operation: SyncOperationV1,
+    },
+    EncodeSetPageBackground {
         library_id: String,
         replica_id: String,
         client_seq: String,
@@ -606,6 +622,19 @@ fn encode_structure_op(
     encode_envelope(library_id, replica_id, client_seq, operation_id, operation)
 }
 
+fn encode_set_page_background(
+    library_id: &str,
+    replica_id: &str,
+    client_seq: &str,
+    operation_id: &str,
+    operation: SyncOperationV1,
+) -> Result<String, String> {
+    if !is_set_page_background(&operation) {
+        return Err("encode_set_page_background builds SetPageBackground only".into());
+    }
+    encode_envelope(library_id, replica_id, client_seq, operation_id, operation)
+}
+
 fn encode_delete_stroke_lineage(
     library_id: &str,
     replica_id: &str,
@@ -888,6 +917,19 @@ pub fn handle(request: &str) -> String {
                 operation_id,
                 operation,
             } => encode_structure_op(
+                &library_id,
+                &replica_id,
+                &client_seq,
+                &operation_id,
+                operation,
+            ),
+            Request::EncodeSetPageBackground {
+                library_id,
+                replica_id,
+                client_seq,
+                operation_id,
+                operation,
+            } => encode_set_page_background(
                 &library_id,
                 &replica_id,
                 &client_seq,

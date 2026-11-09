@@ -15,7 +15,7 @@ use std::ptr;
 
 use crate::display::{DirtyRegion, DisplaySurface, FastInkMode, RefreshMode};
 use crate::error::{PlatformError, PlatformResult};
-use crate::fb_polarity::{copy_logical_rect_to_hw, hardware_complement};
+use crate::fb_polarity::{copy_logical_rect_to_hw, resolve_complement};
 use crate::fb_sample::{sample_visible_grid, FbGridSample, FlushCopyStats};
 use crate::fbdev_abi::{self, FbFixScreeninfo, FbGeometry, FbVarScreeninfo, PanelRectError};
 use crate::hwtcon_abi::{
@@ -26,6 +26,10 @@ use crate::linux::clock::LinuxMonotonicClock;
 use crate::linux::fd::OwnedFd;
 use crate::stylus_mode_ctrl::validate_e1_stylus_mode;
 use crate::time::{MonotonicClock, TimestampUs};
+
+/// Optional polarity override file (`identity` or `complement`); see
+/// [`crate::fb_polarity::resolve_complement`]. Absent on stock installs.
+const POLARITY_OVERRIDE_PATH: &str = "/mnt/us/scribe-app/fb-polarity";
 
 const DEFAULT_FB: &str = "/dev/fb0";
 
@@ -244,7 +248,13 @@ impl MappedFramebuffer {
             map_len,
             next_marker: 1,
             logical: vec![0xFF; map_len],
-            complement: hardware_complement(var.grayscale),
+            complement: resolve_complement(
+                var.grayscale,
+                crate::fb_polarity::load_override_text(std::path::Path::new(
+                    POLARITY_OVERRIDE_PATH,
+                ))
+                .as_deref(),
+            ),
             last_flush: None,
             last_send: None,
         })

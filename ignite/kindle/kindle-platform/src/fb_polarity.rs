@@ -14,11 +14,18 @@
 //! logical source; never invert hardware bytes in place (that would double-invert
 //! on the next dirty copy).
 
+use std::io::Read;
+use std::path::Path;
+
 use crate::gate_b::{ACCEPTED_GRAYSCALE_LINUX_GRAY, EXPECTED_GRAYSCALE};
 
 /// Canonical logical black / white (also the grayscale=2 hardware bytes).
 pub const LOGICAL_BLACK: u8 = 0x00;
 pub const LOGICAL_WHITE: u8 = 0xFF;
+
+/// Maximum accepted size of `/mnt/us/scribe-app/fb-polarity` (bytes). Larger files are
+/// ignored so a runaway write cannot force an unbounded read at framebuffer open.
+pub const POLARITY_OVERRIDE_MAX_BYTES: usize = 128;
 
 /// `true` when mmap must store `!logical` (`GRAYSCALE_8BIT`).
 ///
@@ -26,6 +33,49 @@ pub const LOGICAL_WHITE: u8 = 0xFF;
 /// writable mmap in the app). Identity keeps grayscale=2 byte-for-byte.
 pub fn hardware_complement(grayscale: u32) -> bool {
     grayscale == ACCEPTED_GRAYSCALE_LINUX_GRAY
+}
+
+/// Optional developer/tester override of the polarity decision, for firmware whose reported
+/// `grayscale` does not match its real panel polarity (observed: a 1st-gen Scribe on 5.18.3
+/// reports `grayscale=1` yet displays complemented ink as white-on-dark).
+///
+/// `text` is the content of the override file: `identity` (never complement) or `complement`
+/// (always complement), surrounding whitespace ignored. Anything else, or no file, falls back
+/// to [`hardware_complement`], so devices without the file behave exactly as before.
+pub fn resolve_complement(grayscale: u32, override_text: Option<&str>) -> bool {
+    match override_text.map(str::trim) {
+        Some("identity") => false,
+        Some("complement") => true,
+        _ => hardware_complement(grayscale),
+    }
+}
+
+/// Decode override-file bytes. Returns [`None`] when the payload is oversized or not UTF-8 so
+/// callers fall back to [`hardware_complement`]. Does not interpret the keyword itself.
+pub fn override_text_from_bytes(bytes: &[u8]) -> Option<&str> {
+    if bytes.len() > POLARITY_OVERRIDE_MAX_BYTES {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()
+}
+
+/// Bounded read of the optional polarity override file.
+///
+/// Returns [`None`] (automatic polarity) when the path is missing, unreadable, larger than
+/// [`POLARITY_OVERRIDE_MAX_BYTES`], or not valid UTF-8. Reads until EOF or `MAX + 1` bytes so a
+/// short `read()` cannot miss an oversized file.
+pub fn load_override_text(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    load_override_text_from_reader(file)
+}
+
+fn load_override_text_from_reader(reader: impl Read) -> Option<String> {
+    let mut buf = Vec::with_capacity(POLARITY_OVERRIDE_MAX_BYTES + 1);
+    reader
+        .take((POLARITY_OVERRIDE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    override_text_from_bytes(&buf).map(str::to_owned)
 }
 
 /// Map one logical gray byte to the hardware mmap byte for this `grayscale` field.
@@ -123,6 +173,129 @@ mod tests {
         assert_eq!(encode_panel_gray(LOGICAL_WHITE, 1), 0x00);
         assert_eq!(encode_panel_gray(0x7F, 1), 0x80);
         assert_eq!(encode_panel_gray(0x80, 1), 0x7F);
+    }
+
+    #[test]
+    fn override_wins_and_default_is_unchanged() {
+        // No file / unknown text: exactly the old behavior.
+        for g in [1u32, 2] {
+            assert_eq!(resolve_complement(g, None), hardware_complement(g));
+            assert_eq!(resolve_complement(g, Some("")), hardware_complement(g));
+            assert_eq!(resolve_complement(g, Some("bogus")), hardware_complement(g));
+        }
+        // Explicit override in both directions, whitespace tolerated.
+        assert!(!resolve_complement(1, Some("identity\n")));
+        assert!(resolve_complement(2, Some("  complement ")));
+        assert!(!resolve_complement(2, Some("identity")));
+        assert!(resolve_complement(1, Some("complement")));
+    }
+
+    #[test]
+    fn override_text_from_bytes_accepts_valid_utf8_within_limit() {
+        assert_eq!(override_text_from_bytes(b"identity"), Some("identity"));
+        assert_eq!(
+            override_text_from_bytes(b"complement\n"),
+            Some("complement\n")
+        );
+        let exact = vec![b'a'; POLARITY_OVERRIDE_MAX_BYTES];
+        assert_eq!(
+            override_text_from_bytes(&exact).map(|s| s.len()),
+            Some(POLARITY_OVERRIDE_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn override_text_from_bytes_rejects_oversized_and_invalid_utf8() {
+        let oversized = vec![b'x'; POLARITY_OVERRIDE_MAX_BYTES + 1];
+        assert!(override_text_from_bytes(&oversized).is_none());
+        assert!(override_text_from_bytes(&[0xff, 0xfe, 0xfd]).is_none());
+    }
+
+    #[test]
+    fn load_override_text_covers_missing_valid_invalid_and_oversized() {
+        let root = std::env::temp_dir().join(format!(
+            "ignite-fb-polarity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fb-polarity");
+
+        assert!(load_override_text(&path).is_none(), "missing file");
+
+        std::fs::write(&path, b"  identity \n").unwrap();
+        assert_eq!(load_override_text(&path).as_deref(), Some("  identity \n"));
+        assert!(!resolve_complement(1, load_override_text(&path).as_deref()));
+
+        std::fs::write(&path, b"complement").unwrap();
+        assert!(resolve_complement(2, load_override_text(&path).as_deref()));
+
+        std::fs::write(&path, b"not-a-keyword").unwrap();
+        assert_eq!(
+            resolve_complement(1, load_override_text(&path).as_deref()),
+            hardware_complement(1)
+        );
+
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(load_override_text(&path).is_none(), "invalid UTF-8");
+
+        let oversized = vec![b'z'; POLARITY_OVERRIDE_MAX_BYTES + 1];
+        std::fs::write(&path, &oversized).unwrap();
+        assert!(load_override_text(&path).is_none(), "oversized");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Deliberately returns only a few bytes per `read`, like a short-read filesystem.
+    struct ShortRead<'a> {
+        data: &'a [u8],
+        chunk: usize,
+    }
+
+    impl Read for ShortRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.data.is_empty() || buf.is_empty() {
+                return Ok(0);
+            }
+            let n = self.chunk.min(self.data.len()).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn short_reads_still_reject_oversized_override_files() {
+        let oversized = vec![b'z'; POLARITY_OVERRIDE_MAX_BYTES + 1];
+        let reader = ShortRead {
+            data: &oversized,
+            chunk: 3,
+        };
+        assert!(
+            load_override_text_from_reader(reader).is_none(),
+            "short reads must not let an oversized file pass the bound"
+        );
+
+        let valid = b"  complement \n";
+        let reader = ShortRead {
+            data: valid,
+            chunk: 2,
+        };
+        assert_eq!(
+            load_override_text_from_reader(reader).as_deref(),
+            Some("  complement \n")
+        );
+        assert!(resolve_complement(
+            2,
+            load_override_text_from_reader(ShortRead {
+                data: valid,
+                chunk: 1,
+            })
+            .as_deref()
+        ));
     }
 
     #[test]

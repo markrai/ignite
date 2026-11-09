@@ -88,6 +88,7 @@ struct Harness {
     kh: String,
     hits: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<u8>>>,
+    listener_done: Arc<AtomicUsize>,
     addr: std::net::SocketAddr,
 }
 
@@ -112,8 +113,10 @@ impl Harness {
         fs::write(home.join("forward_tcp"), format!("{}", addr)).unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener_done = Arc::new(AtomicUsize::new(0));
         let hits_c = hits.clone();
         let seen_c = seen.clone();
+        let done_c = listener_done.clone();
         thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -146,15 +149,21 @@ impl Harness {
                         Err(_) => break,
                     }
                 }
-                hits_c.fetch_add(1, Ordering::SeqCst);
-                seen_c.lock().unwrap().extend_from_slice(&buf);
-                let resp = format!(
-                    "{status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(payload);
+                let is_http = buf.windows(4).any(|w| w == b"\r\n\r\n")
+                    || buf.starts_with(b"GET ")
+                    || buf.starts_with(b"POST ");
+                if is_http {
+                    hits_c.fetch_add(1, Ordering::SeqCst);
+                    seen_c.lock().unwrap().extend_from_slice(&buf);
+                    let resp = format!(
+                        "{status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(payload);
+                }
             }
+            done_c.fetch_add(1, Ordering::SeqCst);
         });
         Self {
             home: home.clone(),
@@ -166,6 +175,7 @@ impl Harness {
             kh,
             hits,
             seen,
+            listener_done,
             addr,
         }
     }
@@ -519,8 +529,20 @@ fn loopback_host_does_not_fallback_and_gate_d_unrelated() {
         }
         other => panic!("{other:?}"),
     }
-    thread::sleep(Duration::from_millis(30));
-    assert_eq!(h.hits.load(Ordering::SeqCst), 0);
+    assert!(stream_resources_released(&s));
+    let t0 = Instant::now();
+    while h.listener_done.load(Ordering::SeqCst) == 0 && t0.elapsed() < Duration::from_secs(1) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        h.hits.load(Ordering::SeqCst),
+        0,
+        "loopback Host must not write HTTP to the mock server"
+    );
+    let captured = h.seen.lock().unwrap().clone();
+    let wire = String::from_utf8_lossy(&captured);
+    assert!(!wire.contains("GET "), "{wire:?}");
+    assert!(!wire.contains(SYN_BEARER), "{wire:?}");
     assert!(!LIVE_NON_LOOPBACK_POST_ENABLED);
     let err = bind_attestation_to_recovery_policy(
         &crate::sync_recovery_attest::TunnelAttestation {

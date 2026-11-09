@@ -1,0 +1,31 @@
+{
+  "schema": "ignite-qa-evidence-v1",
+  "command": "qualify",
+  "source": {
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "dirty": true,
+    "version": "0.0.0",
+    "describe": "example-dirty"
+  },
+  "groups": {
+    "identity": {"status": "PASS", "checks": [{"name": "git", "status": "PASS", "detail": "example"}]},
+    "rust": {"status": "NOT_RUN", "checks": [{"name": "linux-cargo", "status": "NOT_RUN", "detail": "example"}]},
+    "armv7": {"status": "NOT_RUN", "checks": [{"name": "docker", "status": "NOT_RUN", "detail": "example"}]},
+    "wasm": {"status": "NOT_RUN", "checks": [{"name": "wasm32-target", "status": "NOT_RUN", "detail": "example"}]},
+    "web": {"status": "NOT_RUN", "checks": [{"name": "npm", "status": "NOT_RUN", "detail": "example"}]},
+    "e2e": {"status": "NOT_RUN", "checks": [{"name": "web-dist", "status": "NOT_RUN", "detail": "example"}]}
+  },
+  "artifacts": {},
+  "states": {
+    "SOURCE_READY": {"status": "PASS", "reason": "example"},
+    "AUTOMATED_VERIFIED": {"status": "NOT_RUN", "reason": "required groups not all PASS"},
+    "ARTIFACT_VERIFIED": {"status": "NOT_RUN", "reason": "ARMv7hf build did not run"},
+    "DEVICE_PREFLIGHT_PASS": {"status": "NOT_RUN", "reason": "kindle preflight not run"},
+    "PHYSICAL_QA_PASS": {"status": "NOT_RUN", "reason": "no human physical-QA evidence file"},
+    "RELEASE_CANDIDATE": {"status": "BLOCKED", "reason": "unrecorded local changes"},
+    "PUBLISHED": {"status": "NOT_RUN", "reason": "human-approved promote"},
+    "OTA_VERIFIED": {"status": "NOT_RUN", "reason": "human-approved OTA"}
+  },
+  "overall": "NOT_RUN",
+  "exit_code": 2
+}
