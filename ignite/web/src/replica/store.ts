@@ -19,7 +19,7 @@
 //   * ACK moves outbox → accepted atomically (bytes kept) and advances acked_client_seq.
 //   * Accepted rows are compacted once a displayed snapshot's through_server_seq ≥ server_seq.
 
-import type { PageSpec, SyncStroke, SyncText } from "../model/types";
+import type { BackgroundRef, PageSpec, SyncStroke, SyncText } from "../model/types";
 import { fromSeq20, nextSeq, REPLICA_SEQUENCE_EXHAUSTED, SequenceError, toSeq20 } from "./seq";
 
 export const DB_NAME = "scribe-web-sync";
@@ -97,6 +97,19 @@ export interface StructureDraft extends DraftBase {
   structure: StructureIntent;
 }
 
+/** Wire `SetPageBackground` — page paper only; strokes/text/links stay. */
+export type SetPageBackgroundIntent = {
+  type: "set_page_background";
+  notebook_id: string;
+  page_id: string;
+  background: BackgroundRef;
+};
+
+export interface SetPageBackgroundDraft extends DraftBase {
+  kind: "set_page_background";
+  set_page_background: SetPageBackgroundIntent;
+}
+
 export interface UndoDraft extends DraftBase {
   kind: "undo";
   /** Lineage root of the newest visible stroke (may differ from a fragment's stroke_id). */
@@ -124,6 +137,7 @@ export type OpDraft =
   | EraseDraft
   | FolderDraft
   | StructureDraft
+  | SetPageBackgroundDraft
   | UndoDraft
   | TextAddDraft
   | TextUpdateDraft
@@ -148,6 +162,10 @@ export function isFolder(op: OpDraft): op is FolderDraft {
 
 export function isStructure(op: OpDraft): op is StructureDraft {
   return op.kind === "structure";
+}
+
+export function isSetPageBackground(op: OpDraft): op is SetPageBackgroundDraft {
+  return op.kind === "set_page_background";
 }
 
 export function isUndo(op: OpDraft): op is UndoDraft {

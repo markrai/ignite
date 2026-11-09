@@ -21,7 +21,9 @@ use crate::home::{
 };
 use crate::keyboard::{EditorKey, EditorOutcome, KeyboardLayout, TitleEditor};
 use crate::link_picker::LinkPickerState;
-use crate::modal::{dialog_spec, ButtonId, DialogLayout, Modal, TitlePurpose, PICKER_PAGE};
+use crate::modal::{
+    dialog_spec, ButtonId, DialogLayout, Modal, PaperChangeScope, TitlePurpose, PICKER_PAGE,
+};
 use crate::paper_templates::PageTemplate;
 use crate::prefs::SideButtonAction;
 use crate::server_link::LinkView;
@@ -66,6 +68,18 @@ pub enum UiCommand {
     MovePageLeft,
     MovePageRight,
     DeletePage,
+    /// Open the Change Paper confirm after the runtime has inspected target pages.
+    PrepareChangePaper {
+        template: PageTemplate,
+        scope: PaperChangeScope,
+    },
+    /// Replace page background(s) with a generated template. Runtime journals `SetPageBackground`.
+    ApplyPageTemplate {
+        template: PageTemplate,
+        scope: PaperChangeScope,
+    },
+    /// Stop an in-progress all-pages Change Paper. Already-applied pages stay changed.
+    CancelPaperChange,
     /// D1: Home → Sync screen.
     OpenSync,
     /// D1: request pairing with this server (by ServerId).
@@ -599,6 +613,13 @@ impl UiState {
         self.modal = Some(modal);
     }
 
+    /// ThisPage Change Paper succeeded: close the confirm so CHANGE cannot journal twice.
+    pub fn dismiss_change_paper_confirm(&mut self) {
+        if matches!(self.modal, Some(Modal::ConfirmChangePaper { .. })) {
+            self.modal = None;
+        }
+    }
+
     /// Resolve one pen tap (Down position, panel pixels).
     pub fn on_tap(
         &mut self,
@@ -834,6 +855,7 @@ impl UiState {
                     Some(folder_id) => Modal::PaperChooser {
                         notebook_title: next_default_title.to_string(),
                         folder_id: Some(folder_id),
+                        change_page: None,
                     },
                     None => Modal::NewChooser {
                         notebook_title: next_default_title.to_string(),
@@ -1128,6 +1150,7 @@ impl UiState {
                 self.modal = Some(Modal::PaperChooser {
                     notebook_title,
                     folder_id: None,
+                    change_page: None,
                 });
                 UiCommand::Redraw(Redraw::Full)
             }
@@ -1142,6 +1165,23 @@ impl UiState {
                 Modal::PaperChooser {
                     notebook_title,
                     folder_id,
+                    change_page: Some((page_number, page_count)),
+                },
+                ButtonId::PickPaper(template),
+            ) => {
+                let _ = (notebook_title, folder_id);
+                self.modal = Some(Modal::PaperScope {
+                    template,
+                    page_number,
+                    page_count,
+                });
+                UiCommand::Redraw(Redraw::Full)
+            }
+            (
+                Modal::PaperChooser {
+                    notebook_title,
+                    folder_id,
+                    change_page: None,
                 },
                 ButtonId::PickPaper(template),
             ) => {
@@ -1173,6 +1213,53 @@ impl UiState {
             }
             (Modal::ConfirmDeleteFolder { folder_id, .. }, ButtonId::ConfirmDelete) => {
                 UiCommand::DeleteFolder(folder_id)
+            }
+            (
+                Modal::PageMenu {
+                    page_number,
+                    page_count,
+                },
+                ButtonId::ChangePaper,
+            ) => {
+                self.modal = Some(Modal::PaperChooser {
+                    notebook_title: String::new(),
+                    folder_id: None,
+                    change_page: Some((page_number, page_count)),
+                });
+                UiCommand::Redraw(Redraw::Full)
+            }
+            (
+                Modal::PaperScope {
+                    template,
+                    page_number: _,
+                    page_count: _,
+                },
+                ButtonId::ThisPage,
+            ) => UiCommand::PrepareChangePaper {
+                template,
+                scope: PaperChangeScope::ThisPage,
+            },
+            (
+                Modal::PaperScope {
+                    template,
+                    page_number: _,
+                    page_count: _,
+                },
+                ButtonId::AllPages,
+            ) => UiCommand::PrepareChangePaper {
+                template,
+                scope: PaperChangeScope::AllPages,
+            },
+            (
+                Modal::ConfirmChangePaper {
+                    template, scope, ..
+                },
+                ButtonId::ConfirmDelete,
+            ) => UiCommand::ApplyPageTemplate { template, scope },
+            (Modal::PaperScope { .. }, ButtonId::Cancel)
+            | (Modal::ConfirmChangePaper { .. }, ButtonId::Cancel)
+            | (Modal::ChangePaperProgress { .. }, ButtonId::CancelPaperChange) => {
+                UiCommand::CancelPaperChange
             }
             (Modal::PageMenu { .. }, ButtonId::InsertPageAfter) => UiCommand::InsertPageAfter,
             (Modal::PageMenu { .. }, ButtonId::MovePageLeft) => UiCommand::MovePageLeft,

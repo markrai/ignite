@@ -25,13 +25,18 @@ mod tests {
         render_title_editor, EditorKey, EditorOutcome, KeyboardLayout, TitleEditor,
     };
     use crate::library::{
-        create_notebook_durable, delete_notebook_durable, open_or_create_library,
-        read_library_manifest_for_test, rename_notebook_durable, CreateNotebookHooks,
-        DeleteNotebookHooks, LibraryManifestWriteHooks, LibraryRepository, RenameNotebookHooks,
-        MAX_TITLE_CHARS, NOTEBOOK_INFO_FILE,
+        create_notebook_durable, create_notebook_durable_with_template, delete_notebook_durable,
+        open_or_create_library, read_library_manifest_for_test, rename_notebook_durable,
+        CreateNotebookHooks, DeleteNotebookHooks, LibraryManifestWriteHooks, LibraryRepository,
+        RenameNotebookHooks, MAX_TITLE_CHARS, NOTEBOOK_INFO_FILE,
     };
-    use crate::modal::{dialog_spec, render_dialog, DialogLayout, Modal, TitlePurpose};
-    use crate::notebook::{insert_page_after_durable, open_or_create_notebook, InsertPageHooks};
+    use crate::modal::{
+        dialog_spec, render_dialog, DialogLayout, Modal, PaperChangeScope, TitlePurpose,
+    };
+    use crate::notebook::{
+        apply_page_background_tracked, insert_page_after_durable, open_or_create_notebook,
+        template_background_bytes, InsertPageHooks,
+    };
     use crate::orch::{FakeTransport, StrokeController, TransportStep, UndoResult};
     use crate::profile::RenderProfile;
     use crate::store::{load_existing_page, MemoryPageStore};
@@ -994,6 +999,170 @@ mod tests {
         ui.show_modal(menu(2, 3));
         assert_eq!(tap(&mut ui, "CANCEL"), UiCommand::Redraw(Redraw::Full));
         assert!(ui.modal.is_none());
+    }
+
+    #[test]
+    fn page_menu_change_paper_this_and_all_pages() {
+        let g = panel_geo();
+        let none = cards(1);
+        let tap = |ui: &mut UiState, label: &str| {
+            let m = ui.modal.clone().unwrap();
+            ui.on_tap(&g, dialog_button(&g, &m, label), &none, "x", nb_ctx(2, 3))
+        };
+        let mut ui = notebook_ui();
+        ui.show_modal(Modal::PageMenu {
+            page_number: 2,
+            page_count: 3,
+        });
+        assert_eq!(
+            tap(&mut ui, "CHANGE PAPER"),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        match &ui.modal {
+            Some(Modal::PaperChooser {
+                change_page: Some((2, 3)),
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(tap(&mut ui, "RULED"), UiCommand::Redraw(Redraw::Full));
+        match &ui.modal {
+            Some(Modal::PaperScope {
+                template: crate::paper_templates::PageTemplate::Ruled,
+                page_number: 2,
+                page_count: 3,
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            tap(&mut ui, "THIS PAGE"),
+            UiCommand::PrepareChangePaper {
+                template: crate::paper_templates::PageTemplate::Ruled,
+                scope: PaperChangeScope::ThisPage,
+            }
+        );
+        ui.show_modal(Modal::PaperScope {
+            template: crate::paper_templates::PageTemplate::Grid,
+            page_number: 2,
+            page_count: 3,
+        });
+        assert_eq!(
+            tap(&mut ui, "ALL PAGES"),
+            UiCommand::PrepareChangePaper {
+                template: crate::paper_templates::PageTemplate::Grid,
+                scope: PaperChangeScope::AllPages,
+            }
+        );
+        ui.show_modal(Modal::ConfirmChangePaper {
+            template: crate::paper_templates::PageTemplate::Ruled,
+            scope: PaperChangeScope::ThisPage,
+            page_number: 2,
+            page_count: 3,
+            custom_pages: true,
+            unreadable_pages: false,
+        });
+        assert!(dialog_spec(ui.modal.as_ref().unwrap())
+            .unwrap()
+            .body
+            .iter()
+            .any(|l| l.contains("not a standard template")));
+        assert_eq!(
+            tap(&mut ui, "CHANGE"),
+            UiCommand::ApplyPageTemplate {
+                template: crate::paper_templates::PageTemplate::Ruled,
+                scope: PaperChangeScope::ThisPage,
+            }
+        );
+        ui.show_modal(Modal::ChangePaperProgress { done: 1, total: 3 });
+        assert_eq!(tap(&mut ui, "CANCEL"), UiCommand::CancelPaperChange);
+    }
+
+    #[test]
+    fn this_page_change_paper_success_dismisses_confirm_and_does_not_reapply() {
+        let (root, mut library) = fresh_library("this-page-confirm");
+        create_notebook_durable_with_template(
+            &mut library,
+            &profile(),
+            &store_geo(),
+            crate::paper_templates::PageTemplate::Dotted,
+            None,
+            &CreateNotebookHooks::default(),
+        )
+        .unwrap();
+        let nb_id = library.active_notebook_id().to_string();
+        let nb = library.notebook_dir(&nb_id);
+        let g = panel_geo();
+        let none = cards(1);
+        let mut ui = notebook_ui();
+        ui.show_modal(Modal::ConfirmChangePaper {
+            template: crate::paper_templates::PageTemplate::Ruled,
+            scope: PaperChangeScope::ThisPage,
+            page_number: 1,
+            page_count: 1,
+            custom_pages: false,
+            unreadable_pages: false,
+        });
+        let cmd = ui.on_tap(
+            &g,
+            dialog_button(&g, ui.modal.as_ref().unwrap(), "CHANGE"),
+            &none,
+            "x",
+            nb_ctx(1, 1),
+        );
+        assert_eq!(
+            cmd,
+            UiCommand::ApplyPageTemplate {
+                template: crate::paper_templates::PageTemplate::Ruled,
+                scope: PaperChangeScope::ThisPage,
+            }
+        );
+        let ruled =
+            template_background_bytes(crate::paper_templates::PageTemplate::Ruled, &store_geo())
+                .unwrap();
+        apply_page_background_tracked(&nb, &nb_id, "page-1", &ruled).unwrap();
+        ui.dismiss_change_paper_confirm();
+        assert!(
+            ui.modal.is_none(),
+            "successful ThisPage must close ConfirmChangePaper"
+        );
+        assert_eq!(
+            fs::read(nb.join("page-1").join("background.raw")).unwrap(),
+            ruled,
+            "updated background must be presented from durable storage"
+        );
+        let cmd = ui.on_tap(
+            &g,
+            UiPoint {
+                x: g.xres / 2,
+                y: g.yres / 2,
+            },
+            &none,
+            "x",
+            nb_ctx(1, 1),
+        );
+        match cmd {
+            UiCommand::ApplyPageTemplate { .. } => {
+                panic!("successful ThisPage must not leave CHANGE able to journal again")
+            }
+            _ => {}
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn change_paper_confirm_distinguishes_unreadable_from_custom() {
+        let mut ui = notebook_ui();
+        ui.show_modal(Modal::ConfirmChangePaper {
+            template: crate::paper_templates::PageTemplate::Blank,
+            scope: PaperChangeScope::AllPages,
+            page_number: 1,
+            page_count: 3,
+            custom_pages: false,
+            unreadable_pages: true,
+        });
+        let body = dialog_spec(ui.modal.as_ref().unwrap()).unwrap().body;
+        assert!(body.iter().any(|l| l.contains("could not be read")));
+        assert!(!body.iter().any(|l| l.contains("not a standard template")));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use super::*;
 use crate::eraser::EraserGestureState;
 use crate::ink::InkRequest;
 use crate::library::open_or_create_library;
+use crate::paper_templates::PageTemplate;
 use crate::pressure_curve::STYLE_PRESSURE_WIDTH_V1;
 use crate::store::{load_existing_page, load_page_texts, PageStore};
 use crate::sync_local::{build_snapshot, local_stroke_id_for_global, read_identity};
@@ -110,6 +111,9 @@ fn server() -> Srv {
     // S2C tests are the upgraded-client world: the disposable server accepts replacements.
     store
         .accept_replace_stroke_lineages
+        .store(true, AtomicOrdering::SeqCst);
+    store
+        .accept_set_page_background
         .store(true, AtomicOrdering::SeqCst);
     let h = ServerHandle::start_with(
         "127.0.0.1:0".parse().unwrap(),
@@ -1616,6 +1620,119 @@ fn remote_background_the_runtime_would_rewrite_fails_closed() {
         local_snapshot(&k.lib).notebooks,
         before.notebooks,
         "no live page created"
+    );
+}
+
+#[test]
+fn remote_set_page_background_materializes_and_preserves_strokes() {
+    let srv = server();
+    let (k, s) = kindle(&srv);
+    let lib = s.state().library_id;
+    kindle_write(&s, &k, "notebook-1", "page-1", 800.0);
+    converge(&s, &srv);
+    let (nb, p0) = first_page(&srv, lib);
+    assert!(!p0.strokes.is_empty());
+    let before_stroke_count = p0.strokes.len();
+    let before_render = p0.render.clone();
+
+    let g = geo();
+    let bytes = crate::notebook::template_background_bytes(PageTemplate::Ruled, &g).unwrap();
+    let mut probe = bytes.clone();
+    assert!(
+        !crate::page_label::scrub_chrome_band(&mut probe, &g).unwrap(),
+        "template bytes must already be chrome-stable"
+    );
+    let sha = sha256_hex(&bytes);
+    assert!(srv.call("PUT", &format!("/v1/blobs/{sha}"), Some(&bytes)).0 < 300);
+
+    Remote::new(lib).submit(
+        &srv,
+        vec![SyncOperationV1::SetPageBackground {
+            notebook_id: nb,
+            page_id: p0.page_id,
+            background: BackgroundRef::Blob {
+                sha256: sha,
+                byte_len: bytes.len() as u64,
+                format: BackgroundFormat {
+                    encoding: BackgroundEncoding::Gray8,
+                    width: g.xres,
+                    height: g.yres,
+                    stride: g.xres,
+                },
+            },
+        }],
+    );
+    converge(&s, &srv);
+    assert_match(&k, &s, &srv);
+
+    let durable = fs::read(
+        k.lib
+            .join("notebooks/notebook-1/page-1")
+            .join("background.raw"),
+    )
+    .unwrap();
+    assert_eq!(durable, bytes);
+    let after = local_snapshot(&k.lib);
+    let page = &after.notebooks[0].pages[0];
+    assert!(matches!(page.background, BackgroundRef::Blob { .. }));
+    assert_eq!(page.strokes.len(), before_stroke_count);
+    assert_eq!(page.render, before_render);
+    assert_eq!(page.texts, p0.texts);
+    assert_eq!(page.links, p0.links);
+    let _ = bytes;
+}
+
+#[test]
+fn remote_set_page_background_chrome_band_fails_closed() {
+    let srv = server();
+    let (k, s) = kindle(&srv);
+    let lib = s.state().library_id;
+    converge(&s, &srv);
+    let (nb, p0) = first_page(&srv, lib);
+    let g = geo();
+    let bytes: Vec<u8> = (0..(g.xres * g.yres) as usize)
+        .map(|i| (i % 7) as u8)
+        .collect();
+    let mut probe = bytes.clone();
+    assert!(crate::page_label::scrub_chrome_band(&mut probe, &g).unwrap());
+    let sha = sha256_hex(&bytes);
+    assert!(srv.call("PUT", &format!("/v1/blobs/{sha}"), Some(&bytes)).0 < 300);
+    let before = local_snapshot(&k.lib);
+    Remote::new(lib).submit(
+        &srv,
+        vec![SyncOperationV1::SetPageBackground {
+            notebook_id: nb,
+            page_id: p0.page_id,
+            background: BackgroundRef::Blob {
+                sha256: sha,
+                byte_len: bytes.len() as u64,
+                format: BackgroundFormat {
+                    encoding: BackgroundEncoding::Gray8,
+                    width: g.xres,
+                    height: g.yres,
+                    stride: g.xres,
+                },
+            },
+        }],
+    );
+    let t0 = Instant::now();
+    while s.fault().is_none() {
+        if s.inbound_ready() {
+            let _ = s.apply_inbound();
+        }
+        s.kick();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(t0.elapsed() < Duration::from_secs(30));
+    }
+    assert!(
+        s.fault().unwrap().contains("chrome band"),
+        "{:?}",
+        s.fault()
+    );
+    assert_eq!(
+        local_snapshot(&k.lib).notebooks,
+        before.notebooks,
+        "inbound refusal must not rewrite the live page"
     );
 }
 

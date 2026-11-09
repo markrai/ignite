@@ -41,9 +41,10 @@ use crate::notebook::{
 use crate::pressure_curve::{STYLE_LEGACY_FIXED_V1, STYLE_PRESSURE_WIDTH_V1};
 use crate::profile::RenderProfile;
 use crate::store::{
-    create_new_page, load_existing_page, load_page_journals_read_only, load_page_links,
-    load_page_texts, page_dir, page_exists, resolve_background_ref, write_page_links,
-    write_page_texts, PageStore, PersistedFragmentV2, PersistedPointV1, PersistedReplacementV2,
+    create_new_page, install_background, load_existing_page, load_page_journals_read_only,
+    load_page_links, load_page_texts, page_dir, page_exists, resolve_background_ref,
+    write_page_links, write_page_texts, PageStore, PersistedFragmentV2, PersistedPointV1,
+    PersistedReplacementV2,
 };
 use crate::sync_local::{
     bind_identities, kindle_global_stroke_id, local_stroke_id_for_global,
@@ -84,6 +85,7 @@ pub struct MaterializeReport {
     pub texts_written: usize,
     pub links_written: usize,
     pub folders_changed: bool,
+    pub backgrounds_replaced: usize,
 }
 
 impl MaterializeReport {
@@ -409,11 +411,37 @@ impl LocalMaterializer<'_> {
 
         for ep in pages {
             if self.scope.is_none_or(|s| s.contains(&ep.page_id)) || created.contains(&ep.page_id) {
+                self.apply_background(&dir, &page_local[&ep.page_id], ep, rep)?;
                 self.strokes(&dir, &page_local[&ep.page_id], ep, rep)?;
                 self.texts(&dir, &page_local[&ep.page_id], ep, rep)?;
                 self.links(&dir, &page_local[&ep.page_id], ep, rep)?;
             }
         }
+        Ok(())
+    }
+
+    /// Replace durable `background.raw` when canonical state moved (inbound `SetPageBackground`).
+    /// Render-profile drift is still refused. Chrome-band blobs fail in [`Self::background`].
+    fn apply_background(
+        &self,
+        dir: &Path,
+        page_local: &str,
+        ep: &SnapshotPage,
+        rep: &mut MaterializeReport,
+    ) -> Result<(), String> {
+        let mut page = load_page_journals_read_only(dir, page_local)?;
+        if render_ref_for(&page.render_profile) != ep.render {
+            return Err(err(format!(
+                "page {page_local}: background/render differ from canonical state (unsupported)"
+            )));
+        }
+        let bg = resolve_background_ref(&page_dir(dir, page_local), &mut page.header)?;
+        if bg == ep.background {
+            return Ok(());
+        }
+        let (bytes, _) = self.background(&ep.background)?;
+        install_background(&page_dir(dir, page_local), &bytes, &mut page.header)?;
+        rep.backgrounds_replaced += 1;
         Ok(())
     }
 

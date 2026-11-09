@@ -138,6 +138,9 @@ describe("library list / head / snapshot response", () => {
   it("parses the poll head", () => {
     const head = { library_id: manifest.library_id, genesis_sha256: manifest.snapshot_sha256, head_server_seq: 3n, snapshot_sha256: manifest.snapshot_sha256 };
     expect(validateLibraryHead(head)).toEqual(head);
+    expect(validateLibraryHead({ ...head, accept_set_page_background: true }).accept_set_page_background).toBe(true);
+    expect(validateLibraryHead({ ...head, accept_set_page_background: false }).accept_set_page_background).toBe(false);
+    expect(() => validateLibraryHead({ ...head, accept_set_page_background: "yes" })).toThrow(ProtocolViolation);
     expect(() => validateLibraryHead({ ...head, head_server_seq: 1.5 })).toThrow(ProtocolViolation);
     expect(() => validateLibraryHead({ ...head, head_server_seq: 3 })).toThrow(ProtocolViolation);
     expect(() => validateLibraryHead({ ...head, head_server_seq: 18446744073709551616n })).toThrow(ProtocolViolation);

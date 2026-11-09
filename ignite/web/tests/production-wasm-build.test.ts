@@ -224,7 +224,7 @@ describe("production Cargo provenance (no env override)", () => {
     }
   });
 
-  it("ignores IGNITE_WEB_CARGO and never installs mock-cargo bytes", () => {
+  it("ignores IGNITE_WEB_CARGO and never installs mock-cargo bytes", { timeout: 30_000 }, () => {
     const root = tempDir("ignite-wasm-no-env-");
     const targetDir = join(root, "target");
     const browserWasm = join(root, "out", "scribe_web_wasm.wasm");

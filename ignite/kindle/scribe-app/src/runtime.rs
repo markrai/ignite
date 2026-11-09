@@ -11,7 +11,7 @@
 //! F11: launch into Home; pen-operated Home/modals/keyboard/notebook chrome drive the same
 //! durable primitives. Chrome is live framebuffer only (never persisted).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -63,22 +63,25 @@ use crate::library::{
     DEV_LIBRARY_OPEN_TRIGGER, DEV_LIBRARY_PREV_TRIGGER,
 };
 use crate::link_picker::{LinkPickerState, PendingLink};
-use crate::modal::{dialog_spec, render_dialog, DialogSpec, Modal, TitlePurpose};
+use crate::modal::{dialog_spec, render_dialog, DialogSpec, Modal, PaperChangeScope, TitlePurpose};
 use crate::nav::{dispatch_side_button, NavDownAction, NavGestureState, SideButtonDispatch};
 use crate::notebook::{
-    allocate_page_id, commit_new_page_to_manifest, consume_dev_notebook_op,
-    create_page_files_from_template, delete_page_durable, insert_page_after_durable,
-    load_page_for_switch, move_page_durable, page_index, peek_dev_notebook_op, persist_active_page,
-    DeletePageHooks, DevNotebookOp, InsertPageHooks, MovePageDirection, MovePageHooks,
-    NotebookOpen, PageSwitchDirection, PersistedNotebookManifestV1, QuarantineOutcome,
-    DEV_DELETE_CURRENT_PAGE_TRIGGER, DEV_INSERT_PAGE_AFTER_TRIGGER, DEV_MOVE_PAGE_LEFT_TRIGGER,
-    DEV_MOVE_PAGE_RIGHT_TRIGGER, NOTEBOOK_MANIFEST_VERSION,
+    allocate_page_id, apply_page_background_tracked, commit_new_page_to_manifest,
+    consume_dev_notebook_op, create_page_files_from_template, delete_page_durable,
+    insert_page_after_durable, inspect_target_paper, load_page_for_switch, move_page_durable,
+    page_index, paper_apply_after_durable, paper_change_incomplete_notice, peek_dev_notebook_op,
+    persist_active_page, template_background_bytes, DeletePageHooks, DevNotebookOp,
+    InsertPageHooks, MovePageDirection, MovePageHooks, NotebookOpen, PageSwitchDirection,
+    PersistedNotebookManifestV1, QuarantineOutcome, DEV_DELETE_CURRENT_PAGE_TRIGGER,
+    DEV_INSERT_PAGE_AFTER_TRIGGER, DEV_MOVE_PAGE_LEFT_TRIGGER, DEV_MOVE_PAGE_RIGHT_TRIGGER,
+    NOTEBOOK_MANIFEST_VERSION,
 };
 use crate::open_page::BoundPageKey;
 use crate::orch::{
     dirty_to_send_rect, input_kernel_for_du_timing, require_eviocgrab, CtrlError, DuSendResult,
     InkTransport, StrokeController, UndoResult, WaitResult,
 };
+use crate::paper_templates::PageTemplate;
 use crate::prefs::{self, SideButtonAction};
 use crate::pressure::PressureStrokeSummary;
 use crate::profile::RenderProfile;
@@ -1734,6 +1737,152 @@ fn sync_prepare<T>(
     }
 }
 
+fn apply_set_page_background(
+    data_dir: &Path,
+    manifest: &PersistedNotebookManifestV1,
+    page_local: &str,
+    pixels: &[u8],
+    ctrl: &mut KindleCtrl,
+    current_bg: &mut Vec<u8>,
+) -> Result<(), String> {
+    if !ctrl.is_idle() || ctrl.life().is_armed() {
+        return Err("A page couldn't be changed while writing.".into());
+    }
+    let durable =
+        apply_page_background_tracked(data_dir, &manifest.notebook_id, page_local, pixels);
+    let present = if durable.is_ok() && ctrl.session.page_id() == page_local {
+        *current_bg = pixels.to_vec();
+        refresh_live_paper(ctrl, manifest, page_local, current_bg)
+    } else {
+        Ok(())
+    };
+    if durable.is_ok() && present.is_ok() && ctrl.session.page_id() == page_local {
+        ctrl.clear_pending_clean();
+    }
+    paper_apply_after_durable(durable, present)
+}
+
+fn refresh_live_paper(
+    ctrl: &mut KindleCtrl,
+    manifest: &PersistedNotebookManifestV1,
+    page_local: &str,
+    current_bg: &[u8],
+) -> Result<(), String> {
+    let chrome = chrome_for_page(manifest, page_local)?;
+    let strokes = ctrl.session.committed_strokes().to_vec();
+    ctrl.transport_mut()
+        .reconstruct_page(current_bg, &strokes, Some(chrome))
+        .map_err(|e| format!("reconstruct after paper change: {e}"))?;
+    Ok(())
+}
+
+fn prepare_change_paper_modal(
+    x: &mut UiExec<'_>,
+    ctrl: &KindleCtrl,
+    template: PageTemplate,
+    scope: PaperChangeScope,
+) -> Result<(), String> {
+    let current = ctrl.session.page_id().to_string();
+    let page_number = page_index(x.manifest, &current).map_or(1, |i| i + 1);
+    let page_count = x.manifest.page_ids.len();
+    let targets = match scope {
+        PaperChangeScope::ThisPage => vec![current],
+        PaperChangeScope::AllPages => x.manifest.page_ids.clone(),
+    };
+    let inspect = inspect_target_paper(x.notebook_dir, &targets, &x.geo);
+    x.ui.show_modal(Modal::ConfirmChangePaper {
+        template,
+        scope,
+        page_number,
+        page_count,
+        custom_pages: inspect.custom_pages,
+        unreadable_pages: inspect.unreadable_pages,
+    });
+    Ok(())
+}
+
+fn start_or_apply_paper_change(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    template: PageTemplate,
+    scope: PaperChangeScope,
+) -> Result<(), String> {
+    let pixels = template_background_bytes(template, &x.geo)?;
+    match scope {
+        PaperChangeScope::ThisPage => {
+            let page = ctrl.session.page_id().to_string();
+            match apply_set_page_background(
+                x.notebook_dir,
+                x.manifest,
+                &page,
+                &pixels,
+                ctrl,
+                x.current_bg,
+            ) {
+                Err(e) => x.ui.show_error(e),
+                Ok(()) => x.ui.dismiss_change_paper_confirm(),
+            }
+            present_ui(x, ctrl, None)
+        }
+        PaperChangeScope::AllPages => {
+            let remaining: VecDeque<String> = x.manifest.page_ids.iter().cloned().collect();
+            let total = remaining.len();
+            *x.paper_change_run = Some(PaperChangeRun {
+                pixels,
+                remaining,
+                done: 0,
+                total,
+                cancelled: false,
+            });
+            x.ui.show_modal(Modal::ChangePaperProgress { done: 0, total });
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
+fn paper_change_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    let Some(run) = x.paper_change_run.as_mut() else {
+        return Ok(());
+    };
+    if run.cancelled {
+        let done = run.done;
+        let total = run.total;
+        *x.paper_change_run = None;
+        x.ui.show_error(paper_change_incomplete_notice(done, total, false));
+        return present_ui(x, ctrl, None);
+    }
+    let Some(page) = run.remaining.pop_front() else {
+        *x.paper_change_run = None;
+        x.ui.modal = None;
+        return present_ui(x, ctrl, None);
+    };
+    let pixels = run.pixels.clone();
+    if let Err(_e) = apply_set_page_background(
+        x.notebook_dir,
+        x.manifest,
+        &page,
+        &pixels,
+        ctrl,
+        x.current_bg,
+    ) {
+        let done = run.done;
+        let total = run.total;
+        *x.paper_change_run = None;
+        x.ui.show_error(paper_change_incomplete_notice(done, total, true));
+        return present_ui(x, ctrl, None);
+    }
+    run.done += 1;
+    let done = run.done;
+    let total = run.total;
+    if run.remaining.is_empty() {
+        *x.paper_change_run = None;
+        x.ui.modal = None;
+    } else {
+        x.ui.show_modal(Modal::ChangePaperProgress { done, total });
+    }
+    present_ui(x, ctrl, None)
+}
+
 /// S2B: capture a durably created notebook (appended after the previous library entry).
 fn sync_notebook_created(library: &LibraryRepository, notebook_id: &str, title: &str) {
     let ids = &library.manifest().notebook_ids;
@@ -2260,6 +2409,11 @@ struct UiExec<'a> {
     stop: &'a Arc<AtomicBool>,
     /// NBK import in progress (Tools screen); one source per idle loop pass.
     import_run: &'a mut Option<ImportRun>,
+    /// Change Paper (all pages): one page per idle loop pass.
+    paper_change_run: &'a mut Option<PaperChangeRun>,
+    /// Change Paper activation GET; completes off the UI thread (60s production deadline).
+    paper_gate_job: &'a mut Option<PaperGateJob>,
+    paper_gate_generation: &'a mut u64,
     /// Software Update discovery job (Preferences); completes off the UI thread.
     update_check: &'a mut Option<UpdateCheckJob>,
     /// Software Update download+stage job; completes off the UI thread.
@@ -2281,6 +2435,150 @@ struct ImportRun {
     imported: usize,
     skipped: usize,
     failures: Vec<crate::tools_ui::ImportFailureLine>,
+}
+
+/// Chunked notebook-wide paper change. Already-applied pages stay changed if cancelled.
+struct PaperChangeRun {
+    pixels: Vec<u8>,
+    remaining: VecDeque<String>,
+    done: usize,
+    total: usize,
+    cancelled: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PaperGateIntent {
+    Prepare {
+        template: PageTemplate,
+        scope: PaperChangeScope,
+    },
+    Apply {
+        template: PageTemplate,
+        scope: PaperChangeScope,
+    },
+}
+
+/// Library-head activation probe. Never runs on the interactive command path.
+struct PaperGateJob {
+    generation: u64,
+    identity: crate::sync_outbound::PaperGateIdentity,
+    intent: PaperGateIntent,
+    rx: std::sync::mpsc::Receiver<Result<bool, String>>,
+}
+
+fn discard_paper_gate_job(x: &mut UiExec<'_>) {
+    *x.paper_gate_generation += 1;
+    *x.paper_gate_job = None;
+}
+
+fn start_paper_gate_job(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    intent: PaperGateIntent,
+) -> Result<(), String> {
+    if x.paper_gate_job.is_some() || x.paper_change_run.is_some() {
+        return present_ui(x, ctrl, None);
+    }
+    match crate::sync_outbound::with_global(|s| s.paper_gate_probe_parts()) {
+        None => finish_paper_gate(x, ctrl, intent, Ok(true)),
+        Some(None) => {
+            x.ui.show_error(crate::sync_outbound::PAPER_GATE_UNREACHABLE);
+            present_ui(x, ctrl, None)
+        }
+        Some(Some((identity, cfg))) => {
+            *x.paper_gate_generation += 1;
+            let generation = *x.paper_gate_generation;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let library_id = identity.library_id;
+            match std::thread::Builder::new()
+                .name("ignite-paper-gate".into())
+                .spawn(move || {
+                    let result =
+                        crate::sync_outbound::probe_accept_set_page_background(&cfg, &library_id);
+                    let _ = tx.send(result);
+                }) {
+                Ok(_) => {
+                    *x.paper_gate_job = Some(PaperGateJob {
+                        generation,
+                        identity,
+                        intent,
+                        rx,
+                    });
+                    present_ui(x, ctrl, None)
+                }
+                Err(e) => {
+                    eprintln!("paper_gate=spawn_failed detail={e}");
+                    x.ui.show_error(crate::sync_outbound::PAPER_GATE_UNREACHABLE);
+                    present_ui(x, ctrl, None)
+                }
+            }
+        }
+    }
+}
+
+fn poll_paper_gate_job(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<bool, String> {
+    let Some(job) = x.paper_gate_job.as_mut() else {
+        return Ok(false);
+    };
+    let result = match job.rx.try_recv() {
+        Ok(r) => r,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(crate::sync_outbound::PAPER_GATE_UNREACHABLE.into())
+        }
+    };
+    let generation = job.generation;
+    let identity = job.identity.clone();
+    let intent = job.intent;
+    *x.paper_gate_job = None;
+    let live_generation = *x.paper_gate_generation;
+    let applies = crate::sync_outbound::with_global(|s| {
+        let current = s.paper_gate_identity();
+        let applies = crate::sync_outbound::paper_gate_result_applies(
+            &identity,
+            generation,
+            current.as_ref(),
+            live_generation,
+        );
+        if applies {
+            s.remember_set_page_background_accepted(result.as_ref().copied().unwrap_or(false));
+        }
+        applies
+    })
+    .unwrap_or(false);
+    if !applies {
+        println!("paper_gate=stale_result generation={generation}");
+        return Ok(false);
+    }
+    finish_paper_gate(x, ctrl, intent, result)?;
+    Ok(true)
+}
+
+fn finish_paper_gate(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    intent: PaperGateIntent,
+    result: Result<bool, String>,
+) -> Result<(), String> {
+    match result {
+        Err(e) => {
+            x.ui.show_error(e);
+            present_ui(x, ctrl, None)
+        }
+        Ok(false) => {
+            x.ui.show_error(crate::sync_outbound::PAPER_GATE_OFF);
+            present_ui(x, ctrl, None)
+        }
+        Ok(true) => match intent {
+            PaperGateIntent::Prepare { template, scope } => {
+                prepare_change_paper_modal(x, ctrl, template, scope)?;
+                present_ui(x, ctrl, None)
+            }
+            PaperGateIntent::Apply { template, scope } => {
+                start_or_apply_paper_change(x, ctrl, template, scope)
+            }
+        },
+    }
 }
 
 /// Background GitHub release discovery. Never installs; results are advisory.
@@ -4042,6 +4340,21 @@ fn execute_ui_command(
             }
             Ok(())
         }
+        UiCommand::PrepareChangePaper { template, scope } => {
+            start_paper_gate_job(x, ctrl, PaperGateIntent::Prepare { template, scope })
+        }
+        UiCommand::ApplyPageTemplate { template, scope } => {
+            start_paper_gate_job(x, ctrl, PaperGateIntent::Apply { template, scope })
+        }
+        UiCommand::CancelPaperChange => {
+            discard_paper_gate_job(x);
+            if let Some(run) = x.paper_change_run.take() {
+                x.ui.show_error(paper_change_incomplete_notice(run.done, run.total, false));
+            } else {
+                x.ui.modal = None;
+            }
+            present_ui(x, ctrl, None)
+        }
     }
 }
 
@@ -4460,6 +4773,9 @@ pub fn run_page_session(
     let mut stylus_mode_disarm_failed = false;
     let mut sleep_guard: Option<crate::sleep_ui::SleepGuard> = None;
     let mut import_run: Option<ImportRun> = None;
+    let mut paper_change_run: Option<PaperChangeRun> = None;
+    let mut paper_gate_job: Option<PaperGateJob> = None;
+    let mut paper_gate_generation: u64 = 0;
     let mut update_check: Option<UpdateCheckJob> = None;
     let mut download_job: Option<UpdateDownloadJob> = None;
     let mut input_lag = crate::input_lag::InputLag::default();
@@ -4587,6 +4903,9 @@ pub fn run_page_session(
                     hosted: cfg.display_events_stdin,
                     stop: &stop,
                     import_run: &mut import_run,
+                    paper_change_run: &mut paper_change_run,
+                    paper_gate_job: &mut paper_gate_job,
+                    paper_gate_generation: &mut paper_gate_generation,
                     update_check: &mut update_check,
                     download_job: &mut download_job,
                     prefs_path: &prefs_path,
@@ -4726,6 +5045,20 @@ pub fn run_page_session(
             continue;
         }
 
+        if structure_eligible && pending_ui.is_none() && paper_gate_job.is_some() {
+            match poll_paper_gate_job(&mut ui_exec!(), &mut ctrl) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("error: change paper gate: {e}");
+                    let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                    shutdown_safe = safe;
+                    stylus_mode_disarm_failed = disarm_fail;
+                    break 1;
+                }
+            }
+        }
+
         if structure_eligible && pending_ui.is_none() && update_check.is_some() {
             match poll_software_update_check(&mut ui_exec!(), &mut ctrl) {
                 Ok(true) => continue,
@@ -4752,6 +5085,17 @@ pub fn run_page_session(
                     break 1;
                 }
             }
+        }
+
+        if structure_eligible && pending_ui.is_none() && paper_change_run.is_some() {
+            if let Err(e) = paper_change_step(&mut ui_exec!(), &mut ctrl) {
+                eprintln!("error: change paper present: {e}");
+                let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                shutdown_safe = safe;
+                stylus_mode_disarm_failed = disarm_fail;
+                break 1;
+            }
+            continue;
         }
 
         // S2C inbound materialization: only at the same safe point as structural work, never

@@ -737,6 +737,17 @@ fn apply_operation(
                 Ok(Outcome::Applied)
             }
         },
+        SyncOperationV1::SetPageBackground {
+            notebook_id,
+            page_id,
+            background,
+        } => match find_page(st, *notebook_id, *page_id)? {
+            Target::Deleted => Ok(Outcome::NoOp("page or notebook deleted")),
+            Target::Live((ni, pi)) => {
+                st.snapshot.notebooks[ni].pages[pi].background = background.clone();
+                Ok(Outcome::Applied)
+            }
+        },
         SyncOperationV1::DeleteText {
             notebook_id,
             page_id,
@@ -925,6 +936,11 @@ fn target_of(op: &SyncOperationV1) -> Option<(NotebookId, Option<PageId>)> {
             ..
         }
         | SyncOperationV1::DeleteText {
+            notebook_id,
+            page_id,
+            ..
+        }
+        | SyncOperationV1::SetPageBackground {
             notebook_id,
             page_id,
             ..

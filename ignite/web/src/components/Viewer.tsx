@@ -7,6 +7,7 @@ import { SORT_LABELS } from "../model/librarySort";
 import { linkJumpLabel, MISSING_LINK_LABEL, preserveSelection, resolve, resolveLinkTarget, stepPage } from "../model/selection";
 import type { BlobApi } from "../api/blobApi";
 import type { PageSpec, SnapshotNotebook, SyncPageLink, SyncStroke, SyncText, SyncSnapshotV1 } from "../model/types";
+import { changePaperOnReady } from "../paper/changePaperPublish";
 import {
   commitFolderOn,
   commitStructureOn,
@@ -160,6 +161,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
       if (!(o.server_seq === null || o.server_seq > through)) return [];
       if (o.kind === "folder") return [o.folder];
       if (o.kind === "structure") return [o.structure];
+      if (o.kind === "set_page_background") return [o.set_page_background];
       return [];
     });
     if (ops.length === 0 || !projectLibrary) return snapshot;
@@ -415,6 +417,53 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
       return ok;
     },
     [finalizeTextForTransition],
+  );
+
+  const changePaper = useCallback(
+    async (args: {
+      notebook: SnapshotNotebook;
+      template: PageTemplate;
+      scope: "this" | "all";
+      onProgress?: (done: number, total: number) => void;
+      isCancelled?: () => boolean;
+    }): Promise<boolean> => {
+      if (!(await finalizeTextForTransition())) return false;
+      const initiating = replicaRef.current;
+      const initiatingSession = sessionRef.current;
+      if (initiating.kind !== "ready") return false;
+      const ready: ReadyReplica = initiating;
+      const currentPageId =
+        args.notebook.notebook_id === r?.notebook.notebook_id
+          ? r.page.page_id
+          : (args.notebook.pages[0]?.page_id ?? null);
+      const { ok, notice } = await changePaperOnReady(ready, {
+        template: args.template,
+        notebook: args.notebook,
+        scope: args.scope,
+        currentPageId,
+        stillValid: () =>
+          initiatingCreateStillValid({
+            mounted: mountedRef.current,
+            initiating: ready,
+            currentReplica: replicaRef.current,
+            initiatingSession,
+            currentSession: sessionRef.current,
+          }),
+        onProgress: args.onProgress,
+        isCancelled: args.isCancelled,
+        setPageBackgroundAccepted: async () => {
+          const head = await initiatingSession.libraryHead();
+          return head.accept_set_page_background === true;
+        },
+      });
+      if (!ok) {
+        setNotice(notice ?? "Couldn’t change the paper on this device. Nothing was changed.");
+      } else if (notice) {
+        setNotice(notice);
+      }
+      return ok;
+    },
+    [finalizeTextForTransition, r],
   );
 
   const mintOperationId = useCallback(() => (replica.kind === "ready" ? replica.mintId("operation") : ""), [replica]);
@@ -765,6 +814,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
             folders={viewSnapshot!.folders}
             membership={membership}
             selectedId={notebook.notebook_id}
+            currentPageId={pageId}
             onSelect={(n) => {
               if (drawing.current) return;
               void afterTextFinalization(() => {
@@ -778,6 +828,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
             mintFolderId={() => (replica.kind === "ready" ? replica.mintId("folder") : "")}
             commit={commitFolder}
             createNotebook={createNotebook}
+            changePaper={changePaper}
             renameNotebook={(notebookId, title) => commitStructure({ type: "rename_notebook", notebook_id: notebookId, title })}
             deleteNotebook={(notebookId) => commitStructure({ type: "delete_notebook", notebook_id: notebookId })}
             canDeleteNotebook={viewSnapshot!.notebooks.length > 1}

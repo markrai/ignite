@@ -579,6 +579,9 @@ pub(crate) fn pull_once(
             | SyncOperationV1::CreatePage { page: p, .. } => {
                 ensure_blob(agent, cfg, &dir, &p.background)?
             }
+            SyncOperationV1::SetPageBackground { background, .. } => {
+                ensure_blob(agent, cfg, &dir, background)?
+            }
             _ => {}
         }
     }

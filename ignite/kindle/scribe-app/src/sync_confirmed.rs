@@ -1004,6 +1004,7 @@ pub(crate) fn touched_pages(op: &sync_protocol::SyncOperationV1) -> Vec<PageId> 
         | O::AddText { page_id, .. }
         | O::UpdateText { page_id, .. }
         | O::DeleteText { page_id, .. }
+        | O::SetPageBackground { page_id, .. }
         | O::AddPageLink { page_id, .. }
         | O::DeletePageLink { page_id, .. } => vec![*page_id],
         O::RenameNotebook { .. }

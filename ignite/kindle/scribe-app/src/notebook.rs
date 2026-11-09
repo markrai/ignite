@@ -1,20 +1,23 @@
 //! Gate F2 notebook manifest: ordered pages + durable active page.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use kindle_platform::FbGeometry;
 use serde::{Deserialize, Serialize};
+use sync_protocol::sha256_hex;
 
 use crate::ink::{ink_for_new_page, resolve_existing_ink, InkRequest};
 use crate::page_label::scrub_chrome_band;
 use crate::profile::RenderProfile;
 use crate::store::{
     create_new_page, install_background, load_existing_page, migrate_all_pages, page_dir,
-    page_exists, validate_live_framebuffer, FsPageStore, LoadedPage, DEFAULT_PAGE_ID,
+    page_exists, validate_live_framebuffer, BackgroundIdentityV1, FsPageStore, LoadedPage,
+    PersistedPageHeader, DEFAULT_PAGE_ID,
 };
 
 pub const NOTEBOOK_MANIFEST_VERSION: u32 = 1;
@@ -295,6 +298,237 @@ pub fn repair_background_chrome(
     install_background(&dir, &loaded.background, &mut loaded.header)?;
     eprintln!("repaired: scrubbed baked chrome from background page={page_id}");
     Ok(true)
+}
+
+/// Packed, chrome-scrubbed template bytes for this panel (safe to hash into `BackgroundRef`).
+pub fn template_background_bytes(
+    template: crate::paper_templates::PageTemplate,
+    fb_geo: &FbGeometry,
+) -> Result<Vec<u8>, String> {
+    let mut bg =
+        crate::paper_templates::generate_page_background(template, fb_geo.xres, fb_geo.yres)?;
+    let _ = scrub_chrome_band(&mut bg, fb_geo)?;
+    Ok(bg)
+}
+
+/// Replace an existing page's durable background. Sync callers must journal
+/// `SetPageBackground` first; this helper only writes files.
+pub fn install_page_background(
+    data_dir: &Path,
+    page_id: &str,
+    pixels: &[u8],
+) -> Result<(), String> {
+    let dir = page_dir(data_dir, page_id);
+    let (_store, mut loaded) = load_existing_page(data_dir, page_id)?;
+    install_background(&dir, pixels, &mut loaded.header)
+}
+
+/// Journal `SetPageBackground` on `sync` (if any), then replace durable paper.
+/// Sync-on failures refuse without writing files. `sync = None` installs locally.
+pub fn apply_page_background_on(
+    sync: Option<&crate::sync_outbound::OutboundSync>,
+    notebook_dir: &Path,
+    notebook_id: &str,
+    page_id: &str,
+    pixels: &[u8],
+) -> Result<(), String> {
+    let ticket = match sync {
+        None => None,
+        Some(s) => {
+            match s.prepare_set_page_background(notebook_dir, notebook_id, page_id, pixels) {
+                None => return Err("local capture journal could not record this edit".into()),
+                Some(t) => Some(t),
+            }
+        }
+    };
+    let result = install_page_background(notebook_dir, page_id, pixels);
+    if let Some(t) = ticket {
+        if let Some(s) = sync {
+            if result.is_ok() {
+                s.commit(t);
+            } else {
+                s.abort(t);
+            }
+        }
+    }
+    result
+}
+
+/// Process-global sync (Kindle runtime) variant of [`apply_page_background_on`].
+pub fn apply_page_background_tracked(
+    notebook_dir: &Path,
+    notebook_id: &str,
+    page_id: &str,
+    pixels: &[u8],
+) -> Result<(), String> {
+    let ticket = match crate::sync_outbound::with_global(|s| {
+        s.prepare_set_page_background(notebook_dir, notebook_id, page_id, pixels)
+    }) {
+        None => None,
+        Some(None) => {
+            return Err("local capture journal could not record this edit".into());
+        }
+        Some(Some(t)) => Some(t),
+    };
+    let result = install_page_background(notebook_dir, page_id, pixels);
+    if let Some(t) = ticket {
+        crate::sync_outbound::with_global(|s| {
+            if result.is_ok() {
+                s.commit(t);
+            } else {
+                s.abort(t);
+            }
+        });
+    }
+    result
+}
+
+/// True when `pixels` match a generated, chrome-scrubbed standard template for this panel.
+pub fn pixels_match_known_template(pixels: &[u8], fb_geo: &FbGeometry) -> bool {
+    let sha = sha256_hex(pixels).to_string();
+    known_template_shas(fb_geo).iter().any(|s| s == &sha)
+}
+
+/// Confirm-dialog inspect: custom paper vs pages that could not be read. Meta/identity first;
+/// hashes `background.raw` only when identity is missing. Does not load strokes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaperChangeInspect {
+    pub custom_pages: bool,
+    pub unreadable_pages: bool,
+}
+
+/// Combine a completed durable paper write with an optional live-display refresh.
+///
+/// `reconstruct_page` / chrome failures happen *after* journal+files succeed. Those must not
+/// be reported as "nothing was changed" and must still count toward an all-pages `done`.
+pub fn paper_apply_after_durable(
+    durable: Result<(), String>,
+    present: Result<(), String>,
+) -> Result<(), String> {
+    durable?;
+    if let Err(e) = present {
+        eprintln!("warning: paper changed on disk but the display could not refresh: {e}");
+    }
+    Ok(())
+}
+
+/// User-facing copy when an all-pages run stops after `done` of `total` pages.
+/// Already-committed pages stay changed; this never implies rollback.
+pub fn paper_change_incomplete_notice(done: usize, total: usize, failed: bool) -> String {
+    if done == 0 {
+        return if failed {
+            "Couldn’t change the paper. Nothing was changed.".into()
+        } else {
+            "No pages were changed.".into()
+        };
+    }
+    let stay = "Already-changed pages stay changed.";
+    if failed {
+        format!("Changed {done} of {total} pages. Some pages could not be changed. {stay}")
+    } else {
+        format!("Changed {done} of {total} pages. {stay}")
+    }
+}
+
+static KNOWN_TEMPLATE_SHAS: Mutex<Option<HashMap<(u32, u32), Vec<String>>>> = Mutex::new(None);
+
+fn known_template_shas(fb_geo: &FbGeometry) -> Vec<String> {
+    let key = (fb_geo.xres, fb_geo.yres);
+    let mut guard = KNOWN_TEMPLATE_SHAS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(v) = cache.get(&key) {
+        return v.clone();
+    }
+    let mut shas = Vec::new();
+    for t in crate::paper_templates::PageTemplate::picker_choices() {
+        if let Ok(bytes) = template_background_bytes(t, fb_geo) {
+            shas.push(sha256_hex(&bytes).to_string());
+        }
+    }
+    cache.insert(key, shas.clone());
+    shas
+}
+
+fn paper_sha_is_known(sha: &str, fb_geo: &FbGeometry) -> bool {
+    known_template_shas(fb_geo).iter().any(|s| s == sha)
+}
+
+fn inspect_one_page_paper(data_dir: &Path, page_id: &str, fb_geo: &FbGeometry) -> PagePaperKind {
+    let dir = page_dir(data_dir, page_id);
+    let header: PersistedPageHeader = match fs::read_to_string(dir.join("page.meta"))
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+    {
+        Ok(h) => h,
+        Err(_) => return PagePaperKind::Unreadable,
+    };
+    match header.background_identity.as_ref() {
+        Some(id) if id.validate().is_ok() => match id {
+            BackgroundIdentityV1::Blank { .. } => PagePaperKind::Known,
+            BackgroundIdentityV1::Blob { sha256, .. } => {
+                if paper_sha_is_known(sha256, fb_geo) {
+                    PagePaperKind::Known
+                } else {
+                    PagePaperKind::Custom
+                }
+            }
+        },
+        Some(_) | None => classify_background_file(&dir, fb_geo),
+    }
+}
+
+fn classify_background_file(dir: &Path, fb_geo: &FbGeometry) -> PagePaperKind {
+    match fs::read(dir.join("background.raw")) {
+        Ok(bytes) => {
+            let sha = sha256_hex(&bytes).to_string();
+            if paper_sha_is_known(&sha, fb_geo) {
+                PagePaperKind::Known
+            } else {
+                PagePaperKind::Custom
+            }
+        }
+        Err(_) => PagePaperKind::Unreadable,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagePaperKind {
+    Known,
+    Custom,
+    Unreadable,
+}
+
+/// Inspect target pages for the Change Paper confirm. O(pages) meta reads; template bytes
+/// are generated once per panel size and cached. Unreadable pages are not reported as custom.
+pub fn inspect_target_paper(
+    data_dir: &Path,
+    page_ids: &[String],
+    fb_geo: &FbGeometry,
+) -> PaperChangeInspect {
+    let mut out = PaperChangeInspect::default();
+    for id in page_ids {
+        match inspect_one_page_paper(data_dir, id, fb_geo) {
+            PagePaperKind::Known => {}
+            PagePaperKind::Custom => out.custom_pages = true,
+            PagePaperKind::Unreadable => out.unreadable_pages = true,
+        }
+        if out.custom_pages && out.unreadable_pages {
+            break;
+        }
+    }
+    out
+}
+
+/// True when any named page's durable background is not a known template.
+/// Unreadable pages are **not** treated as custom (see [`inspect_target_paper`]).
+pub fn pages_include_custom_background(
+    data_dir: &Path,
+    page_ids: &[String],
+    fb_geo: &FbGeometry,
+) -> bool {
+    inspect_target_paper(data_dir, page_ids, fb_geo).custom_pages
 }
 
 /// Open notebook: adopt F1.1 page-1, create fresh, or load existing manifest.

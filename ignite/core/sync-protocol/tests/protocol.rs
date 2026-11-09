@@ -201,6 +201,11 @@ fn every_current_semantic_operation_round_trips() {
             notebook_id: nb,
             page_id: pg,
         },
+        SyncOperationV1::SetPageBackground {
+            notebook_id: nb,
+            page_id: pg,
+            background: BackgroundRef::Blank,
+        },
         SyncOperationV1::AddStroke {
             notebook_id: nb,
             page_id: pg,
@@ -314,6 +319,13 @@ fn ui_and_undo_are_not_operations_and_bad_payloads_are_refused() {
         "undo",
         "undo_button_pressed",
         "replace_strokes",
+        // Future / unknown tags fail closed the same way a v0.9.22 decoder rejects
+        // `set_page_background` (deny_unknown_fields on the tagged op enum). A v0.9.22
+        // peer must refuse the envelope rather than skip it and diverge.
+        "set_page_paper",
+        "set_notebook_background",
+        // Stand-in for any post-v0.9.22 tag a current decoder does not know.
+        "not_a_real_op",
     ] {
         let bad = base.replace("delete_notebook", ui);
         assert!(
@@ -321,6 +333,14 @@ fn ui_and_undo_are_not_operations_and_bad_payloads_are_refused() {
             "{ui} must not parse"
         );
     }
+    // Current (≥0.9.23) decoder accepts the real wire tag; older peers do not.
+    let modern = base.replace("delete_notebook", "set_page_background");
+    // Incomplete payload (missing notebook_id/page_id/background) still fails closed —
+    // proves the tag is recognized but validation remains strict.
+    assert!(
+        SyncEnvelopeV1::parse(modern.as_bytes()).is_err(),
+        "recognized tag with wrong fields must still refuse"
+    );
     for bad in [
         base.replace(r#""client_seq":1"#, r#""client_seq":0"#),
         base.replace(r#""v":1"#, r#""v":2"#),
@@ -664,6 +684,64 @@ fn streamed_snapshot_hash_equals_the_hash_of_the_canonical_bytes() {
         sync_protocol::canonical_sha256(&s).unwrap(),
         sync_protocol::sha256_hex(&bytes)
     );
+}
+
+#[test]
+fn set_page_background_envelope_round_trips_and_validates() {
+    let nb: NotebookId = id(2);
+    let pg: PageId = id(3);
+    let blank = SyncOperationV1::SetPageBackground {
+        notebook_id: nb,
+        page_id: pg,
+        background: BackgroundRef::Blank,
+    };
+    blank.validate().unwrap();
+    let e = envelope(blank.clone());
+    let bytes = e.to_canonical_bytes().unwrap();
+    let back = SyncEnvelopeV1::parse(&bytes).unwrap();
+    assert_eq!(back, e);
+    let t = String::from_utf8(bytes).unwrap();
+    assert!(t.contains(r#""type":"set_page_background""#), "{t}");
+    assert!(t.contains(r#""background":{"kind":"blank"}"#), "{t}");
+
+    let (w, h) = (4u32, 2u32);
+    let bytes: Vec<u8> = vec![0x80; (w * h) as usize];
+    let blob = BackgroundRef::Blob {
+        sha256: sync_protocol::sha256_hex(&bytes),
+        byte_len: bytes.len() as u64,
+        format: sync_protocol::BackgroundFormat {
+            encoding: sync_protocol::BackgroundEncoding::Gray8,
+            width: w,
+            height: h,
+            stride: w,
+        },
+    };
+    let patterned = SyncOperationV1::SetPageBackground {
+        notebook_id: nb,
+        page_id: pg,
+        background: blob,
+    };
+    patterned.validate().unwrap();
+    let e = envelope(patterned);
+    let round = SyncEnvelopeV1::parse(&e.to_canonical_bytes().unwrap()).unwrap();
+    assert_eq!(round, e);
+
+    // Malformed blob reference is refused at envelope validation (byte_len mismatch).
+    let bad = SyncOperationV1::SetPageBackground {
+        notebook_id: nb,
+        page_id: pg,
+        background: BackgroundRef::Blob {
+            sha256: sync_protocol::sha256_hex(b"x"),
+            byte_len: 99,
+            format: sync_protocol::BackgroundFormat {
+                encoding: sync_protocol::BackgroundEncoding::Gray8,
+                width: 1,
+                height: 1,
+                stride: 1,
+            },
+        },
+    };
+    assert!(bad.validate().is_err());
 }
 
 /// Pins the f32 text-width semantics that ignite-web mirrors (`textWidthFits`; its protocol

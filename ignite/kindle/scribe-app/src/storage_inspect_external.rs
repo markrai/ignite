@@ -994,6 +994,9 @@ fn add_envelope_blobs(
         SyncOperationV1::CreatePage { page, .. } => {
             add_background(&page.background, blobs, prefix, report)
         }
+        SyncOperationV1::SetPageBackground { background, .. } => {
+            add_background(background, blobs, prefix, report)
+        }
         _ => {}
     }
 }

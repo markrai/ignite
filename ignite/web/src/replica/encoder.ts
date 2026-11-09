@@ -1,7 +1,7 @@
 // The store's synchronous envelope encoder: every browser operation is built by the Rust bridge.
 
 import type { ProtocolBridge } from "../wasm/bridge";
-import { isErase, isFolder, isStructure, isTextAdd, isTextDelete, isTextUpdate, isUndo, type Encoder } from "./store";
+import { isErase, isFolder, isSetPageBackground, isStructure, isTextAdd, isTextDelete, isTextUpdate, isUndo, type Encoder } from "./store";
 
 export function bridgeEncoder(bridge: ProtocolBridge, libraryId: string): Encoder {
   return (replicaId, clientSeq, d) => {
@@ -21,6 +21,15 @@ export function bridgeEncoder(bridge: ProtocolBridge, libraryId: string): Encode
         client_seq: clientSeq,
         operation_id: d.operation_id,
         operation: d.structure,
+      });
+    }
+    if (isSetPageBackground(d)) {
+      return bridge.encodeSetPageBackground({
+        library_id: libraryId,
+        replica_id: replicaId,
+        client_seq: clientSeq,
+        operation_id: d.operation_id,
+        operation: d.set_page_background,
       });
     }
     if (isUndo(d)) {
