@@ -782,6 +782,8 @@ pub struct MemoryPageStore {
     pub root_of: std::collections::HashMap<String, String>,
     pub deleted_ids: HashSet<String>,
     pub fail_append: bool,
+    /// Fail every append once this many strokes are stored (host tests).
+    pub fail_append_after: Option<usize>,
     pub fail_flush: bool,
     pub fail_delete: bool,
     pub fail_delete_fsync: bool,
@@ -805,6 +807,12 @@ impl PageStore for MemoryPageStore {
             return Err("store not writable".into());
         }
         if self.fail_append {
+            return Err("fake append fail".into());
+        }
+        if self
+            .fail_append_after
+            .is_some_and(|n| self.strokes.len() >= n)
+        {
             return Err("fake append fail".into());
         }
         if self.fail_flush {
