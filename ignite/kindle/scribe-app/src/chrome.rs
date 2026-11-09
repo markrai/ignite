@@ -37,6 +37,16 @@ pub fn set_erase_mode(on: bool) {
     ERASE_MODE.with(|m| m.set(on));
 }
 
+/// Drop transient Erase mode after leaving the current notebook writing surface.
+///
+/// Call only once the transition has committed: GoHome, durable notebook delete (Home
+/// without GoHome), a durable cross-notebook switch, or a durable notebook create — and
+/// before the destination is presented. Failed switch/create/delete paths must not call
+/// this. Same-notebook page navigation never calls this.
+pub fn clear_erase_mode() {
+    set_erase_mode(false);
+}
+
 /// Positional page state painted in the bottom band (1-based `index`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageChrome {
@@ -306,5 +316,21 @@ mod erase_button_tests {
 
         set_erase_mode(false);
         assert!(!erase_mode());
+    }
+
+    #[test]
+    fn clear_erase_mode_is_the_shared_leave_notebook_hook() {
+        // Runtime calls clear_erase_mode() only after GoHome / durable cross-notebook
+        // switch / durable create succeed — never on a failed open/create, never on a
+        // same-notebook page turn.
+        set_erase_mode(true);
+        assert!(erase_mode());
+        clear_erase_mode();
+        assert!(!erase_mode());
+
+        // A failed transition simply omits the call: mode stays on.
+        set_erase_mode(true);
+        assert!(erase_mode());
+        set_erase_mode(false);
     }
 }

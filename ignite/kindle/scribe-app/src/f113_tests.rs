@@ -748,6 +748,7 @@ mod tests {
         for (r, want) in [
             (layout.home, UiCommand::GoHome),
             (layout.undo, UiCommand::Undo),
+            (layout.erase, UiCommand::ToggleEraser),
         ] {
             let mut ui = notebook();
             ui.chrome.reveal(0);

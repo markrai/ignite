@@ -390,6 +390,37 @@ mod tests {
         let _ = g.clear_on_stream_gap();
         assert!(!g.is_active());
     }
+
+    #[test]
+    fn pen_originated_erase_mode_gesture_commits_like_hardware_eraser() {
+        // Runtime remaps only Down when erase mode is on; Move/Up follow EraserGestureState.
+        // This is the production gesture machine with the remapping gate, not a drive() stub.
+        use crate::chrome::{clear_erase_mode, erase_mode, set_erase_mode};
+        use kindle_platform::{StylusEventKind as K, StylusTool as T};
+
+        set_erase_mode(true);
+        assert!(pen_down_acts_as_eraser(erase_mode(), K::Down, T::Pen));
+        assert!(!pen_down_acts_as_eraser(erase_mode(), K::Move, T::Pen));
+        assert!(!pen_down_acts_as_eraser(erase_mode(), K::Up, T::Pen));
+
+        let s = stroke("s-a", &[(0.0, 0.0), (2000.0, 0.0)]);
+        let mut roots = HashMap::new();
+        roots.insert("s-a".into(), "s-a".into());
+        let mut g = EraserGestureState::Idle;
+        // Same Down → stationary first sample → sweep → Up path the runtime uses for eraser.
+        let down = PagePoint::new(1000.0, -500.0);
+        assert!(g.on_down(down, &[s], &roots));
+        g.process_to(down);
+        g.process_to(PagePoint::new(1000.0, 500.0));
+        let commit = g.on_up();
+        assert!(commit.dirty);
+        assert_eq!(commit.replacements.len(), 1);
+        assert_eq!(commit.replacements[0].fragments.len(), 2);
+        assert!(!g.is_active());
+
+        clear_erase_mode();
+        assert!(!pen_down_acts_as_eraser(erase_mode(), K::Down, T::Pen));
+    }
 }
 
 /// With on-screen Erase mode on, a pen-tip Down that the router left to the page starts an

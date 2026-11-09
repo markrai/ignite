@@ -3489,7 +3489,12 @@ fn open_notebook_from_ui(
         }
     } else {
         match switch_notebook_durable(x.library, notebook_id, &SwitchNotebookHooks::default()) {
-            Ok(c) => c,
+            Ok(c) => {
+                // Only after a durable cross-notebook switch: failed opens keep Erase mode.
+                // Clear before bind/present so the destination never inherits remapped pen.
+                crate::chrome::clear_erase_mode();
+                c
+            }
             Err(e) => {
                 eprintln!("notebook_open_failed notebook={notebook_id} detail={e}");
                 x.ui.show_error("This notebook couldn't be opened.");
@@ -4021,7 +4026,7 @@ fn execute_ui_command(
             Ok(())
         }
         UiCommand::GoHome => {
-            crate::chrome::set_erase_mode(false);
+            crate::chrome::clear_erase_mode();
             if x.ui.view == AppView::Sync {
                 crate::server_link::with_global(|l| {
                     l.send(crate::server_link::LinkCmd::LeaveSyncScreen)
@@ -4137,6 +4142,8 @@ fn execute_ui_command(
                             commit.notebook_id
                         ),
                     }
+                    // Durable create left the prior notebook; clear before present/bind.
+                    crate::chrome::clear_erase_mode();
                     x.ui.enter_notebook();
                     install_active_notebook(x, ctrl).map_err(|e| {
                         format!("FATAL: notebook create committed but open failed: {e}")
@@ -4169,6 +4176,8 @@ fn execute_ui_command(
                         commit.manifest_persist_us,
                         x.library.active_notebook_id()
                     );
+                    // Durable create left the prior notebook; clear before present/bind.
+                    crate::chrome::clear_erase_mode();
                     x.ui.enter_notebook();
                     install_active_notebook(x, ctrl).map_err(|e| {
                         format!("FATAL: notebook create committed but open failed: {e}")
@@ -4251,6 +4260,8 @@ fn execute_ui_command(
                         commit.manifest_persist_us
                     );
                     let total = x.library.manifest().notebook_ids.len();
+                    // Successful delete enters Home without GoHome; clear Erase mode here.
+                    crate::chrome::clear_erase_mode();
                     x.ui.enter_home(active_notebook_index(x.library), total);
                     present_ui(x, ctrl, None).map_err(|e| {
                         format!("FATAL: notebook delete committed but Home redraw failed: {e}")
