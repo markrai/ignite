@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.24] - 2026-11-09
+
+### Added
+
+- On-screen Erase mode toggle in the Kindle notebook chrome: an ERASE
+  button between the title and UNDO switches the pen tip to the eraser
+  without needing the hardware eraser. The button inverts while the mode
+  is on and repaints only the chrome band. The mode is transient (never
+  persisted); a pen Down starts an eraser gesture while on, and UI taps
+  still use the real tool so the pen can operate chrome. Page navigation
+  keeps the mode; leaving the notebook (GoHome, durable cross-notebook
+  switch, create, or delete) clears it, while failed transitions keep it.
+
 ## [0.9.23] - 2026-11-08
 
 ### Added
