@@ -85,6 +85,47 @@ issues, include:
 - Firmware string (e.g. 5.18.6)
 - Panel polarity / grayscale notes if ink looks inverted
 
+## Inverted ink / wrong panel polarity
+
+**Symptom:** The whole UI and handwriting appear white-on-dark (or otherwise
+inverted) even though Diagnose reports a supported `grayscale` value.
+
+**Meaning:** Some firmware builds report a grayscale mode whose automatic
+polarity choice does not match the panel. Ignite normally picks polarity from
+the framebuffer `grayscale` field at open time.
+
+**Optional override (advanced):** Create a one-line text file on the device:
+
+```text
+/mnt/us/scribe-app/fb-polarity
+```
+
+Accepted contents (surrounding whitespace ignored; file must be ≤128 bytes):
+
+- `identity` — never complement logical pixels
+- `complement` — always complement logical pixels
+
+Anything else (missing file, unreadable, oversized, invalid UTF-8, or an
+unrecognized value) keeps the automatic `grayscale`-based decision. The file is
+read only when the framebuffer is opened; restart Ignite after changing it.
+
+**Enable (SSH example):**
+
+```sh
+echo identity >/mnt/us/scribe-app/fb-polarity
+```
+
+Use `complement` instead if the panel needs forced inversion.
+
+**Remove the override** (return to automatic polarity):
+
+```sh
+rm -f /mnt/us/scribe-app/fb-polarity
+```
+
+Then relaunch Ignite. Do not leave this file in place unless you need it; stock
+installs do not ship it.
+
 ## Safe uninstall
 
 **Uninstall Ignite** removes application files and Library registration.

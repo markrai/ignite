@@ -250,9 +250,10 @@ impl MappedFramebuffer {
             logical: vec![0xFF; map_len],
             complement: resolve_complement(
                 var.grayscale,
-                std::fs::read_to_string(POLARITY_OVERRIDE_PATH)
-                    .ok()
-                    .as_deref(),
+                crate::fb_polarity::load_override_text(std::path::Path::new(
+                    POLARITY_OVERRIDE_PATH,
+                ))
+                .as_deref(),
             ),
             last_flush: None,
             last_send: None,
