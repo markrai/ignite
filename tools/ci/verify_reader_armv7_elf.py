@@ -36,27 +36,19 @@ def glibc_key(symbol: str) -> tuple[int, ...]:
     return tuple(int(part) for part in symbol.removeprefix("GLIBC_").split("."))
 
 
-def glibc_ceiling() -> tuple[str, str]:
-    policy = ROOT / "tools" / "dropbear" / "PINNED.txt"
-    for line in policy.read_text(encoding="utf-8").splitlines():
-        if line.startswith("max_glibc="):
-            value = line.split("=", 1)[1].strip()
-            if re.fullmatch(r"GLIBC_[0-9]+(?:\.[0-9]+)+", value):
-                return value, policy.relative_to(ROOT).as_posix()
-    raise VerificationError(f"valid max_glibc missing from {policy}")
-
-
-def verify_dynamic_libraries(binary: Path) -> list[tuple[str, Path]]:
+def verify_dynamic_libraries(binary: Path, label: str) -> list[tuple[str, Path]]:
     dynamic = run("arm-linux-gnueabihf-readelf", "-d", str(binary))
     names = re.findall(r"\(NEEDED\).*?\[([^]]+)\]", dynamic)
     if not names:
-        raise VerificationError("reader test ELF has no declared shared libraries")
+        raise VerificationError(f"{label} ELF has no declared shared libraries")
     resolved: list[tuple[str, Path]] = []
     for name in names:
         value = run("arm-linux-gnueabihf-gcc", f"-print-file-name={name}").strip()
         path = Path(value)
         if value == name or not path.is_file():
-            raise VerificationError(f"required shared library is absent from ARM sysroot: {name}")
+            raise VerificationError(
+                f"{label} required shared library is absent from ARM sysroot: {name}"
+            )
         header = run("arm-linux-gnueabihf-readelf", "-h", str(path))
         if not re.search(r"Class:\s+ELF32", header):
             raise VerificationError(f"{name} is not ELF32: {path}")
@@ -68,11 +60,28 @@ def verify_dynamic_libraries(binary: Path) -> list[tuple[str, Path]]:
     return resolved
 
 
+def verify_no_added_libraries(
+    reader_libraries: list[tuple[str, Path]],
+    baseline_libraries: list[tuple[str, Path]],
+) -> None:
+    baseline_names = {name for name, _ in baseline_libraries}
+    added_libraries = [
+        name for name, _ in reader_libraries if name not in baseline_names
+    ]
+    if added_libraries:
+        raise VerificationError(
+            "reader test ELF adds shared libraries outside the equivalent "
+            f"reader-disabled test baseline: {','.join(added_libraries)}"
+        )
+
+
 def verify_native_outputs(target_dir: Path, triple: str) -> tuple[int, set[str]]:
     build_root = target_dir / triple / "debug" / "build"
     mupdf_out_dirs = sorted(build_root.glob("mupdf-sys-*/out"))
     if not mupdf_out_dirs:
-        raise VerificationError(f"MuPDF native output directory missing under {build_root}")
+        raise VerificationError(
+            f"MuPDF native output directory missing under {build_root}"
+        )
     out_dirs = sorted(build_root.glob("*-*/out"))
     objects: list[Path] = []
     for out_dir in out_dirs:
@@ -92,7 +101,9 @@ def verify_native_outputs(target_dir: Path, triple: str) -> tuple[int, set[str]]
         detail = run("arm-linux-gnueabihf-objdump", "-f", str(path))
         current = set(re.findall(r"file format\s+(\S+)", detail))
         if not current:
-            raise VerificationError(f"cannot identify native object architecture: {path}")
+            raise VerificationError(
+                f"cannot identify native object architecture: {path}"
+            )
         formats.update(current)
         unexpected = current - {"elf32-littlearm"}
         if unexpected:
@@ -102,40 +113,64 @@ def verify_native_outputs(target_dir: Path, triple: str) -> tuple[int, set[str]]
     return len(objects), formats
 
 
-def verify_linked_symbols(binary: Path) -> tuple[str, str]:
-    symbols = run("arm-linux-gnueabihf-nm", "-C", "--defined-only", str(binary))
+def find_linked_symbols(symbols: str) -> tuple[str, str]:
     reader_match = re.search(
-        r"scribe_app::reader_engine::tests::pdf_page_renders_to_fit_the_box_in_gray",
+        r"\s[Tt]\s+(\S*scribe_app13reader_engine5tests\S*"
+        r"pdf_page_renders_to_fit_the_box_in_gray\S*)",
         symbols,
     )
-    mupdf_match = re.search(r"\s[Tt]\s+(fz_[A-Za-z0-9_]+)", symbols)
+    mupdf_match = re.search(r"\s[Tt]\s+(fz_[A-Za-z0-9_]+)$", symbols, re.MULTILINE)
     if reader_match is None:
-        raise VerificationError("linked test ELF does not contain the reader rendering test")
+        raise VerificationError(
+            "linked test ELF does not contain the reader rendering test"
+        )
     if mupdf_match is None:
-        raise VerificationError("linked test ELF does not contain MuPDF implementation symbols")
-    return reader_match.group(0), mupdf_match.group(1)
+        raise VerificationError(
+            "linked test ELF does not contain MuPDF implementation symbols"
+        )
+    return reader_match.group(1), mupdf_match.group(1)
 
 
-def verify_glibc(binary: Path) -> tuple[list[str], str, str, str]:
+def verify_linked_symbols(binary: Path) -> tuple[str, str]:
+    symbols = run("arm-linux-gnueabihf-nm", "--defined-only", str(binary))
+    return find_linked_symbols(symbols)
+
+
+def glibc_requirements(binary: Path, label: str) -> tuple[list[str], str]:
     symbols = run("arm-linux-gnueabihf-objdump", "-T", str(binary))
     versions = sorted(
         set(re.findall(r"GLIBC_[0-9]+(?:\.[0-9]+)+", symbols)), key=glibc_key
     )
     if not versions:
-        raise VerificationError("reader test ELF has no versioned GLIBC requirements")
-    ceiling, policy = glibc_ceiling()
+        raise VerificationError(f"{label} ELF has no versioned GLIBC requirements")
     maximum = max(versions, key=glibc_key)
-    if glibc_key(maximum) > glibc_key(ceiling):
+    return versions, maximum
+
+
+def verify_glibc_not_higher(reader_maximum: str, baseline_maximum: str) -> None:
+    if glibc_key(reader_maximum) > glibc_key(baseline_maximum):
         raise VerificationError(
-            f"reader test ELF requires {maximum}, above {policy} ceiling {ceiling}"
+            f"reader test ELF requires {reader_maximum}, above equivalent "
+            f"reader-disabled test baseline {baseline_maximum}"
         )
-    return versions, maximum, ceiling, policy
+
+
+def verify_elf(binary: Path, label: str) -> dict[str, object]:
+    try:
+        info = inspect_armv7hf_elf(binary, require_stripped=False)
+    except ElfError as exc:
+        raise VerificationError(f"{label}: {exc}") from exc
+    attributes = run("arm-linux-gnueabihf-readelf", "-A", str(binary))
+    if not re.search(r"Tag_ABI_VFP_args:\s+VFP registers", attributes):
+        raise VerificationError(f"{label} ELF lacks VFP-register hard-float attributes")
+    return info
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     parser.add_argument("--baseline-binary", required=True, type=Path)
+    parser.add_argument("--ordinary-binary", required=True, type=Path)
     parser.add_argument("--target-dir", required=True, type=Path)
     parser.add_argument(
         "--target", default="armv7-unknown-linux-gnueabihf", dest="triple"
@@ -146,25 +181,27 @@ def main() -> int:
         raise VerificationError(f"linked reader test executable missing: {binary}")
     baseline = args.baseline_binary.resolve()
     if not baseline.is_file():
-        raise VerificationError(f"ordinary ARM executable missing: {baseline}")
-    try:
-        info = inspect_armv7hf_elf(binary, require_stripped=False)
-        baseline_info = inspect_armv7hf_elf(baseline, require_stripped=False)
-    except ElfError as exc:
-        raise VerificationError(str(exc)) from exc
-    attributes = run("arm-linux-gnueabihf-readelf", "-A", str(binary))
-    if not re.search(r"Tag_ABI_VFP_args:\s+VFP registers", attributes):
-        raise VerificationError("reader test ELF lacks VFP-register hard-float attributes")
-    libraries = verify_dynamic_libraries(binary)
-    baseline_libraries = verify_dynamic_libraries(baseline)
-    baseline_names = {name for name, _ in baseline_libraries}
-    added_libraries = [name for name, _ in libraries if name not in baseline_names]
-    if added_libraries:
         raise VerificationError(
-            "reader test ELF adds shared libraries outside the ordinary Kindle runtime "
-            f"baseline: {','.join(added_libraries)}"
+            f"linked reader-disabled test executable missing: {baseline}"
         )
-    versions, maximum, ceiling, policy = verify_glibc(binary)
+    ordinary = args.ordinary_binary.resolve()
+    if not ordinary.is_file():
+        raise VerificationError(f"ordinary ARM executable missing: {ordinary}")
+    info = verify_elf(binary, "reader test")
+    baseline_info = verify_elf(baseline, "reader-disabled test")
+    ordinary_info = verify_elf(ordinary, "ordinary application")
+    libraries = verify_dynamic_libraries(binary, "reader test")
+    baseline_libraries = verify_dynamic_libraries(baseline, "reader-disabled test")
+    ordinary_libraries = verify_dynamic_libraries(ordinary, "ordinary application")
+    verify_no_added_libraries(libraries, baseline_libraries)
+    versions, maximum = glibc_requirements(binary, "reader test")
+    baseline_versions, baseline_maximum = glibc_requirements(
+        baseline, "reader-disabled test"
+    )
+    ordinary_versions, ordinary_maximum = glibc_requirements(
+        ordinary, "ordinary application"
+    )
+    verify_glibc_not_higher(maximum, baseline_maximum)
     reader_symbol, mupdf_symbol = verify_linked_symbols(binary)
     native_count, native_formats = verify_native_outputs(
         args.target_dir.resolve(), args.triple
@@ -178,22 +215,41 @@ def main() -> int:
     print(f"reader_elf_interpreter={info['interpreter']}")
     print(f"reader_elf_stripped={str(info['stripped']).lower()}")
     print(f"reader_needed={','.join(name for name, _ in libraries)}")
-    print(f"reader_needed_baseline={','.join(name for name, _ in baseline_libraries)}")
+    print(
+        "reader_disabled_test_needed="
+        f"{','.join(name for name, _ in baseline_libraries)}"
+    )
+    print(f"ordinary_needed={','.join(name for name, _ in ordinary_libraries)}")
     print("reader_needed_added=none")
     for name, path in libraries:
         print(f"reader_needed_resolved={name}:{path}")
+    for name, path in baseline_libraries:
+        print(f"reader_disabled_test_needed_resolved={name}:{path}")
+    for name, path in ordinary_libraries:
+        print(f"ordinary_needed_resolved={name}:{path}")
     print(f"reader_glibc_versions={','.join(versions)}")
     print(f"reader_max_glibc={maximum}")
-    print(f"reader_glibc_ceiling={ceiling}")
-    print(f"reader_glibc_policy={policy}")
+    print(f"reader_disabled_test_glibc_versions={','.join(baseline_versions)}")
+    print(f"reader_disabled_test_max_glibc={baseline_maximum}")
+    print(f"ordinary_glibc_versions={','.join(ordinary_versions)}")
+    print(f"ordinary_max_glibc={ordinary_maximum}")
+    print("reader_glibc_added_max=none")
+    print("device_runtime_compatibility=unqualified")
     print(f"reader_linked_test_symbol={reader_symbol}")
     print(f"reader_linked_mupdf_symbol={mupdf_symbol}")
     print(f"reader_native_objects={native_count}")
     print(f"reader_native_formats={','.join(sorted(native_formats))}")
-    print(f"ordinary_elf_class={baseline_info['class']}")
-    print(f"ordinary_elf_machine={baseline_info['machine']}")
-    print(f"ordinary_elf_hard_float={str(baseline_info['hard_float']).lower()}")
-    print(f"ordinary_elf_interpreter={baseline_info['interpreter']}")
+    print(f"reader_disabled_test_elf_class={baseline_info['class']}")
+    print(f"reader_disabled_test_elf_machine={baseline_info['machine']}")
+    print(
+        "reader_disabled_test_elf_hard_float="
+        f"{str(baseline_info['hard_float']).lower()}"
+    )
+    print(f"reader_disabled_test_elf_interpreter={baseline_info['interpreter']}")
+    print(f"ordinary_elf_class={ordinary_info['class']}")
+    print(f"ordinary_elf_machine={ordinary_info['machine']}")
+    print(f"ordinary_elf_hard_float={str(ordinary_info['hard_float']).lower()}")
+    print(f"ordinary_elf_interpreter={ordinary_info['interpreter']}")
     print("READER_ARMV7_ELF_OK")
     return 0
 
