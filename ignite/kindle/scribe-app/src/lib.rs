@@ -71,6 +71,8 @@ pub mod pressure_curve;
 pub mod profile;
 pub mod publication_evidence;
 pub mod publication_trust_boundary;
+#[cfg(feature = "reader")]
+pub mod reader_engine;
 pub mod release_acquisition;
 pub mod release_manifest;
 pub mod render;

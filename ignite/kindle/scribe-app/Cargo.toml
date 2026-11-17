@@ -30,6 +30,10 @@ kindle_supervisor_harness = []
 # (tools/docker_build_armv7hf.sh). Builds without it hide the action; startup recovery of an
 # interrupted adoption is always built in.
 restore_from_server = []
+# Experimental book reader engine (MuPDF: PDF, EPUB, CBZ). Off by default: ordinary, release and
+# Scriptlet builds neither compile nor link MuPDF or its bundled C libraries. Build plumbing and
+# validation only for now (`reader_engine`), with no UI. See docs/reader-engine.md.
+reader = ["dep:mupdf"]
 
 [dependencies]
 notebook-core = { workspace = true, features = ["mint"] }
@@ -52,6 +56,8 @@ fontdue = { version = "0.9", default-features = false }
 ed25519-dalek = { version = "2.2", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 updater-transaction-lock = { workspace = true }
+# Only with `--features reader`. Bundles MuPDF 1.27.2 (AGPL-3.0) and builds it from source.
+mupdf = { version = "=0.8.0", optional = true, default-features = false, features = ["epub", "html", "img", "svg", "cbz", "base14-fonts"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
