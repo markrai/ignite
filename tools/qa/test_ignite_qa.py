@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import struct
 import sys
@@ -28,8 +29,17 @@ from ignite_qa import _preserve_evidence, _run_stamp  # noqa: E402
 from preflight import evaluate_isolation, parse_preflight_kv, run_preflight  # noqa: E402
 from qualify import GROUPS, Qualify  # noqa: E402
 
+_READER_VALIDATOR_PATH = _QA.parent / "ci" / "verify_reader_armv7_elf.py"
+_READER_VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "reader_armv7_validator", _READER_VALIDATOR_PATH
+)
+if _READER_VALIDATOR_SPEC is None or _READER_VALIDATOR_SPEC.loader is None:
+    raise RuntimeError(f"cannot load {_READER_VALIDATOR_PATH}")
+_READER_VALIDATOR = importlib.util.module_from_spec(_READER_VALIDATOR_SPEC)
+_READER_VALIDATOR_SPEC.loader.exec_module(_READER_VALIDATOR)
 
-def _fake_arm_elf(path: Path) -> None:
+
+def _fake_arm_elf(path: Path, *, symtab: bool = False) -> None:
     interp = b"/lib/ld-linux-armhf.so.3\x00"
     ehdr = bytearray(52)
     ehdr[0:4] = b"\x7fELF"
@@ -44,11 +54,18 @@ def _fake_arm_elf(path: Path) -> None:
     struct.pack_into("<H", ehdr, 40, 52)
     struct.pack_into("<H", ehdr, 42, 32)
     struct.pack_into("<H", ehdr, 44, 1)
+    section = b""
+    if symtab:
+        section = bytearray(40)
+        struct.pack_into("<I", section, 4, 2)
+        struct.pack_into("<I", ehdr, 32, 52 + 32 + len(interp))
+        struct.pack_into("<H", ehdr, 46, 40)
+        struct.pack_into("<H", ehdr, 48, 1)
     phdr = bytearray(32)
     struct.pack_into("<I", phdr, 0, 3)
     struct.pack_into("<I", phdr, 4, 52 + 32)
     struct.pack_into("<I", phdr, 16, len(interp))
-    path.write_bytes(bytes(ehdr) + bytes(phdr) + interp)
+    path.write_bytes(bytes(ehdr) + bytes(phdr) + interp + bytes(section))
 
 
 class ElfTests(unittest.TestCase):
@@ -68,6 +85,57 @@ class ElfTests(unittest.TestCase):
             path.write_bytes(b"not-elf")
             with self.assertRaises(ElfError):
                 inspect_armv7hf_elf(path)
+
+    def test_can_inspect_unstripped_validation_harness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scribe-app-test"
+            _fake_arm_elf(path, symtab=True)
+            with self.assertRaises(ElfError):
+                inspect_armv7hf_elf(path)
+            info = inspect_armv7hf_elf(path, require_stripped=False)
+            self.assertFalse(info["stripped"])
+
+
+class ReaderArmv7ValidatorTests(unittest.TestCase):
+    def test_accepts_matching_test_harness_libraries(self) -> None:
+        libraries = [
+            ("libgcc_s.so.1", Path("/arm/libgcc_s.so.1")),
+            ("libm.so.6", Path("/arm/libm.so.6")),
+            ("libc.so.6", Path("/arm/libc.so.6")),
+        ]
+        _READER_VALIDATOR.verify_no_added_libraries(libraries, libraries.copy())
+
+    def test_rejects_reader_only_shared_library(self) -> None:
+        reader = [
+            ("libc.so.6", Path("/arm/libc.so.6")),
+            ("libunexpected.so.1", Path("/arm/libunexpected.so.1")),
+        ]
+        baseline = [("libc.so.6", Path("/arm/libc.so.6"))]
+        with self.assertRaisesRegex(
+            _READER_VALIDATOR.VerificationError, "libunexpected.so.1"
+        ):
+            _READER_VALIDATOR.verify_no_added_libraries(reader, baseline)
+
+    def test_accepts_equal_glibc_requirement(self) -> None:
+        _READER_VALIDATOR.verify_glibc_not_higher("GLIBC_2.30", "GLIBC_2.30")
+
+    def test_rejects_higher_reader_glibc_requirement(self) -> None:
+        with self.assertRaisesRegex(
+            _READER_VALIDATOR.VerificationError,
+            "GLIBC_2.31.*reader-disabled test baseline GLIBC_2.30",
+        ):
+            _READER_VALIDATOR.verify_glibc_not_higher("GLIBC_2.31", "GLIBC_2.30")
+
+    def test_finds_rust_v0_reader_and_mupdf_symbols(self) -> None:
+        reader = (
+            "00fcb510 t _RNvNtNtC123_10scribe_app13reader_engine5testss_39"
+            "pdf_page_renders_to_fit_the_box_in_gray\n"
+        )
+        reader_symbol, mupdf_symbol = _READER_VALIDATOR.find_linked_symbols(
+            reader + "017188c1 t fz_abs\n"
+        )
+        self.assertIn("pdf_page_renders_to_fit_the_box_in_gray", reader_symbol)
+        self.assertEqual(mupdf_symbol, "fz_abs")
 
 
 class IsolationTests(unittest.TestCase):
@@ -227,7 +295,11 @@ def _green_preflight() -> dict:
         "status": STATUS_PASS,
         "data_compatibility": "ok",
         "qualify_tree_fingerprint": "fp1",
-        "artifact_match": {"status": STATUS_PASS, "qualified": "deadbeef", "installed": "deadbeef"},
+        "artifact_match": {
+            "status": STATUS_PASS,
+            "qualified": "deadbeef",
+            "installed": "deadbeef",
+        },
     }
 
 
@@ -260,7 +332,9 @@ class FabricatedEvidenceTests(unittest.TestCase):
             report=_green_report(), preflight=pf, physical_pass=_green_physical()
         )
         self.assertEqual(states["RELEASE_CANDIDATE"]["status"], STATUS_BLOCKED)
-        self.assertIn("data_compatibility=unknown", states["RELEASE_CANDIDATE"]["reason"])
+        self.assertIn(
+            "data_compatibility=unknown", states["RELEASE_CANDIDATE"]["reason"]
+        )
 
     def test_missing_data_compatibility_cannot_be_release_candidate(self) -> None:
         pf = _green_preflight()
@@ -269,7 +343,9 @@ class FabricatedEvidenceTests(unittest.TestCase):
             report=_green_report(), preflight=pf, physical_pass=_green_physical()
         )
         self.assertEqual(states["RELEASE_CANDIDATE"]["status"], STATUS_BLOCKED)
-        self.assertIn("data_compatibility=missing", states["RELEASE_CANDIDATE"]["reason"])
+        self.assertIn(
+            "data_compatibility=missing", states["RELEASE_CANDIDATE"]["reason"]
+        )
 
     def test_preflight_fingerprint_mismatch_cannot_be_release_candidate(self) -> None:
         pf = _green_preflight()
@@ -278,7 +354,10 @@ class FabricatedEvidenceTests(unittest.TestCase):
             report=_green_report(), preflight=pf, physical_pass=_green_physical()
         )
         self.assertEqual(states["RELEASE_CANDIDATE"]["status"], STATUS_BLOCKED)
-        self.assertIn("preflight qualify_tree_fingerprint mismatch", states["RELEASE_CANDIDATE"]["reason"])
+        self.assertIn(
+            "preflight qualify_tree_fingerprint mismatch",
+            states["RELEASE_CANDIDATE"]["reason"],
+        )
 
     def test_fabricated_physical_pass_without_sha_is_blocked(self) -> None:
         states = evaluate_states(
@@ -306,7 +385,9 @@ class FabricatedEvidenceTests(unittest.TestCase):
             report=_green_report(), preflight=pf, physical_pass=_green_physical()
         )
         self.assertEqual(states["RELEASE_CANDIDATE"]["status"], STATUS_BLOCKED)
-        self.assertIn("data_compatibility=incompatible", states["RELEASE_CANDIDATE"]["reason"])
+        self.assertIn(
+            "data_compatibility=incompatible", states["RELEASE_CANDIDATE"]["reason"]
+        )
 
     def test_preflight_artifact_mismatch_cannot_be_release_candidate(self) -> None:
         pf = _green_preflight()
@@ -393,15 +474,24 @@ class QualifySelectionTests(unittest.TestCase):
             self.assertEqual(report["groups"]["armv7"]["status"], STATUS_NOT_RUN)
             self.assertEqual(report["overall"], STATUS_PASS)
             self.assertEqual(report["exit_code"], 0)
-            self.assertTrue(any("check_version_sync.py" in " ".join(map(str, c)) for c in calls))
-            vs = next(c for c in report["groups"]["identity"]["checks"] if c["name"] == "version-sync")
+            self.assertTrue(
+                any("check_version_sync.py" in " ".join(map(str, c)) for c in calls)
+            )
+            vs = next(
+                c
+                for c in report["groups"]["identity"]["checks"]
+                if c["name"] == "version-sync"
+            )
             self.assertIn("argv", vs["run"])
             self.assertTrue(report["source"].get("tree_fingerprint"))
-            self.assertEqual(report["states"]["RELEASE_CANDIDATE"]["status"], STATUS_BLOCKED)
+            self.assertEqual(
+                report["states"]["RELEASE_CANDIDATE"]["status"], STATUS_BLOCKED
+            )
 
     def test_failed_selected_group_is_fail_not_pass(self) -> None:
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as tmp:
+
             def runner(argv, cwd, env, timeout):
                 return {
                     "argv": argv,
@@ -417,7 +507,10 @@ class QualifySelectionTests(unittest.TestCase):
                 "wsl_available": True,
                 "linux_rust_available": True,
                 "wasm32_available": False,
-                "tools": {"cargo": {"available": True, "how": "wsl"}, "docker": {"available": False}},
+                "tools": {
+                    "cargo": {"available": True, "how": "wsl"},
+                    "docker": {"available": False},
+                },
             }
             report = Qualify(
                 root,
@@ -429,7 +522,9 @@ class QualifySelectionTests(unittest.TestCase):
             self.assertEqual(report["groups"]["rust"]["status"], STATUS_FAIL)
             self.assertEqual(report["exit_code"], 1)
             ws = next(
-                c for c in report["groups"]["rust"]["checks"] if c["name"] == "cargo-test-workspace"
+                c
+                for c in report["groups"]["rust"]["checks"]
+                if c["name"] == "cargo-test-workspace"
             )
             self.assertEqual(ws["run"]["exit_code"], 1)
             self.assertTrue(ws["run"]["argv"])
@@ -439,10 +534,14 @@ class QualifySelectionTests(unittest.TestCase):
             out_dir = Path(tmp)
             first = out_dir / _run_stamp()
             first.mkdir()
-            _preserve_evidence(out_dir, "qualify", {"overall": "FAIL", "n": 1}, "first\n", first)
+            _preserve_evidence(
+                out_dir, "qualify", {"overall": "FAIL", "n": 1}, "first\n", first
+            )
             second = out_dir / (_run_stamp() + "-b")
             second.mkdir()
-            _preserve_evidence(out_dir, "qualify", {"overall": "PASS", "n": 2}, "second\n", second)
+            _preserve_evidence(
+                out_dir, "qualify", {"overall": "PASS", "n": 2}, "second\n", second
+            )
             self.assertEqual(json.loads((first / "qualify.json").read_text())["n"], 1)
             self.assertEqual(json.loads((out_dir / "qualify.json").read_text())["n"], 2)
 
@@ -453,13 +552,18 @@ class QualifySelectionTests(unittest.TestCase):
                 "wsl_available": False,
                 "linux_rust_available": False,
                 "wasm32_available": False,
-                "tools": {"cargo": {"available": True, "how": "native"}, "docker": {"available": False}},
+                "tools": {
+                    "cargo": {"available": True, "how": "native"},
+                    "docker": {"available": False},
+                },
             }
             report = Qualify(
                 root,
                 out_dir=Path(tmp),
                 groups=("rust",),
-                runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not invoke cargo")),
+                runner=lambda *a, **k: (_ for _ in ()).throw(
+                    AssertionError("must not invoke cargo")
+                ),
                 skip_env_probe=env,
             ).run()
             self.assertEqual(report["groups"]["rust"]["status"], STATUS_NOT_RUN)
@@ -513,7 +617,9 @@ preflight_exec_scribe_app=no
     def test_unreachable_kindle_is_not_run_not_pass(self) -> None:
         report = run_preflight(
             ssh_host="kindle",
-            run_script=lambda _script: (_ for _ in ()).throw(OSError("connection timed out")),
+            run_script=lambda _script: (_ for _ in ()).throw(
+                OSError("connection timed out")
+            ),
         )
         self.assertEqual(report["overall"], STATUS_NOT_RUN)
         self.assertEqual(report["exit_code"], 2)

@@ -71,25 +71,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: armv7-unknown-linux-gnueabihf
-      - name: Install MuPDF build tools (clang for bindgen, ARM cross toolchain)
-        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang libclang-dev make gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+      - name: Install MuPDF host build tools
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang libclang-dev make
       - uses: Swatinem/rust-cache@v2
         with:
-          key: reader
+          key: reader-host
       - name: Ordinary and release builds do not include MuPDF
         run: bash tools/ci/check_reader_isolation.sh
       - name: Reader engine tests (host)
         run: cargo test -p scribe-app --lib --locked --features reader reader_engine
-      - name: Reader engine compile check (Kindle target)
-        # MuPDF's Makefile embeds fonts with `$(LD) -r -b binary` and archives with `$(AR)`, so
-        # both must be the ARM binutils; bindgen needs the ARM sysroot for libc headers.
-        env:
-          LD: arm-linux-gnueabihf-ld
-          AR: arm-linux-gnueabihf-ar
-          BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf: --sysroot=/usr/arm-linux-gnueabihf
-        run: cargo check -p scribe-app --locked --target armv7-unknown-linux-gnueabihf --features scribe-app/restore_from_server,scribe-app/reader
+      - name: Reader engine linked ARMv7 validation (pinned Kindle toolchain)
+        run: |
+          set -euo pipefail
+          image="$(sed -n 's/^rust_armv7hf=//p' tools/pinned-docker-images.txt | tr -d '\r')"
+          case "$image" in
+            *@sha256:*) ;;
+            *) echo "rust_armv7hf image is not digest-pinned" >&2; exit 1 ;;
+          esac
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            "$image" \
+            bash /src/tools/ci/validate_reader_armv7.sh
 
   version-sync:
     name: Version file synchronization

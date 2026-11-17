@@ -58,12 +58,12 @@ impl Book {
     /// Lays out a reflowable document for a page of `width` x `height` points with a font size
     /// of `em` points. Fixed-layout documents ignore it.
     pub fn layout(&mut self, width: f32, height: f32, em: f32) -> Result<(), ReaderError> {
+        validate_layout(width, height, em)?;
         Ok(self.doc.layout(width, height, em)?)
     }
 
     pub fn page_count(&self) -> Result<u32, ReaderError> {
-        let n = self.doc.page_count()?;
-        Ok(u32::try_from(n).unwrap_or(0))
+        page_count_from_mupdf(self.doc.page_count()?)
     }
 
     /// Renders page `index` (0-based) as large as fits in `box_w` x `box_h` pixels, keeping its
@@ -81,10 +81,13 @@ impl Book {
         let page = self.doc.load_page(index)?;
         let b = page.bounds()?;
         let (pw, ph) = (b.x1 - b.x0, b.y1 - b.y0);
-        if !(pw > 0.0 && ph > 0.0) {
-            return Err(ReaderError("page has an empty size".into()));
+        if !(pw.is_finite() && ph.is_finite() && pw > 0.0 && ph > 0.0) {
+            return Err(ReaderError("page has an invalid size".into()));
         }
         let zoom = (box_w as f32 / pw).min(box_h as f32 / ph);
+        if !(zoom.is_finite() && zoom > 0.0) {
+            return Err(ReaderError("page has an invalid scale".into()));
+        }
         let pix = page.to_pixmap(
             &Matrix::new_scale(zoom, zoom),
             &Colorspace::device_gray(),
@@ -94,20 +97,92 @@ impl Book {
 
         // Rounding can make the pixmap one pixel larger than the box; never exceed it.
         let (w, h) = (pix.width().min(box_w), pix.height().min(box_h));
-        let n = pix.n() as usize;
-        let stride = pix.stride() as usize;
-        let samples = pix.samples();
-        let mut pixels = Vec::with_capacity(w as usize * h as usize);
-        for y in 0..h as usize {
-            let row = &samples[y * stride..];
-            pixels.extend((0..w as usize).map(|x| row[x * n]));
+        if pix.alpha() {
+            return Err(ReaderError("gray pixmap unexpectedly has alpha".into()));
         }
+        let pixels = copy_gray_samples(w, h, pix.n(), pix.stride(), pix.samples())?;
         Ok(GrayPage {
             width: w,
             height: h,
             pixels,
         })
     }
+}
+
+fn validate_layout(width: f32, height: f32, em: f32) -> Result<(), ReaderError> {
+    if [width, height, em]
+        .into_iter()
+        .all(|value| value.is_finite() && value > 0.0)
+    {
+        Ok(())
+    } else {
+        Err(ReaderError(
+            "layout dimensions must be finite and positive".into(),
+        ))
+    }
+}
+
+fn page_count_from_mupdf(count: i32) -> Result<u32, ReaderError> {
+    u32::try_from(count).map_err(|_| ReaderError(format!("invalid page count: {count}")))
+}
+
+fn copy_gray_samples(
+    width: u32,
+    height: u32,
+    components: u8,
+    stride: isize,
+    samples: &[u8],
+) -> Result<Vec<u8>, ReaderError> {
+    if width == 0 || height == 0 {
+        return Err(ReaderError("MuPDF returned an empty pixmap".into()));
+    }
+    if components != 1 {
+        return Err(ReaderError(format!(
+            "gray pixmap has {components} components"
+        )));
+    }
+    let width = usize::try_from(width)
+        .map_err(|_| ReaderError("pixmap width cannot be represented".into()))?;
+    let height = usize::try_from(height)
+        .map_err(|_| ReaderError("pixmap height cannot be represented".into()))?;
+    let stride = usize::try_from(stride)
+        .map_err(|_| ReaderError("pixmap stride cannot be represented".into()))?;
+    if stride < width {
+        return Err(ReaderError("pixmap stride is shorter than a row".into()));
+    }
+    let (pixel_count, required) = gray_buffer_layout(width, height, stride)?;
+    if samples.len() < required {
+        return Err(ReaderError(format!(
+            "pixmap sample buffer is too short: {} < {required}",
+            samples.len()
+        )));
+    }
+    let mut pixels = Vec::with_capacity(pixel_count);
+    for row in samples.chunks(stride).take(height) {
+        pixels.extend_from_slice(&row[..width]);
+    }
+    if pixels.len() != pixel_count {
+        return Err(ReaderError("pixmap row count is inconsistent".into()));
+    }
+    Ok(pixels)
+}
+
+fn gray_buffer_layout(
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> Result<(usize, usize), ReaderError> {
+    if width == 0 || height == 0 {
+        return Err(ReaderError("MuPDF returned an empty pixmap".into()));
+    }
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| ReaderError("pixmap dimensions overflow".into()))?;
+    let required = (height - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(width))
+        .ok_or_else(|| ReaderError("pixmap sample span overflows".into()))?;
+    Ok((pixel_count, required))
 }
 
 #[cfg(test)]
@@ -183,6 +258,34 @@ mod tests {
         let book = Book::open_bytes(&rectangle_pdf(), "application/pdf").unwrap();
         assert!(book.render_page_gray(0, 0, 100).is_err());
         assert!(book.render_page_gray(5, 100, 100).is_err());
+    }
+
+    #[test]
+    fn layout_rejects_nonfinite_and_nonpositive_dimensions() {
+        let mut book = Book::open_bytes(&long_html(), "text/html").unwrap();
+        assert!(book.layout(f32::NAN, 100.0, 10.0).is_err());
+        assert!(book.layout(100.0, f32::INFINITY, 10.0).is_err());
+        assert!(book.layout(100.0, 100.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn invalid_page_counts_are_errors() {
+        assert_eq!(page_count_from_mupdf(3).unwrap(), 3);
+        assert!(page_count_from_mupdf(-1).is_err());
+    }
+
+    #[test]
+    fn gray_sample_copy_validates_layout_and_buffer_size() {
+        assert_eq!(
+            copy_gray_samples(2, 2, 1, 3, &[1, 2, 9, 3, 4]).unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(copy_gray_samples(2, 2, 2, 4, &[0; 8]).is_err());
+        assert!(copy_gray_samples(2, 2, 1, -1, &[0; 4]).is_err());
+        assert!(copy_gray_samples(2, 2, 1, 1, &[0; 4]).is_err());
+        assert!(copy_gray_samples(2, 2, 1, 2, &[0; 3]).is_err());
+        assert!(gray_buffer_layout(usize::MAX, 2, usize::MAX).is_err());
+        assert!(gray_buffer_layout(1, 2, usize::MAX).is_err());
     }
 
     #[test]

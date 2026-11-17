@@ -33,8 +33,18 @@ do
   fi
 done
 
-# 4) With the feature it is (so check 3 is not vacuous).
-cargo tree -p scribe-app --locked -e normal --prefix none --features reader | grep -qE '^mupdf v' \
-  || fail "mupdf is missing from the graph even with --features reader"
+# 4) With the feature it and its native build crate are present, including for Kindle.
+for mode in host arm; do
+  if [ "$mode" = host ]; then
+    args=(--features reader)
+  else
+    args=(--target armv7-unknown-linux-gnueabihf --features "restore_from_server,reader")
+  fi
+  enabled="$(cargo tree -p scribe-app --locked -e normal,build --prefix none "${args[@]}")"
+  grep -qE '^mupdf v' <<<"$enabled" \
+    || fail "mupdf is missing from the graph with the reader feature ($mode)"
+  grep -qE '^mupdf-sys v' <<<"$enabled" \
+    || fail "mupdf-sys is missing from the graph with the reader feature ($mode)"
+done
 
 echo "reader isolation: ok"
