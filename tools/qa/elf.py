@@ -20,7 +20,7 @@ class ElfError(ValueError):
     pass
 
 
-def inspect_armv7hf_elf(path: Path) -> dict[str, Any]:
+def inspect_armv7hf_elf(path: Path, *, require_stripped: bool = True) -> dict[str, Any]:
     data = path.read_bytes()
     if len(data) < 52 or data[:4] != ELF_MAGIC:
         raise ElfError(f"{path.name}: not an ELF file")
@@ -60,7 +60,7 @@ def inspect_armv7hf_elf(path: Path) -> dict[str, Any]:
         if sh_type == SHT_SYMTAB:
             has_symtab = True
             break
-    if has_symtab:
+    if require_stripped and has_symtab:
         raise ElfError(f"{path.name}: refusing unstripped ELF (SHT_SYMTAB present)")
     return {
         "class": "ELF32",
@@ -69,6 +69,6 @@ def inspect_armv7hf_elf(path: Path) -> dict[str, Any]:
         "hard_float": True,
         "interpreter": interp,
         "flags": f"0x{e_flags:x}",
-        "stripped": True,
+        "stripped": not has_symtab,
         "bytes": len(data),
     }

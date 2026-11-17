@@ -29,7 +29,7 @@ from preflight import evaluate_isolation, parse_preflight_kv, run_preflight  # n
 from qualify import GROUPS, Qualify  # noqa: E402
 
 
-def _fake_arm_elf(path: Path) -> None:
+def _fake_arm_elf(path: Path, *, symtab: bool = False) -> None:
     interp = b"/lib/ld-linux-armhf.so.3\x00"
     ehdr = bytearray(52)
     ehdr[0:4] = b"\x7fELF"
@@ -44,11 +44,18 @@ def _fake_arm_elf(path: Path) -> None:
     struct.pack_into("<H", ehdr, 40, 52)
     struct.pack_into("<H", ehdr, 42, 32)
     struct.pack_into("<H", ehdr, 44, 1)
+    section = b""
+    if symtab:
+        section = bytearray(40)
+        struct.pack_into("<I", section, 4, 2)
+        struct.pack_into("<I", ehdr, 32, 52 + 32 + len(interp))
+        struct.pack_into("<H", ehdr, 46, 40)
+        struct.pack_into("<H", ehdr, 48, 1)
     phdr = bytearray(32)
     struct.pack_into("<I", phdr, 0, 3)
     struct.pack_into("<I", phdr, 4, 52 + 32)
     struct.pack_into("<I", phdr, 16, len(interp))
-    path.write_bytes(bytes(ehdr) + bytes(phdr) + interp)
+    path.write_bytes(bytes(ehdr) + bytes(phdr) + interp + bytes(section))
 
 
 class ElfTests(unittest.TestCase):
@@ -68,6 +75,15 @@ class ElfTests(unittest.TestCase):
             path.write_bytes(b"not-elf")
             with self.assertRaises(ElfError):
                 inspect_armv7hf_elf(path)
+
+    def test_can_inspect_unstripped_validation_harness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scribe-app-test"
+            _fake_arm_elf(path, symtab=True)
+            with self.assertRaises(ElfError):
+                inspect_armv7hf_elf(path)
+            info = inspect_armv7hf_elf(path, require_stripped=False)
+            self.assertFalse(info["stripped"])
 
 
 class IsolationTests(unittest.TestCase):

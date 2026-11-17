@@ -16,36 +16,94 @@ the engine, and no customer build contains it. Background and plan:
   separately from the release jobs:
   1. `tools/ci/check_reader_isolation.sh`: `reader` is not a default feature, no packaging or
      release script enables it, and without it `mupdf` is not in `scribe-app`'s dependency graph
-     (host, and Kindle target with the release features).
-  2. The `reader_engine` tests on the host.
-  3. `cargo check` for `armv7-unknown-linux-gnueabihf` with the feature on.
+     or ordinary ARM executable. The enabled graph must contain both `mupdf` and `mupdf-sys`.
+  2. The `reader_engine` tests execute MuPDF rendering and reflow on the Linux host.
+  3. `tools/ci/validate_reader_armv7.sh` links an ordinary ARM executable without MuPDF, then
+     links the feature-enabled `scribe-app` library test executable in the pinned Kindle Docker
+     image. The ARM executable is inspected but never run on the x86 host.
 
 Out of scope for now: book identity, reading positions, book folders, UI, packaging and notices
 in the release payload.
 
 ## Building
 
-Host (Linux):
+Host tests (Linux):
 
 ```sh
 sudo apt-get install clang libclang-dev make          # bindgen needs libclang
-cargo test -p scribe-app --lib --features reader reader_engine
+cargo test -p scribe-app --lib --locked --features reader reader_engine
 ```
 
-Kindle target (same cross toolchain as the `armv7-check` job, plus clang):
+Complete ARM link and compatibility validation from the repository root:
 
 ```sh
-sudo apt-get install clang libclang-dev make gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-LD=arm-linux-gnueabihf-ld AR=arm-linux-gnueabihf-ar \
-BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf=--sysroot=/usr/arm-linux-gnueabihf \
-cargo build -p scribe-app --release --target armv7-unknown-linux-gnueabihf \
-  --features scribe-app/restore_from_server,scribe-app/reader
+image="$(sed -n 's/^rust_armv7hf=//p' tools/pinned-docker-images.txt | tr -d '\r')"
+case "$image" in *@sha256:*) ;; *) exit 1 ;; esac
+docker run --rm -v "$PWD:/src" -w /src "$image" \
+  bash /src/tools/ci/validate_reader_armv7.sh
 ```
 
-MuPDF's Makefile embeds its fonts with `$(LD) -r -b binary` and archives with `$(AR)`. Without
-the ARM `LD` and `AR` the host tools produce x86 objects and the link fails.
+For a one-shot local run that also executes the Linux host rendering tests inside the disposable
+container, add `-e IGNITE_READER_RUN_HOST_TESTS=1` before the volume argument. CI keeps the host
+tests as a separate step and uses the script for ARM linking and inspection.
 
-The first build compiles MuPDF and its bundled libraries (a few minutes); later builds reuse it.
+The script installs its build-only dependencies inside the disposable pinned Bullseye container:
+Clang/libclang for bindgen, `make`, Python 3, and Debian's ARM GNU hard-float GCC, G++, binutils,
+and sysroot. It configures target C and C++ compilers, Cargo's linker, `LD`, `AR`, `RANLIB`, and
+bindgen's ARM target/sysroot. MuPDF embeds resources with `$(LD) -r -b binary` and archives with
+`$(AR)`; host binutils would create incompatible objects. The ARM validation path statically links
+the C++ runtime so the reader does not add an unqualified Kindle `libstdc++`/`GLIBCXX` dependency.
+
+The decisive link command inside the script is:
+
+```sh
+cargo test -p scribe-app --lib --locked --no-run \
+  --target armv7-unknown-linux-gnueabihf \
+  --features scribe-app/restore_from_server,scribe-app/reader \
+  reader_engine
+```
+
+`--no-run` is intentional: it produces the real Rust test executable, including MuPDF's native
+static libraries, without attempting to execute an ARM binary on x86. The verifier requires the
+linked executable to contain both the rendering test and MuPDF implementation symbols.
+
+## ARM ELF compatibility checks
+
+`tools/ci/verify_reader_armv7_elf.py` reuses the release ELF parser in `tools/qa/elf.py` and the
+cross-toolchain's `readelf`, `objdump`, and `nm`. It fails unless all of the following hold:
+
+- the executable is little-endian ELF32 for ARM with the hard-float EABI flag and VFP-register
+  calling convention;
+- the interpreter is `/lib/ld-linux-armhf.so.3`;
+- every `DT_NEEDED` library resolves in the ARM sysroot and is itself ELF32 ARM hard-float;
+- the reader test introduces no shared-library dependency beyond the ordinary ARM `scribe-app`
+  built in the same pinned container;
+- the highest required GLIBC symbol is no newer than the repository's existing Kindle ceiling,
+  read from `tools/dropbear/PINNED.txt` (`max_glibc=GLIBC_2.28`);
+- the linked file contains the reader rendering test and defined MuPDF `fz_*` symbols; and
+- every native archive/object in the ARM Cargo build, including MuPDF's libraries, reports
+  `elf32-littlearm`, preventing host objects from passing unnoticed.
+
+The script also links an ordinary ARM `scribe-app` with only the official
+`scribe-app/restore_from_server` feature and requires its target output and symbol table to remain
+free of MuPDF and the reader module. Validation outputs live outside the customer release target
+and are never packaged or uploaded as customer artifacts.
+
+## Validation record
+
+On 2026-11-16, the following checks were executed on the hardening branch:
+
+- `tools/ci/check_reader_isolation.sh`: passed for host and ARM dependency graphs, disabled and
+  enabled directions.
+- `python tools/qa/test_ignite_qa.py`: 27 tests passed, including stripped and unstripped ARM ELF
+  parser behavior.
+- Python compilation/lint, Rust formatting, and shell syntax checks: passed.
+- Windows host `reader_engine` test build: not qualified. MuPDF's MSBuild step stopped with local
+  Visual Studio error `C1902 Program database manager mismatch` before Rust tests ran.
+- Linux host reader tests, pinned-container ARM link, and ELF/GLIBC validation: not yet executed
+  locally. They remain required; a future GitHub Actions result is not represented as a local pass.
+
+No physical Kindle test has been performed for this reader implementation.
 
 ## Dependencies
 
@@ -73,14 +131,20 @@ Versions are those vendored in `mupdf-sys` 0.8.0. Ignite is AGPL-3.0-only, so th
 components add no new distribution terms; the release notices and the component inventory still
 need entries before any build containing the reader ships.
 
-## Before this reaches users (open)
+## Remaining limitations
 
 - **Security review and upgrades.** MuPDF 1.27.2 is behind current upstream, which has since
   received memory-safety fixes. Needed: a review of the fixes since 1.27.2 and of the bundled
   libraries above, then either a `mupdf-sys` release with a newer MuPDF or a pinned
   `[patch.crates-io]` with the newer MuPDF sources. The exact `=0.8.0` pin keeps upgrades
   deliberate.
-- **Packaging:** component inventory, provenance and notices in the release pipeline.
+- **Production distribution and licensing notices:** component inventory, provenance, and notices
+  in the release pipeline remain unresolved. Reader artifacts are experimental validation output.
 - **EPUB anchors:** a proof of concept that a saved location survives font size and margin
   changes, before choosing an anchor representation.
-- **Book identity:** separate a file's identity (content hash) from the logical book it holds.
+- **Book catalog and stable identity:** separate a file's identity (content hash) from the logical
+  book it holds; no storage or catalog is part of Phase 0.
+- **Reading-position persistence:** no EPUB anchors or stable reading-position format exists.
+- **Reader UI:** no UI or application call site exists.
+- **Hardware acceptance:** host and cross-compile evidence is not physical Kindle validation. The
+  new implementation has not been accepted on supported hardware or firmware.
