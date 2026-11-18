@@ -1,17 +1,18 @@
 # Reader engine (experimental, opt-in)
 
-Status: **build plumbing and validation only.** There is no reader UI. Nothing in the app calls
-the engine, and no customer build contains it. Background and plan:
+Status: **controlled file-backed engine testing only.** There is no reader UI. Nothing in the app
+calls the engine, and no customer build contains it. Background and plan:
 [markrai/ignite#22](https://github.com/markrai/ignite/issues/22).
 
 ## What is here
 
 - `scribe-app` has a Cargo feature, `reader`, that is **off by default**. It pulls in the
   [`mupdf`](https://crates.io/crates/mupdf) crate, which builds MuPDF from source.
-- `ignite/kindle/scribe-app/src/reader_engine.rs` (compiled only with the feature) opens a
-  document from memory, lays out reflowable formats, and renders a page as 8-bit gray scaled to
-  fit a box. Its tests render a generated PDF page and check that reflowable text repaginates
-  when the font size changes. EPUB goes through the same HTML layout engine.
+- `ignite/kindle/scribe-app/src/reader_engine.rs` (compiled only with the feature) opens existing
+  PDF, EPUB and CBZ files by path without reading the complete file into a Rust buffer. It retains
+  `Book::open_bytes` for generated test fixtures, lays out reflowable formats, and renders a page
+  as bounded 8-bit gray output. Its tests exercise generated PDF, EPUB and CBZ files, reflow,
+  corrupt inputs, path policy, render limits and repeated open/render/close cycles.
 - CI job **Reader engine (experimental, opt-in)** in `.github/workflows/ci.yml`. It runs
   separately from the release jobs:
   1. `tools/ci/check_reader_isolation.sh`: `reader` is not a default feature, no packaging or
@@ -23,8 +24,8 @@ the engine, and no customer build contains it. Background and plan:
      executable in the pinned Kindle Docker image. The ARM executables are inspected but never
      run on the x86 host.
 
-Out of scope for now: book identity, reading positions, book folders, UI, packaging and notices
-in the release payload.
+Out of scope for now: discovery, book identity, reading positions, book folders, UI, packaging and
+notices in the release payload.
 
 ## Building
 
@@ -80,6 +81,64 @@ cargo test -p scribe-app --lib --locked --no-run \
 `--no-run` is intentional: it produces the real Rust test executable, including MuPDF's native
 static libraries, without attempting to execute an ARM binary on x86. The verifier requires the
 linked executable to contain both the rendering test and MuPDF implementation symbols.
+
+## Phase 1A engine contracts
+
+### File-backed opening
+
+`Book::open_path` accepts one explicit existing path; it does not scan directories, discover
+books, create identities, or copy a document into Ignite storage. The extension must be PDF,
+EPUB or CBZ (ASCII case-insensitive), and the input must remain a regular file. Missing files,
+directories, special files, unsupported or non-UTF-8 extensions, corrupt content, and MuPDF parse
+errors are returned as reader errors with the affected path.
+
+The path policy rejects a symlink in any component, not only a symlink at the final filename. It
+checks the path before opening, opens a read-only file handle, compares that handle with the path,
+lets MuPDF open its own stream, then checks the path and identity again. On Unix, including the
+Kindle target, the identity comparison includes device, inode, length, modification time and
+change time. Other hosts compare the metadata available through the portable Rust API: length and
+modification time.
+
+MuPDF Rust 0.8.0 only exposes pathname-backed `Document::open`; it cannot accept the already-open
+Rust file descriptor. The checks therefore narrow but cannot eliminate the race between pathname
+inspection and MuPDF's native open. They also cannot make a file safe against concurrent in-place
+writes or an attacker that can replace and restore a path entirely between checks. Controlled
+tests must use a stable, trusted file tree. A future storage design should use a descriptor-backed
+native API or a storage-owned immutable snapshot if it needs a stronger guarantee. Phase 1A does
+not silently make such a snapshot.
+
+`Book::open_bytes` remains available for small generated fixtures. It still copies the complete
+input into MuPDF-owned memory and is not the real-document path.
+
+### Render and layout bounds
+
+The experimental gray output budget is one complete Scribe visible panel:
+`1860 * 2480 = 4,612,800` pixels and bytes, about 4.40 MiB. Each requested dimension is also
+limited to the Scribe long edge, 2,480 pixels, so a thin request cannot use an extreme dimension
+while staying under the byte cap. Landscape requests up to 2480 by 1860 remain possible.
+
+Before `Page::to_pixmap` can allocate the native destination, the engine:
+
+- checks the requested dimensions, pixel multiplication and platform-size conversions;
+- requires finite, ordered page bounds and a finite positive fit scale;
+- transforms the page bounds and applies MuPDF's own rounding operation;
+- reduces the scale when rounded edges would exceed the requested box;
+- checks the rounded width, height, Gray8 stride and total sample bytes against the limits; and
+- records the expected origin, geometry, component count, alpha state, stride and sample length.
+
+After rendering, every recorded property must match the returned pixmap. The `GrayPage` owns that
+native pixmap and exposes a borrowed packed-gray slice, avoiding a second full-size Rust buffer.
+Reflow layout accepts width and height from 1 through 4,096 points and an `em` size from 1 through
+512 points; non-finite and out-of-range values fail before entering MuPDF. Those layout ceilings
+are deliberately generous relative to the measured 418 by 528 point Scribe safe area and normal
+font sizes. They are input-sanity limits, not a claim that EPUB layout memory is bounded.
+
+The 4.40 MiB limit bounds only the final Gray8 destination. It does not bound decoded source
+images, display lists, fonts, EPUB layout state, transparency groups, masks, MuPDF caches, parser
+state or temporary native allocations. A malicious or unusually complex document can still cause
+large native allocations, process termination by the kernel, or a native crash. Rust errors are
+recoverable where MuPDF returns an error, but the engine does not represent a process crash or
+out-of-memory kill as a successful reader result.
 
 ## ARM ELF compatibility checks
 
@@ -141,6 +200,20 @@ No physical Kindle test has been performed for this reader implementation. The a
 qualifies the pinned Linux build path and differential ABI checks only; supported-device runtime
 compatibility and behavior still require evidence collected from Kindle hardware.
 
+Phase 1A validation on 2026-11-17 is incomplete on the available Windows host:
+
+- the ordinary `scribe-app` library suite passed: 1,583 passed and 29 explicitly ignored;
+- host and ARM dependency-graph checks passed in both disabled and enabled directions, and the
+  release/packaging scan found no reader feature activation;
+- Cargo formatting, ShellCheck and `git diff --check` passed;
+- both debug and release reader builds stopped in MuPDF's unchanged MSBuild step with the local
+  Visual Studio PDB-version failures `C1902` and `LNK1101`, before Rust reader tests could run; and
+- Docker Desktop reported that it could not start, so the pinned Linux reader tests, Python QA,
+  ARMv7 link, ELF, shared-library, GLIBC and native-object checks have not been rerun for Phase 1A.
+
+This partial record does not qualify Phase 1A or a device runtime. It must be replaced with the
+complete pinned-container results before review readiness is claimed.
+
 ## Dependencies
 
 All of these are compiled from source and linked statically, and only with `--features reader`.
@@ -169,11 +242,17 @@ need entries before any build containing the reader ships.
 
 ## Remaining limitations
 
-- **Security review and upgrades.** MuPDF 1.27.2 is behind current upstream, which has since
-  received memory-safety fixes. Needed: a review of the fixes since 1.27.2 and of the bundled
-  libraries above, then either a `mupdf-sys` release with a newer MuPDF or a pinned
-  `[patch.crates-io]` with the newer MuPDF sources. The exact `=0.8.0` pin keeps upgrades
-  deliberate.
+- **Phase 1B native dependency work.** MuPDF 1.27.2 is behind current upstream, which has since
+  received memory-safety fixes. Phase 1B should inventory security fixes since 1.27.2, review the
+  bundled libraries, select a maintained Rust/native combination, repeat malformed-document and
+  memory-pressure testing, and rerun the complete host and ARM validation. The exact `=0.8.0` pin
+  remains unchanged in Phase 1A so an upgrade cannot happen silently.
+- **Native memory is not globally bounded.** The destination pixmap has a hard limit, but parsing,
+  image decoding, layout, caches, masks and transparency groups do not. Hardware tests need RSS
+  and failure measurements with adversarial and image-heavy documents before customer use.
+- **Path races remain.** The safe Rust API accepts a pathname rather than an open descriptor.
+  Symlink rejection and identity checks are fail-closed but cannot make a concurrently writable
+  source immutable.
 - **Production distribution and licensing notices:** component inventory, provenance, and notices
   in the release pipeline remain unresolved. Reader artifacts are experimental validation output.
 - **EPUB anchors:** a proof of concept that a saved location survives font size and margin
