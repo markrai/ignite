@@ -137,6 +137,28 @@ class ReaderArmv7ValidatorTests(unittest.TestCase):
         self.assertIn("pdf_page_renders_to_fit_the_box_in_gray", reader_symbol)
         self.assertEqual(mupdf_symbol, "fz_abs")
 
+    def test_accepts_reader_symbol_policy_without_writers(self) -> None:
+        _READER_VALIDATOR.verify_reader_symbol_policy(
+            "00010000 T fz_open_document\n00020000 t fz_run_page\n"
+        )
+
+    def test_rejects_cff_subsetting_symbol(self) -> None:
+        with self.assertRaisesRegex(
+            _READER_VALIDATOR.VerificationError,
+            "CVE-2026-7233.*fz_subset_cff_for_gids",
+        ):
+            _READER_VALIDATOR.verify_reader_symbol_policy(
+                "00010000 T fz_open_document\n00020000 T fz_subset_cff_for_gids\n"
+            )
+
+    def test_rejects_disabled_optional_component_symbol(self) -> None:
+        with self.assertRaisesRegex(
+            _READER_VALIDATOR.VerificationError, "cmark-gfm.*cmark_parse_document"
+        ):
+            _READER_VALIDATOR.verify_reader_symbol_policy(
+                "00010000 T cmark_parse_document\n"
+            )
+
 
 class IsolationTests(unittest.TestCase):
     def test_production_slot_refuses_physical_qa(self) -> None:

@@ -6,8 +6,8 @@ calls the engine, and no customer build contains it. Background and plan:
 
 ## What is here
 
-- `scribe-app` has a Cargo feature, `reader`, that is **off by default**. It pulls in the
-  [`mupdf`](https://crates.io/crates/mupdf) crate, which builds MuPDF from source.
+- `scribe-app` has a Cargo feature, `reader`, that is **off by default**. It pulls in Ignite's
+  source-pinned `mupdf` 0.8.0 fork, which builds MuPDF 1.28.6 from source.
 - `ignite/kindle/scribe-app/src/reader_engine.rs` (compiled only with the feature) opens existing
   PDF, EPUB and CBZ files by path without reading the complete file into a Rust buffer. It retains
   `Book::open_bytes` for generated test fixtures, lays out reflowable formats, and renders a page
@@ -32,6 +32,7 @@ notices in the release payload.
 Host tests (Linux):
 
 ```sh
+git submodule update --init --recursive
 sudo apt-get install clang libclang-dev make          # bindgen needs libclang
 cargo test -p scribe-app --lib --locked --features reader reader_engine
 ```
@@ -46,8 +47,9 @@ docker run --rm -v "$PWD:/src" -w /src "$image" \
 ```
 
 For a one-shot local run that also executes the Linux host rendering tests inside the disposable
-container, add `-e IGNITE_READER_RUN_HOST_TESTS=1` before the volume argument. CI keeps the host
-tests as a separate step and uses the script for ARM linking and inspection.
+container, add `-e IGNITE_READER_RUN_HOST_TESTS=1` before the volume argument. CI performs a
+separate host test and also sets that variable for the pinned validator so the raw validator log
+contains bounded host execution and peak-RSS evidence.
 
 The script installs its build-only dependencies inside the disposable pinned Bullseye container:
 Clang/libclang for bindgen, `make`, Python 3, and Debian's ARM GNU hard-float GCC, G++, binutils,
@@ -154,7 +156,9 @@ cross-toolchain's `readelf`, `objdump`, and `nm`. It fails unless all of the fol
   the feature-isolation artifact;
 - the reader test introduces no higher GLIBC requirement than the reader-disabled test baseline;
   the verifier also reports the maximum for the ordinary application and both test harnesses;
-- the linked file contains the reader rendering test and defined MuPDF `fz_*` symbols; and
+- the linked file contains the reader rendering test and defined MuPDF `fz_*` symbols;
+- the linked file excludes the CVE-2026-7233 CFF subsetting routine and symbols from disabled
+  MuJS, Brotli, cmark-gfm, Tesseract and zxing-cpp components; and
 - every native archive/object in the ARM Cargo build, including MuPDF's libraries, reports
   `elf32-littlearm`, preventing host objects from passing unnoticed.
 
@@ -169,6 +173,27 @@ free of MuPDF and the reader module. Validation outputs live outside the custome
 and are never packaged or uploaded as customer artifacts.
 
 ## Validation record
+
+Phase 1B.2 local validation on 2026-11-19 is incomplete on the available Windows host:
+
+- the source is pinned to MuPDF 1.28.6 commit
+  `da5f5eb890d7b3fb76903160b5f7f48ba1301492` with all recursive third-party revisions;
+- the deterministic font fallback, store-lifetime and CVE-2026-112036 patches matched their
+  expected source exactly once;
+- the ordinary `scribe-app` library suite passed outside the restricted sandbox: 1,583 passed and
+  29 explicitly ignored, with no reader feature enabled;
+- host and ARM dependency-graph isolation passed in both directions, including the release and
+  packaging activation scan;
+- the Python validator suite passed, including negative cases for a linked CFF-subsetting routine
+  and disabled optional-component symbols;
+- the Windows native build then stopped with Visual Studio error
+  `C1902 Program database manager mismatch`, before any reader test could execute; and
+- Docker Desktop was unavailable and WSL enumeration timed out, so Linux host tests, peak RSS and
+  the complete ARMv7 link and inspection did not run.
+
+No new library, GLIBC, ARM ABI, native-object or feature-isolation result is claimed from that
+partial run. The complete pinned-container output with `IGNITE_READER_RUN_HOST_TESTS=1` must
+replace this record before Phase 1B.2 is ready for review.
 
 On 2026-11-16, the corrected validation was executed on Linux against the hardening working tree:
 
@@ -220,33 +245,33 @@ All of these are compiled from source and linked statically, and only with `--fe
 
 | Component | Version | Licence | Notes |
 |---|---|---|---|
-| `mupdf` crate | 0.8.0 (pinned `=0.8.0`) | AGPL-3.0 | Safe Rust wrapper |
-| `mupdf-sys` crate | 0.8.0 | AGPL-3.0 | Build script and bindings; build-time `bindgen`, `cc` |
-| MuPDF | 1.27.2 (vendored in `mupdf-sys`) | AGPL-3.0 | Features: PDF, EPUB, HTML, images, SVG, CBZ, base-14 fonts |
-| FreeType | 2.13.3 | FreeType Licence (FTL) | Bundled by MuPDF |
-| HarfBuzz | 6.0.0 (as vendored) | MIT ("Old MIT") | Bundled by MuPDF |
+| `mupdf` crate | 0.8.0 (exact API pin, in-repository fork) | AGPL-3.0 | Safe Rust wrapper; source lineage `deaacc87c4cea6a2146e90e00e0d5658c911277b` |
+| `mupdf-sys` crate | 0.8.0 (in-repository fork) | AGPL-3.0 | Build script and bindings; build-time `bindgen`, `cc` |
+| MuPDF | 1.28.6 | AGPL-3.0 | Submodule `da5f5eb890d7b3fb76903160b5f7f48ba1301492`; PDF, EPUB, HTML, images, SVG, CBZ, base-14 fonts |
+| FreeType | 2.14.3 | FreeType Licence (FTL) | `0a0221a1347e2f1e07c395263540026e9a0aa7c7` |
+| HarfBuzz | 13.0.1 | MIT ("Old MIT") | `c28ba35a1e6dc4b6b32e2b1d11fd2a408f6c86bb` |
 | jbig2dec | 0.20 | AGPL-3.0 | Bundled by MuPDF |
-| Little CMS (`lcms2mt`, Artifex fork) | 2.16 | MIT | Bundled by MuPDF |
-| libjpeg (IJG) | 9f | IJG licence | Bundled by MuPDF |
-| OpenJPEG | 2.5.x | BSD-2-Clause | Bundled by MuPDF |
-| zlib | 1.3.1 | zlib | Bundled by MuPDF |
-| Gumbo HTML parser | (as vendored) | Apache-2.0 | Bundled by MuPDF; EPUB and HTML |
+| Little CMS (`lcms2mt`, Artifex fork) | 2.19.1.art | MIT | `d69c64417c4a33a4629957fc0e08f4f4c5abcc3d` |
+| libjpeg (IJG) | 10 | IJG licence | `627faae398468d5d11e3d694dc325432f734b5c4` |
+| OpenJPEG | 2.5.3 declared | BSD-2-Clause | `957029eb875eee1118743f200cb86da9d8289de2` |
+| zlib | 1.3.2 | zlib | `da607da739fa6047df13e66a2af6b8bec7c2a498` |
+| Gumbo HTML parser | 0.10.1 lineage | Apache-2.0 | `61bd4e736c3b342e592f65be0d65ec6a0acd8dcb`; EPUB and HTML |
 
-Not built with this feature set: MuJS (JavaScript), Tesseract, Leptonica, Brotli, `extract`
-(DOCX output), zxing-cpp, curl, X11/GLUT viewers. MuPDF's own fonts are limited to the base-14
-set.
+Not built with this feature set: MuJS (JavaScript), Tesseract, Leptonica, Brotli, cmark-gfm,
+`extract` (DOCX output), zxing-cpp, libarchive, curl, FB2, Markdown, MOBI, Office, text, OCR/ODT
+output, or X11/GLUT viewers. MuPDF's own fonts are limited to the base-14 set.
 
-Versions are those vendored in `mupdf-sys` 0.8.0. Ignite is AGPL-3.0-only, so the AGPL
-components add no new distribution terms; the release notices and the component inventory still
-need entries before any build containing the reader ships.
+The exact recursive source revisions and crates.io provenance checksums are recorded in
+`vendor/README.md` and the Phase 1B assessment. Ignite is AGPL-3.0-only, so the AGPL components
+add no new headline licence; release notices, corresponding source and a final component inventory
+still need review before any build containing the reader ships.
 
 ## Remaining limitations
 
-- **Phase 1B native dependency work.** MuPDF 1.27.2 is behind current upstream, which has since
-  received memory-safety fixes. Phase 1B should inventory security fixes since 1.27.2, review the
-  bundled libraries, select a maintained Rust/native combination, repeat malformed-document and
-  memory-pressure testing, and rerun the complete host and ARM validation. The exact `=0.8.0` pin
-  remains unchanged in Phase 1A so an upgrade cannot happen silently.
+- **Phase 1B.2 qualification.** The source integration now selects MuPDF 1.28.6 plus a fail-closed
+  CVE-2026-112036 backport, while excluding the still-unfixed CVE-2026-7233 subsetting path from
+  the linked reader. The complete Linux host, peak-RSS, ARM ELF, shared-library and GLIBC
+  validation has not yet run on this source pin.
 - **Native memory is not globally bounded.** The destination pixmap has a hard limit, but parsing,
   image decoding, layout, caches, masks and transparency groups do not. Hardware tests need RSS
   and failure measurements with adversarial and image-heavy documents before customer use.

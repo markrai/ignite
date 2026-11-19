@@ -40,6 +40,7 @@ default-members = [
     "ignite/tools/scribe-sync-tool",
     "ignite/tools/backup-export",
 ]
+exclude = ["vendor/mupdf", "vendor/mupdf-sys"]
 
 [workspace.package]
 edition = "2021"
@@ -56,6 +57,10 @@ updater-transaction-lock = { path = "ignite/kindle/updater-transaction-lock" }
 scribe-app = { path = "ignite/kindle/scribe-app" }
 scribe-sync-server = { path = "ignite/server/scribe-sync-server" }
 scribe-server = { path = "ignite/server/scribe-server" }
+
+[patch.crates-io]
+mupdf = { path = "vendor/mupdf" }
+mupdf-sys = { path = "vendor/mupdf-sys" }
 
 # Ship optimized binaries without DWARF or a leftover symbol table.
 # Does not change unwind/panic behavior (panic = "unwind" remains the default).

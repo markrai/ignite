@@ -70,6 +70,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - name: Install MuPDF host build tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang libclang-dev make
@@ -89,6 +91,7 @@ jobs:
             *) echo "rust_armv7hf image is not digest-pinned" >&2; exit 1 ;;
           esac
           docker run --rm \
+            -e IGNITE_READER_RUN_HOST_TESTS=1 \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
             "$image" \
