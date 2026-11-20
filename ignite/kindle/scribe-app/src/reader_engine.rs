@@ -8,6 +8,7 @@
 //! in pixels. Book identity, reading positions and any UI are deliberately out of scope here.
 
 use std::fs::{self, File, Metadata};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -75,7 +76,7 @@ impl Book {
         let path = absolute_path(path.as_ref())?;
         reject_symlink_components(&path)?;
         let path_metadata = regular_file_metadata(&path)?;
-        validate_document_extension(&path)?;
+        let format = validate_document_extension(&path)?;
 
         let file = File::open(&path)
             .map_err(|error| path_error(&path, format!("cannot open for reading: {error}")))?;
@@ -90,6 +91,8 @@ impl Book {
         if path_identity != opened_identity {
             return Err(path_error(&path, "input changed before it could be opened"));
         }
+
+        validate_document_signature(&path, &file, format)?;
 
         let doc = open_mupdf_document(&path)?;
         reject_symlink_components(&path)?;
@@ -260,20 +263,51 @@ fn regular_file_metadata(path: &Path) -> Result<Metadata, ReaderError> {
     Ok(metadata)
 }
 
-fn validate_document_extension(path: &Path) -> Result<(), ReaderError> {
+#[derive(Clone, Copy)]
+enum DocumentFormat {
+    Pdf,
+    Zip,
+}
+
+fn validate_document_extension(path: &Path) -> Result<DocumentFormat, ReaderError> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .ok_or_else(|| path_error(path, "input has no supported UTF-8 extension"))?;
-    if ["pdf", "epub", "cbz"]
+    if extension.eq_ignore_ascii_case("pdf") {
+        Ok(DocumentFormat::Pdf)
+    } else if ["epub", "cbz"]
         .iter()
         .any(|supported| extension.eq_ignore_ascii_case(supported))
     {
-        Ok(())
+        Ok(DocumentFormat::Zip)
     } else {
         Err(path_error(
             path,
             format!("unsupported document extension: {extension}"),
+        ))
+    }
+}
+
+fn validate_document_signature(
+    path: &Path,
+    file: &File,
+    format: DocumentFormat,
+) -> Result<(), ReaderError> {
+    let mut header = Vec::with_capacity(1024);
+    file.take(1024)
+        .read_to_end(&mut header)
+        .map_err(|error| path_error(path, format!("cannot read document signature: {error}")))?;
+    let matches = match format {
+        DocumentFormat::Pdf => header.starts_with(b"%PDF-"),
+        DocumentFormat::Zip => header.starts_with(b"PK\x03\x04"),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(path_error(
+            path,
+            "document signature does not match filename extension",
         ))
     }
 }
@@ -860,6 +894,34 @@ mod tests {
             .unwrap()
             .0
             .contains("MuPDF could not open document"));
+    }
+
+    #[test]
+    fn file_backed_open_rejects_mismatched_signatures_and_gzip() {
+        let dir = TempDocumentDir::new("mismatched-signatures");
+        let zip_as_pdf = dir.write("archive.pdf", &cbz_fixture());
+        let pdf_as_cbz = dir.write("document.cbz", &rectangle_pdf());
+        let html_as_epub = dir.write("markup.epub", b"<html><body>book</body></html>");
+        let gzip_as_pdf = dir.write("compressed.pdf", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03");
+
+        for path in [&zip_as_pdf, &pdf_as_cbz, &html_as_epub, &gzip_as_pdf] {
+            let error = Book::open_path(path).err().expect("signature must be rejected");
+            assert!(
+                error.0.contains("document signature does not match"),
+                "{}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn file_backed_signature_read_is_bounded() {
+        let dir = TempDocumentDir::new("signature-window");
+        let mut prefix = vec![b'A'; 1024];
+        prefix.extend_from_slice(b"%PDF-1.4\n");
+        let path = dir.write("hidden.pdf", &prefix);
+        let error = Book::open_path(path).err().expect("late PDF marker must be rejected");
+        assert!(error.0.contains("document signature does not match"));
     }
 
     #[test]

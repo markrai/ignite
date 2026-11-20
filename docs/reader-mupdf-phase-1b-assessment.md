@@ -36,7 +36,7 @@ not treated as proof that a fix was present.
 | Finding | 1.28.6 source decision | Ignite disposition |
 |---|---|---|
 | **CVE-2026-112036**, signature-locking `free_char_list` use-after-free/double-free | Upstream fix `3984925b660afb8a781ddf504021e91be1bc671e` is not an ancestor of the selected release commit. The vulnerable function frees `c->list` without clearing it. | The build script applies the exact one-line pointer clear to its copied source and fails closed if the source pattern changes. Signature locking is not needed for rendering, but the PDF object code is part of the native library, so reachability was not used to excuse it. |
-| **CVE-2026-7233**, CFF subsetting out-of-bounds read | The affected `fz_subset_cff_for_gids` implementation remains in 1.28.6 and Debian still records no fixed release. Its callers are PDF/TTF subsetting and writing paths, not Ignite's open/layout/render operations. | The source issue is **not claimed fixed**. The ARM verifier fails if `fz_subset_cff_for_gids` is linked into the reader executable, proving exclusion from the delivered static link. A future writer/subsetter feature must first supply an audited fix. |
+| **CVE-2026-7233**, CFF subsetting out-of-bounds read | The affected `fz_subset_cff_for_gids` implementation remains in 1.28.6 and Debian still records no fixed release. Its callers are PDF/TTF subsetting and writing paths, not Ignite's open/layout/render operations. | The source issue is **not claimed fixed**. The ARM debug-test verifier rejects this symbol; this is **not** evidence about a delivered release binary. The stacked hardening change also blocklists the Rust FFI for `fz_subset_.*`, `pdf_subset_fonts` and `pdf_clean_file`. This restricts Rust callers, but does not remove native C code. A future writer/subsetter feature needs an audited fix and release-artifact verification. |
 | **CVE-2026-3308**, PDF image stride integer overflow and heap write | Fix `a26f0142e7d390d4a82c6e5ae0e312e07cc4ec85` is an ancestor of the selected commit. It is not an ancestor of Ignite's old 1.27.2 release branch. | Fixed by the selected source. This path is relevant to normal PDF image rendering. |
 | **CVE-2026-92413**, external PDF stream null dereference | The named fix `3df1e30f9d7b77260e13bd0dbe1928ddeba8386e` is not an ancestor because it was made on a divergent development branch. The selected 1.28.6 release implementation of `pdf_open_filter` has no external-stream/archive branch or vulnerable null return. | Unreachable because the affected implementation is absent, not because of release chronology. |
 | MuPDF 1.28.x hardening | 1.28.0 through 1.28.6 include the upstream parser, image, pixmap, font, overflow, decompression-bomb and robustness work recorded in the release history. | Exact source remains pinned. Malformed, truncated and image-heavy reader tests are bounded by a 120-second validator timeout; a pass must also report peak RSS. |
@@ -53,7 +53,13 @@ Ignite enables only PDF plus the EPUB/HTML, image, SVG and CBZ support required 
 base-14 fonts. MuPDF 1.28's new defaults would otherwise enable extra document formats and
 cmark-gfm. The fork explicitly disables FB2, Markdown, MOBI, Office, plain-text, OCR output and ODT
 output, as well as MuJS, Brotli, DOCX extraction, Tesseract, zxing-cpp, libarchive and cmark-gfm.
-The ARM verifier rejects linked MuJS, Brotli, cmark-gfm, Tesseract and zxing symbols.
+The ARM verifier rejects linked MuJS, Brotli, cmark-gfm, Tesseract and zxing symbols,
+including weak or data definitions. The stacked Milestone A hardening also makes gzip document
+handler registration conditional and explicitly disables it, with an exact source-pattern check;
+the upstream gzip implementation may remain in native source and archives but cannot register
+through `fz_register_document_handlers`. A bounded signature guard rejects PDF/ZIP mismatches and
+gzip inputs before MuPDF's pathname-based open. Since EPUB and CBZ share ZIP signatures and
+MuPDF still content-sniffs registered handlers, this does not claim complete parser confinement.
 
 The recursively pinned native components used by this configuration are:
 
@@ -97,6 +103,10 @@ The last command is intended for the digest-pinned
 container. It checks the exact native revision and every recorded recursive submodule before
 installing tools from the timestamped Debian snapshot. The Docker image pin and the established
 `GLIBC_2.30` differential baseline are unchanged.
+
+The Milestone A changes are stacked on the qualified Phase 1B.2 integration. The recorded
+November 19 ARM evidence is the baseline and does **not** qualify the additional hardening.
+Repeat the pinned Linux host and ARMv7 checks for the Milestone A branch before merge.
 
 ## Validation status
 
