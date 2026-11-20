@@ -26,6 +26,7 @@ class VerificationError(RuntimeError):
 
 FORBIDDEN_READER_SYMBOLS = {
     "fz_subset_cff_for_gids": "CVE-2026-7233 CFF subsetting path",
+    "gz_document_handler": "gzip document-handler registration",
 }
 FORBIDDEN_READER_SYMBOL_PREFIXES = {
     "Brotli": "Brotli",
@@ -146,7 +147,13 @@ def find_linked_symbols(symbols: str) -> tuple[str, str]:
 
 
 def verify_reader_symbol_policy(symbols: str) -> None:
-    defined = set(re.findall(r"\s[Tt]\s+(\S+)$", symbols, re.MULTILINE))
+    defined = {
+        match.group(2)
+        for match in re.finditer(
+            r"(?m)^\s*(?:[0-9A-Fa-f]+\s+)?(\S)\s+(\S+)\s*$", symbols
+        )
+        if match.group(1) not in {"U", "u", "w", "v"}
+    }
     for symbol, reason in FORBIDDEN_READER_SYMBOLS.items():
         if symbol in defined:
             raise VerificationError(
