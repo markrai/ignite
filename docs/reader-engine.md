@@ -90,9 +90,19 @@ linked executable to contain both the rendering test and MuPDF implementation sy
 
 `Book::open_path` accepts one explicit existing path; it does not scan directories, discover
 books, create identities, or copy a document into Ignite storage. The extension must be PDF,
-EPUB or CBZ (ASCII case-insensitive), and the input must remain a regular file. Missing files,
-directories, special files, unsupported or non-UTF-8 extensions, corrupt content, and MuPDF parse
-errors are returned as reader errors with the affected path.
+EPUB or CBZ (ASCII case-insensitive), and the input must remain a regular file. Before invoking
+MuPDF, the reader checks at most 1024 initial bytes from its already-open file handle: PDF inputs
+must start with `%PDF-`, and EPUB/CBZ inputs must start with the ZIP local-file header
+`PK\x03\x04`. A mismatch is rejected before native parsing; empty files and gzip streams fail
+this guard. These strict signatures intentionally reject some unusual files MuPDF might otherwise
+accept, including PDFs with a preamble. Missing files, directories, special files, unsupported or
+non-UTF-8 extensions, corrupt content and MuPDF errors are returned as path-specific reader errors.
+
+This guard does not prove that MuPDF will choose the expected parser after sniffing, and it cannot
+distinguish EPUB from CBZ because both use ZIP. The native build additionally removes the
+unconditional gzip handler registration by a checked source patch and configures `FZ_ENABLE_GZ=0`.
+Its original gzip source remains in the upstream tree, but the document dispatcher does not
+register it. `Book::open_bytes` remains a test-fixture interface and does not use the path guard.
 
 The path policy rejects a symlink in any component, not only a symlink at the final filename. It
 checks the path before opening, opens a read-only file handle, compares that handle with the path,
@@ -277,6 +287,10 @@ still need review before any build containing the reader ships.
 
 ## Remaining limitations
 
+- **Milestone A follow-up validation.** Format-signature gating, gzip handler registration
+  hardening, FFI blocklisting and broader defined-symbol inspection are changes on the stacked
+  hardening branch; rerun the complete pinned host/ARMv7 validator after applying them. The
+  November 19 baseline log covers commit `c2abb4c`, not this subsequent hardening.
 - **Kindle runtime qualification.** The MuPDF 1.28.6 build, fail-closed CVE-2026-112036 backport
   and exclusion of the CVE-2026-7233 subsetting symbol passed pinned Linux/ARMv7 validation.
   Actual Kindle loader, memory and crash behavior remain unqualified.
