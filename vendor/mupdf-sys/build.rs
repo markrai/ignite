@@ -33,6 +33,10 @@ fn run() -> Result<()> {
         )?
     }
 
+    for path in ["mupdf", "wrapper", "build.rs", "make.rs", "msbuild.rs", "docs.rs"] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+
     let target = Target::from_cargo().map_err(|e| {
         format!(
             "Unable to detect target: {e}\n\
@@ -221,6 +225,21 @@ fn patch_mupdf_sources(build_dir: &Path) -> Result<()> {
     replace_exactly_once(&mut source, old, new, "fz_filter_store reaping", &path)?;
     fs::write(&path, source).map_err(|e| format!("Unable to write {}: {e}", path.display()))?;
 
+    let path = build_dir.join("source/fitz/document-all.c");
+    let mut source =
+        fs::read_to_string(&path).map_err(|e| format!("Unable to read {}: {e}", path.display()))?;
+    source = source.replace("\r\n", "\n");
+    let old = "\tfz_register_document_handler(ctx, &gz_document_handler);\n";
+    let new = "#if FZ_ENABLE_GZ\n\tfz_register_document_handler(ctx, &gz_document_handler);\n#endif\n";
+    replace_exactly_once(
+        &mut source,
+        old,
+        new,
+        "gzip document-handler registration",
+        &path,
+    )?;
+    fs::write(&path, source).map_err(|e| format!("Unable to write {}: {e}", path.display()))?;
+
     let path = build_dir.join("source/pdf/pdf-xref.c");
     let mut source =
         fs::read_to_string(&path).map_err(|e| format!("Unable to read {}: {e}", path.display()))?;
@@ -325,7 +344,10 @@ fn generate_bindings(target: &Target, path: &Path, sysroot: Option<String>) -> R
         .blocklist_function("fz_append_vprintf") // fz_append_printf
         .blocklist_function("fz_write_vprintf") // fz_write_printf
         .blocklist_function("fz_vsnprintf") // fz_snprintf
-        .blocklist_function("fz_format_string"); // mupdf_format_string
+        .blocklist_function("fz_format_string")
+        .blocklist_function("fz_subset_.*")
+        .blocklist_function("pdf_subset_fonts")
+        .blocklist_function("pdf_clean_file");
 
     // build config
     builder = builder
@@ -432,6 +454,7 @@ impl Build {
 
         // gates #ifdef
         self.fz_enable("XPS", xps);
+        self.fz_enable("GZ", false);
         self.fz_enable("SVG", svg);
         self.fz_enable("CBZ", cbz);
         self.fz_enable("IMG", img);

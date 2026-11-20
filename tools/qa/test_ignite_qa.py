@@ -151,6 +151,35 @@ class ReaderArmv7ValidatorTests(unittest.TestCase):
                 "00010000 T fz_open_document\n00020000 T fz_subset_cff_for_gids\n"
             )
 
+    def test_rejects_weak_optional_component_symbol(self) -> None:
+        with self.assertRaisesRegex(
+            _READER_VALIDATOR.VerificationError, "zxing-cpp.*_ZN5ZXing"
+        ):
+            _READER_VALIDATOR.verify_reader_symbol_policy(
+                "00010000 W _ZN5ZXing10ReadBarcodeEv\n"
+            )
+
+    def test_rejects_data_optional_component_symbol(self) -> None:
+        with self.assertRaisesRegex(
+            _READER_VALIDATOR.VerificationError, "MuJS.*js_global"
+        ):
+            _READER_VALIDATOR.verify_reader_symbol_policy(
+                "00010000 D js_global\n"
+            )
+
+    def test_rejects_gzip_document_handler(self) -> None:
+        with self.assertRaisesRegex(
+            _READER_VALIDATOR.VerificationError, "gzip.*gz_document_handler"
+        ):
+            _READER_VALIDATOR.verify_reader_symbol_policy(
+                "00010000 D gz_document_handler\n"
+            )
+
+    def test_ignores_undefined_symbols(self) -> None:
+        _READER_VALIDATOR.verify_reader_symbol_policy(
+            "         U js_global\n         w _ZN5ZXing10ReadBarcodeEv\n"
+        )
+
     def test_rejects_disabled_optional_component_symbol(self) -> None:
         with self.assertRaisesRegex(
             _READER_VALIDATOR.VerificationError, "cmark-gfm.*cmark_parse_document"
