@@ -21,6 +21,11 @@ required-features = ["kindle_supervisor_harness"]
 name = "durable-write-bench"
 path = "src/bin/durable_write_bench.rs"
 
+[[bin]]
+name = "reader-probe"
+path = "src/bin/reader_probe.rs"
+required-features = ["reader"]
+
 [features]
 # Narrow, non-production gate: exposes DisposableStreamPermit construction and the
 # isolated harness binary. Ordinary scribe-app / Scriptlet builds must omit this.

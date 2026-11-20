@@ -215,3 +215,37 @@ python3 tools/ci/verify_reader_armv7_elf.py \
   --ordinary-binary "$ORDINARY_BIN" \
   --target-dir "$READER_TARGET_DIR" \
   --target "$TARGET"
+
+if [ "${IGNITE_READER_BUILD_PROBE:-0}" = 1 ]; then
+  echo "== Release-profile ordinary ARMv7 executable"
+  PROBE_TARGET_DIR="${IGNITE_READER_PROBE_TARGET_DIR:-/tmp/ignite-reader-probe-target}"
+  RELEASE_BASELINE_DIR="${IGNITE_READER_RELEASE_BASELINE_DIR:-/tmp/ignite-reader-release-baseline}"
+  PROBE_OUTPUT_DIR="${IGNITE_READER_PROBE_OUTPUT_DIR:-/tmp/ignite-reader-probe-output}"
+  export CARGO_PROFILE_RELEASE_STRIP=none
+
+  CARGO_TARGET_DIR="$RELEASE_BASELINE_DIR" cargo build \
+    -p scribe-app --locked --release --target "$TARGET" \
+    --features scribe-app/restore_from_server --bin scribe-app
+
+  CARGO_TARGET_DIR="$PROBE_TARGET_DIR" cargo build \
+    -p scribe-app --locked --release --target "$TARGET" \
+    --features scribe-app/restore_from_server,scribe-app/reader --bin reader-probe
+
+  ORDINARY_RELEASE="$RELEASE_BASELINE_DIR/$TARGET/release/scribe-app"
+  PROBE_UNSTRIPPED="$PROBE_TARGET_DIR/$TARGET/release/reader-probe"
+  test -f "$ORDINARY_RELEASE"
+  test -f "$PROBE_UNSTRIPPED"
+
+  mkdir -p "$PROBE_OUTPUT_DIR"
+  PROBE_STRIPPED="$PROBE_OUTPUT_DIR/reader-probe-armv7hf"
+  install -m 0755 "$PROBE_UNSTRIPPED" "$PROBE_STRIPPED"
+  arm-linux-gnueabihf-strip --strip-all "$PROBE_STRIPPED"
+
+  python3 tools/ci/verify_reader_probe_armv7.py \
+    --unstripped "$PROBE_UNSTRIPPED" \
+    --stripped "$PROBE_STRIPPED" \
+    --ordinary "$ORDINARY_RELEASE"
+
+  echo "reader_probe_artifact=$PROBE_STRIPPED"
+  echo "reader_probe_distribution=developer_only_not_published"
+fi
