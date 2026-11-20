@@ -174,7 +174,7 @@ and are never packaged or uploaded as customer artifacts.
 
 ## Validation record
 
-Phase 1B.2 local validation on 2026-11-19 is incomplete on the available Windows host:
+The initial Phase 1B.2 Windows-local validation on 2026-11-19 was incomplete:
 
 - the source is pinned to MuPDF 1.28.6 commit
   `da5f5eb890d7b3fb76903160b5f7f48ba1301492` with all recursive third-party revisions;
@@ -191,9 +191,18 @@ Phase 1B.2 local validation on 2026-11-19 is incomplete on the available Windows
 - Docker Desktop was unavailable and WSL enumeration timed out, so Linux host tests, peak RSS and
   the complete ARMv7 link and inspection did not run.
 
-No new library, GLIBC, ARM ABI, native-object or feature-isolation result is claimed from that
-partial run. The complete pinned-container output with `IGNITE_READER_RUN_HOST_TESTS=1` must
-replace this record before Phase 1B.2 is ready for review.
+Those Windows-local results alone were not sufficient. The subsequent 2026-11-19 pinned-container
+run on Dragonfly against `feat/reader-mupdf-upgrade` commit `c2abb4c` passed:
+
+- `mupdf_version=1.28.6` and `reader_host_tests=passed`;
+- `reader_host_peak_rss_kib=40176` (39.2 MiB, Linux host test process);
+- `reader_needed_added=none` and `reader_max_glibc=GLIBC_2.30`;
+- `reader_cve_2026_7233_subsetting_symbol=absent` and `READER_ARMV7_ELF_OK`;
+- reader isolation passed and Python QA passed 35 tests.
+
+The validator exited with code 0. Raw log: `/home/dragonfly/ignite-reader-phase1b2-qualified.log`.
+SHA-256: `1512c16c3289b954a570584a6b838db3cafb84d569f4cac7d9b93aafb9f9476c`.
+This is host/ARM build evidence, not physical Kindle runtime qualification.
 
 On 2026-11-16, the corrected validation was executed on Linux against the hardening working tree:
 
@@ -268,10 +277,9 @@ still need review before any build containing the reader ships.
 
 ## Remaining limitations
 
-- **Phase 1B.2 qualification.** The source integration now selects MuPDF 1.28.6 plus a fail-closed
-  CVE-2026-112036 backport, while excluding the still-unfixed CVE-2026-7233 subsetting path from
-  the linked reader. The complete Linux host, peak-RSS, ARM ELF, shared-library and GLIBC
-  validation has not yet run on this source pin.
+- **Kindle runtime qualification.** The MuPDF 1.28.6 build, fail-closed CVE-2026-112036 backport
+  and exclusion of the CVE-2026-7233 subsetting symbol passed pinned Linux/ARMv7 validation.
+  Actual Kindle loader, memory and crash behavior remain unqualified.
 - **Native memory is not globally bounded.** The destination pixmap has a hard limit, but parsing,
   image decoding, layout, caches, masks and transparency groups do not. Hardware tests need RSS
   and failure measurements with adversarial and image-heavy documents before customer use.

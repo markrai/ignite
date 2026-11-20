@@ -1,7 +1,7 @@
 # MuPDF Phase 1B: security and upgrade assessment
 
-Status: **Phase 1B.2 implementation complete in the working tree; Linux and ARM qualification
-pending** (2026-11-19). Tracks [Ignite #22](https://github.com/markrai/ignite/issues/22).
+Status: **Phase 1B.2 Linux and ARMv7 validation passed; Kindle runtime remains unqualified**
+(2026-11-19). Tracks [Ignite #22](https://github.com/markrai/ignite/issues/22).
 
 ## Decision
 
@@ -26,7 +26,7 @@ The fork contains two necessary changes:
   or already-patched form cannot be proved.
 
 This is the smallest maintainable integration that does not require publishing an external fork.
-It remains unqualified until the pinned Linux and ARM validator succeeds.
+The pinned Linux and ARMv7 validator now passes; physical Kindle runtime remains unqualified.
 
 ## Security decisions
 
@@ -103,20 +103,23 @@ installing tools from the timestamped Debian snapshot. The Docker image pin and 
 Local source and Python checks can run on the available Windows host. The native MSVC compile
 reached the deterministic patch stage, proving all required source patterns matched exactly once,
 then stopped in the host toolchain with repeated `C1902 Program database manager mismatch`
-errors. Docker Desktop was unavailable and `wsl.exe -l -v --all` timed out, so the required
-Linux host execution, peak-RSS observation and pinned ARMv7 link have not run for this source pin.
+errors. Docker Desktop was unavailable and `wsl.exe -l -v --all` timed out, so Linux/ARM
+qualification could not run on that Windows host. It subsequently passed on Dragonfly.
 The ordinary `scribe-app` library suite passed with 1,583 tests and 29 explicit ignores, and the
 disabled/enabled dependency and packaging-isolation checks passed.
 
-Consequently there is not yet Phase 1B.2 evidence for:
+The subsequent 2026-11-19 pinned-container run on Dragonfly against commit `c2abb4c` passed:
 
-- `reader_host_tests=passed` and the measured peak RSS;
-- `READER_ARMV7_ELF_OK`, ARM hard-float ABI and native-object formats;
-- unchanged `DT_NEEDED` libraries and no GLIBC increase over the reader-disabled harness; or
-- absence of MuPDF symbols in the newly linked ordinary executable.
+- `mupdf_version=1.28.6` and `reader_host_tests=passed`;
+- `reader_host_peak_rss_kib=40176` (39.2 MiB, Linux host test process);
+- `reader_needed_added=none` and `reader_max_glibc=GLIBC_2.30`;
+- `reader_cve_2026_7233_subsetting_symbol=absent` and `READER_ARMV7_ELF_OK`;
+- reader isolation passed, and Python QA passed all 35 tests.
 
-Historical Phase 0 results for MuPDF 1.27.2 remain useful comparison data, but they do not qualify
-this 1.28.6 build. Phase 1B.2 remains blocked until the full pinned-container log passes.
+The validator exited with code 0. Raw log: `/home/dragonfly/ignite-reader-phase1b2-qualified.log`.
+SHA-256: `1512c16c3289b954a570584a6b838db3cafb84d569f4cac7d9b93aafb9f9476c`.
+This qualifies the build and host tests; the reader remains disabled by default, and Kindle
+runtime qualification is still required.
 
 No physical Kindle test has been performed. Even after Linux and ARM build qualification, supported
 Scribe firmware still needs loader/library inspection, RSS and crash monitoring with malformed and
