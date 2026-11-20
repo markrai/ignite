@@ -902,10 +902,15 @@ mod tests {
         let zip_as_pdf = dir.write("archive.pdf", &cbz_fixture());
         let pdf_as_cbz = dir.write("document.cbz", &rectangle_pdf());
         let html_as_epub = dir.write("markup.epub", b"<html><body>book</body></html>");
-        let gzip_as_pdf = dir.write("compressed.pdf", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03");
+        let gzip_as_pdf = dir.write(
+            "compressed.pdf",
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03",
+        );
 
         for path in [&zip_as_pdf, &pdf_as_cbz, &html_as_epub, &gzip_as_pdf] {
-            let error = Book::open_path(path).err().expect("signature must be rejected");
+            let error = Book::open_path(path)
+                .err()
+                .expect("signature must be rejected");
             assert!(
                 error.0.contains("document signature does not match"),
                 "{}: {error}",
@@ -920,7 +925,9 @@ mod tests {
         let mut prefix = vec![b'A'; 1024];
         prefix.extend_from_slice(b"%PDF-1.4\n");
         let path = dir.write("hidden.pdf", &prefix);
-        let error = Book::open_path(path).err().expect("late PDF marker must be rejected");
+        let error = Book::open_path(path)
+            .err()
+            .expect("late PDF marker must be rejected");
         assert!(error.0.contains("document signature does not match"));
     }
 
