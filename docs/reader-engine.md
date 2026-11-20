@@ -24,6 +24,11 @@ calls the engine, and no customer build contains it. Background and plan:
      executable in the pinned Kindle Docker image. The ARM executables are inspected but never
      run on the x86 host.
 
+Milestone B adds a separate release-optimized ARMv7 `reader-probe` binary behind the same
+feature gate. It is not packaged for customers or activated by the Ignite app. Its pinned
+cross-build, ELF verification, read-only corpus boundary and physical QA restrictions are
+documented in [reader-probe-milestone-b.md](reader-probe-milestone-b.md).
+
 Out of scope for now: discovery, book identity, reading positions, book folders, UI, packaging and
 notices in the release payload.
 
