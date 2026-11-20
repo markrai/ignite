@@ -24,6 +24,20 @@ class VerificationError(RuntimeError):
     pass
 
 
+FORBIDDEN_READER_SYMBOLS = {
+    "fz_subset_cff_for_gids": "CVE-2026-7233 CFF subsetting path",
+}
+FORBIDDEN_READER_SYMBOL_PREFIXES = {
+    "Brotli": "Brotli",
+    "cmark_": "cmark-gfm",
+    "js_": "MuJS",
+    "mupdf_js_": "MuJS wrapper",
+    "tess_": "Tesseract",
+    "zxing": "zxing-cpp",
+    "_ZN5ZXing": "zxing-cpp",
+}
+
+
 def run(*argv: str) -> str:
     result = subprocess.run(argv, capture_output=True, text=True, errors="replace")
     if result.returncode != 0:
@@ -131,8 +145,24 @@ def find_linked_symbols(symbols: str) -> tuple[str, str]:
     return reader_match.group(1), mupdf_match.group(1)
 
 
+def verify_reader_symbol_policy(symbols: str) -> None:
+    defined = set(re.findall(r"\s[Tt]\s+(\S+)$", symbols, re.MULTILINE))
+    for symbol, reason in FORBIDDEN_READER_SYMBOLS.items():
+        if symbol in defined:
+            raise VerificationError(
+                f"reader test ELF links forbidden {reason} symbol: {symbol}"
+            )
+    for symbol in defined:
+        for prefix, component in FORBIDDEN_READER_SYMBOL_PREFIXES.items():
+            if symbol.startswith(prefix):
+                raise VerificationError(
+                    f"reader test ELF links disabled optional {component} symbol: {symbol}"
+                )
+
+
 def verify_linked_symbols(binary: Path) -> tuple[str, str]:
     symbols = run("arm-linux-gnueabihf-nm", "--defined-only", str(binary))
+    verify_reader_symbol_policy(symbols)
     return find_linked_symbols(symbols)
 
 
@@ -237,6 +267,8 @@ def main() -> int:
     print("device_runtime_compatibility=unqualified")
     print(f"reader_linked_test_symbol={reader_symbol}")
     print(f"reader_linked_mupdf_symbol={mupdf_symbol}")
+    print("reader_cve_2026_7233_subsetting_symbol=absent")
+    print("reader_disabled_optional_component_symbols=absent")
     print(f"reader_native_objects={native_count}")
     print(f"reader_native_formats={','.join(sorted(native_formats))}")
     print(f"reader_disabled_test_elf_class={baseline_info['class']}")

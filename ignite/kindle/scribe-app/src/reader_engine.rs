@@ -552,6 +552,58 @@ mod tests {
         out
     }
 
+    fn image_pdf(width: u32, height: u32) -> Vec<u8> {
+        let sample_count = usize::try_from(u64::from(width) * u64::from(height)).unwrap();
+        let samples = vec![0x80; sample_count];
+        let content = format!("q {width} 0 0 {height} 0 0 cm /Im0 Do Q");
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
+            )
+            .into_bytes(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            )
+            .into_bytes(),
+            {
+                let mut image = format!(
+                    "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\nstream\n",
+                    samples.len()
+                )
+                .into_bytes();
+                image.extend_from_slice(&samples);
+                image.extend_from_slice(b"\nendstream");
+                image
+            },
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
     fn long_html() -> Vec<u8> {
         let para = "<p>Ignite renders this paragraph to check that reflowable layout works. \
                     A larger font has to spread the same text over more pages.</p>";
@@ -766,6 +818,19 @@ mod tests {
             .unwrap()
             .pixels()
             .is_empty());
+    }
+
+    #[test]
+    fn image_heavy_pdf_renders_within_output_budget() {
+        let dir = TempDocumentDir::new("image-heavy");
+        let path = dir.write("image-heavy.pdf", &image_pdf(2_048, 2_048));
+        let book = Book::open_path(&path).expect("open image-heavy PDF");
+        let page = book
+            .render_page_gray(0, 1_860, 1_860)
+            .expect("render image-heavy PDF");
+        assert_eq!((page.width, page.height), (1_860, 1_860));
+        assert_eq!(page.pixels().len(), 1_860 * 1_860);
+        assert!(page.pixels().len() as u64 <= MAX_RENDER_BYTES);
     }
 
     #[test]

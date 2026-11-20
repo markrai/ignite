@@ -1,85 +1,139 @@
-# MuPDF Phase 1B.1: security and upgrade assessment
+# MuPDF Phase 1B: security and upgrade assessment
 
-Status: **assessment for review, no dependency or runtime changes** (2026-11-18). Tracks [Ignite #22](https://github.com/markrai/ignite/issues/22).
+Status: **Phase 1B.2 Linux and ARMv7 validation passed; Kindle runtime remains unqualified**
+(2026-11-19). Tracks [Ignite #22](https://github.com/markrai/ignite/issues/22).
 
 ## Decision
 
-**Candidate native release:** MuPDF **1.28.6**, upstream tag `1.28.6`, commit [`da5f5eb890d7b3fb76903160b5f7f48ba1301492`](https://github.com/ArtifexSoftware/mupdf/commit/da5f5eb890d7b3fb76903160b5f7f48ba1301492) (2026-10-29). This is a *candidate source pin*, not a qualified or automatically secure binary. Validate any relevant post-release security patch before selecting the final source tree.
+Ignite now selects MuPDF **1.28.6** at upstream tag and commit
+[`da5f5eb890d7b3fb76903160b5f7f48ba1301492`](https://github.com/ArtifexSoftware/mupdf/commit/da5f5eb890d7b3fb76903160b5f7f48ba1301492).
+The source is a recursive Git submodule, so the native tree and every third-party submodule are
+immutable revisions rather than a floating tag or branch. The native submodule is kept pristine.
 
-**Preferred integration:** first look for a completed, maintained upstream `mupdf-rs` release with the necessary native fixes. If none exists when implementation starts, maintain a narrowly scoped, source-pinned fork of **`mupdf-sys` 0.8.0** and, only where required by ABI/API changes, the `mupdf` Rust wrapper. Pin the resulting fork by immutable Git commit in `Cargo.lock` using a narrowly scoped `[patch.crates-io]` entry or an equivalent explicit source override. Do not claim that the fork's commit SHA exists until the implementation is created and qualified.
+No maintained Rust release newer than `mupdf`/`mupdf-sys` 0.8.0 was available on 2026-11-19.
+The latest released bindings and their `main` branch still selected MuPDF 1.27.2; upstream PR
+[#261](https://github.com/messense/mupdf-rs/pull/261) only proposed 1.28.2. Ignite therefore uses
+narrow in-repository forks of the two 0.8.0 crates under `vendor/`, sourced from
+`mupdf-rs` commit `deaacc87c4cea6a2146e90e00e0d5658c911277b`. The root
+`[patch.crates-io]` entries select those paths while the application keeps its exact
+`mupdf = "=0.8.0"` API pin.
 
-**Current Ignite baseline:** `scribe-app` pins `mupdf = "=0.8.0"`, and `mupdf-sys` 0.8.0 vendors MuPDF **1.27.2**. The `mupdf-rs` `v0.8.0` submodule resolves to native commit [`73d3100d46d8a9ad634f6ef035bbe78f0f947886`](https://github.com/ArtifexSoftware/mupdf/tree/73d3100d46d8a9ad634f6ef035bbe78f0f947886), exactly the upstream `1.27.2` tag. It is not a hypothetical version inferred from the Rust crate number.
+The fork contains two necessary changes:
 
-## Why this is necessary
+- initialize MuPDF 1.28's new `fz_stext_options.table_hunt_options` field; and
+- apply the existing font fallback and store-lifetime fixes plus the security patch below to a
+  disposable build copy, with exact source-pattern checks that stop the build if the expected old
+  or already-patched form cannot be proved.
 
-The [MuPDF release history](https://mupdf.com/releases/history) lists extensive memory-safety and robustness fixes in 1.28.x. In particular, **1.28.5** addresses out-of-bounds reads/writes in pixmap conversions, painting, font subsetting, recoloring and JPEG handling, as well as a BMP stride integer overflow and image decompression-bomb detection. **1.28.6** updates bundled Brotli to 1.2.1. Not every fixed routine is necessarily reachable through Ignite's restricted PDF/EPUB/CBZ reader; reachability must be determined rather than assumed.
+This is the smallest maintainable integration that does not require publishing an external fork.
+The pinned Linux and ARMv7 validator now passes; physical Kindle runtime remains unqualified.
 
-The most recent published [`mupdf-rs` release](https://github.com/messense/mupdf-rs/releases) is **v0.8.0** (2026-06-22); its current `main` submodule is also pinned to native 1.27.2. An upstream [PR #261](https://github.com/messense/mupdf-rs/pull/261) proposes 1.28.2 but remains open as of this assessment. Therefore `cargo update` alone cannot provide native 1.28.6, and swapping a MuPDF source directory without testing the FFI is not a safe upgrade procedure.
+## Security decisions
 
-## Security findings requiring source-level closure
+The selected release was assessed at source and commit-ancestry level. A newer version number was
+not treated as proof that a fix was present.
 
-| Finding | Evidence / affected surface | Required Phase 1B.2 disposition |
-| --- | --- | --- |
-| MuPDF 1.28.x hardening | [Upstream release history](https://mupdf.com/releases/history), notably 1.28.0 and 1.28.5, describes security, OOB, overflow and parsing fixes | Record which fixes are in the exact selected tree and which relevant code paths are compiled/reachable |
-| **CVE-2026-112036**, signature-locking `free_char_list` double-free | [Debian tracker](https://security-tracker.debian.org/tracker/CVE-2026-112036) reports affected versions through 1.28.5 and names fix commit `3984925b660afb8a781ddf504021e91be1bc671e` | Inspect the *actual 1.28.6 source* for the fix or equivalent; do **not** equate release date with proven patch inclusion; assess whether signature locking is reachable while viewing PDFs |
-| **CVE-2026-7233**, CFF subsetting OOB read | [Debian tracker](https://security-tracker.debian.org/tracker/CVE-2026-7233) lists 1.28.2 Debian packages as unfixed, with no fixed version | Check 1.28.6 source and compiled feature reachability; if still affected, decide whether a verified patch/feature exclusion is required before shipping |
-| **CVE-2026-3308**, PDF image integer overflow and heap OOB write | [Debian tracker](https://security-tracker.debian.org/tracker/CVE-2026-3308) describes 1.27.0 and a downstream fix | Check source ancestry to determine whether Ignite's **1.27.2** already includes the fix; do not label 1.27.2 vulnerable from a 1.27.0 report without verification |
-| Native image/font/HTML parser exposure | Ignite enables `epub`, `html`, `img`, `svg`, `cbz`, and `base14-fonts`; untrusted files can exercise font, archive and image decoders | Review the shipped native source, malformed-file corpus, and compiled component inventory, not just Rust crate advisories |
+| Finding | 1.28.6 source decision | Ignite disposition |
+|---|---|---|
+| **CVE-2026-112036**, signature-locking `free_char_list` use-after-free/double-free | Upstream fix `3984925b660afb8a781ddf504021e91be1bc671e` is not an ancestor of the selected release commit. The vulnerable function frees `c->list` without clearing it. | The build script applies the exact one-line pointer clear to its copied source and fails closed if the source pattern changes. Signature locking is not needed for rendering, but the PDF object code is part of the native library, so reachability was not used to excuse it. |
+| **CVE-2026-7233**, CFF subsetting out-of-bounds read | The affected `fz_subset_cff_for_gids` implementation remains in 1.28.6 and Debian still records no fixed release. Its callers are PDF/TTF subsetting and writing paths, not Ignite's open/layout/render operations. | The source issue is **not claimed fixed**. The ARM verifier fails if `fz_subset_cff_for_gids` is linked into the reader executable, proving exclusion from the delivered static link. A future writer/subsetter feature must first supply an audited fix. |
+| **CVE-2026-3308**, PDF image stride integer overflow and heap write | Fix `a26f0142e7d390d4a82c6e5ae0e312e07cc4ec85` is an ancestor of the selected commit. It is not an ancestor of Ignite's old 1.27.2 release branch. | Fixed by the selected source. This path is relevant to normal PDF image rendering. |
+| **CVE-2026-92413**, external PDF stream null dereference | The named fix `3df1e30f9d7b77260e13bd0dbe1928ddeba8386e` is not an ancestor because it was made on a divergent development branch. The selected 1.28.6 release implementation of `pdf_open_filter` has no external-stream/archive branch or vulnerable null return. | Unreachable because the affected implementation is absent, not because of release chronology. |
+| MuPDF 1.28.x hardening | 1.28.0 through 1.28.6 include the upstream parser, image, pixmap, font, overflow, decompression-bomb and robustness work recorded in the release history. | Exact source remains pinned. Malformed, truncated and image-heavy reader tests are bounded by a 120-second validator timeout; a pass must also report peak RSS. |
+| PyMuPDF path traversal **CVE-2026-82035** | This is in PyMuPDF's Python `extract_objects` API, not the MuPDF C library or the Rust bindings. | Not present in Ignite's dependency graph or compiled configuration. |
 
-This table is **not** a comprehensive, closed CVE audit. Phase 1B.2 must update it with the selected source commit's actual patch status, affected configurations, and any newly reported advisories. The assessment does not assert that MuPDF 1.28.6 fixes every known issue.
+The Debian source tracker still lists several old denial-of-service findings as unimportant or
+unresolved across packaged MuPDF versions. This review does not declare the native parser free of
+unknown or all denial-of-service defects. The reader remains experimental, off by default, and
+must process untrusted documents under device-level memory and crash observation.
 
-## Upgrade approaches
+## Compiled configuration
 
-| Option | Assessment |
-| --- | --- |
-| Official newer `mupdf` / `mupdf-sys` release | **Best long-term choice** if it includes security fixes and passes our target; none newer than 0.8.0 was published at assessment time |
-| Pinned fork of `mupdf-sys` 0.8.0, updating native source and adapting the wrapper | **Recommended implementation fallback.** Keeps Ignite's high-level API as stable as possible, but requires explicit wrapper/bindgen/build-script review, submodule pinning and a maintainership plan |
-| Independently built system/native MuPDF with existing Rust bindings | **Not recommended initially.** Higher risk of header/ABI mismatch, build/provenance drift, extra shared libraries, and glibc/GLIBCXX incompatibility on Kindle |
-| Simply replacing vendored MuPDF files under the published crate | **Reject.** Neither ABI compatibility nor the crate's source/provenance contract is established |
+Ignite enables only PDF plus the EPUB/HTML, image, SVG and CBZ support required by Phase 1A and
+base-14 fonts. MuPDF 1.28's new defaults would otherwise enable extra document formats and
+cmark-gfm. The fork explicitly disables FB2, Markdown, MOBI, Office, plain-text, OCR output and ODT
+output, as well as MuJS, Brotli, DOCX extraction, Tesseract, zxing-cpp, libarchive and cmark-gfm.
+The ARM verifier rejects linked MuJS, Brotli, cmark-gfm, Tesseract and zxing symbols.
 
-Potential breakpoints include changed native signatures, missing/renamed `fz_*` or `pdf_*` symbols, `bindgen` output, wrapper C code, font-loading hooks, native build flags, and ownership/lifetime assumptions. [MuPDF's API change log](https://mupdf.readthedocs.io/en/1.28.6/other/changes.html) documents a `pdf_validate_signature` API change between 1.27 and 1.28, illustrating why the complete wrapper must be compiled and examined even if Ignite does not call that API.
+The recursively pinned native components used by this configuration are:
 
-**Existing downstream patches are an additional blocker:** the `mupdf-sys` 0.8.0 build script performs source-text substitutions for special font fallback and cache reaping, and may only warn if expected patterns are missing. For the selected upgraded tree, audit their necessity and make any required patch application fail closed. Silently skipping a formerly necessary memory/cache fix is not acceptable.
+| Component | Declared version | Exact source revision | Licence |
+|---|---|---|---|
+| MuPDF | 1.28.6 | `da5f5eb890d7b3fb76903160b5f7f48ba1301492` | AGPL-3.0 |
+| FreeType | 2.14.3 | `0a0221a1347e2f1e07c395263540026e9a0aa7c7` | FreeType Licence |
+| HarfBuzz | 13.0.1 | `c28ba35a1e6dc4b6b32e2b1d11fd2a408f6c86bb` | Old MIT |
+| jbig2dec | 0.20 | `dc15c39bbbddc90f79c14563d2eb5a794106be8f` | AGPL-3.0 |
+| Little CMS, Artifex multithreaded fork | 2.19.1.art | `d69c64417c4a33a4629957fc0e08f4f4c5abcc3d` | MIT |
+| libjpeg, IJG | 10 | `627faae398468d5d11e3d694dc325432f734b5c4` | IJG |
+| OpenJPEG | 2.5.3 declared | `957029eb875eee1118743f200cb86da9d8289de2` | BSD-2-Clause |
+| zlib | 1.3.2 | `da607da739fa6047df13e66a2af6b8bec7c2a498` | zlib |
+| Gumbo parser | 0.10.1 lineage | `61bd4e736c3b342e592f65be0d65ec6a0acd8dcb` | Apache-2.0 |
 
-## Native dependency and license considerations
+Brotli 1.2.1 and cmark-gfm 0.29.0.gfm.13 source revisions are present in the recursive upstream
+tree but are disabled and must not contribute linked symbols. Presence in the source checkout is
+not represented as presence in the binary. MuPDF, the Rust crates and jbig2dec are AGPL-compatible
+with Ignite's AGPL-3.0-only licence, but a future shipped reader still needs corresponding-source,
+notice and complete component-inventory review.
 
-Current [Ignite reader inventory](reader-engine.md#dependencies) identifies FreeType, HarfBuzz, jbig2dec, lcms2, libjpeg, OpenJPEG, zlib and Gumbo in the selected build. The source bundle also has optional Brotli, MuJS, Tesseract, Leptonica, zxing and other components. **Presence in a source package is not proof that a component is compiled.** After upgrading, derive the exact list of compiled libraries and versions from the selected native submodule commits, feature flags and link results; check each component's security advisories and licensing.
+## Reproducibility
 
-MuPDF, `mupdf`, and `mupdf-sys` are AGPL-3.0. Ignite is AGPL-3.0-only, so that is compatible at the headline-license level. It is **not** a substitute for release component attribution, notice packaging, complete corresponding source, third-party license reconciliation, or a redistribution review when the feature first ships. Version upgrades may change the third-party inventory and notices.
+The crates.io sources used to create the in-repository fork have these checksums:
 
-Keep embedded fonts and optional native features deliberately constrained. The current `reader` Cargo feature remains **off by default**; ordinary/customer builds and release packaging remain free of MuPDF until a separately approved activation phase.
+- `mupdf` 0.8.0:
+  `185fb74927a40c569b7152c01c73f4c0206059b8b3d37c7eb007cc3f63453b64`
+- `mupdf-sys` 0.8.0:
+  `1c20755e9694e43da4ce8ee2e0211d63883cccd68d314ea4d518c031efee7d8e`
 
-## Reproducibility and target requirements
+From a fresh checkout:
 
-The production-relevant baseline is the existing pinned `rust_armv7hf` image in `tools/pinned-docker-images.txt`, currently `rust:1-bullseye@sha256:4730e387a220a08a365c77da3096544dde214f9d796c16284d4be45438cad4a9`. The inherited reader validation links native code with the ARM hard-float toolchain and checks the ELF interpreter, native objects, `DT_NEEDED`, and GLIBC requirements.
+```sh
+git submodule update --init --recursive
+cargo test -p scribe-app --lib --locked --features reader reader_engine
+IGNITE_READER_RUN_HOST_TESTS=1 bash tools/ci/validate_reader_armv7.sh
+```
 
-The last qualified **1.27.2** baseline required `GLIBC_2.30` and added no shared-library dependencies over the equivalent reader-disabled harness. **Those are regression-comparison baselines, not proof of supported Kindle firmware compatibility.** Do not loosen them or change the pinned image to make the upgrade pass.
+The last command is intended for the digest-pinned
+`rust:1-bullseye@sha256:4730e387a220a08a365c77da3096544dde214f9d796c16284d4be45438cad4a9`
+container. It checks the exact native revision and every recorded recursive submodule before
+installing tools from the timestamped Debian snapshot. The Docker image pin and the established
+`GLIBC_2.30` differential baseline are unchanged.
 
-Phase 1B.2 must pin or record:
+## Validation status
 
-1. Native MuPDF tree commit (candidate `da5f5eb890d7b3fb76903160b5f7f48ba1301492`) and all transitive source/submodule revisions, plus archive checksums when used.
-2. The resulting `mupdf-sys` and optional `mupdf` fork commits, reviewed patches, feature switches, `Cargo.lock` source entries and licenses.
-3. The pinned Rust/image/toolchain versions, ARM sysroot, static library architecture, ELF/GLIBC baseline and any native runtime dependencies.
-4. A verifiable build-to-source mapping and a plan for future CVE refreshes.
+Local source and Python checks can run on the available Windows host. The native MSVC compile
+reached the deterministic patch stage, proving all required source patterns matched exactly once,
+then stopped in the host toolchain with repeated `C1902 Program database manager mismatch`
+errors. Docker Desktop was unavailable and `wsl.exe -l -v --all` timed out, so Linux/ARM
+qualification could not run on that Windows host. It subsequently passed on Dragonfly.
+The ordinary `scribe-app` library suite passed with 1,583 tests and 29 explicit ignores, and the
+disabled/enabled dependency and packaging-isolation checks passed.
 
-## Implementation and acceptance plan (Phase 1B.2)
+The subsequent 2026-11-19 pinned-container run on Dragonfly against commit `c2abb4c` passed:
 
-1. Freeze the current `main` baseline; keep this assessment separate from the native upgrade.
-2. Resolve the CVE and upstream-diff questions above. Select an exact upstream commit plus any indispensable verified fixes. Confirm the compiled third-party inventory.
-3. Trial the selected native sources in a tightly pinned `mupdf-sys` fork, initially keeping Rust high-level interfaces unchanged. Make necessary source patches deterministic; patch the high-level wrapper only if ABI changes require it.
-4. Test source/build reproducibility and packaging isolation; verify PDF, EPUB and CBZ file-backed opening and grayscale rendering, Phase 1A pixel budget, path policy, input errors, reflow, and 16+ open/render/close cycles.
-5. Add representative malformed, truncated, image-heavy, compression-bomb and adversarial fixtures with bounded execution and RSS/peak native allocation observations. Document native crashes and OOM rather than treating the 4.40 MiB output buffer limit as a process-memory bound.
-6. Rerun the complete host test suite, `tools/ci/check_reader_isolation.sh`, Python QA, pinned `tools/ci/validate_reader_armv7.sh` with `IGNITE_READER_RUN_HOST_TESTS=1`, and all cross-linked ELF/GLIBC/DT_NEEDED/native-object checks. Keep default builds MuPDF-free.
-7. Separately qualify the upgraded reader on supported Scribe firmware with runtime loader/library inspection, crash and RSS monitoring, and lifecycle tests before enabling any customer-facing UI.
-8. Review component inventory, source distribution, notices, and provenance in a separate packaging gate. No version bump or production deployment is implied by this assessment.
+- `mupdf_version=1.28.6` and `reader_host_tests=passed`;
+- `reader_host_peak_rss_kib=40176` (39.2 MiB, Linux host test process);
+- `reader_needed_added=none` and `reader_max_glibc=GLIBC_2.30`;
+- `reader_cve_2026_7233_subsetting_symbol=absent` and `READER_ARMV7_ELF_OK`;
+- reader isolation passed, and Python QA passed all 35 tests.
 
-**Phase 1B.2 is blocked until the exact source/patch decision is made and its native validation succeeds.** This document alone does not qualify any upgraded MuPDF binary.
+The validator exited with code 0. Raw log: `/home/dragonfly/ignite-reader-phase1b2-qualified.log`.
+SHA-256: `1512c16c3289b954a570584a6b838db3cafb84d569f4cac7d9b93aafb9f9476c`.
+This qualifies the build and host tests; the reader remains disabled by default, and Kindle
+runtime qualification is still required.
+
+No physical Kindle test has been performed. Even after Linux and ARM build qualification, supported
+Scribe firmware still needs loader/library inspection, RSS and crash monitoring with malformed and
+image-heavy documents, repeated lifecycle testing, and confirmation that ordinary customer
+packaging remains unaffected. The 4,612,800-byte Gray8 cap is not a process-wide native-memory cap.
 
 ## Evidence
 
-- [Ignite Phase 0 / Phase 1A reader contracts](reader-engine.md)
-- [MuPDF official release history](https://mupdf.com/releases/history)
-- [MuPDF 1.28.6 interface change log](https://mupdf.readthedocs.io/en/1.28.6/other/changes.html)
-- [mupdf-rs v0.8.0 release](https://github.com/messense/mupdf-rs/releases/tag/v0.8.0) and [bundled native submodule](https://github.com/messense/mupdf-rs/tree/v0.8.0/mupdf-sys)
-- [Open upstream MuPDF 1.28.2 binding update PR](https://github.com/messense/mupdf-rs/pull/261)
+- [Ignite reader contracts and validation history](reader-engine.md)
+- [MuPDF release history](https://mupdf.com/releases/history)
+- [MuPDF 1.28.6 API changes](https://mupdf.readthedocs.io/en/1.28.6/other/changes.html)
+- [mupdf-rs v0.8.0](https://github.com/messense/mupdf-rs/releases/tag/v0.8.0)
+- [Open mupdf-rs 1.28.2 update PR](https://github.com/messense/mupdf-rs/pull/261)
 - [Debian MuPDF security tracker](https://security-tracker.debian.org/tracker/source-package/mupdf)
+- [CVE-2026-112036](https://security-tracker.debian.org/tracker/CVE-2026-112036)
+- [CVE-2026-7233](https://security-tracker.debian.org/tracker/CVE-2026-7233)
+- [CVE-2026-3308](https://security-tracker.debian.org/tracker/CVE-2026-3308)
