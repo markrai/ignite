@@ -35,9 +35,9 @@ fn safe_filename(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && name.len() <= 128
-        && name.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
-        })
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         && matches!(
             Path::new(name).extension().and_then(|ext| ext.to_str()),
             Some("pdf" | "epub" | "cbz")
@@ -95,11 +95,13 @@ fn fixture_path(options: &Options) -> Result<PathBuf, String> {
         return Err("corpus must be a directory".into());
     }
     if cfg!(target_arch = "arm") && root != Path::new(DEVICE_CORPUS_ROOT) {
-        return Err("ARM probe requires the dedicated /mnt/us/ignite-reader-qa/corpus directory".into());
+        return Err(
+            "ARM probe requires the dedicated /mnt/us/ignite-reader-qa/corpus directory".into(),
+        );
     }
     let path = root.join(&options.file);
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|e| format!("cannot inspect fixture: {e}"))?;
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|e| format!("cannot inspect fixture: {e}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("fixture must be a regular file, not a symlink".into());
     }
@@ -141,7 +143,10 @@ fn run(options: Options) -> Result<(), String> {
         }
         let pages = book.page_count().map_err(|e| format!("pages: {e}"))?;
         if options.page >= pages {
-            return Err(format!("page index {} is outside {pages} pages", options.page));
+            return Err(format!(
+                "page index {} is outside {pages} pages",
+                options.page
+            ));
         }
         let open_ms = begin.elapsed().as_millis();
         let render_start = Instant::now();
@@ -150,9 +155,12 @@ fn run(options: Options) -> Result<(), String> {
             .map_err(|e| format!("render: {e}"))?;
         let width = page.width;
         let height = page.height;
-        let checksum = page.pixels().iter().fold(0xcbf29ce484222325_u64, |hash, b| {
-            (hash ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-        });
+        let checksum = page
+            .pixels()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, b| {
+                (hash ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+            });
         let render_ms = render_start.elapsed().as_millis();
         drop(page);
         drop(book);
