@@ -58,7 +58,7 @@ pub mod notebook;
 pub mod open_page;
 pub mod orch;
 #[cfg(unix)]
-pub mod orientation_watch;
+mod orientation_watch;
 pub mod page_label;
 pub mod page_ledger;
 #[cfg(test)]
