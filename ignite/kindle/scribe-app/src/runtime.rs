@@ -4774,6 +4774,8 @@ pub fn run_page_session(
     let mut cached_move_ids: Option<HashSet<String>> = None;
     let mut move_coalesce = MovePreviewCoalesce::default();
     let mut logged_proximity: Option<bool> = None;
+    let orientation_watch = crate::orientation_watch::Watcher::start();
+    let mut orientation_repaint_at: Option<Instant> = None;
     let ms_since_start =
         |at: Instant| at.saturating_duration_since(session_start).as_millis() as u64;
     println!("ready: waiting for Pen Down / Eraser Down (Ctrl+C to exit) ...");
@@ -4894,6 +4896,35 @@ pub fn run_page_session(
                         }
                     }
                 }
+            }
+        }
+
+        // The stock X11 layer below Ignite may repaint its white background on a physical
+        // orientation transition even though Ignite is registered upright-only. Coalesce rapid
+        // sensor transitions, wait for the stock relayout to settle, then reconstruct the same
+        // UI that a page turn would have restored manually.
+        if let Some(value) = orientation_watch
+            .as_ref()
+            .and_then(crate::orientation_watch::Watcher::take_latest)
+        {
+            if router.display_valid() {
+                orientation_repaint_at = Some(Instant::now() + crate::orientation_watch::SETTLE);
+                println!(
+                    "orientation_interference value={value} action=debounce_repaint settle_ms={}",
+                    crate::orientation_watch::SETTLE.as_millis()
+                );
+            } else {
+                orientation_repaint_at = None;
+                println!("orientation_interference value={value} action=ignore_display_invalid");
+            }
+        }
+        if !router.display_valid() {
+            orientation_repaint_at = None;
+        } else if orientation_repaint_at.is_some_and(|due| Instant::now() >= due) {
+            orientation_repaint_at = None;
+            if pending_ui.is_none() {
+                pending_ui = Some(UiCommand::Redraw(Redraw::Full));
+                println!("orientation_interference settled action=repaint");
             }
         }
 
