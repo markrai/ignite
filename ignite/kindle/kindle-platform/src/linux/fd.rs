@@ -130,7 +130,7 @@ pub fn abs_info(fd: &OwnedFd, axis: u16) -> PlatformResult<InputAbsinfo> {
 /// [`crate::linux::LinuxMonotonicClock`]. Failing is not fatal; it only means dispatch latency
 /// cannot be measured.
 pub fn set_clock_monotonic(fd: &OwnedFd) -> PlatformResult<()> {
-    let clk: i32 = libc::CLOCK_MONOTONIC;
+    let clk = libc::CLOCK_MONOTONIC as i32;
     let rc = unsafe {
         libc::ioctl(
             fd.raw(),
