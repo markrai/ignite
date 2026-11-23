@@ -10,6 +10,24 @@ from pathlib import Path
 import verify_reader_armv7_elf as existing
 
 
+ALLOWED_PROBE_ONLY_LIBRARIES = frozenset({"libm.so.6"})
+
+
+def verify_probe_added_libraries(
+    probe_libraries: list[tuple[str, Path]], ordinary_libraries: list[tuple[str, Path]]
+) -> str:
+    added = {name for name, _ in probe_libraries} - {
+        name for name, _ in ordinary_libraries
+    }
+    unapproved = added - ALLOWED_PROBE_ONLY_LIBRARIES
+    if unapproved:
+        raise existing.VerificationError(
+            "reader probe adds unapproved shared libraries: "
+            + ",".join(sorted(unapproved))
+        )
+    return ",".join(sorted(added)) or "none"
+
+
 def verify_release_probe(
     unstripped: Path, stripped: Path, ordinary: Path
 ) -> dict[str, str]:
@@ -41,7 +59,7 @@ def verify_release_probe(
     ordinary_libs = existing.verify_dynamic_libraries(ordinary, "ordinary release app")
     if {name for name, _ in full_libs} != {name for name, _ in probe_libs}:
         raise existing.VerificationError("stripping changed the probe dynamic dependencies")
-    existing.verify_no_added_libraries(probe_libs, ordinary_libs)
+    added_libraries = verify_probe_added_libraries(probe_libs, ordinary_libs)
 
     _, probe_max = existing.glibc_requirements(stripped, "stripped reader probe")
     _, ordinary_max = existing.glibc_requirements(ordinary, "ordinary release app")
@@ -53,7 +71,7 @@ def verify_release_probe(
         "reader_probe_elf": "ARMv7 hard-float",
         "reader_probe_linked_mupdf": "present",
         "reader_probe_forbidden_symbols": "absent",
-        "reader_probe_added_needed": "none",
+        "reader_probe_added_needed": added_libraries,
         "reader_probe_max_glibc": probe_max,
         "reader_probe_ordinary_max_glibc": ordinary_max,
         "reader_probe_stripped": "true",
