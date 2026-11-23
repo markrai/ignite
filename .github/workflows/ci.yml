@@ -87,6 +87,8 @@ jobs:
         run: cargo test -p scribe-app --bin reader-probe --locked --features reader
       - name: Probe release verifier unit tests
         run: python3 -m unittest discover -s tools/ci -p 'test_verify_reader_probe_armv7.py'
+      - name: Reader sandbox isolation rehearsal contract tests (host)
+        run: python3 -m unittest discover -s tools/qa -p 'test_reader_sandbox_preflight.py'
       - name: Reader engine linked ARMv7 validation (pinned Kindle toolchain)
         run: |
           set -euo pipefail
