@@ -20,7 +20,10 @@ class ReleaseProbeVerifierTests(unittest.TestCase):
         if reader_symbols is None:
             reader_symbols = "00000100 T fz_open_document\n"
         if probe_libraries is None:
-            probe_libraries = [("libc.so.6", Path("/arm/libc.so.6"))]
+            probe_libraries = [
+                ("libc.so.6", Path("/arm/libc.so.6")),
+                ("libm.so.6", Path("/arm/libm.so.6")),
+            ]
 
         def fake_run(*argv):
             if str(self.unstripped) == argv[-1]:
@@ -61,9 +64,15 @@ class ReleaseProbeVerifierTests(unittest.TestCase):
 
     def test_release_probe_passes_with_bounded_dependencies(self):
         report = self.verify()
-        self.assertEqual(report["reader_probe_added_needed"], "none")
+        self.assertEqual(report["reader_probe_added_needed"], "libm.so.6")
         self.assertEqual(report["reader_probe_device_execution"], "not_run")
         self.assertEqual(len(report["reader_probe_sha256"]), 64)
+
+    def test_release_probe_passes_without_any_added_libraries(self):
+        report = self.verify(
+            probe_libraries=[("libc.so.6", Path("/arm/libc.so.6"))]
+        )
+        self.assertEqual(report["reader_probe_added_needed"], "none")
 
     def test_rejects_forbidden_data_symbol(self):
         with self.assertRaisesRegex(
@@ -81,7 +90,19 @@ class ReleaseProbeVerifierTests(unittest.TestCase):
             self.verify(
                 probe_libraries=[
                     ("libc.so.6", Path("/arm/libc.so.6")),
+                    ("libm.so.6", Path("/arm/libm.so.6")),
                     ("libunexpected.so", Path("/arm/libunexpected.so")),
+                ]
+            )
+
+    def test_rejects_unapproved_math_library_name(self):
+        with self.assertRaisesRegex(
+            probe.existing.VerificationError, "libm_custom.so.6"
+        ):
+            self.verify(
+                probe_libraries=[
+                    ("libc.so.6", Path("/arm/libc.so.6")),
+                    ("libm_custom.so.6", Path("/arm/libm_custom.so.6")),
                 ]
             )
 

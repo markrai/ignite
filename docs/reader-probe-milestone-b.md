@@ -52,7 +52,13 @@ with `nm`, then strips a copy for experimental device qualification.
 `tools/ci/verify_reader_probe_armv7.py` checks both ARM ELF files, ABI,
 dynamic dependencies, GLIBC requirements against the **ordinary release**
 executable, and forbidden CFF/gzip/optional native symbols in the unstripped
-probe. The script prints the SHA-256 and byte count of the stripped probe
+probe. The probe may add only `libm.so.6` to the ordinary executable's shared
+libraries; the verifier still checks the ARM hard-float sysroot library and rejects
+any other newly introduced dependency. The `reader_probe_added_needed` field
+reports the actual additions, including `libm.so.6` when present. Device-specific
+runtime compatibility remains unqualified until a separately authorized hardware
+run; presence in the cross-build sysroot does not prove Kindle compatibility.
+The script prints the SHA-256 and byte count of the stripped probe
 and `READER_PROBE_ARMV7_RELEASE_OK` on success.
 
 The validator does **not** run ARM code or qualify Kindle runtime behavior.
