@@ -57,7 +57,8 @@ libraries; the verifier still checks the ARM hard-float sysroot library and reje
 any other newly introduced dependency. The `reader_probe_added_needed` field
 reports the actual additions, including `libm.so.6` when present. Device-specific
 runtime compatibility remains unqualified until a separately authorized hardware
-run; presence in the cross-build sysroot does not prove Kindle compatibility. The script prints the SHA-256 and byte count of the stripped probe
+run; presence in the cross-build sysroot does not prove Kindle compatibility.
+The script prints the SHA-256 and byte count of the stripped probe
 and `READER_PROBE_ARMV7_RELEASE_OK` on success.
 
 The validator does **not** run ARM code or qualify Kindle runtime behavior.
