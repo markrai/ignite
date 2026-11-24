@@ -27,7 +27,10 @@ calls the engine, and no customer build contains it. Background and plan:
 Milestone B adds a separate release-optimized ARMv7 `reader-probe` binary behind the same
 feature gate. It is not packaged for customers or activated by the Ignite app. Its pinned
 cross-build, ELF verification, read-only corpus boundary and physical QA restrictions are
-documented in [reader-probe-milestone-b.md](reader-probe-milestone-b.md).
+documented in [reader-probe-milestone-b.md](reader-probe-milestone-b.md). The
+original probe has passed one supervised, isolated PDF, EPUB and CBZ smoke test
+on firmware 5.18.6; a bounded multipage probe mode is being developed next.
+These results do not qualify reader integration into the production app.
 
 Out of scope for now: discovery, book identity, reading positions, book folders, UI, packaging and
 notices in the release payload.
@@ -245,9 +248,12 @@ On 2026-11-16, the corrected validation was executed on Linux against the harden
 - Windows host `reader_engine` test build: not qualified. MuPDF's MSBuild step stopped with local
   Visual Studio error `C1902 Program database manager mismatch` before Rust tests ran.
 
-No physical Kindle test has been performed for this reader implementation. The automated result
-qualifies the pinned Linux build path and differential ABI checks only; supported-device runtime
-compatibility and behavior still require evidence collected from Kindle hardware.
+The historical validation above qualified the pinned Linux build path and differential ABI
+checks only. Subsequent supervised Kindle testing on 2026-11-24 established one successful
+open/render/close cycle for each of PDF, EPUB and CBZ using the separate standalone probe.
+The operator-reported results and remaining qualification gaps are recorded in
+[reader-probe-milestone-b.md](reader-probe-milestone-b.md). They do not imply
+that the full reader, production integration or sustained runtime is qualified.
 
 Phase 1A validation on 2026-11-17 is incomplete on the available Windows host:
 
@@ -298,7 +304,10 @@ still need review before any build containing the reader ships.
   November 19 baseline log covers commit `c2abb4c`, not this subsequent hardening.
 - **Kindle runtime qualification.** The MuPDF 1.28.6 build, fail-closed CVE-2026-112036 backport
   and exclusion of the CVE-2026-7233 subsetting symbol passed pinned Linux/ARMv7 validation.
-  Actual Kindle loader, memory and crash behavior remain unqualified.
+  The exact standalone probe binary loaded on one Kindle 5.18.6 device and rendered
+  one small fixture per format under an isolated, bounded test. Loader compatibility
+  and memory observations are established for those cases only; broader runtime
+  stability and error behavior remain unqualified.
 - **Native memory is not globally bounded.** The destination pixmap has a hard limit, but parsing,
   image decoding, layout, caches, masks and transparency groups do not. Hardware tests need RSS
   and failure measurements with adversarial and image-heavy documents before customer use.
@@ -313,5 +322,7 @@ still need review before any build containing the reader ships.
   book it holds; no storage or catalog is part of Phase 0.
 - **Reading-position persistence:** no EPUB anchors or stable reading-position format exists.
 - **Reader UI:** no UI or application call site exists.
-- **Hardware acceptance:** host and cross-compile evidence is not physical Kindle validation. The
-  new implementation has not been accepted on supported hardware or firmware.
+- **Hardware acceptance:** three initial physical smoke tests now exist, but one cycle
+  per format is insufficient for sustained-use acceptance. Multipage navigation,
+  retained-memory trends, real-world content and normal Ignite integration have
+  not been qualified.
