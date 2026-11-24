@@ -39,7 +39,9 @@ fn parse_page_sequence(value: &str) -> Result<Vec<u32>, String> {
     }
     let pages: Vec<_> = value.split(',').collect();
     if pages.len() > MAX_SEQUENCE_PAGES {
-        return Err(format!("page sequence cannot exceed {MAX_SEQUENCE_PAGES} entries"));
+        return Err(format!(
+            "page sequence cannot exceed {MAX_SEQUENCE_PAGES} entries"
+        ));
     }
     pages
         .into_iter()
@@ -88,7 +90,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             }
             "--pages" if page.is_none() && pages.is_none() => {
                 pages = Some(parse_page_sequence(&value)?)
-            },
+            }
             "--width" => width = parse_number(&value, "width", 1, 2_480)?,
             "--height" => height = parse_number(&value, "height", 1, 2_480)?,
             "--corpus" if !cfg!(target_arch = "arm") => corpus = PathBuf::from(value),
@@ -188,9 +190,7 @@ fn run(options: Options) -> Result<(), String> {
         let pages = book.page_count().map_err(|e| format!("pages: {e}"))?;
         for &page_index in &options.pages {
             if page_index >= pages {
-                return Err(format!(
-                    "page index {page_index} is outside {pages} pages"
-                ));
+                return Err(format!("page index {page_index} is outside {pages} pages"));
             }
         }
         let open_ms = begin.elapsed().as_millis();
@@ -293,7 +293,10 @@ mod tests {
     #[test]
     fn accepts_bounded_navigation_and_preserves_single_page_compatibility() {
         assert_eq!(parse(&["--file", "a.pdf"]).unwrap().pages, vec![0]);
-        assert_eq!(parse(&["--file", "a.pdf", "--page", "2"]).unwrap().pages, vec![2]);
+        assert_eq!(
+            parse(&["--file", "a.pdf", "--page", "2"]).unwrap().pages,
+            vec![2]
+        );
         assert_eq!(
             parse(&["--file", "a.pdf", "--pages", "0,1,2,1,0"])
                 .unwrap()
@@ -324,7 +327,10 @@ mod tests {
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 5 0 R >>".to_string(),
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 6 0 R >>".to_string(),
             format!("<< /Length {} >>\nstream\n{first}\nendstream", first.len()),
-            format!("<< /Length {} >>\nstream\n{second}\nendstream", second.len()),
+            format!(
+                "<< /Length {} >>\nstream\n{second}\nendstream",
+                second.len()
+            ),
         ];
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
