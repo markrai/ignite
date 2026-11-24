@@ -1,7 +1,8 @@
 # Milestone B: experimental ARMv7 reader probe
 
-Status: **build and inspection only; Kindle execution not qualified**. This standalone
-executable does not change the installed Ignite runtime, its update mechanism, or notebooks.
+Status: **ARMv7 release build verified; limited physical smoke tests passed; sustained Kindle
+runtime still unqualified**. This standalone executable does not change the installed Ignite
+runtime, its update mechanism, or notebooks.
 It is built under the off-by-default `scribe-app/reader` feature and is never part of the
 customer Scriptlet, stable GitHub release, or normal application startup.
 
@@ -13,6 +14,15 @@ drops the document, and repeats the cycle with process memory measurements. Its 
 includes open/render times, page count, checksum, RSS and process high-water RSS in KiB.
 `VmHWM` is a process-lifetime high-water mark, not a per-cycle reset. Each document should
 be run in a new process to obtain meaningful per-document peak memory.
+
+Milestone B.2 adds `--pages 0,1,2,1,0` for bounded within-book navigation. The probe
+opens and lays out the document once per cycle, renders the requested pages in order,
+and only then closes the book. It prints `reader_probe_page_cycle` records containing
+page index, dimensions, checksum, render time, RSS and process HWM after dropping each
+rendered pixmap; `reader_probe_cycle` still reports RSS after the book is closed.
+`--page N` and the single-page output remain compatible with the original probe.
+A sequence has 1 to 16 entries and the product of sequence length and cycle count
+cannot exceed 1,000 renders. These are CLI bounds, not a memory or wall-clock limit.
 
 The probe itself never writes a file, launches Ignite, modifies notebooks or calls the
 OTA installer. It does not catch native crashes or terminate runaway parsing; external
@@ -62,6 +72,8 @@ The script prints the SHA-256 and byte count of the stripped probe
 and `READER_PROBE_ARMV7_RELEASE_OK` on success.
 
 The validator does **not** run ARM code or qualify Kindle runtime behavior.
+Any change to the reader-probe requires a newly built, hash-verified binary;
+previous Kindle smoke-test hashes do not qualify a changed executable.
 Its output directory is QA-only and is not uploaded into production
 release promotion artifacts. Re-run the build after any reader or native
 source change. Do not confuse the older debug-harness RSS with the new
@@ -85,9 +97,11 @@ external timeout and address-space limit. The binary accepts:
 reader-probe --file normal.pdf --cycles 1 --page 0 --width 1000 --height 1400
 ```
 
-`--cycles` ranges from 1 through 1000. Every render must stay inside the
-reader's 4,612,800-pixel output limit. Only non-ARM host builds accept
-`--corpus <path>` for disposable fixture tests; ARM executables reject it.
+`--cycles` ranges from 1 through 1000 for a single page. With `--pages`, there
+are at most 16 requested page indices and at most 1,000 total renders across all
+cycles. Every render must stay inside the reader's 4,612,800-pixel output limit.
+Only non-ARM host builds accept `--corpus <path>` for disposable fixture tests;
+ARM executables reject it.
 
 Use separate processes for normal PDF, EPUB, CBZ, image-heavy, malformed,
 mismatched-signature and controlled adversarial inputs. Capture stdout,
@@ -95,16 +109,51 @@ stderr, process exit status, kernel crash or OOM evidence, wall-clock
 timeout status, process memory and the device firmware/build identity.
 `reader_probe_result=pass` means only that the requested cycles finished.
 
-## Acceptance still outstanding
+## Physical smoke evidence (2026-11-24)
 
-- Demonstrate an executable ARMv7 ELF actually runs on the target Kindle firmware.
-- Confirm loader and all declared shared libraries on the device.
-- Confirm rendered content and missing-font behavior, especially CJK and symbols.
-- Measure process RSS and peak RSS per document, including retained memory across
-  hundreds of open/render/close cycles, with defined limits for each test.
-- Exercise adversarial inputs under external time and memory limits without
-  affecting the notebook or sync environment.
-- Establish a safe handoff/distribution method. A separate opt-in developer OTA
-  channel is **Milestone C** and is not implied by this executable.
+The operator reported a **single successful cycle each** on a first-generation
+Kindle Scribe running firmware 5.18.6, under a separately approved,
+memory-only, namespace/chroot-isolated test environment. This was an
+exceptional, supervised developer experiment, **not** a pass of the normal
+production-slot physical QA gate. The existing gate remains enforced.
+
+| Disposable fixture | Page dimensions | Open | Render | Cycle | Validation |
+| --- | --- | ---: | ---: | ---: | --- |
+| Rectangle PDF | 1000 x 500 | 4 ms | 5 ms | 10 ms | Independent expected pixel checksum |
+| Text EPUB | 1000 x 1264 | 11 ms | 27 ms | 39 ms | Same-source host oracle; nonblank text |
+| Grayscale CBZ | 1000 x 1000 | 3 ms | 20 ms | 25 ms | Independent expected pixel checksum |
+
+All three were reported to exit successfully with clean temporary resources,
+no device reboot, and no change to Ignite's production PID or notebook state.
+The exact pre-B.2 executable used in these tests had SHA-256
+`3abcf429850b0546eb785f57dccd0effef9d307d64551250be10547e5d370930`.
+The operator retained the raw transcripts and metadata outside the repository;
+this table summarizes those reported observations rather than independently
+archived, CI-verifiable physical evidence.
+
+The tests demonstrated the loader, basic decoding, simple EPUB layout, and
+bounded grayscale rendering on that particular Kindle. They do not qualify
+sustained use, general font coverage, large books, concurrent workloads, or
+the production app integration. The initial PDF, EPUB, and CBZ fixtures were
+all one page each.
+
+## Milestone B.2 acceptance, still outstanding
+
+- Verify page sequences with different images/text, backwards navigation,
+  and repeat visits in a single open document on Kindle hardware.
+- Record post-render RSS per page and post-close RSS per cycle, alongside
+  process-lifetime HWM. A flat HWM does not prove that live allocations were
+  released; evaluate the RSS trend across multiple cycles.
+- Use a benign, small, multipage fixture before considering bounded repeat
+  cycles; define explicit memory and time thresholds and authorize each
+  physical run separately.
+- Rebuild and hash-verify the changed ARMv7 probe before any hardware
+  execution. The three previous device results belong to the older hash.
+- Validate real text/fonts (especially CJK and symbols), image formats,
+  realistic page sizes, and failure behavior on a disposable QA device.
+- Establish a reusable, reviewed QA runner and durable evidence capture before
+  claiming broader hardware qualification.
+- Review the eventual opt-in developer distribution and licensing notices.
+  The opt-in update path would be **Milestone C** and is not implied here.
 
 No version bump, public release, deployment or activation is part of Milestone B.
