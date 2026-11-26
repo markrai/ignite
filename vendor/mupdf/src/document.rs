@@ -208,6 +208,16 @@ impl Document {
         }
     }
 
+    /// Ignite: number of chapters (EPUB spine items); 1 for fixed-layout documents.
+    pub fn chapter_count(&self) -> Result<i32, Error> {
+        unsafe { ffi_try!(mupdf_count_chapters(context(), self.inner)) }
+    }
+
+    /// Ignite: pages in `chapter` under the current layout; 0 for an out-of-range chapter.
+    pub fn chapter_page_count(&self, chapter: i32) -> Result<i32, Error> {
+        unsafe { ffi_try!(mupdf_count_chapter_pages(context(), self.inner, chapter)) }
+    }
+
     pub fn load_page(&self, page_no: i32) -> Result<Page, Error> {
         unsafe { ffi_try!(mupdf_load_page(context(), self.inner, page_no)) }
             // SAFETY: We're trusting the FFI layer here to provide a valid pointer

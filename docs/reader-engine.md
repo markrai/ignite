@@ -32,8 +32,12 @@ original probe has passed one supervised, isolated PDF, EPUB and CBZ smoke test
 on firmware 5.18.6; a bounded multipage probe mode is being developed next.
 These results do not qualify reader integration into the production app.
 
-Out of scope for now: discovery, book identity, reading positions, book folders, UI, packaging and
-notices in the release payload.
+An experimental reading-position layer (`reader_engine/location.rs`, milestones C.1 and C.1.1)
+turns a page into a layout-independent content location and restores it after relayout or
+reopening. See [Reading positions](#reading-positions-experimental) below.
+
+Out of scope for now: discovery, computing and caching book identities, storing reading positions,
+book folders, UI, packaging and notices in the release payload.
 
 ## Building
 
@@ -159,6 +163,161 @@ state or temporary native allocations. A malicious or unusually complex document
 large native allocations, process termination by the kernel, or a native crash. Rust errors are
 recoverable where MuPDF returns an error, but the engine does not represent a process crash or
 out-of-memory kill as a successful reader result.
+
+## Reading positions (experimental)
+
+Status: **engine API and host tests only.** Nothing stores positions or identities yet, and no
+stored-record encoding is committed to.
+
+### Why not MuPDF bookmarks
+
+`fz_make_bookmark` cannot be persisted. For EPUB it returns the address of a laid-out text node
+(`fz_make_html_bookmark`), and lookup compares addresses while laying out every chapter. It follows
+relayout only while the chapter's parsed tree stays in MuPDF's store. After store eviction the
+chapter is re-parsed into new nodes and the bookmark is lost. After the document is closed, a reused
+address can match an unrelated node. For fixed-layout formats it is a packed page number.
+
+The fork therefore adds only two error-safe wrappers, `mupdf_count_chapters` and
+`mupdf_count_chapter_pages`, following the existing `fz_try`/`mupdf_save_error` convention. They
+return plain integers, allocate nothing and borrow the document. MuPDF's single-chapter handlers
+(PDF, CBZ, images, SVG, plain HTML) ignore the chapter index and return the whole page count, so
+the page wrapper checks `0 <= chapter < fz_count_chapters` itself and returns 0 otherwise.
+
+### Model
+
+Three concepts are kept separate:
+
+- `DocumentIdentity { sha256, len }`: which bytes a position belongs to. It is owned by the open
+  `Book` (see below), never passed in by the caller of `restore`.
+- `ContentLocation`: `FixedPage(page)` for PDF and CBZ, `Text(TextAnchor)` for EPUB.
+- The current page index, valid only for the current layout. `Book::restore` returns it; it is
+  never part of a saved record.
+
+A `TextAnchor` holds a text-model identifier, the EPUB spine index, an offset and up to 32 units of
+context. Units are MuPDF structured-text characters except whitespace and soft hyphens, plus
+`U+FFFC` for each image. Line breaks add and remove whitespace, and MuPDF reports a word broken at
+a soft hyphen as ending in `U+00AD`, so both are excluded. The source text's own `U+FFFC` is not a
+unit, so the image unit cannot be forged by text. No Unicode normalisation is applied.
+
+`SavedPosition { format, document, location }` is the record a future store would hold. All fields
+are owned and fixed-size or bounded. `Book::save_position(page)` creates one for the book's own
+identity.
+
+### Document identity ownership
+
+`Book::open_path_identified(path, known)` binds the identity while opening. The existing path
+checks already open one read-only handle and compare its device, inode, length and modification
+and change times with the path before and after MuPDF opens the file. The identity is hashed from
+that same handle, after the signature check and before MuPDF opens the path, and the handle is
+compared with its original metadata again after hashing. The resulting guarantees:
+
+- **Replacement before or during opening** (rename over the path, a write, truncation) changes the
+  inode or timestamps and fails the open. A file replaced after opening does not affect the open
+  `Book`: on Linux MuPDF keeps reading the inode it opened, which is the one that was hashed.
+- **Concurrent in-place writes** after the final check remain possible, as already documented for
+  the path policy. They can make MuPDF read bytes other than the hashed ones. Storage that needs a
+  stronger guarantee must give the reader an immutable file.
+- **Reopening** always produces a fresh identity. Nothing is carried over from an earlier `Book`.
+- **Avoiding repeated hashing:** `Book::known_identity()` returns the identity together with the
+  file's `FileStamp` (device, inode, length, modification and change times). A later open that
+  receives this `KnownIdentity` skips hashing only if the newly opened handle has exactly the same
+  stamp. Otherwise it hashes again. That shortcut trusts the filesystem to change the stamp
+  whenever content changes. A stamp whose change time is less than 3 seconds old when it is read is
+  never offered for reuse, because a rewrite within the same timestamp tick (coarse kernel clocks,
+  2-second FAT times) might not change it; the next open simply hashes again. Clock changes on the
+  device and filesystems with unstable inode numbers can only cause extra hashing, except for the
+  theoretical case of a same-length rewrite landing on an identical earlier timestamp.
+  Non-Unix hosts have no stamp and always hash.
+- `Book::open_path` and `Book::open_bytes` have no identity. `save_position` fails for them and
+  `restore` returns `Rejected(DocumentUnidentified)`.
+
+Hashing reads the whole file once per uncached open in 64 KiB blocks (constant memory). On the
+Dragonfly host SHA-256 (the `sha2` crate as configured) hashed 64 MiB in 0.32 s, about 200 MiB/s.
+The Kindle's ARMv7 CPU will be slower, so a large book may take seconds to hash; device throughput
+must be measured before deciding when the reader hashes, and stamp reuse is what keeps reopening
+cheap.
+
+### Restoration policy
+
+`Book::restore(saved)` returns:
+
+| Outcome | When | Position |
+|---|---|---|
+| `Exact { page, position }` | Same identity and text model, and the context is at the stored offset. Also a chapter start (offset 0, empty context) under any text model, and a fixed page in range. | The saved record, unchanged. |
+| `Relocated { page, position }` | The offset is untrusted (another text model) or did not hold, and the context (at least 12 units) occurs exactly once in the chapter. | A corrected record (current text model and offset) that restores exactly. |
+| `Fallback { page, target, cause }` | The content could not be placed. `cause` is `Ambiguous { candidates }` or `Stale(reason)`; `target` is the chapter start, or the document start when the chapter is missing or a fixed page is out of range. | None. |
+| `Rejected(reason)` | Unknown record format, no identity, a different identity, a fixed-page record for a reflowable document (or the reverse), or a malformed anchor. | None, and no page. |
+
+`Restore::restored()` returns `Some((page, position))` only for `Exact` and `Relocated`. That is
+the only way a restore yields a position, so a fallback page cannot be stored as the reading
+position or used as an annotation anchor without the caller explicitly anchoring a page. A caller
+that falls back should keep the saved record until the user navigates, and should not autosave the
+fallback page as if it were the restored location.
+
+A different document fails closed even when its text would relocate cleanly. Migrating positions
+between editions is a separate, explicit future operation. Repeated text is never resolved by
+proximity: more than one match is `Ambiguous`.
+
+### Cost and execution model
+
+No operation caches text. Costs per call:
+
+| Operation | Work |
+|---|---|
+| `layout`, then the first page count | MuPDF parses and lays out every chapter once per layout (cached in its accelerator). |
+| `save_position(page)` (EPUB) | Text of the chapter's pages up to `page`, plus following pages until 32 units are collected. |
+| `restore`: `Exact` | Text of the chapter's pages up to the anchor's page. |
+| `restore`: `Relocated` and every unresolved `Fallback` | Text of the whole chapter. |
+| `restore`: `Rejected`, missing chapter, fixed layout | No text extraction. |
+| `open_path_identified` without a reusable stamp | One SHA-256 pass over the file. |
+
+Host measurements (release build, Dragonfly, C.1.2 run): about 0.55–0.65 ms per page of extraction
+up to 348-page chapters and 0.95 ms per page at 1,392 pages (an earlier C.1.1 run measured
+0.7–1.5 ms per page), with no measurable memory above the laid-out document.
+Raw output and configuration are preserved in
+`~/ignite-qa-evidence/c1.2-anchor-benchmark-*` on the measurement host.
+
+A `Book` is not `Send`: MuPDF state belongs to the thread that created it. The future UI should
+therefore:
+
+1. Own each `Book` on one dedicated reader thread, created there, that performs layout, rendering,
+   `save_position` and `restore`. The UI thread sends requests over a channel and receives results
+   tagged with a request generation, discarding replies older than the current page or layout.
+2. Keep pen input, stroke capture and panel refresh off that thread so they never wait for MuPDF.
+   Strokes are buffered with their page and attached to an anchor when the reader thread delivers
+   one.
+3. On open, render a placeholder (or the last rendered page image) while `restore` runs, then render
+   the restored page. A `Fallback` is shown as such.
+4. Debounce `save_position` after page turns. It runs on the reader thread after the visible page is
+   rendered, never before it.
+5. Before any of this ships, add cooperative cancellation between pages to the chapter loops (they
+   already proceed one page at a time) so a superseded restore stops early; and measure whole-chapter
+   extraction on the device.
+
+### Bounds
+
+Stored fields are validated before any document work: the context is limited by byte length
+before it is decoded, then to 32 units of the allowed set, and the text-model identifier to 64
+bytes without control characters. Resolution streams the chapter one page at a time, using memory
+for one page's units plus a 32-unit window and a page-start table. Time is proportional to the pages
+read. The chapter's length is a property of the document, not of the record.
+
+### Limitations
+
+- Offsets depend on MuPDF's text extraction. `TEXT_MODEL` names the unit rules and the MuPDF
+  release; changing either must change it, which turns exact restores into context relocation.
+- Chapters are identified by spine index only. Within one document identity that is stable; chapter
+  file names would only matter for edition migration, and need an EPUB package reader.
+- Anchors are page starts. A page without units anchors to the next unit in its chapter, and
+  restores to the page that unit is on.
+- Context matching is per chapter. Text repeated within a chapter can only be restored exactly
+  through a trusted offset.
+- Canonically equivalent spellings (NFC and NFD) are different content. This only matters across
+  documents, which are rejected anyway.
+- Right-to-left text was observed in logical order and layout-invariant for the tested fixture only.
+- Stamp-based identity reuse depends on the filesystem; the Kindle user-storage filesystem's
+  timestamp and inode behaviour has not been characterised.
+- Kindle runtime cost (extraction and hashing) is not measured.
 
 ## ARM ELF compatibility checks
 
@@ -316,11 +475,11 @@ still need review before any build containing the reader ships.
   source immutable.
 - **Production distribution and licensing notices:** component inventory, provenance, and notices
   in the release pipeline remain unresolved. Reader artifacts are experimental validation output.
-- **EPUB anchors:** a proof of concept that a saved location survives font size and margin
-  changes, before choosing an anchor representation.
+- **EPUB anchors:** an experimental content-anchor API with host tests; see
+  [Reading positions](#reading-positions-experimental). Not measured on the Kindle.
 - **Book catalog and stable identity:** separate a file's identity (content hash) from the logical
   book it holds; no storage or catalog is part of Phase 0.
-- **Reading-position persistence:** no EPUB anchors or stable reading-position format exists.
+- **Reading-position persistence:** no store or committed record format exists.
 - **Reader UI:** no UI or application call site exists.
 - **Hardware acceptance:** three initial physical smoke tests now exist, but one cycle
   per format is insufficient for sustained-use acceptance. Multipage navigation,

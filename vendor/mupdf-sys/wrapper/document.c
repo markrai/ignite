@@ -186,6 +186,29 @@ fz_link_dest mupdf_resolve_link_dest(fz_context *ctx, fz_document *doc, const ch
     TRY_CATCH(fz_link_dest, {}, fz_resolve_link_dest(ctx, doc, uri));
 }
 
+/* Ignite: chapter structure of reflowable documents (EPUB spine items). */
+int mupdf_count_chapters(fz_context *ctx, fz_document *doc, mupdf_error_t **errptr)
+{
+    TRY_CATCH(int, 0, fz_count_chapters(ctx, doc));
+}
+
+/* Single-chapter handlers (PDF, CBZ, images, SVG, plain HTML) ignore the chapter index and return
+   the document's page count, so the range is checked here for every format. */
+int mupdf_count_chapter_pages(fz_context *ctx, fz_document *doc, int chapter, mupdf_error_t **errptr)
+{
+    int pages = 0;
+    fz_try(ctx)
+    {
+        if (chapter >= 0 && chapter < fz_count_chapters(ctx, doc))
+            pages = fz_count_chapter_pages(ctx, doc, chapter);
+    }
+    fz_catch(ctx)
+    {
+        mupdf_save_error(ctx, errptr);
+    }
+    return pages;
+}
+
 fz_colorspace *mupdf_document_output_intent(fz_context *ctx, fz_document *doc, mupdf_error_t **errptr)
 {
     TRY_CATCH(fz_colorspace*, NULL, fz_document_output_intent(ctx, doc));

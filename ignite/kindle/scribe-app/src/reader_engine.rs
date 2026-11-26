@@ -5,14 +5,20 @@
 //! copying their complete contents, while retaining an in-memory fixture path for tests.
 //!
 //! Everything is rendered as 8-bit gray, the Kindle panel's format, scaled to fit a box given
-//! in pixels. Book identity, reading positions and any UI are deliberately out of scope here.
+//! in pixels. [`Book::open_path_identified`] binds a content identity to the opened bytes, and
+//! the experimental [`location`] module turns a page into a layout-independent position and
+//! restores it after relayout or reopening. Storing positions or identities, and any UI, are
+//! still out of scope.
 
 use std::fs::{self, File, Metadata};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use mupdf::{Colorspace, Document, Matrix, Pixmap, Rect};
+use sha2::{Digest, Sha256};
+
+pub mod location;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -58,9 +64,48 @@ impl From<mupdf::Error> for ReaderError {
     }
 }
 
-/// An open document.
+/// Content identity of the exact bytes a [`Book`] opened: SHA-256 and length. Paths and file
+/// metadata are not identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DocumentIdentity {
+    pub sha256: [u8; 32],
+    pub len: u64,
+}
+
+/// File metadata that changes whenever the file's content may have changed: device, inode,
+/// length, and modification and status-change times as `(seconds, nanoseconds)`. Unix only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub mtime: (i64, i64),
+    pub ctime: (i64, i64),
+}
+
+/// An identity computed earlier, and the stamp of the file it was computed from. Supplying one
+/// to [`Book::open_path_identified`] skips rehashing only if the opened file has the same stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KnownIdentity {
+    pub stamp: FileStamp,
+    pub identity: DocumentIdentity,
+}
+
+/// A stamp observed this soon after the file's last status change might not change if the file
+/// is rewritten within the same timestamp tick (coarse kernel clocks, 2-second FAT times), so it
+/// is not offered for reuse. The next open hashes again.
+const RACY_STAMP_WINDOW: Duration = Duration::from_secs(3);
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+/// An open document. A `Book` cannot move between threads: MuPDF objects belong to the thread
+/// that created them.
 pub struct Book {
     doc: Document,
+    /// Set only by [`Book::open_path_identified`], from the same file handle MuPDF's input was
+    /// checked against.
+    identity: Option<DocumentIdentity>,
+    stamp: Option<FileStamp>,
+    stamp_reusable: bool,
 }
 
 impl Book {
@@ -69,11 +114,52 @@ impl Book {
     pub fn open_bytes(bytes: &[u8], magic: &str) -> Result<Self, ReaderError> {
         Ok(Self {
             doc: Document::from_bytes(bytes, magic)?,
+            identity: None,
+            stamp: None,
+            stamp_reusable: false,
         })
     }
 
+    /// Opens a document without computing its identity. Reading positions cannot be saved or
+    /// restored for it.
     pub fn open_path(path: impl AsRef<Path>) -> Result<Self, ReaderError> {
-        let path = absolute_path(path.as_ref())?;
+        Self::open_file(path.as_ref(), None, false)
+    }
+
+    /// Opens a document and binds its [`DocumentIdentity`] to the bytes of the opened file.
+    ///
+    /// The identity is hashed from the same handle whose device, inode, size and timestamps are
+    /// compared with the path before and after MuPDF opens it, so a replacement or a write during
+    /// opening is an error. If `known` carries this file's current stamp its identity is reused
+    /// instead of rehashing. That trusts the filesystem to change the stamp whenever the content
+    /// changes.
+    pub fn open_path_identified(
+        path: impl AsRef<Path>,
+        known: Option<&KnownIdentity>,
+    ) -> Result<Self, ReaderError> {
+        Self::open_file(path.as_ref(), known, true)
+    }
+
+    /// The identity bound when the book was opened, if it was opened with one.
+    pub fn identity(&self) -> Option<DocumentIdentity> {
+        self.identity
+    }
+
+    /// The identity with the stamp it is valid for, for reuse on a later open. `None` when the
+    /// book has no identity, the platform has no stamp, or the stamp was too recent to trust.
+    pub fn known_identity(&self) -> Option<KnownIdentity> {
+        match (self.identity, self.stamp, self.stamp_reusable) {
+            (Some(identity), Some(stamp), true) => Some(KnownIdentity { stamp, identity }),
+            _ => None,
+        }
+    }
+
+    fn open_file(
+        path: &Path,
+        known: Option<&KnownIdentity>,
+        identify: bool,
+    ) -> Result<Self, ReaderError> {
+        let path = absolute_path(path)?;
         reject_symlink_components(&path)?;
         let path_metadata = regular_file_metadata(&path)?;
         let format = validate_document_extension(&path)?;
@@ -94,6 +180,27 @@ impl Book {
 
         validate_document_signature(&path, &file, format)?;
 
+        let stamp = opened_identity.stamp();
+        let mut stamp_reusable = false;
+        let identity = if !identify {
+            None
+        } else if let Some(known) = known.filter(|known| {
+            Some(known.stamp) == stamp && known.identity.len == opened_metadata.len()
+        }) {
+            stamp_reusable = true;
+            Some(known.identity)
+        } else {
+            let identity = hash_open_file(&path, &file, opened_metadata.len())?;
+            let handle_metadata = file.metadata().map_err(|error| {
+                path_error(&path, format!("cannot inspect opened file: {error}"))
+            })?;
+            if FileIdentity::from_metadata(&handle_metadata) != opened_identity {
+                return Err(path_error(&path, "input changed while it was being hashed"));
+            }
+            stamp_reusable = stamp.is_some_and(stamp_is_settled);
+            Some(identity)
+        };
+
         let doc = open_mupdf_document(&path)?;
         reject_symlink_components(&path)?;
         let final_metadata = regular_file_metadata(&path)?;
@@ -105,7 +212,12 @@ impl Book {
         }
         drop(file);
 
-        Ok(Self { doc })
+        Ok(Self {
+            doc,
+            identity,
+            stamp: stamp.filter(|_| identify),
+            stamp_reusable,
+        })
     }
 
     /// True for formats whose pages depend on the layout (EPUB, HTML), false for PDF and CBZ.
@@ -200,6 +312,67 @@ impl FileIdentity {
             ctime_nsec: metadata.ctime_nsec(),
         }
     }
+
+    #[cfg(unix)]
+    fn stamp(&self) -> Option<FileStamp> {
+        Some(FileStamp {
+            dev: self.dev,
+            ino: self.ino,
+            len: self.len,
+            mtime: (self.mtime, self.mtime_nsec),
+            ctime: (self.ctime, self.ctime_nsec),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn stamp(&self) -> Option<FileStamp> {
+        None
+    }
+}
+
+/// True when the stamp's status-change time is at least [`RACY_STAMP_WINDOW`] in the past.
+fn stamp_is_settled(stamp: FileStamp) -> bool {
+    let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    let (seconds, nanos) = stamp.ctime;
+    let (Ok(seconds), Ok(nanos)) = (u64::try_from(seconds), u32::try_from(nanos)) else {
+        return false;
+    };
+    now.checked_sub(Duration::new(seconds, nanos.min(999_999_999)))
+        .is_some_and(|age| age >= RACY_STAMP_WINDOW)
+}
+
+/// SHA-256 of the whole file read from `file` (the handle the path checks refer to).
+fn hash_open_file(
+    path: &Path,
+    file: &File,
+    expected_len: u64,
+) -> Result<DocumentIdentity, ReaderError> {
+    let mut reader = file;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| path_error(path, format!("cannot rewind for hashing: {error}")))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+    let mut len = 0u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| path_error(path, format!("cannot read for hashing: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        len += read as u64;
+    }
+    if len != expected_len {
+        return Err(path_error(path, "input changed while it was being hashed"));
+    }
+    Ok(DocumentIdentity {
+        sha256: hasher.finalize().into(),
+        len,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -524,10 +697,10 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    struct TempDocumentDir(PathBuf);
+    pub(super) struct TempDocumentDir(pub(super) PathBuf);
 
     impl TempDocumentDir {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "ignite-reader-{label}-{}-{sequence}",
@@ -537,7 +710,7 @@ mod tests {
             Self(path)
         }
 
-        fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        pub(super) fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
             let path = self.0.join(name);
             fs::write(&path, bytes).unwrap();
             path
@@ -552,7 +725,7 @@ mod tests {
 
     /// A one-page PDF (200 x 100 pt) with a black rectangle at x 50..150, y 25..75 (PDF
     /// coordinates, origin bottom left), with a correct cross-reference table.
-    fn rectangle_pdf() -> Vec<u8> {
+    pub(super) fn rectangle_pdf() -> Vec<u8> {
         let content = "0 g 50 25 100 50 re f";
         let objects = [
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
@@ -663,7 +836,7 @@ mod tests {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(super) fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut output = Vec::new();
         let mut central = Vec::new();
         for (name, data) in entries {
@@ -742,7 +915,7 @@ mod tests {
         ])
     }
 
-    fn cbz_fixture() -> Vec<u8> {
+    pub(super) fn cbz_fixture() -> Vec<u8> {
         stored_zip(&[("page.pgm", b"P5\n2 2\n255\n\x00\xff\x80\x40")])
     }
 
