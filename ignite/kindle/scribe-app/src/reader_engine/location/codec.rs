@@ -251,7 +251,7 @@ mod tests {
             r#"{{ "location": {{ "page": 42, "kind": "fixed_page" }}, "document": {{ "len": 8765, "sha256": "{}" }}, "format": 1 }}"#,
             "5a".repeat(32)
         );
-        assert_eq!(decode(&raw), Ok(value));
+        assert_eq!(decode(&raw), Ok(value.clone()));
         assert_eq!(json(&decode(&raw).unwrap()), json(&value));
     }
 
