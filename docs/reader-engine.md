@@ -361,6 +361,47 @@ The wrapper now executes the complete try/catch sequence on every path.
 A dedicated native regression test exercises both the fixed-layout no-op
 and invalid reflow dimensions.
 
+### Dedicated reader worker (C.3A)
+
+`reader_engine::worker::ReaderWorker::start()` starts a named native Rust thread
+without opening a book. The thread creates, uses and drops its own `ReaderSession`,
+including the MuPDF document, pixmaps and position store. No native object
+crosses the channel; `Reply::Rendered` owns an ordinary boxed Gray8 byte buffer
+with the page index, dimensions and an opaque display token. Copying the pixels
+temporarily holds both the native buffer and its bounded Rust copy. The caller
+owns received buffers and must release them when no longer needed.
+
+The worker is single-flight: `try_submit` admits one command and returns
+`Busy` until its response has been taken by `try_response`, even if computation
+has already finished. A rejected command is consumed and must be reconstructed
+by the caller. Both calls are nonblocking; command and response channels each
+have capacity one. No unbounded queue, automatic retry or background autosave
+is present. The caller correlates the single response to its admitted command.
+
+Commands explicitly open, navigate, render, acknowledge, save and close. Opening
+an already open session is rejected; close it first. Errors leave the worker
+available for subsequent commands. A failed open leaves no active session.
+Display tokens include a process-unique session generation so an old token
+cannot acknowledge a new session, even across separate workers. The session
+continues to enforce the C.2C render and persistence rules. Acknowledgment is
+an explicit caller assertion that the corresponding pixels were presented;
+receiving a render response is not itself acknowledgment.
+
+`shutdown` disconnects both channels and joins the worker. An admitted command
+may complete during shutdown, but its reply is discarded. Neither close,
+shutdown nor Drop implicitly saves. Drop also joins to ensure native resources
+are destroyed on their owner thread. Joining can wait for an in-flight native
+operation or store write and must not run in a latency-sensitive UI callback.
+C.3A provides no preemption of MuPDF calls or filesystem operations.
+
+The worker remains behind the existing off-by-default reader feature. Host
+tests cover single-flight admission, explicit save and reopen, invalid
+operations, stale and cross-worker tokens, and shutdown with an unread or
+outstanding result. C.3B will add request supersession and cancellation;
+C.3C will integrate display acknowledgment delivery and asynchronous
+persistence coordination. No production UI, Kindle paths, notebook state,
+device execution or hardware performance qualification is introduced here.
+
 ### Document identity ownership
 
 `Book::open_path_identified(path, known)` binds the identity while opening. The existing path
