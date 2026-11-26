@@ -166,8 +166,10 @@ out-of-memory kill as a successful reader result.
 
 ## Reading positions (experimental)
 
-Status: **engine API and host tests only.** C.2A defines a versioned, bounded JSON record
-encoding. No on-device position store, disk write, reader UI, or sync integration exists yet.
+Status: **engine API and host tests only.** C.2A defines the bounded JSON record
+encoding; C.2B adds an opt-in, local position-store library with crash-recovery tests.
+Nothing calls the store from the Kindle app; no device files or notebook data are touched.
+Reader UI and sync integration are still absent.
 
 ### Why not MuPDF bookmarks
 
@@ -245,6 +247,61 @@ from corrupt files. Those are C.2B responsibilities; a rejected record must not
 silently replace a previously valid position. The stored record contains
 content identity and content location, never current-layout page numbers for
 reflowable documents or a trusted file-system stamp.
+
+### Device-local position store (C.2B)
+
+`PositionStore::new(root)` takes an explicit, trusted, app-owned directory; neither
+the reader engine nor the store automatically chooses a production path or opens
+the Kindle notebook library. The eventual integration should use a reader-only
+directory under the existing application state, separate from ebooks and
+`/mnt/us/scribe-data`. The parent directory must already exist. `load(identity)`
+does not create folders; `save(position)` creates its leaf directory on Unix.
+
+Each document is indexed by its content SHA-256 and byte length, not filename.
+There are exactly two recoverable record slots per document:
+`<sha256>-<byte-length>.slot0` and `.slot1`. Each slot contains a strict JSON
+envelope (version 1) with a monotonically increasing generation, the complete
+C.2A `SavedPosition` object and a SHA-256 checksum over the generation and
+the exact encoded position JSON, with a fixed domain separator. The slot size
+is bounded to 4,608 bytes. The checksum detects accidental corruption; it is
+**not** authentication against a malicious local writer.
+
+`save` acquires an advisory Unix `flock` on the persistent `.writer-lock`,
+reads both slots and chooses the highest valid generation. It writes the next
+generation to the *other* slot using a private, exclusive-create temporary
+file in the same directory. The operation writes and syncs that file, renames
+it over its target slot and syncs the directory before reporting success.
+The first creation of the directory also syncs the parent. It never
+overwrites the last valid slot during an update. Lock files remain present;
+temporary names left by a process crash are ignored, not promoted or applied.
+This design targets the Linux Kindle and host, not Windows atomic-replace
+semantics.
+
+`load` verifies bounded size, JSON schema, generation, checksum, C.2A fields
+and exact document identity for both slots. It returns the highest-generation
+valid record if one exists, even if the other slot is corrupt or missing.
+Missing slots mean no position. Existing slots with no valid record produce
+an error, not `None`. Equal valid generations are a conflict. An unsupported
+envelope format or inner C.2A record version is a hard error rather than a
+silent downgrade/overwrite.
+Unreadable files and unsafe leaf symlinks also fail closed. Concurrent readers
+may observe the old or new committed generation, never a partially written
+slot. Concurrent Unix writers serialize through the advisory lock.
+
+**Limitations:** This is a storage component, not a reader-session feature.
+No page-turn hook, debounce, retry, rendering or autosave behavior exists yet;
+C.2C owns the save/resume flow. The filesystem's real directory-sync,
+replacement and lock behavior on Kindle user storage has not been physically
+qualified. A metadata/data loss at the filesystem layer, two independently
+corrupted slots, in-place file tampering, and storage-owner path races remain
+outside the guarantee. There is no guarantee against hostile local writers,
+and the store does not repair corrupted slots automatically or replace a
+rejected record with a fallback reading position.
+
+Host-only tests cover two-slot ordering, corruption recovery, ambiguous and
+future-format rejection, writer concurrency, interrupted writes at each
+durability boundary, symlink refusal and document isolation. Ordinary
+production builds still exclude the reader feature and its store.
 
 ### Document identity ownership
 
