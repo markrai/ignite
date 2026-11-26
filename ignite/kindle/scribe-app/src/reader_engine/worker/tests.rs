@@ -140,7 +140,10 @@ fn admission_is_single_flight_even_if_the_worker_already_finished() {
     let mut worker = ReaderWorker::start().unwrap();
     worker.try_submit(fixture.open()).unwrap();
     assert_eq!(worker.try_submit(Command::Close), Err(SubmitError::Busy));
-    assert!(matches!(response(&mut worker).unwrap(), Reply::Opened { .. }));
+    assert!(matches!(
+        response(&mut worker).unwrap(),
+        Reply::Opened { .. }
+    ));
     assert!(matches!(
         call(&mut worker, Command::Close).unwrap(),
         Reply::Closed
