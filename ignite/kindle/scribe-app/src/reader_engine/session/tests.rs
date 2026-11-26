@@ -1,7 +1,9 @@
 use std::fs;
 
 use super::*;
-use crate::reader_engine::location::{ContentLocation, Restore, StaleReason, TextAnchor, Unresolved};
+use crate::reader_engine::location::{
+    ContentLocation, Restore, StaleReason, TextAnchor, Unresolved,
+};
 use crate::reader_engine::tests::{cbz_fixture, rectangle_pdf, stored_zip, TempDocumentDir};
 
 const NARROW: PageLayout = PageLayout {
@@ -84,7 +86,10 @@ fn new_pdf_stays_unwritten_until_page_is_rendered_and_acknowledged() {
     assert_eq!(session.status(), &OpenStatus::New);
     assert_eq!(session.selected_page(), Some(0));
     assert_eq!(session.displayed_page(), None);
-    assert_eq!(session.save_displayed().unwrap(), SaveStatus::NoDisplayedPage);
+    assert_eq!(
+        session.save_displayed().unwrap(),
+        SaveStatus::NoDisplayedPage
+    );
     assert!(!fixture.store_root.exists());
     assert!(matches!(
         session.navigate_to(1),
@@ -92,13 +97,19 @@ fn new_pdf_stays_unwritten_until_page_is_rendered_and_acknowledged() {
     ));
     assert_eq!(session.selected_page(), Some(0));
     assert!(session.render_selected(0, 200).is_err());
-    assert_eq!(session.save_displayed().unwrap(), SaveStatus::NoDisplayedPage);
+    assert_eq!(
+        session.save_displayed().unwrap(),
+        SaveStatus::NoDisplayedPage
+    );
     let rendered = session.render_selected(260, 360).unwrap();
     assert!(matches!(
         session.acknowledge_displayed(rendered.token + 1),
         Err(SessionError::StaleRender)
     ));
-    assert_eq!(session.save_displayed().unwrap(), SaveStatus::NoDisplayedPage);
+    assert_eq!(
+        session.save_displayed().unwrap(),
+        SaveStatus::NoDisplayedPage
+    );
     session.acknowledge_displayed(rendered.token).unwrap();
     assert_eq!(session.displayed_page(), Some(0));
     assert_eq!(session.save_displayed().unwrap(), SaveStatus::Saved(1));
@@ -106,24 +117,27 @@ fn new_pdf_stays_unwritten_until_page_is_rendered_and_acknowledged() {
     drop(session);
 
     let mut reopened = fixture.open(WIDE);
-    assert!(matches!(reopened.status(), OpenStatus::Saved(Restore::Exact { page: 0, .. })));
+    assert!(matches!(
+        reopened.status(),
+        OpenStatus::Saved(Restore::Exact { page: 0, .. })
+    ));
     fixture.confirm(&mut reopened);
     assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::Unchanged);
 }
 
 #[test]
 fn fixed_layout_pdf_and_cbz_reopen_at_saved_position() {
-    for (name, bytes) in [
-        ("file.pdf", rectangle_pdf()),
-        ("file.cbz", cbz_fixture()),
-    ] {
+    for (name, bytes) in [("file.pdf", rectangle_pdf()), ("file.cbz", cbz_fixture())] {
         let fixture = Fixture::new(name, &bytes);
         let mut session = fixture.open(NARROW);
         fixture.confirm(&mut session);
         assert_eq!(session.save_displayed().unwrap(), SaveStatus::Saved(1));
         drop(session);
         let mut reopened = fixture.open(WIDE);
-        assert!(matches!(reopened.status(), OpenStatus::Saved(Restore::Exact { page: 0, .. })));
+        assert!(matches!(
+            reopened.status(),
+            OpenStatus::Saved(Restore::Exact { page: 0, .. })
+        ));
         fixture.confirm(&mut reopened);
         assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::Unchanged);
     }
@@ -159,7 +173,10 @@ fn epub_reflows_and_preserves_content_anchor_until_user_navigates() {
     assert_eq!(reopened.selected_page(), Some(current_page));
     fixture.confirm(&mut reopened);
     assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::Unchanged);
-    assert_eq!(fixture.store().load(&identity).unwrap(), Some(saved.clone()));
+    assert_eq!(
+        fixture.store().load(&identity).unwrap(),
+        Some(saved.clone())
+    );
 
     let next = if current_page + 1 < reopened.page_count() {
         current_page + 1
@@ -176,7 +193,9 @@ fn epub_reflows_and_preserves_content_anchor_until_user_navigates() {
     drop(reopened);
 
     let last = fixture.open(WIDE);
-    assert!(matches!(last.status(), OpenStatus::Saved(Restore::Exact { page, .. }) if *page == next));
+    assert!(
+        matches!(last.status(), OpenStatus::Saved(Restore::Exact { page, .. }) if *page == next)
+    );
 }
 
 #[test]
@@ -263,11 +282,20 @@ fn unresolvable_saved_anchor_never_gets_overwritten_by_a_fallback() {
         })
     ));
     fixture.confirm(&mut reopened);
-    assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::ProtectedPosition);
-    assert_eq!(fixture.store().load(&identity).unwrap(), Some(position.clone()));
+    assert_eq!(
+        reopened.save_displayed().unwrap(),
+        SaveStatus::ProtectedPosition
+    );
+    assert_eq!(
+        fixture.store().load(&identity).unwrap(),
+        Some(position.clone())
+    );
 
     reopened.navigate_to(1).unwrap();
-    assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::ProtectedPosition);
+    assert_eq!(
+        reopened.save_displayed().unwrap(),
+        SaveStatus::ProtectedPosition
+    );
     fixture.confirm(&mut reopened);
     assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::Saved(2));
     assert_ne!(fixture.store().load(&identity).unwrap(), Some(position));
@@ -283,14 +311,20 @@ fn rejected_saved_position_requires_an_explicit_navigation_choice() {
     drop(session);
 
     let mut reopened = fixture.open(NARROW);
-    assert!(matches!(reopened.status(), OpenStatus::Saved(Restore::Rejected(_))));
+    assert!(matches!(
+        reopened.status(),
+        OpenStatus::Saved(Restore::Rejected(_))
+    ));
     assert_eq!(reopened.status().suggested_page(), None);
     assert_eq!(reopened.selected_page(), None);
     assert!(matches!(
         reopened.render_selected(200, 200),
         Err(SessionError::NoSelectedPage)
     ));
-    assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::NoDisplayedPage);
+    assert_eq!(
+        reopened.save_displayed().unwrap(),
+        SaveStatus::NoDisplayedPage
+    );
     reopened.navigate_to(1).unwrap();
     fixture.confirm(&mut reopened);
     assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::Saved(2));
