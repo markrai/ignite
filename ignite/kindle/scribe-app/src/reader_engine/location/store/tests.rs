@@ -75,7 +75,10 @@ fn first_save_is_private_durable_and_survives_new_instance() {
     let store = dir.store();
     let position = text();
     assert_eq!(store.save(&position).unwrap(), 1);
-    assert_eq!(dir.store().load(&position.document).unwrap(), Some(position.clone()));
+    assert_eq!(
+        dir.store().load(&position.document).unwrap(),
+        Some(position.clone())
+    );
     assert!(dir.slot(&position, 0).is_file());
     assert!(!dir.slot(&position, 1).exists());
     #[cfg(unix)]
@@ -102,7 +105,10 @@ fn alternating_slots_keep_previous_and_newest_generations() {
     let store = dir.store();
     for page in 0..4 {
         assert_eq!(store.save(&fixed(page)).unwrap(), u64::from(page) + 1);
-        assert_eq!(store.load(&fixed(page).document).unwrap(), Some(fixed(page)));
+        assert_eq!(
+            store.load(&fixed(page).document).unwrap(),
+            Some(fixed(page))
+        );
     }
     assert!(dir.slot(&fixed(0), 0).exists());
     assert!(dir.slot(&fixed(0), 1).exists());
@@ -129,7 +135,10 @@ fn corrupt_newest_recovers_previous_and_replaces_only_corrupt_slot() {
     let latest = dir.slot(&fixed(1), 1);
     let mut bytes = fs::read(&latest).unwrap();
     let needle = br#""page":2"#;
-    let index = bytes.windows(needle.len()).position(|x| x == needle).unwrap();
+    let index = bytes
+        .windows(needle.len())
+        .position(|x| x == needle)
+        .unwrap();
     bytes[index + 7] = b'9';
     fs::write(&latest, bytes).unwrap();
     assert_eq!(store.load(&fixed(1).document).unwrap(), Some(fixed(1)));
@@ -228,7 +237,10 @@ fn generation_overflow_refuses_write() {
         encode_slot(u64::MAX, &position.to_json_bytes().unwrap()).unwrap(),
     )
     .unwrap();
-    assert_eq!(store.load(&position.document).unwrap(), Some(position.clone()));
+    assert_eq!(
+        store.load(&position.document).unwrap(),
+        Some(position.clone())
+    );
     assert!(matches!(
         store.save(&fixed(4)),
         Err(PositionStoreError::GenerationExhausted)
@@ -267,7 +279,9 @@ fn interruption_after_rename_cannot_destroy_previous_valid_slot() {
     let store = dir.store();
     store.save(&fixed(1)).unwrap();
     let original = fs::read(dir.slot(&fixed(1), 0)).unwrap();
-    assert!(store.save_with_failure(&fixed(2), FailurePoint::AfterRename).is_err());
+    assert!(store
+        .save_with_failure(&fixed(2), FailurePoint::AfterRename)
+        .is_err());
     assert_eq!(store.load(&fixed(1).document).unwrap(), Some(fixed(2)));
     assert_eq!(fs::read(dir.slot(&fixed(1), 0)).unwrap(), original);
 }
