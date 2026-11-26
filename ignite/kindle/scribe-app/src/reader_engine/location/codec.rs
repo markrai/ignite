@@ -284,10 +284,7 @@ mod tests {
     #[test]
     fn rejects_unknown_format_even_with_future_location_shape() {
         let raw = r#"{"format":2,"document":{"sha256":"irrelevant"},"location":{"kind":"future"}}"#;
-        assert_eq!(
-            decode(raw),
-            Err(PositionCodecError::UnsupportedFormat(2))
-        );
+        assert_eq!(decode(raw), Err(PositionCodecError::UnsupportedFormat(2)));
         let mut value = fixed();
         value.format = 2;
         assert_eq!(
@@ -304,7 +301,13 @@ mod tests {
         let unknown_nested = raw.replace(r#""page":42"#, r#""page":42,"unexpected":"field""#);
         let duplicate_nested = raw.replace(r#""page":42"#, r#""page":42,"page":43"#);
         let missing = raw.replace(r#","len":8765"#, "");
-        for candidate in [unknown, duplicate, unknown_nested, duplicate_nested, missing] {
+        for candidate in [
+            unknown,
+            duplicate,
+            unknown_nested,
+            duplicate_nested,
+            missing,
+        ] {
             assert_eq!(decode(&candidate), Err(PositionCodecError::Malformed));
         }
     }
@@ -335,16 +338,10 @@ mod tests {
             format!("{}zz", "5a".repeat(31)),
         ] {
             let candidate = raw.replace(&"5a".repeat(32), &hash);
-            assert_eq!(
-                decode(&candidate),
-                Err(PositionCodecError::InvalidDocument)
-            );
+            assert_eq!(decode(&candidate), Err(PositionCodecError::InvalidDocument));
         }
         let zero_len = raw.replace(r#""len":8765"#, r#""len":0"#);
-        assert_eq!(
-            decode(&zero_len),
-            Err(PositionCodecError::InvalidDocument)
-        );
+        assert_eq!(decode(&zero_len), Err(PositionCodecError::InvalidDocument));
     }
 
     #[test]
@@ -361,10 +358,7 @@ mod tests {
             ),
         ];
         for candidate in invalids {
-            assert_eq!(
-                decode(&candidate),
-                Err(PositionCodecError::InvalidAnchor)
-            );
+            assert_eq!(decode(&candidate), Err(PositionCodecError::InvalidAnchor));
         }
     }
 
