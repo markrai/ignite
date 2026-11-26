@@ -209,6 +209,29 @@ fn future_store_format_blocks_downgrade_even_if_old_slot_is_valid() {
 }
 
 #[test]
+fn future_position_format_is_not_overwritten_on_downgrade() {
+    let dir = TestDirectory::new();
+    let store = dir.store();
+    store.save(&fixed(1)).unwrap();
+    let future = String::from_utf8(fixed(2).to_json_bytes().unwrap())
+        .unwrap()
+        .replace(r#""format":1"#, r#""format":2"#);
+    assert!(future.contains(r#""format":2"#));
+    let slot = dir.slot(&fixed(1), 1);
+    let bytes = encode_slot(2, future.as_bytes()).unwrap();
+    fs::write(&slot, &bytes).unwrap();
+    assert!(matches!(
+        store.load(&fixed(1).document),
+        Err(PositionStoreError::UnsupportedPositionFormat(2))
+    ));
+    assert!(matches!(
+        store.save(&fixed(3)),
+        Err(PositionStoreError::UnsupportedPositionFormat(2))
+    ));
+    assert_eq!(fs::read(slot).unwrap(), bytes);
+}
+
+#[test]
 fn equal_generations_are_a_conflict_not_a_tie_break() {
     let dir = TestDirectory::new();
     let store = dir.store();

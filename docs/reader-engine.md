@@ -282,7 +282,8 @@ and exact document identity for both slots. It returns the highest-generation
 valid record if one exists, even if the other slot is corrupt or missing.
 Missing slots mean no position. Existing slots with no valid record produce
 an error, not `None`. Equal valid generations are a conflict. An unsupported
-envelope format is a hard error rather than a silent downgrade/overwrite.
+envelope format or inner C.2A record version is a hard error rather than a
+silent downgrade/overwrite.
 Unreadable files and unsafe leaf symlinks also fail closed. Concurrent readers
 may observe the old or new committed generation, never a partially written
 slot. Concurrent Unix writers serialize through the advisory lock.

@@ -31,6 +31,7 @@ pub enum PositionStoreError {
     Corrupt,
     ConflictingGenerations,
     UnsupportedStoreFormat(u16),
+    UnsupportedPositionFormat(u16),
     GenerationExhausted,
     UnsupportedPlatform,
 }
@@ -45,6 +46,9 @@ impl std::fmt::Display for PositionStoreError {
             Self::ConflictingGenerations => write!(f, "conflicting reading-position generations"),
             Self::UnsupportedStoreFormat(version) => {
                 write!(f, "unsupported reading-position store format {version}")
+            }
+            Self::UnsupportedPositionFormat(version) => {
+                write!(f, "unsupported saved-position format {version}")
             }
             Self::GenerationExhausted => write!(f, "reading-position generation exhausted"),
             Self::UnsupportedPlatform => write!(f, "durable position writes require Unix"),
@@ -89,6 +93,7 @@ enum SlotStatus {
     Missing,
     Invalid,
     Unsupported(u16),
+    UnsupportedPosition(u16),
     Valid(ValidSlot),
 }
 
@@ -270,6 +275,9 @@ impl PositionStore {
             Ok(valid) => SlotStatus::Valid(valid),
             Err(SlotIssue::Invalid) => SlotStatus::Invalid,
             Err(SlotIssue::Unsupported(version)) => SlotStatus::Unsupported(version),
+            Err(SlotIssue::UnsupportedPosition(version)) => {
+                SlotStatus::UnsupportedPosition(version)
+            },
         })
     }
 
@@ -282,6 +290,9 @@ impl PositionStore {
                 SlotStatus::Invalid => corrupt = true,
                 SlotStatus::Unsupported(version) => {
                     return Err(PositionStoreError::UnsupportedStoreFormat(*version));
+                }
+                SlotStatus::UnsupportedPosition(version) => {
+                    return Err(PositionStoreError::UnsupportedPositionFormat(*version));
                 }
                 SlotStatus::Valid(slot) => {
                     if let Some((_, previous)) = latest {
@@ -330,6 +341,7 @@ impl PositionStore {
 enum SlotIssue {
     Invalid,
     Unsupported(u16),
+    UnsupportedPosition(u16),
 }
 
 fn decode_slot(bytes: &[u8], identity: &DocumentIdentity) -> Result<ValidSlot, SlotIssue> {
@@ -347,7 +359,13 @@ fn decode_slot(bytes: &[u8], identity: &DocumentIdentity) -> Result<ValidSlot, S
     {
         return Err(SlotIssue::Invalid);
     }
-    let position = SavedPosition::from_json_bytes(payload).map_err(|_| SlotIssue::Invalid)?;
+    let position = match SavedPosition::from_json_bytes(payload) {
+        Ok(position) => position,
+        Err(PositionCodecError::UnsupportedFormat(version)) => {
+            return Err(SlotIssue::UnsupportedPosition(version));
+        }
+        Err(_) => return Err(SlotIssue::Invalid),
+    };
     if &position.document != identity {
         return Err(SlotIssue::Invalid);
     }
