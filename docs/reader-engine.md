@@ -166,8 +166,8 @@ out-of-memory kill as a successful reader result.
 
 ## Reading positions (experimental)
 
-Status: **engine API and host tests only.** Nothing stores positions or identities yet, and no
-stored-record encoding is committed to.
+Status: **engine API and host tests only.** C.2A defines a versioned, bounded JSON record
+encoding. No on-device position store, disk write, reader UI, or sync integration exists yet.
 
 ### Why not MuPDF bookmarks
 
@@ -202,6 +202,49 @@ unit, so the image unit cannot be forged by text. No Unicode normalisation is ap
 `SavedPosition { format, document, location }` is the record a future store would hold. All fields
 are owned and fixed-size or bounded. `Book::save_position(page)` creates one for the book's own
 identity.
+
+### Position serialization (C.2A)
+
+`SavedPosition::to_json_bytes()` and `SavedPosition::from_json_bytes(bytes)` encode and
+decode the existing engine location model, without accessing the filesystem or MuPDF.
+Records are UTF-8 JSON, with a strict maximum of 4,096 bytes including whitespace.
+Version 1 uses this schema:
+
+```json
+{
+  "format": 1,
+  "document": {
+    "sha256": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    "len": 8765
+  },
+  "location": {
+    "kind": "fixed_page",
+    "page": 42
+  }
+}
+```
+
+For EPUB, `location` is
+`{"kind":"text","chapter":3,"offset":170,"text_model":"ignite-units-1/mupdf-1.28.6","context":"..."}`.
+The JSON document hash is exactly 64 lowercase hexadecimal characters; `len`
+is a nonzero unsigned integer. Location and format numbers are checked for their
+declared integer widths, and neither page numbers nor offsets are claimed valid
+until `Book::restore()` checks the opened document.
+
+Decoding rejects missing or duplicate fields, unknown fields, unknown location
+kinds, malformed JSON, invalid UTF-8, invalid hashes and out-of-bounds anchors.
+A record with an unrecognized `format` is rejected explicitly as
+`UnsupportedFormat`, including when the future schema differs. Text model and
+context are validated under the engine's existing anchor rules before a record
+can be used. Encoding performs the same checks and emits deterministic compact
+JSON with a fixed field order.
+
+C.2A is a data format only, not a persistence guarantee. It does not choose a
+storage path, handle atomic writes, migrate legacy records, or decide recovery
+from corrupt files. Those are C.2B responsibilities; a rejected record must not
+silently replace a previously valid position. The stored record contains
+content identity and content location, never current-layout page numbers for
+reflowable documents or a trusted file-system stamp.
 
 ### Document identity ownership
 
