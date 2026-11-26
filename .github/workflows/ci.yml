@@ -82,7 +82,7 @@ jobs:
       - name: Ordinary and release builds do not include MuPDF
         run: bash tools/ci/check_reader_isolation.sh
       - name: Reader engine tests (host)
-        run: cargo test -p scribe-app --lib --locked --features reader reader_engine -- --test-threads=1 --nocapture
+        run: cargo test -p scribe-app --lib --locked --features reader reader_engine
       - name: Reader probe CLI contract tests (host)
         run: cargo test -p scribe-app --bin reader-probe --locked --features reader
       - name: Probe release verifier unit tests

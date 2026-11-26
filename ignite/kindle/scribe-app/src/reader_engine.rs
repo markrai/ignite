@@ -965,6 +965,23 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_wrapper_leaves_the_mupdf_context_balanced() {
+        let fixtures = [(rectangle_pdf(), "application/pdf"), (cbz_fixture(), "cbz")];
+        for (bytes, magic) in fixtures {
+            let mut book = Book::open_bytes(&bytes, magic).unwrap();
+            book.layout(300.0, 420.0, 14.0).unwrap();
+            assert_eq!(book.page_count().unwrap(), 1);
+            let page = book.render_page_gray(0, 100, 100).unwrap();
+            assert!(!page.pixels().is_empty());
+        }
+
+        let mut epub = Document::from_bytes(&epub_fixture(), "epub").unwrap();
+        assert!(epub.layout(0.0, 400.0, 12.0).is_err());
+        epub.layout(300.0, 400.0, 12.0).unwrap();
+        assert!(epub.page_count().unwrap() > 0);
+    }
+
+    #[test]
     fn invalid_page_counts_are_errors() {
         assert_eq!(page_count_from_mupdf(3).unwrap(), 3);
         assert!(page_count_from_mupdf(-1).is_err());

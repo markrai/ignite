@@ -169,7 +169,7 @@ out-of-memory kill as a successful reader result.
 Status: **engine API and host tests only.** C.2A defines the bounded JSON record,
 C.2B supplies the local two-slot store, and C.2C connects them through a synchronous
 `ReaderSession`. None of this is connected to the Kindle application's UI or
-production storage. No device files, notebooks, or ebooks are modified by the tests.
+production storage. No Kindle files or production notebooks and ebooks are touched by the host tests.
 
 ### Why not MuPDF bookmarks
 
@@ -351,6 +351,15 @@ dedicated reader thread, request supersession/cancellation, and displayed-page
 acknowledgment delivery. Tests exercise PDF/CBZ and EPUB reopen, relayout,
 document replacement, stale render tokens, corrupted stores, explicit fallback
 recovery, and failed-store retry on a disposable Linux host.
+
+C.2C also corrects `mupdf_layout_document` in the vendored native FFI.
+Its previous early returns inside `fz_try` skipped the paired exception-frame
+unwind when a fixed-layout PDF/CBZ was laid out or an invalid width was
+reported. That left the thread-local MuPDF context in an invalid state and
+triggered `fz_drop_context` assertions when the test thread exited.
+The wrapper now executes the complete try/catch sequence on every path.
+A dedicated native regression test exercises both the fixed-layout no-op
+and invalid reflow dimensions.
 
 ### Document identity ownership
 

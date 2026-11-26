@@ -199,6 +199,34 @@ fn epub_reflows_and_preserves_content_anchor_until_user_navigates() {
 }
 
 #[test]
+fn relocated_anchor_is_saved_only_after_the_page_is_shown() {
+    let fixture = Fixture::new("book.epub", &epub_fixture("Relocation"));
+    let initial = fixture.open(NARROW);
+    let mut previous = initial.book.save_position(0).unwrap();
+    let identity = previous.document;
+    if let ContentLocation::Text(anchor) = &mut previous.location {
+        anchor.text_model = "prior-text-model".to_owned();
+    }
+    assert_eq!(fixture.store().save(&previous).unwrap(), 1);
+    drop(initial);
+
+    let mut reopened = fixture.open(WIDE);
+    let corrected = match reopened.status() {
+        OpenStatus::Saved(Restore::Relocated { page: 0, position }) => position.clone(),
+        other => panic!("expected unambiguous EPUB relocation: {other:?}"),
+    };
+    assert_ne!(corrected, previous);
+    assert_eq!(fixture.store().load(&identity).unwrap(), Some(previous));
+    assert_eq!(
+        reopened.save_displayed().unwrap(),
+        SaveStatus::NoDisplayedPage
+    );
+    fixture.confirm(&mut reopened);
+    assert_eq!(reopened.save_displayed().unwrap(), SaveStatus::Saved(2));
+    assert_eq!(fixture.store().load(&identity).unwrap(), Some(corrected));
+}
+
+#[test]
 fn navigation_and_failed_render_do_not_persist_an_unseen_page() {
     let fixture = Fixture::new("book.epub", &epub_fixture("Navigation"));
     let mut session = fixture.open(NARROW);
