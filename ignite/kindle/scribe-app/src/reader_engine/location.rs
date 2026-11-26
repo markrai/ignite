@@ -40,7 +40,9 @@ use mupdf::text_page::{TextBlockType, TextPageFlags};
 use super::{Book, DocumentIdentity, ReaderError};
 
 mod codec;
+mod store;
 pub use codec::{PositionCodecError, MAX_SAVED_POSITION_BYTES};
+pub use store::{PositionStore, PositionStoreError};
 
 /// Version of the [`SavedPosition`] record layout.
 pub const SAVED_POSITION_FORMAT: u16 = 1;
