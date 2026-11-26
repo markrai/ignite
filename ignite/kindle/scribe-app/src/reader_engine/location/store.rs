@@ -277,7 +277,7 @@ impl PositionStore {
             Err(SlotIssue::Unsupported(version)) => SlotStatus::Unsupported(version),
             Err(SlotIssue::UnsupportedPosition(version)) => {
                 SlotStatus::UnsupportedPosition(version)
-            },
+            }
         })
     }
 
