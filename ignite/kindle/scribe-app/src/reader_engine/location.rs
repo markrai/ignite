@@ -39,6 +39,9 @@ use mupdf::text_page::{TextBlockType, TextPageFlags};
 
 use super::{Book, DocumentIdentity, ReaderError};
 
+mod codec;
+pub use codec::{PositionCodecError, MAX_SAVED_POSITION_BYTES};
+
 /// Version of the [`SavedPosition`] record layout.
 pub const SAVED_POSITION_FORMAT: u16 = 1;
 /// The unit rules of this module and the MuPDF release whose text extraction they count. Change
