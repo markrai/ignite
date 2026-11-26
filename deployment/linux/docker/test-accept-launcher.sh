@@ -91,9 +91,12 @@ case "$cmd" in
         rm -rf "$t"
         exit 0 ;;
       *accept-disposable.sh*)
-        echo guest-run >>"$S/guest.log"
         if [ -n "${FAKE_MP_GUEST_SLEEP:-}" ]; then
+          trap 'exit 130' INT
+          echo guest-run >>"$S/guest.log"
           for _ in $(seq 1 "$FAKE_MP_GUEST_SLEEP"); do sleep 1; done
+        else
+          echo guest-run >>"$S/guest.log"
         fi
         exit "${FAKE_MP_GUEST_RC:-0}" ;;
       *"base64 -w0"*)
@@ -264,17 +267,29 @@ PATH="$MP_PATH" python3 - "$ACCEPT" "$CASE/state/guest.log" "$CASE/out.txt" <<'P
 import os, signal, subprocess, sys, time
 accept, guest_log, out = sys.argv[1:4]
 with open(out, "wb") as f:
+    def reset_interrupt():
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
     p = subprocess.Popen(["bash", accept], stdout=f, stderr=subprocess.STDOUT,
-                         start_new_session=True,
-                         preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
-    for _ in range(300):
-        if os.path.exists(guest_log):
-            break
-        time.sleep(0.1)
-    else:
-        p.kill(); sys.exit("guest run never started")
-    os.killpg(p.pid, signal.SIGINT)
-    sys.exit(0 if p.wait(timeout=60) != 0 else "interrupted run exited 0")
+                         start_new_session=True, preexec_fn=reset_interrupt)
+    try:
+        for _ in range(300):
+            if os.path.exists(guest_log):
+                break
+            if p.poll() is not None:
+                sys.exit("launcher exited before guest run")
+            time.sleep(0.1)
+        else:
+            sys.exit("guest run never started")
+        os.killpg(p.pid, signal.SIGINT)
+        rc = p.wait(timeout=60)
+        if rc != 130:
+            sys.exit(f"expected interrupted launcher exit 130, got {rc}")
+    finally:
+        if p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
 PY
 prc=$?
 set -e
