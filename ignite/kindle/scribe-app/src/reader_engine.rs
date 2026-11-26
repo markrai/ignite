@@ -7,8 +7,8 @@
 //! Everything is rendered as 8-bit gray, the Kindle panel's format, scaled to fit a box given
 //! in pixels. [`Book::open_path_identified`] binds a content identity to the opened bytes, and
 //! the experimental [`location`] module turns a page into a layout-independent position and
-//! restores it after relayout or reopening. Storing positions or identities, and any UI, are
-//! still out of scope.
+//! restores it after relayout or reopening. A host-only session composes that engine with the
+//! experimental position store. The Kindle app still has no reader UI or integration.
 
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
@@ -19,6 +19,7 @@ use mupdf::{Colorspace, Document, Matrix, Pixmap, Rect};
 use sha2::{Digest, Sha256};
 
 pub mod location;
+pub mod session;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -961,6 +962,23 @@ mod tests {
         assert!(book.layout(0.5, 100.0, 10.0).is_err());
         assert!(book.layout(4_097.0, 100.0, 10.0).is_err());
         assert!(book.layout(100.0, 100.0, 513.0).is_err());
+    }
+
+    #[test]
+    fn native_layout_wrapper_leaves_the_mupdf_context_balanced() {
+        let fixtures = [(rectangle_pdf(), "application/pdf"), (cbz_fixture(), "cbz")];
+        for (bytes, magic) in fixtures {
+            let mut book = Book::open_bytes(&bytes, magic).unwrap();
+            book.layout(300.0, 420.0, 14.0).unwrap();
+            assert_eq!(book.page_count().unwrap(), 1);
+            let page = book.render_page_gray(0, 100, 100).unwrap();
+            assert!(!page.pixels().is_empty());
+        }
+
+        let mut epub = Document::from_bytes(&epub_fixture(), "epub").unwrap();
+        assert!(epub.layout(0.0, 400.0, 12.0).is_err());
+        epub.layout(300.0, 400.0, 12.0).unwrap();
+        assert!(epub.page_count().unwrap() > 0);
     }
 
     #[test]
