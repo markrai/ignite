@@ -36,7 +36,7 @@ An experimental reading-position layer (`reader_engine/location.rs`, milestones 
 turns a page into a layout-independent content location and restores it after relayout or
 reopening. See [Reading positions](#reading-positions-experimental) below.
 
-Out of scope for now: discovery, computing and caching book identities, storing reading positions,
+Out of scope for now: book discovery and catalog, production wiring for persisted positions,
 book folders, UI, packaging and notices in the release payload.
 
 ## Building
@@ -166,10 +166,10 @@ out-of-memory kill as a successful reader result.
 
 ## Reading positions (experimental)
 
-Status: **engine API and host tests only.** C.2A defines the bounded JSON record
-encoding; C.2B adds an opt-in, local position-store library with crash-recovery tests.
-Nothing calls the store from the Kindle app; no device files or notebook data are touched.
-Reader UI and sync integration are still absent.
+Status: **engine API and host tests only.** C.2A defines the bounded JSON record,
+C.2B supplies the local two-slot store, and C.2C connects them through a synchronous
+`ReaderSession`. None of this is connected to the Kindle application's UI or
+production storage. No device files, notebooks, or ebooks are modified by the tests.
 
 ### Why not MuPDF bookmarks
 
@@ -288,9 +288,9 @@ Unreadable files and unsafe leaf symlinks also fail closed. Concurrent readers
 may observe the old or new committed generation, never a partially written
 slot. Concurrent Unix writers serialize through the advisory lock.
 
-**Limitations:** This is a storage component, not a reader-session feature.
-No page-turn hook, debounce, retry, rendering or autosave behavior exists yet;
-C.2C owns the save/resume flow. The filesystem's real directory-sync,
+**Limitations:** This is a storage component, separate from the reader session.
+C.2C composes the store and renderer but does not add application page-turn hooks,
+debounce, scheduled retries or autosave. The filesystem's real directory-sync,
 replacement and lock behavior on Kindle user storage has not been physically
 qualified. A metadata/data loss at the filesystem layer, two independently
 corrupted slots, in-place file tampering, and storage-owner path races remain
@@ -302,6 +302,55 @@ Host-only tests cover two-slot ordering, corruption recovery, ambiguous and
 future-format rejection, writer concurrency, interrupted writes at each
 durability boundary, symlink refusal and document isolation. Ordinary
 production builds still exclude the reader feature and its store.
+
+### Synchronous save and resume session (C.2C)
+
+`reader_engine::session::ReaderSession::open(path, store, layout)` opens an
+identified file, lays it out, obtains its page count, loads a saved position
+from the supplied `PositionStore` and resolves it with `Book::restore`.
+The caller supplies a trusted app-owned storage root to the store; the session
+does not choose a Kindle path or modify an ebook. It does not persist data
+merely because a book was opened or a page was selected.
+
+`OpenStatus::New` suggests page 0. `OpenStatus::Saved(Restore)` retains the
+engine's exact, relocated, fallback, or rejected distinctions. Exact and
+relocated resumes select the page and preserve the **content anchor itself**
+rather than creating an anchor at the beginning of its newly laid-out page.
+Fallback selects the offered page but blocks persistence, and Rejected offers
+no page until the caller explicitly navigates. A corrupt or unsupported
+position store prevents the session from opening; it is never treated as
+an empty store.
+
+The synchronous lifecycle is explicit:
+
+1. `navigate_to(page)` chooses a new page without changing storage.
+2. `render_selected(width, height)` produces a Gray8 page and a monotonically
+   increasing render token. A failed render is not eligible for acknowledgment.
+3. The eventual display owner calls `acknowledge_displayed(token)` **only
+   after the corresponding pixels have actually been presented**. Stale
+   tokens and acknowledgments after another navigation are rejected.
+4. `save_displayed()` persists the most recently acknowledged eligible
+   location. It returns `NoDisplayedPage`, `ProtectedPosition`,
+   `Unchanged`, or `Saved(generation)`. Failed writes preserve the
+   eligible location for retry and do not update the session's last known
+   persisted position.
+
+If the user navigates after a restored page, the new page can be anchored
+when explicitly saved. Selecting the already-selected page does not turn a
+fallback into an implicit user navigation. An offered fallback is never
+automatically recorded as a valid position. Choosing a different page and
+acknowledging its display is an explicit new reading location. The session
+may continue to save the previously acknowledged page when a later
+navigation or render fails; it cannot save the not-yet-shown page.
+
+C.2C is intentionally **not** asynchronous, does not acquire display
+ownership, and never saves on `Drop`. It has no automatic page-turn
+debounce, background worker, cancellation, persistent file-identity cache,
+cross-device sync, UI event loop, or handwriting integration. C.3 owns the
+dedicated reader thread, request supersession/cancellation, and displayed-page
+acknowledgment delivery. Tests exercise PDF/CBZ and EPUB reopen, relayout,
+document replacement, stale render tokens, corrupted stores, explicit fallback
+recovery, and failed-store retry on a disposable Linux host.
 
 ### Document identity ownership
 

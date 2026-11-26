@@ -7,8 +7,8 @@
 //! Everything is rendered as 8-bit gray, the Kindle panel's format, scaled to fit a box given
 //! in pixels. [`Book::open_path_identified`] binds a content identity to the opened bytes, and
 //! the experimental [`location`] module turns a page into a layout-independent position and
-//! restores it after relayout or reopening. Storing positions or identities, and any UI, are
-//! still out of scope.
+//! restores it after relayout or reopening. A host-only session composes that engine with the
+//! experimental position store. The Kindle app still has no reader UI or integration.
 
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
@@ -19,6 +19,7 @@ use mupdf::{Colorspace, Document, Matrix, Pixmap, Rect};
 use sha2::{Digest, Sha256};
 
 pub mod location;
+pub mod session;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
