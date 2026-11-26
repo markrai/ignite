@@ -128,7 +128,7 @@ fn corrupt_newest_recovers_previous_and_replaces_only_corrupt_slot() {
     let older = fs::read(dir.slot(&fixed(1), 0)).unwrap();
     let latest = dir.slot(&fixed(1), 1);
     let mut bytes = fs::read(&latest).unwrap();
-    let needle = b#""page":2"#;
+    let needle = br#""page":2"#;
     let index = bytes.windows(needle.len()).position(|x| x == needle).unwrap();
     bytes[index + 7] = b'9';
     fs::write(&latest, bytes).unwrap();
