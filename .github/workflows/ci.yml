@@ -83,6 +83,762 @@ jobs:
         run: bash tools/ci/check_reader_isolation.sh
       - name: Reader engine tests (host)
         run: cargo test -p scribe-app --lib --locked --features reader reader_engine
+      - name: Reader application lifecycle check (host, no hardware)
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          mkdir "$root/books"
+          python3 - "$root/books/book.cbz" <<'PY'
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1], "w") as archive:
+              archive.writestr("page.pgm", b"P5\n2 2\n255\n\x00\xff\x80\x40")
+          PY
+          cargo run -p scribe-app --locked --features reader --bin scribe-app -- \
+            --reader-lifecycle-check book.cbz --reader-root "$root" | tee "$root/result.log"
+          grep -q '^reader_lifecycle_opened page_count=1
+        run: cargo test -p scribe-app --bin reader-probe --locked --features reader
+      - name: Probe release verifier unit tests
+        run: python3 -m unittest discover -s tools/ci -p 'test_verify_reader_probe_armv7.py'
+      - name: Reader engine linked ARMv7 validation (pinned Kindle toolchain)
+        run: |
+          set -euo pipefail
+          image="$(sed -n 's/^rust_armv7hf=//p' tools/pinned-docker-images.txt | tr -d '\r')"
+          case "$image" in
+            *@sha256:*) ;;
+            *) echo "rust_armv7hf image is not digest-pinned" >&2; exit 1 ;;
+          esac
+          docker run --rm \
+            -e IGNITE_READER_RUN_HOST_TESTS=1 \
+            -e IGNITE_READER_BUILD_PROBE=1 \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            "$image" \
+            bash /src/tools/ci/validate_reader_armv7.sh
+
+  version-sync:
+    name: Version file synchronization
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check VERSION / Cargo / web lockfiles
+        run: python3 tools/ci/check_version_sync.py
+      - name: Standalone version tool check
+        run: python3 tools/release/ignite_version.py check
+      - name: Version mismatch fixture fails closed
+        run: python3 tools/ci/test_check_version_sync.py
+      - name: Version tool fixtures
+        run: python3 tools/release/test_ignite_version.py
+
+  kindle-installer:
+    name: Kindle installer pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run deployment/kindle tests
+        working-directory: deployment/kindle
+        run: pytest -q
+      - name: Launcher unit tests
+        working-directory: tools/kindle_launcher
+        run: pytest -q
+
+  kindle-package:
+    name: Kindle installer package
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Assert a clean packaging workspace
+        run: |
+          set -euo pipefail
+          for p in target/dropbear-kindle target/armv7-unknown-linux-gnueabihf target/package/kindle; do
+            if [ -e "$p" ]; then
+              echo "unexpected pre-existing $p on a clean runner" >&2
+              exit 1
+            fi
+          done
+      - name: Build customer Scriptlet (pinned Docker, no SkipBuild)
+        env:
+          IGNITE_DROPBEAR_FORCE: "1"
+        run: bash scripts/kindle/package-release.sh
+      - name: Verify customer artifacts and Dropbear pin
+        run: |
+          set -euo pipefail
+          v="$(tr -d '[:space:]' <ignite/VERSION)"
+          src="target/package/kindle"
+          want_sha="$(sed -n 's/^elf_sha256=//p' tools/dropbear/PINNED.txt | tr -d '\r')"
+          want_bytes="$(sed -n 's/^elf_bytes=//p' tools/dropbear/PINNED.txt | tr -d '\r')"
+          have_sha="$(sha256sum target/dropbear-kindle/dropbearmulti | awk '{print $1}')"
+          have_bytes="$(wc -c <target/dropbear-kindle/dropbearmulti | tr -d ' ')"
+          if [ "$have_sha" != "$want_sha" ] || [ "$have_bytes" != "$want_bytes" ]; then
+            echo "Dropbear ELF pin mismatch have=$have_sha/$have_bytes want=$want_sha/$want_bytes" >&2
+            exit 1
+          fi
+          echo "dropbear_sha256=$have_sha bytes=$have_bytes pin=ok"
+          mkdir -p dist/kindle-release
+          cp "$src/Install Ignite v$v.sh" "$src/Install Ignite v$v.sha256" dist/kindle-release/
+          (cd dist/kindle-release && sha256sum -c "Install Ignite v$v.sha256")
+          python3 deployment/kindle/validate_stage.py --sfx "dist/kindle-release/Install Ignite v$v.sh" --version "$v"
+          # Slice 3D-B2a.4.3c: reproducible component profiles from the staged payload
+          # (build evidence only; not Release assets). SFX↔payload byte equivalence after
+          # customer extraction remains a separate blocked check (see docs).
+          payload="$(find target/package/kindle/staging -maxdepth 1 -type d -name "Ignite-Kindle-$v" | head -n 1)"
+          if [ -z "$payload" ] || [ ! -d "$payload" ]; then
+            echo "missing staged payload Ignite-Kindle-$v for component profiles" >&2
+            exit 1
+          fi
+          python3 deployment/kindle/release_component_profiles.py \
+            --payload "$payload" --version "$v" --check-deterministic \
+            --out-dir target/package/kindle/component-profiles
+          test -s target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1
+          # Slice 3D-B2a.4.3d: independent byte-equivalence of the copied customer
+          # Scriptlet against the staged payload + canonical package profile.
+          # Inspects dist/kindle-release (upload candidate), never executes the Scriptlet.
+          python3 deployment/kindle/verify_sfx_payload_equivalence.py \
+            --sfx "dist/kindle-release/Install Ignite v$v.sh" \
+            --payload "$payload" \
+            --version "$v" \
+            --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+            --report target/package/kindle/component-profiles/sfx-payload-equivalence.v1
+          # Slice 3D-B2a.4.3l: CI packaging measurement from the same build inputs.
+          # Associated artifact for offline ceremony; not a GitHub Release asset.
+          # Prefer the measurement already emitted by package_release.py when present.
+          meas_src="target/package/kindle/packaging-measurements"
+          if [ ! -f "$meas_src/ignite-kindle-ci-packaging-measurement.v1" ]; then
+            python3 deployment/kindle/ci_packaging_measurement.py build \
+              --version "$v" \
+              --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+              --payload "$payload" \
+              --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+              --equivalence-report target/package/kindle/component-profiles/sfx-payload-equivalence.v1 \
+              --out-dir "$meas_src" \
+              --source-revision "${GITHUB_SHA}" \
+              --workflow-run-id "${GITHUB_RUN_ID}"
+          fi
+          mkdir -p dist/kindle-packaging-measurements
+          cp "$meas_src/ignite-kindle-ci-packaging-measurement.v1" \
+             "$meas_src/ignite-kindle-component-profile-package.v1" \
+             dist/kindle-packaging-measurements/
+          if [ -f "$meas_src/sfx-payload-equivalence.v1" ]; then
+            cp "$meas_src/sfx-payload-equivalence.v1" dist/kindle-packaging-measurements/
+          fi
+          # Bind measurement to the exact upload-candidate Scriptlet (no execution).
+          python3 deployment/kindle/ci_packaging_measurement.py verify \
+            --measurement dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 \
+            --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+            --package-profile dist/kindle-packaging-measurements/ignite-kindle-component-profile-package.v1 \
+            --expected-version "$v" \
+            --expected-source-revision "${GITHUB_SHA}"
+          # Record association with the customer artifact set for the same run.
+          {
+            echo "IGNITE_CI_KINDLE_ARTIFACT_ASSOCIATION_V1"
+            echo "schema=1"
+            echo "customer_artifact=ignite-kindle-release"
+            echo "measurement_artifact=ignite-kindle-packaging-measurements"
+            echo "scriptlet=Install Ignite v$v.sh"
+            echo "scriptlet_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
+            echo "measurement_sha256=$(sha256sum dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 | awk '{print $1}')"
+            echo "version=$v"
+            echo "source_revision=${GITHUB_SHA}"
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "github_release_asset=false"
+          } > dist/kindle-packaging-measurements/artifact-association.v1
+          echo "kindle_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
+      - name: Upload Kindle release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-kindle-release
+          path: dist/kindle-release/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Upload Kindle packaging measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-kindle-packaging-measurements
+          path: dist/kindle-packaging-measurements/
+          retention-days: 30
+          if-no-files-found: error
+
+  ignite-web:
+    name: ignite-web production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ignite/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignite-web-wasm
+      - name: Install npm dependencies
+        working-directory: ignite/web
+        run: npm ci
+      - name: Production build (Cargo WASM + Vite)
+        working-directory: ignite/web
+        run: npm run build
+      - name: Typecheck and lint
+        working-directory: ignite/web
+        run: |
+          npm run typecheck
+          npm run lint
+      - name: Vitest (fresh WASM)
+        working-directory: ignite/web
+        run: npm test
+      - name: Rust WASM bridge + web fixture parity
+        run: |
+          cargo test -p scribe-web-wasm --locked
+          cargo test -p scribe-sync-tool --test web_fixtures --locked
+      - name: Confirm dist WASM matches Cargo artifact
+        working-directory: ignite/web
+        run: node scripts/verify-dist-wasm.mjs
+
+  ignite-server-linux:
+    name: Ignite Server Linux bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ignite/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignite-server-linux
+      - name: Shell syntax checks
+        run: |
+          set -euo pipefail
+          for f in deployment/linux/*.sh deployment/linux/docker/*.sh \
+                   scripts/kindle/*.sh tools/dropbear/*.sh tools/release/*.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f"
+          done
+      - name: Build portable Linux bundle
+        run: bash deployment/linux/build-bundle.sh dist/ignite-server-linux
+      - name: Static bundle checks
+        run: bash deployment/linux/test-bundle.sh dist/ignite-server-linux
+      - name: Unsafe path rejection
+        run: bash deployment/linux/test-path-safety.sh dist/ignite-server-linux
+      - name: Staging install / upgrade / rollback seams
+        run: bash deployment/linux/test-staging.sh dist/ignite-server-linux
+      - name: CARGO_TARGET_DIR binary location
+        run: bash deployment/linux/test-cargo-target-dir.sh
+      - name: ignite-update (mock releases, staging)
+        run: bash deployment/linux/test-update.sh dist/ignite-server-linux
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+          bash deployment/linux/package-release.sh dist/ignite-server-linux dist/release
+          v="$(tr -d '[:space:]' <ignite/VERSION)"
+          test -f "dist/release/ignite-server-$v-linux-$(uname -m).tar.gz"
+          (cd dist/release && sha256sum -c ./*.sha256)
+          echo "linux_sha256=$(awk '{print $1}' "dist/release/ignite-server-$v-linux-$(uname -m).tar.gz.sha256")"
+      - name: Upload Linux bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-linux-bundle
+          path: dist/ignite-server-linux/
+          retention-days: 7
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-linux-release
+          path: dist/release/
+          retention-days: 30
+
+  # Docker image + host-network disposable accept (separate from unit tests; Linux Engine only).
+  ignite-server-docker:
+    name: Ignite Server Docker image
+    runs-on: ubuntu-latest
+    needs: ignite-server-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Linux bundle artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ignite-server-linux-bundle
+          path: dist/ignite-server-linux
+      - name: Compose/Dockerfile static checks
+        run: bash deployment/linux/docker/test-compose-static.sh
+      - name: Accept evidence/ownership safety (mocked)
+        run: bash deployment/linux/docker/test-accept-safety.sh
+      - name: Make bundle binary executable
+        run: chmod +x dist/ignite-server-linux/scribe-server
+      - name: Build image + disposable accept (host network)
+        run: |
+          set -euo pipefail
+          export IGNITE_DOCKER_ACCEPT=1
+          export IGNITE_DOCKER_BUNDLE="$GITHUB_WORKSPACE/dist/ignite-server-linux"
+          export IGNITE_DOCKER_EVIDENCE="$GITHUB_WORKSPACE/deployment/linux/docker/evidence-ci"
+          export IGNITE_DOCKER_BROWSER_SMOKE=0
+          bash deployment/linux/docker/accept-disposable.sh
+      - name: Assert evidence contains no secrets
+        if: always()
+        id: evidence_clean
+        run: bash deployment/linux/docker/assert-evidence-clean.sh deployment/linux/docker/evidence-ci
+      - name: Upload sanitized Docker accept evidence
+        # Only after secret scan passes — never upload raw credentials on failure.
+        if: always() && steps.evidence_clean.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-docker-evidence
+          path: deployment/linux/docker/evidence-ci/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  ignite-server-firewall:
+    name: Ignite Server firewall ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ufw + firewalld ownership (disposable containers)
+        run: bash deployment/linux/ci-firewall.sh
+
+  # Focused acceptance harness regressions only — no Multipass, HCS, VM, or Chromium download.
+  ignite-accept-regressions:
+    name: Ignite Server acceptance regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: deployment/linux/acceptance/browser-smoke/package-lock.json
+      - name: Browser-smoke helper tests (pinned Node 20)
+        working-directory: deployment/linux/acceptance/browser-smoke
+        run: |
+          npm ci --omit=dev
+          npm test
+      - name: Browser smoke exit-status capture (behavioral)
+        run: bash deployment/linux/acceptance/test-run-browser-smoke-rc.sh
+      - name: Guest browser-class structure
+        shell: pwsh
+        run: pwsh -NoProfile -File deployment/linux/acceptance/test-guest-browser-class.ps1
+      - name: PowerShell argv forwarding (literal --)
+        shell: pwsh
+        run: pwsh -NoProfile -File deployment/linux/acceptance/test-run-host-ps1-argv.ps1
+      - name: Kindle package-release.ps1 wrapper (SkipBuild)
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/kindle/test-package-release.ps1
+      - name: Kindle package-release.sh host-owned target/
+        run: bash scripts/kindle/test-package-release.sh
+      - name: Docker networking probe safety
+        run: bash deployment/linux/test-docker-network-probe.sh
+      - name: Docker Compose/Dockerfile static checks
+        run: bash deployment/linux/docker/test-compose-static.sh
+      - name: GHCR publishing guards and image references
+        run: bash deployment/linux/docker/test-ghcr-publish.sh
+      - name: Offline Kindle release signing helper
+        run: python3 tools/release/test_kindle_release_sign.py
+      - name: Promote-publish guards
+        run: bash tools/release/test-promote-release.sh
+      - name: Version file synchronization
+        run: python3 tools/ci/check_version_sync.py
+      - name: Standalone version tool check
+        run: python3 tools/release/ignite_version.py check
+      - name: Version mismatch fixture fails closed
+        run: python3 tools/ci/test_check_version_sync.py
+      - name: Version tool fixtures
+        run: python3 tools/release/test_ignite_version.py
+      - name: Docker accept evidence/ownership safety
+        run: bash deployment/linux/docker/test-accept-safety.sh
+
+  # Publication is not performed here. Tag pushes must not rebuild-and-publish.
+  # Promote exact CI artifacts via .github/workflows/release-promote.yml.
+ "$root/result.log"
+          grep -q '^reader_lifecycle_rendered page=0 ' "$root/result.log"
+          grep -q '^reader_lifecycle_closed presented=false
+        run: cargo test -p scribe-app --bin reader-probe --locked --features reader
+      - name: Probe release verifier unit tests
+        run: python3 -m unittest discover -s tools/ci -p 'test_verify_reader_probe_armv7.py'
+      - name: Reader engine linked ARMv7 validation (pinned Kindle toolchain)
+        run: |
+          set -euo pipefail
+          image="$(sed -n 's/^rust_armv7hf=//p' tools/pinned-docker-images.txt | tr -d '\r')"
+          case "$image" in
+            *@sha256:*) ;;
+            *) echo "rust_armv7hf image is not digest-pinned" >&2; exit 1 ;;
+          esac
+          docker run --rm \
+            -e IGNITE_READER_RUN_HOST_TESTS=1 \
+            -e IGNITE_READER_BUILD_PROBE=1 \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            "$image" \
+            bash /src/tools/ci/validate_reader_armv7.sh
+
+  version-sync:
+    name: Version file synchronization
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check VERSION / Cargo / web lockfiles
+        run: python3 tools/ci/check_version_sync.py
+      - name: Standalone version tool check
+        run: python3 tools/release/ignite_version.py check
+      - name: Version mismatch fixture fails closed
+        run: python3 tools/ci/test_check_version_sync.py
+      - name: Version tool fixtures
+        run: python3 tools/release/test_ignite_version.py
+
+  kindle-installer:
+    name: Kindle installer pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run deployment/kindle tests
+        working-directory: deployment/kindle
+        run: pytest -q
+      - name: Launcher unit tests
+        working-directory: tools/kindle_launcher
+        run: pytest -q
+
+  kindle-package:
+    name: Kindle installer package
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Assert a clean packaging workspace
+        run: |
+          set -euo pipefail
+          for p in target/dropbear-kindle target/armv7-unknown-linux-gnueabihf target/package/kindle; do
+            if [ -e "$p" ]; then
+              echo "unexpected pre-existing $p on a clean runner" >&2
+              exit 1
+            fi
+          done
+      - name: Build customer Scriptlet (pinned Docker, no SkipBuild)
+        env:
+          IGNITE_DROPBEAR_FORCE: "1"
+        run: bash scripts/kindle/package-release.sh
+      - name: Verify customer artifacts and Dropbear pin
+        run: |
+          set -euo pipefail
+          v="$(tr -d '[:space:]' <ignite/VERSION)"
+          src="target/package/kindle"
+          want_sha="$(sed -n 's/^elf_sha256=//p' tools/dropbear/PINNED.txt | tr -d '\r')"
+          want_bytes="$(sed -n 's/^elf_bytes=//p' tools/dropbear/PINNED.txt | tr -d '\r')"
+          have_sha="$(sha256sum target/dropbear-kindle/dropbearmulti | awk '{print $1}')"
+          have_bytes="$(wc -c <target/dropbear-kindle/dropbearmulti | tr -d ' ')"
+          if [ "$have_sha" != "$want_sha" ] || [ "$have_bytes" != "$want_bytes" ]; then
+            echo "Dropbear ELF pin mismatch have=$have_sha/$have_bytes want=$want_sha/$want_bytes" >&2
+            exit 1
+          fi
+          echo "dropbear_sha256=$have_sha bytes=$have_bytes pin=ok"
+          mkdir -p dist/kindle-release
+          cp "$src/Install Ignite v$v.sh" "$src/Install Ignite v$v.sha256" dist/kindle-release/
+          (cd dist/kindle-release && sha256sum -c "Install Ignite v$v.sha256")
+          python3 deployment/kindle/validate_stage.py --sfx "dist/kindle-release/Install Ignite v$v.sh" --version "$v"
+          # Slice 3D-B2a.4.3c: reproducible component profiles from the staged payload
+          # (build evidence only; not Release assets). SFX↔payload byte equivalence after
+          # customer extraction remains a separate blocked check (see docs).
+          payload="$(find target/package/kindle/staging -maxdepth 1 -type d -name "Ignite-Kindle-$v" | head -n 1)"
+          if [ -z "$payload" ] || [ ! -d "$payload" ]; then
+            echo "missing staged payload Ignite-Kindle-$v for component profiles" >&2
+            exit 1
+          fi
+          python3 deployment/kindle/release_component_profiles.py \
+            --payload "$payload" --version "$v" --check-deterministic \
+            --out-dir target/package/kindle/component-profiles
+          test -s target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1
+          # Slice 3D-B2a.4.3d: independent byte-equivalence of the copied customer
+          # Scriptlet against the staged payload + canonical package profile.
+          # Inspects dist/kindle-release (upload candidate), never executes the Scriptlet.
+          python3 deployment/kindle/verify_sfx_payload_equivalence.py \
+            --sfx "dist/kindle-release/Install Ignite v$v.sh" \
+            --payload "$payload" \
+            --version "$v" \
+            --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+            --report target/package/kindle/component-profiles/sfx-payload-equivalence.v1
+          # Slice 3D-B2a.4.3l: CI packaging measurement from the same build inputs.
+          # Associated artifact for offline ceremony; not a GitHub Release asset.
+          # Prefer the measurement already emitted by package_release.py when present.
+          meas_src="target/package/kindle/packaging-measurements"
+          if [ ! -f "$meas_src/ignite-kindle-ci-packaging-measurement.v1" ]; then
+            python3 deployment/kindle/ci_packaging_measurement.py build \
+              --version "$v" \
+              --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+              --payload "$payload" \
+              --package-profile target/package/kindle/component-profiles/ignite-kindle-component-profile-package.v1 \
+              --equivalence-report target/package/kindle/component-profiles/sfx-payload-equivalence.v1 \
+              --out-dir "$meas_src" \
+              --source-revision "${GITHUB_SHA}" \
+              --workflow-run-id "${GITHUB_RUN_ID}"
+          fi
+          mkdir -p dist/kindle-packaging-measurements
+          cp "$meas_src/ignite-kindle-ci-packaging-measurement.v1" \
+             "$meas_src/ignite-kindle-component-profile-package.v1" \
+             dist/kindle-packaging-measurements/
+          if [ -f "$meas_src/sfx-payload-equivalence.v1" ]; then
+            cp "$meas_src/sfx-payload-equivalence.v1" dist/kindle-packaging-measurements/
+          fi
+          # Bind measurement to the exact upload-candidate Scriptlet (no execution).
+          python3 deployment/kindle/ci_packaging_measurement.py verify \
+            --measurement dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 \
+            --scriptlet "dist/kindle-release/Install Ignite v$v.sh" \
+            --package-profile dist/kindle-packaging-measurements/ignite-kindle-component-profile-package.v1 \
+            --expected-version "$v" \
+            --expected-source-revision "${GITHUB_SHA}"
+          # Record association with the customer artifact set for the same run.
+          {
+            echo "IGNITE_CI_KINDLE_ARTIFACT_ASSOCIATION_V1"
+            echo "schema=1"
+            echo "customer_artifact=ignite-kindle-release"
+            echo "measurement_artifact=ignite-kindle-packaging-measurements"
+            echo "scriptlet=Install Ignite v$v.sh"
+            echo "scriptlet_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
+            echo "measurement_sha256=$(sha256sum dist/kindle-packaging-measurements/ignite-kindle-ci-packaging-measurement.v1 | awk '{print $1}')"
+            echo "version=$v"
+            echo "source_revision=${GITHUB_SHA}"
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "github_release_asset=false"
+          } > dist/kindle-packaging-measurements/artifact-association.v1
+          echo "kindle_sha256=$(cut -d' ' -f1 "dist/kindle-release/Install Ignite v$v.sha256")"
+      - name: Upload Kindle release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-kindle-release
+          path: dist/kindle-release/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Upload Kindle packaging measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-kindle-packaging-measurements
+          path: dist/kindle-packaging-measurements/
+          retention-days: 30
+          if-no-files-found: error
+
+  ignite-web:
+    name: ignite-web production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ignite/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignite-web-wasm
+      - name: Install npm dependencies
+        working-directory: ignite/web
+        run: npm ci
+      - name: Production build (Cargo WASM + Vite)
+        working-directory: ignite/web
+        run: npm run build
+      - name: Typecheck and lint
+        working-directory: ignite/web
+        run: |
+          npm run typecheck
+          npm run lint
+      - name: Vitest (fresh WASM)
+        working-directory: ignite/web
+        run: npm test
+      - name: Rust WASM bridge + web fixture parity
+        run: |
+          cargo test -p scribe-web-wasm --locked
+          cargo test -p scribe-sync-tool --test web_fixtures --locked
+      - name: Confirm dist WASM matches Cargo artifact
+        working-directory: ignite/web
+        run: node scripts/verify-dist-wasm.mjs
+
+  ignite-server-linux:
+    name: Ignite Server Linux bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ignite/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignite-server-linux
+      - name: Shell syntax checks
+        run: |
+          set -euo pipefail
+          for f in deployment/linux/*.sh deployment/linux/docker/*.sh \
+                   scripts/kindle/*.sh tools/dropbear/*.sh tools/release/*.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f"
+          done
+      - name: Build portable Linux bundle
+        run: bash deployment/linux/build-bundle.sh dist/ignite-server-linux
+      - name: Static bundle checks
+        run: bash deployment/linux/test-bundle.sh dist/ignite-server-linux
+      - name: Unsafe path rejection
+        run: bash deployment/linux/test-path-safety.sh dist/ignite-server-linux
+      - name: Staging install / upgrade / rollback seams
+        run: bash deployment/linux/test-staging.sh dist/ignite-server-linux
+      - name: CARGO_TARGET_DIR binary location
+        run: bash deployment/linux/test-cargo-target-dir.sh
+      - name: ignite-update (mock releases, staging)
+        run: bash deployment/linux/test-update.sh dist/ignite-server-linux
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+          bash deployment/linux/package-release.sh dist/ignite-server-linux dist/release
+          v="$(tr -d '[:space:]' <ignite/VERSION)"
+          test -f "dist/release/ignite-server-$v-linux-$(uname -m).tar.gz"
+          (cd dist/release && sha256sum -c ./*.sha256)
+          echo "linux_sha256=$(awk '{print $1}' "dist/release/ignite-server-$v-linux-$(uname -m).tar.gz.sha256")"
+      - name: Upload Linux bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-linux-bundle
+          path: dist/ignite-server-linux/
+          retention-days: 7
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-linux-release
+          path: dist/release/
+          retention-days: 30
+
+  # Docker image + host-network disposable accept (separate from unit tests; Linux Engine only).
+  ignite-server-docker:
+    name: Ignite Server Docker image
+    runs-on: ubuntu-latest
+    needs: ignite-server-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Linux bundle artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ignite-server-linux-bundle
+          path: dist/ignite-server-linux
+      - name: Compose/Dockerfile static checks
+        run: bash deployment/linux/docker/test-compose-static.sh
+      - name: Accept evidence/ownership safety (mocked)
+        run: bash deployment/linux/docker/test-accept-safety.sh
+      - name: Make bundle binary executable
+        run: chmod +x dist/ignite-server-linux/scribe-server
+      - name: Build image + disposable accept (host network)
+        run: |
+          set -euo pipefail
+          export IGNITE_DOCKER_ACCEPT=1
+          export IGNITE_DOCKER_BUNDLE="$GITHUB_WORKSPACE/dist/ignite-server-linux"
+          export IGNITE_DOCKER_EVIDENCE="$GITHUB_WORKSPACE/deployment/linux/docker/evidence-ci"
+          export IGNITE_DOCKER_BROWSER_SMOKE=0
+          bash deployment/linux/docker/accept-disposable.sh
+      - name: Assert evidence contains no secrets
+        if: always()
+        id: evidence_clean
+        run: bash deployment/linux/docker/assert-evidence-clean.sh deployment/linux/docker/evidence-ci
+      - name: Upload sanitized Docker accept evidence
+        # Only after secret scan passes — never upload raw credentials on failure.
+        if: always() && steps.evidence_clean.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignite-server-docker-evidence
+          path: deployment/linux/docker/evidence-ci/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  ignite-server-firewall:
+    name: Ignite Server firewall ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ufw + firewalld ownership (disposable containers)
+        run: bash deployment/linux/ci-firewall.sh
+
+  # Focused acceptance harness regressions only — no Multipass, HCS, VM, or Chromium download.
+  ignite-accept-regressions:
+    name: Ignite Server acceptance regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: deployment/linux/acceptance/browser-smoke/package-lock.json
+      - name: Browser-smoke helper tests (pinned Node 20)
+        working-directory: deployment/linux/acceptance/browser-smoke
+        run: |
+          npm ci --omit=dev
+          npm test
+      - name: Browser smoke exit-status capture (behavioral)
+        run: bash deployment/linux/acceptance/test-run-browser-smoke-rc.sh
+      - name: Guest browser-class structure
+        shell: pwsh
+        run: pwsh -NoProfile -File deployment/linux/acceptance/test-guest-browser-class.ps1
+      - name: PowerShell argv forwarding (literal --)
+        shell: pwsh
+        run: pwsh -NoProfile -File deployment/linux/acceptance/test-run-host-ps1-argv.ps1
+      - name: Kindle package-release.ps1 wrapper (SkipBuild)
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/kindle/test-package-release.ps1
+      - name: Kindle package-release.sh host-owned target/
+        run: bash scripts/kindle/test-package-release.sh
+      - name: Docker networking probe safety
+        run: bash deployment/linux/test-docker-network-probe.sh
+      - name: Docker Compose/Dockerfile static checks
+        run: bash deployment/linux/docker/test-compose-static.sh
+      - name: GHCR publishing guards and image references
+        run: bash deployment/linux/docker/test-ghcr-publish.sh
+      - name: Offline Kindle release signing helper
+        run: python3 tools/release/test_kindle_release_sign.py
+      - name: Promote-publish guards
+        run: bash tools/release/test-promote-release.sh
+      - name: Version file synchronization
+        run: python3 tools/ci/check_version_sync.py
+      - name: Standalone version tool check
+        run: python3 tools/release/ignite_version.py check
+      - name: Version mismatch fixture fails closed
+        run: python3 tools/ci/test_check_version_sync.py
+      - name: Version tool fixtures
+        run: python3 tools/release/test_ignite_version.py
+      - name: Docker accept evidence/ownership safety
+        run: bash deployment/linux/docker/test-accept-safety.sh
+
+  # Publication is not performed here. Tag pushes must not rebuild-and-publish.
+  # Promote exact CI artifacts via .github/workflows/release-promote.yml.
+ "$root/result.log"
+          test ! -e "$root/positions"
       - name: Reader probe CLI contract tests (host)
         run: cargo test -p scribe-app --bin reader-probe --locked --features reader
       - name: Probe release verifier unit tests
