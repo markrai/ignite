@@ -132,7 +132,10 @@ fn unpresented_and_stale_tokens_do_not_gain_persistence_authority() {
     let fixture = Fixture::new();
     let mut reader = start(&fixture);
     let first = page(&mut reader, 0, 0);
-    assert_eq!(reader.request_page(1, 260, 360), Err(CoordinatorError::Busy));
+    assert_eq!(
+        reader.request_page(1, 260, 360),
+        Err(CoordinatorError::Busy)
+    );
     assert_eq!(reader.request_close(), Err(CoordinatorError::Busy));
     reader.discard(first).unwrap();
     assert_eq!(
@@ -158,7 +161,10 @@ fn close_flushes_acknowledged_page_before_releasing_document() {
     let token = page(&mut reader, 2, 0);
     reader.presented(token).unwrap();
     reader.request_close().unwrap();
-    assert_eq!(reader.request_page(0, 260, 360), Err(CoordinatorError::Busy));
+    assert_eq!(
+        reader.request_page(0, 260, 360),
+        Err(CoordinatorError::Busy)
+    );
     assert!(matches!(next(&mut reader, 0), Event::Presented));
     assert!(matches!(
         next(&mut reader, 0),
