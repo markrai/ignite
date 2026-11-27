@@ -271,6 +271,12 @@ mod tests {
         let long = gesture(&ui, &line((1600, 1300), (200, 1310), 400), 1100, false);
         assert_eq!(long, vec![FingerAction::NextPage]);
 
+        // A natural "back" swipe starts near the left edge; a short flick still counts.
+        let back_near_edge = gesture(&ui, &line((90, 1500), (700, 1480), 12), 250, false);
+        assert_eq!(back_near_edge, vec![FingerAction::PreviousPage]);
+        let flick = gesture(&ui, &line((1300, 1200), (1020, 1210), 8), 180, false);
+        assert_eq!(flick, vec![FingerAction::NextPage]);
+
         // Vertical, diagonal (recorded 1284,-1301), short, too slow: nothing.
         assert!(gesture(&ui, &line((900, 600), (910, 1800), 20), 300, false).is_empty());
         assert!(gesture(&ui, &line((489, 1750), (1773, 449), 30), 440, false).is_empty());
