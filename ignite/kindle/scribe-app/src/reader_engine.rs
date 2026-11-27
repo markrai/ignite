@@ -1,7 +1,7 @@
 //! Experimental book reader engine: MuPDF behind the off-by-default `reader` feature.
 //!
-//! Build plumbing and validation only. Nothing in the app calls this module yet, and ordinary
-//! builds do not compile it or link MuPDF. It opens controlled PDF, EPUB and CBZ files without
+//! Ordinary builds do not compile this module or link MuPDF. The feature-enabled app exposes
+//! an exclusive developer lifecycle diagnostic without framebuffer or notebook initialization. It opens controlled PDF, EPUB and CBZ files without
 //! copying their complete contents, while retaining an in-memory fixture path for tests.
 //!
 //! Everything is rendered as 8-bit gray, the Kindle panel's format, scaled to fit a box given
@@ -9,7 +9,7 @@
 //! the experimental [`location`] module turns a page into a layout-independent position and
 //! restores it after relayout or reopening. A host-only session composes that engine with the
 //! experimental position store. The worker owns the session on a dedicated thread.
-//! The Kindle app still has no reader UI or integration.
+//! The Kindle app still has no reader UI.
 
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use mupdf::{Colorspace, Document, Matrix, Pixmap, Rect};
 use sha2::{Digest, Sha256};
 
+pub mod app;
 pub mod coordinator;
 pub mod location;
 pub mod session;
