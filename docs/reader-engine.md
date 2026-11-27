@@ -1,7 +1,7 @@
 # Reader engine (experimental, opt-in)
 
-Status: **controlled file-backed engine testing only.** There is no reader UI. Nothing in the app
-calls the engine, and no customer build contains it. Background and plan:
+Status: **experimental reader lifecycle integration, developer-only.** There is no reader UI.
+The opt-in application can run an exclusive no-display lifecycle check; no customer build contains the engine. Background and plan:
 [markrai/ignite#22](https://github.com/markrai/ignite/issues/22).
 
 ## What is here
@@ -37,7 +37,7 @@ turns a page into a layout-independent content location and restores it after re
 reopening. See [Reading positions](#reading-positions-experimental) below.
 
 Out of scope for now: book discovery and catalog, production wiring for persisted positions,
-book folders, UI, packaging and notices in the release payload.
+interactive book folders, UI, packaging and notices in the release payload.
 
 ## Building
 
@@ -506,10 +506,62 @@ invented. An already running native operation may delay shutdown.
 
 Host regressions use actual temporary CBZ documents and position stores,
 simulated presentation confirmation, a manually advanced clock, and a
-deliberately obstructed store root to verify retry behavior. C.4 will
-bind the coordinator to the application lifecycle and a real display
-owner. The physical display acknowledgment contract, storage durability,
+deliberately obstructed store root to verify retry behavior. C.4A begins binding the coordinator to the application lifecycle; C.4B
+will connect the real display owner. The physical display acknowledgment contract, storage durability,
 latency and memory usage remain unqualified on Kindle.
+
+### Application lifecycle bridge (C.4A)
+
+`reader_engine::app::ReaderMode` is the application-owned boundary around
+the coordinator. Its explicit states are Closed, Opening, Active, Leaving
+and Faulted. A new document may be entered only from Closed; opening
+and leaving are asynchronous. Leaving during open waits for the open
+result and closes any successfully opened document before admitting a
+new entry. An unresolved presentation offer must be discarded or
+confirmed before leaving. Close, save retry and acknowledgment semantics
+remain those of C.3C. The worker is joined only after a graceful close,
+not by the polling loop.
+
+Reader storage has a proposed dedicated root `/mnt/us/ignite-reader`,
+with existing `books/` and separately owned `positions/` (created by
+the position store only when a valid position is written). The bridge
+accepts a single filename below books, not an absolute path or nested
+catalog path. It requires absolute directory roots, rejects symlink
+components and refuses a root overlapping any caller-supplied protected
+application storage directory in either direction. Root and books must
+exist; the bridge never creates them. The positions directory may be
+absent. As with the position store, roots must be trusted and must not be
+concurrently replaced by another process. No catalog, migration, sync,
+installer ownership or backup contract for these paths is established.
+
+The feature-enabled Unix application accepts an exclusive developer check:
+
+```sh
+scribe-app --reader-lifecycle-check book.pdf --reader-root /absolute/reader-root
+```
+
+The root can be omitted to select the proposed default. Prepare the
+directory and its books subdirectory separately, with a controlled file
+inside. The check is standalone, refuses mixed notebook options and is
+rejected by feature-disabled builds. It acquires the existing application
+singleton, then dispatches into a separate reader event loop before the
+physical notebook runtime starts. It opens, polls, renders the suggested
+page, discards the pixels, closes, and joins. It uses the same mode bridge
+that will be consumed by the eventual display owner. It never initializes
+the notebook library, framebuffer, stylus, touch, or sync, never confirms
+presentation and never writes a reading position. A missing or rejected
+suggested page is not silently replaced with a new location. Do not invoke
+this check through the customer launcher; it does not claim UI readiness.
+This is not a customer-facing mode, release artifact, or authorization
+to run on a physical device.
+
+The host CI exercises both the bridge with controlled fixtures and the
+actual feature-enabled application entry point with a temporary CBZ. The
+pinned ARM validator also links the feature-enabled application without
+executing or packaging it. C.4B will add interactive transitions in the
+existing Home/notebook event loop, display ownership and real presentation
+confirmation. C.4C will harden suspend, restore and exit. Hardware
+qualification remains outstanding.
 
 ### Document identity ownership
 

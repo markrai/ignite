@@ -83,6 +83,24 @@ jobs:
         run: bash tools/ci/check_reader_isolation.sh
       - name: Reader engine tests (host)
         run: cargo test -p scribe-app --lib --locked --features reader reader_engine
+      - name: Reader application lifecycle check (host, no hardware)
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          mkdir "$root/books"
+          python3 - "$root/books/book.cbz" <<'PY'
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1], "w") as archive:
+              archive.writestr("page.pgm", b"P5\n2 2\n255\n\x00\xff\x80\x40")
+          PY
+          cargo run -p scribe-app --locked --features reader --bin scribe-app -- \
+            --reader-lifecycle-check book.cbz --reader-root "$root" | tee "$root/result.log"
+          grep -q '^reader_lifecycle_opened page_count=1$' "$root/result.log"
+          grep -q '^reader_lifecycle_rendered page=0 ' "$root/result.log"
+          grep -q '^reader_lifecycle_closed presented=false$' "$root/result.log"
+          test ! -e "$root/positions"
       - name: Reader probe CLI contract tests (host)
         run: cargo test -p scribe-app --bin reader-probe --locked --features reader
       - name: Probe release verifier unit tests

@@ -216,6 +216,13 @@ python3 tools/ci/verify_reader_armv7_elf.py \
   --target-dir "$READER_TARGET_DIR" \
   --target "$TARGET"
 
+echo "== Reader-enabled ARMv7 application lifecycle link"
+CARGO_TARGET_DIR="$READER_TARGET_DIR" cargo build \
+  -p scribe-app --locked --target "$TARGET" \
+  --features scribe-app/restore_from_server,scribe-app/reader --bin scribe-app
+test -f "$READER_TARGET_DIR/$TARGET/debug/scribe-app"
+echo "reader_app_armv7_link=pass"
+
 if [ "${IGNITE_READER_BUILD_PROBE:-0}" = 1 ]; then
   echo "== Release-profile ordinary ARMv7 executable"
   PROBE_TARGET_DIR="${IGNITE_READER_PROBE_TARGET_DIR:-/tmp/ignite-reader-probe-target}"
