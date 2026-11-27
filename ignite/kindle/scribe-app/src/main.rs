@@ -24,9 +24,10 @@ fn main() -> ExitCode {
         }
     };
     #[cfg(not(all(unix, feature = "reader")))]
-    if args.iter().any(|arg| {
-        arg.starts_with("--reader-lifecycle-check") || arg.starts_with("--reader-root")
-    }) {
+    if args
+        .iter()
+        .any(|arg| arg.starts_with("--reader-lifecycle-check") || arg.starts_with("--reader-root"))
+    {
         eprintln!("reader lifecycle check requires a Unix build with the reader feature");
         return ExitCode::FAILURE;
     }
