@@ -229,6 +229,10 @@ impl ReaderWorker {
                 return Err(WorkerStopped);
             }
         };
+        self.handle_response(response)
+    }
+
+    fn handle_response(&mut self, response: Response) -> Result<Option<Response>, WorkerStopped> {
         let pending = std::mem::replace(&mut self.pending, Pending::Idle);
         match pending {
             Pending::Idle | Pending::Control => Ok(Some(response)),
