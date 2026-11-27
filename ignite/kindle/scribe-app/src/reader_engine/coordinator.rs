@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::session::{OpenStatus, PageLayout, SaveStatus};
-use super::worker::{
-    Command, CommandError, DisplayToken, PagePixels, PageRequestId, ReaderWorker, Reply, SubmitError,
-};
+use super::worker::{Command, CommandError, Reply, SubmitError};
+use super::worker::{DisplayToken, PagePixels, PageRequestId, ReaderWorker};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SavePolicy {
@@ -204,7 +203,7 @@ impl ReaderCoordinator {
     }
 
     pub fn has_unsaved_position(&self) -> bool {
-        self.save_due.is_some() || self.phase == Phase::Acknowledging
+        self.save_due.is_some() || matches!(self.phase, Phase::Acknowledging | Phase::Faulted)
     }
 
     pub fn close_pending(&self) -> bool {
@@ -329,7 +328,18 @@ impl ReaderCoordinator {
         Ok(Some(event))
     }
 
-    pub fn shutdown(self) -> std::thread::Result<()> {
+    pub fn is_closed(&self) -> bool {
+        self.phase == Phase::Closed
+    }
+
+    pub fn shutdown(self) -> Result<std::thread::Result<()>, Box<Self>> {
+        if !self.is_closed() {
+            return Err(Box::new(self));
+        }
+        Ok(self.worker.shutdown())
+    }
+
+    pub fn abort(self) -> std::thread::Result<()> {
         self.worker.shutdown()
     }
 }
