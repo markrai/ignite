@@ -20,7 +20,7 @@ impl ReaderCheck {
         }) {
             return Ok(None);
         }
-        if args.len() % 2 != 0 {
+        if !args.chunks_exact(2).remainder().is_empty() {
             return Err("reader lifecycle check requires option/value pairs".into());
         }
         let mut root = None;
@@ -66,8 +66,8 @@ impl ReaderCheck {
         if stop.load(Ordering::SeqCst) {
             return Err("reader lifecycle check interrupted".into());
         }
-        let mut reader = ReaderMode::start(paths, SavePolicy::default())
-            .map_err(|error| error.to_string())?;
+        let mut reader =
+            ReaderMode::start(paths, SavePolicy::default()).map_err(|error| error.to_string())?;
         reader
             .enter(&self.book, layout)
             .map_err(|error| format!("reader entry: {error:?}"))?;
