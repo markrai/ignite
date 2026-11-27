@@ -123,7 +123,9 @@ impl ReaderCheck {
                         .map_err(|error| format!("reader leave: {error:?}"))?;
                 }
                 Some(Event::Opened { .. } | Event::Cancelled(_) | Event::Closed) | None => {}
-                Some(event) => return Err(format!("unexpected reader diagnostic event: {event:?}")),
+                Some(event) => {
+                    return Err(format!("unexpected reader diagnostic event: {event:?}"))
+                }
             }
             if reader.state() == ModeState::Closed {
                 break;
@@ -156,8 +158,18 @@ mod tests {
         for invalid in [
             vec!["--reader-root", "/tmp"],
             vec!["--reader-lifecycle-check"],
-            vec!["--reader-lifecycle-check", "book.pdf", "--confirm-write", "yes"],
-            vec!["--reader-lifecycle-check", "book.pdf", "--reader-root", "--bad"],
+            vec![
+                "--reader-lifecycle-check",
+                "book.pdf",
+                "--confirm-write",
+                "yes",
+            ],
+            vec![
+                "--reader-lifecycle-check",
+                "book.pdf",
+                "--reader-root",
+                "--bad",
+            ],
         ] {
             assert!(ReaderCheck::parse(&args(&invalid)).is_err());
         }
