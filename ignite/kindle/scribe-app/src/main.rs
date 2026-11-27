@@ -13,6 +13,22 @@ use scribe_app::cadence::parse_du_interval_us;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(all(unix, feature = "reader"))]
+    let reader_check =
+        match scribe_app::reader_engine::app::diagnostic::ReaderCheck::parse(&args) {
+            Ok(check) => check,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    #[cfg(not(all(unix, feature = "reader")))]
+    if args.iter().any(|arg| {
+        arg.starts_with("--reader-lifecycle-check") || arg.starts_with("--reader-root")
+    }) {
+        eprintln!("reader lifecycle check requires a Unix build with the reader feature");
+        return ExitCode::FAILURE;
+    }
     match scribe_app::storage_capabilities::command_requested(&args) {
         Ok(true) => return emit_storage_capabilities(),
         Ok(false) => {}
@@ -153,6 +169,16 @@ fn main() -> ExitCode {
                 stop_c.store(true, Ordering::SeqCst);
             }) {
                 eprintln!("warning: ctrlc handler: {e}");
+            }
+            #[cfg(feature = "reader")]
+            if let Some(check) = reader_check.as_ref() {
+                return match check.run(&stop) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        1
+                    }
+                };
             }
             loop {
                 let cfg = match runtime::default_config(du_interval_us, du_override, &args) {
