@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use mupdf::{Colorspace, Document, Matrix, Pixmap, Rect};
 use sha2::{Digest, Sha256};
 
+pub mod coordinator;
 pub mod location;
 pub mod session;
 pub mod worker;
