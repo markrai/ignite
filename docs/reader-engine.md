@@ -441,9 +441,75 @@ Caller-retained pixel buffers are outside the scheduler's memory bound.
 
 Tests cover rapid requests, cancellation of buffered results, failure
 correlation, control barriers, multi-page persistence, cancellation followed
-by replacement, and shutdown. C.3C still owns actual presentation
-acknowledgment delivery and asynchronous persistence coordination. There is
+by replacement, and shutdown. C.3C adds the presentation and persistence coordinator described below. There is
 no native preemption, UI integration, device activity, or hardware benchmark.
+
+### Presentation and persistence coordination (C.3C)
+
+The experimental `reader_engine::coordinator::ReaderCoordinator` owns the
+C.3B worker and provides a nonblocking, caller-driven lifecycle. The caller
+supplies the same trusted document path, position-store root and page layout
+as before. No Kindle paths, UI callbacks, timers or additional threads are
+introduced.
+
+The event loop regularly calls `poll(now)` with monotonically increasing
+elapsed `Duration` values from its own clock. Equal timestamps are valid;
+a backwards timestamp is rejected. Commands and persistence work execute
+on the existing reader thread, not on the polling thread.
+
+The lifecycle is explicit:
+
+1. Submit `open` and wait for `Event::Opened`. Request the suggested page
+   (or an explicit page when no suggestion is available).
+2. `request_page` retains C.3B latest-request supersession while rendering.
+   The coordinator only exposes the matching `Event::PageReady` and its
+   owned pixels.
+3. The display owner must resolve that offer by calling `presented(token)`
+   only after successful presentation, or `discard(token)` if those
+   pixels were never presented. Stale tokens are rejected. No further
+   navigation or close is admitted while an offer is unresolved.
+4. Wait for the worker acknowledgment (`Event::Presented`). Only then
+   is a save scheduled. The default debounce is 750 ms from acknowledgment
+   observation, configurable in `SavePolicy`. New acknowledged pages
+   coalesce into the most recent eligible reading position.
+5. Polling dispatches the save once due and idle. `SaveComplete` reports
+   the actual session outcome (saved generation, unchanged, or protected
+   fallback); a protected fallback is not a successful position write.
+   `SaveFailed` leaves a pending save and schedules a retry, default 2 s.
+   A newer acknowledged page can replace the pending location without
+   resetting the retry deadline. The next retry saves the newest eligible
+   location. No write success is inferred from an error.
+
+Control work remains serialized. While a save or acknowledgment is in
+flight, navigation returns `Busy`; the caller retains and retries its
+latest intent. An already-due idle save takes precedence over new
+navigation based on the last supplied clock value. Rendering, unresolved
+presentation and native operations may delay dispatch; these timers
+are not hard real-time deadlines.
+
+`request_close` stops admission of new pages, cancels pending render
+work and waits for an admitted acknowledgment or save. It flushes a
+dirty position immediately unless a failed save is awaiting its retry
+deadline. A failed flush blocks closing and opening another document;
+the caller continues polling and can report the failure. The worker
+only closes after the position is saved, unchanged, protected, or
+there was no acknowledged position to save. `Event::Closed` is the
+barrier before switching books or graceful shutdown.
+
+Graceful `shutdown` refuses to consume an open coordinator (returning
+it boxed to the caller); after closing, it joins the reader thread.
+Explicit `abort` and dropping the coordinator are unflushed teardown
+paths, not substitutes for graceful close. A worker disconnect,
+unexpected reply, acknowledgment failure or close failure faults the
+coordinator and prevents further operations; no successful save is
+invented. An already running native operation may delay shutdown.
+
+Host regressions use actual temporary CBZ documents and position stores,
+simulated presentation confirmation, a manually advanced clock, and a
+deliberately obstructed store root to verify retry behavior. C.4 will
+bind the coordinator to the application lifecycle and a real display
+owner. The physical display acknowledgment contract, storage durability,
+latency and memory usage remain unqualified on Kindle.
 
 ### Document identity ownership
 
