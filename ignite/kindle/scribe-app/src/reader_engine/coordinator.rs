@@ -299,6 +299,10 @@ impl ReaderCoordinator {
                 self.phase = Phase::Faulted;
                 Event::AcknowledgeFailed(error)
             }
+            (Phase::Saving, Ok(Reply::Saved(SaveStatus::NoDisplayedPage))) => {
+                self.phase = Phase::Faulted;
+                return Err(CoordinatorError::Protocol);
+            }
             (Phase::Saving, Ok(Reply::Saved(status))) => {
                 self.phase = Phase::Idle;
                 self.save_due = None;
