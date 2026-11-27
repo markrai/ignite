@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::reader_engine::location::Restore;
-use crate::reader_engine::tests::{rectangle_pdf, TempDocumentDir};
+use crate::reader_engine::tests::{rectangle_pdf, stored_zip, TempDocumentDir};
 
 const LAYOUT: PageLayout = PageLayout {
     width: 260.0,
@@ -251,4 +251,201 @@ fn close_and_shutdown_do_not_save_implicitly() {
     worker.try_submit(fixture.open()).unwrap();
     drop(worker);
     assert!(!fixture.root.exists());
+}
+
+fn page_finished(worker: &mut ReaderWorker, expected: PageRequestId) -> PagePixels {
+    match response(worker).unwrap() {
+        Reply::PageFinished {
+            request,
+            result: Ok(pixels),
+        } => {
+            assert_eq!(request, expected);
+            pixels
+        }
+        other => panic!("expected scheduled page, got {other:?}"),
+    }
+}
+
+#[test]
+fn latest_request_replaces_pending_work_and_preserves_control_order() {
+    let fixture = Fixture::new();
+    let mut worker = ReaderWorker::start().unwrap();
+    worker.try_submit(fixture.open()).unwrap();
+    assert_eq!(worker.request_page(0, 260, 360), Err(SubmitError::Busy));
+    assert_eq!(worker.cancel_page(), None);
+    response(&mut worker).unwrap();
+
+    let first = worker.request_page(0, 100, 100).unwrap();
+    let obsolete = worker.request_page(9, 0, 0).unwrap();
+    let latest = worker.request_page(0, 260, 360).unwrap();
+    assert_ne!(first, obsolete);
+    assert_ne!(obsolete, latest);
+    assert_eq!(worker.try_submit(Command::Save), Err(SubmitError::Busy));
+    let page = page_finished(&mut worker, latest);
+    assert_eq!(page.page, 0);
+    assert_eq!((page.width, page.height), (260, 130));
+    assert!(matches!(
+        call(&mut worker, Command::Save).unwrap(),
+        Reply::Saved(SaveStatus::NoDisplayedPage)
+    ));
+    call(&mut worker, Command::Acknowledge(page.token)).unwrap();
+    assert!(matches!(
+        call(&mut worker, Command::Save).unwrap(),
+        Reply::Saved(SaveStatus::Saved(1))
+    ));
+    worker.shutdown().unwrap();
+}
+
+#[test]
+fn cancellation_discards_unread_result_and_revokes_old_render_authority() {
+    let fixture = Fixture::new();
+    let mut worker = ReaderWorker::start().unwrap();
+    call(&mut worker, fixture.open()).unwrap();
+    let previous = render(&mut worker);
+    let request = worker.request_page(0, 260, 360).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let buffered = loop {
+        match worker.replies.as_ref().unwrap().try_recv() {
+            Ok(reply) => break reply,
+            Err(TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(TryRecvError::Disconnected) => panic!("worker stopped"),
+        }
+    };
+    assert!(matches!(
+        &buffered,
+        Ok(Reply::PageFinished {
+            request: actual,
+            result: Ok(_),
+        }) if *actual == request
+    ));
+    assert_eq!(worker.cancel_page(), Some(request));
+    assert_eq!(worker.cancel_page(), None);
+    assert!(matches!(
+        worker.handle_response(buffered).unwrap(),
+        Some(Ok(Reply::PageCancelled(id))) if id == request
+    ));
+    assert!(matches!(
+        call(&mut worker, Command::Acknowledge(previous.token)),
+        Err(CommandError::Session(SessionError::StaleRender))
+    ));
+    assert!(matches!(
+        call(&mut worker, Command::Save).unwrap(),
+        Reply::Saved(SaveStatus::NoDisplayedPage)
+    ));
+    worker.shutdown().unwrap();
+    assert!(!fixture.root.exists());
+}
+
+#[test]
+fn cancelling_then_replacing_keeps_only_the_newest_request() {
+    let fixture = Fixture::new();
+    let mut worker = ReaderWorker::start().unwrap();
+    call(&mut worker, fixture.open()).unwrap();
+    let first = worker.request_page(0, 100, 100).unwrap();
+    let second = worker.request_page(0, 200, 200).unwrap();
+    assert_eq!(worker.cancel_page(), Some(second));
+    let third = worker.request_page(0, 260, 360).unwrap();
+    assert_ne!(first, third);
+    assert_ne!(second, third);
+    let page = page_finished(&mut worker, third);
+    assert_eq!(page.width, 260);
+    worker.shutdown().unwrap();
+}
+
+#[test]
+fn latest_failure_is_correlated_and_does_not_advance_saved_position() {
+    let fixture = Fixture::new();
+    let mut worker = ReaderWorker::start().unwrap();
+    call(&mut worker, fixture.open()).unwrap();
+    let first = worker.request_page(0, 260, 360).unwrap();
+    let shown = page_finished(&mut worker, first);
+    call(&mut worker, Command::Acknowledge(shown.token)).unwrap();
+    let bad = worker.request_page(1, 260, 360).unwrap();
+    assert!(matches!(
+        response(&mut worker).unwrap(),
+        Reply::PageFinished {
+            request,
+            result: Err(CommandError::Session(SessionError::PageOutOfRange { .. })),
+        } if request == bad
+    ));
+    assert!(matches!(
+        call(&mut worker, Command::Save).unwrap(),
+        Reply::Saved(SaveStatus::Saved(1))
+    ));
+    call(&mut worker, Command::Close).unwrap();
+    assert!(matches!(
+        call(&mut worker, fixture.open()).unwrap(),
+        Reply::Opened {
+            status: OpenStatus::Saved(Restore::Exact { page: 0, .. }),
+            ..
+        }
+    ));
+    worker.shutdown().unwrap();
+}
+
+#[test]
+fn pending_scheduled_work_can_be_cancelled_and_shutdown_without_saving() {
+    let fixture = Fixture::new();
+    let mut worker = ReaderWorker::start().unwrap();
+    call(&mut worker, fixture.open()).unwrap();
+    worker.request_page(0, 100, 100).unwrap();
+    let latest = worker.request_page(0, 260, 360).unwrap();
+    assert_eq!(worker.cancel_page(), Some(latest));
+    assert!(matches!(
+        response(&mut worker).unwrap(),
+        Reply::PageCancelled(id) if id == latest
+    ));
+    worker.request_page(0, 260, 360).unwrap();
+    worker.request_page(0, 100, 100).unwrap();
+    worker.shutdown().unwrap();
+    assert!(!fixture.root.exists());
+}
+
+#[test]
+fn rapid_navigation_across_pages_saves_only_the_displayed_page() {
+    let files = TempDocumentDir::new("worker-multipage");
+    let archive = stored_zip(&[
+        ("001.pgm", b"P5\n2 2\n255\n\x00\xff\x80\x40"),
+        ("002.pgm", b"P5\n2 2\n255\n\xff\xff\xff\xff"),
+        ("003.pgm", b"P5\n2 2\n255\n\x00\x00\x00\x00"),
+    ]);
+    let fixture = Fixture {
+        path: files.write("book.cbz", &archive),
+        root: files.0.join("positions"),
+        _files: files,
+    };
+    let mut worker = ReaderWorker::start().unwrap();
+    assert!(matches!(
+        call(&mut worker, fixture.open()).unwrap(),
+        Reply::Opened { page_count: 3, .. }
+    ));
+    let first = worker.request_page(0, 260, 360).unwrap();
+    let shown = page_finished(&mut worker, first);
+    call(&mut worker, Command::Acknowledge(shown.token)).unwrap();
+
+    worker.request_page(1, 260, 360).unwrap();
+    let latest = worker.request_page(2, 260, 360).unwrap();
+    let last = page_finished(&mut worker, latest);
+    assert_eq!(last.page, 2);
+    assert!(matches!(
+        call(&mut worker, Command::Save).unwrap(),
+        Reply::Saved(SaveStatus::Saved(1))
+    ));
+    call(&mut worker, Command::Acknowledge(last.token)).unwrap();
+    assert!(matches!(
+        call(&mut worker, Command::Save).unwrap(),
+        Reply::Saved(SaveStatus::Saved(2))
+    ));
+    call(&mut worker, Command::Close).unwrap();
+    assert!(matches!(
+        call(&mut worker, fixture.open()).unwrap(),
+        Reply::Opened {
+            status: OpenStatus::Saved(Restore::Exact { page: 2, .. }),
+            ..
+        }
+    ));
+    worker.shutdown().unwrap();
 }

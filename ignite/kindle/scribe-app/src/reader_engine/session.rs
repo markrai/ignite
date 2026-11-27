@@ -207,6 +207,10 @@ impl ReaderSession {
         Ok(RenderedPage { page, token, image })
     }
 
+    pub(super) fn invalidate_render(&mut self) {
+        self.rendered = None;
+    }
+
     pub fn acknowledge_displayed(&mut self, token: u64) -> Result<(), SessionError> {
         let (expected, page) = self.rendered.ok_or(SessionError::StaleRender)?;
         if expected != token || self.selected_page() != Some(page) {

@@ -371,7 +371,7 @@ with the page index, dimensions and an opaque display token. Copying the pixels
 temporarily holds both the native buffer and its bounded Rust copy. The caller
 owns received buffers and must release them when no longer needed.
 
-The worker is single-flight: `try_submit` admits one command and returns
+The control path is single-flight: `try_submit` admits one command and returns
 `Busy` until its response has been taken by `try_response`, even if computation
 has already finished. A rejected command is consumed and must be reconstructed
 by the caller. Both calls are nonblocking; command and response channels each
@@ -397,10 +397,53 @@ C.3A provides no preemption of MuPDF calls or filesystem operations.
 The worker remains behind the existing off-by-default reader feature. Host
 tests cover single-flight admission, explicit save and reopen, invalid
 operations, stale and cross-worker tokens, and shutdown with an unread or
-outstanding result. C.3B will add request supersession and cancellation;
-C.3C will integrate display acknowledgment delivery and asynchronous
+outstanding result. C.3C will integrate display acknowledgment delivery and asynchronous
 persistence coordination. No production UI, Kindle paths, notebook state,
 device execution or hardware performance qualification is introduced here.
+
+### Latest-page scheduling (C.3B)
+
+For rapid page turns, `request_page(page, width, height)` combines navigation
+and rendering into a replaceable request with an opaque, monotonically
+increasing worker-local `PageRequestId`. At most one scheduled request is
+submitted to the worker and one newer request is retained on the caller side.
+Replacing that slot supersedes the previous intent; superseded requests do
+not produce individual replies. The caller regularly polls `try_response`
+to discard obsolete results and dispatch the latest pending request. Polling
+returns `None` during this handoff, not an intermediate page.
+
+A shared atomic generation lets the reader skip obsolete work before
+navigation, before native rendering, and before copying native pixels.
+Cancellation is cooperative: a native operation already underway may finish.
+The caller-side generation check also discards results that completed before
+a newer request or cancellation arrived. Neither cancellation nor
+supersession rolls back the selected page; callers use an absolute page
+request for the next navigation. Cancellation does not change the previously
+acknowledged reading location or perform persistence.
+
+The latest result is `Reply::PageFinished { request, result }`, containing
+owned grayscale pixels or a typed command error. `cancel_page()` returns
+the cancelled ID if scheduled work is pending. After the running operation
+has drained, polling yields `Reply::PageCancelled(id)` unless a newer
+request has replaced that intent. No obsolete buffer is delivered by the
+scheduler. Beginning a scheduled operation invalidates the previous
+unacknowledged native render token; receiving the latest result alone is
+still not proof of presentation.
+
+Control commands remain single-flight, ordered barriers: no scheduled
+request is admitted while a control command is outstanding, and no control
+command is admitted while a scheduled request is outstanding or draining.
+A caller receiving `Busy` must retry its control command explicitly after
+polling. Open, close, acknowledge and save are never coalesced or silently
+superseded. Shutdown cancels scheduled work, discards undelivered results,
+and joins; an already admitted control command retains its C.3A semantics.
+Caller-retained pixel buffers are outside the scheduler's memory bound.
+
+Tests cover rapid requests, cancellation of buffered results, failure
+correlation, control barriers, multi-page persistence, cancellation followed
+by replacement, and shutdown. C.3C still owns actual presentation
+acknowledgment delivery and asynchronous persistence coordination. There is
+no native preemption, UI integration, device activity, or hardware benchmark.
 
 ### Document identity ownership
 
