@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use super::location::PositionStore;
-use super::session::{OpenStatus, PageLayout, ReaderSession, RenderedPage, SaveStatus, SessionError};
+use super::session::{
+    OpenStatus, PageLayout, ReaderSession, RenderedPage, SaveStatus, SessionError,
+};
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
