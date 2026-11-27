@@ -10,18 +10,19 @@ use scribe_app::runtime;
 use std::process::ExitCode;
 
 use scribe_app::cadence::parse_du_interval_us;
+#[cfg(all(unix, feature = "reader"))]
+use scribe_app::reader_engine::app::diagnostic::ReaderCheck;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(all(unix, feature = "reader"))]
-    let reader_check =
-        match scribe_app::reader_engine::app::diagnostic::ReaderCheck::parse(&args) {
-            Ok(check) => check,
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let reader_check = match ReaderCheck::parse(&args) {
+        Ok(check) => check,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     #[cfg(not(all(unix, feature = "reader")))]
     if args.iter().any(|arg| {
         arg.starts_with("--reader-lifecycle-check") || arg.starts_with("--reader-root")
