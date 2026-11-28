@@ -164,7 +164,8 @@ pub(super) fn run(launch: Launch, devices: Devices<'_>) -> Result<bool, String> 
             Some(Notice::SaveFailed(error)) => {
                 eprintln!("reader_save_retry detail={error}");
             }
-            Some(Notice::SaveComplete | Notice::Closed) | None => {}
+            Some(Notice::SaveComplete(status)) => println!("reader_save status={status:?}"),
+            Some(Notice::Closed) | None => {}
         }
         thread::sleep(Duration::from_millis(2));
     }
