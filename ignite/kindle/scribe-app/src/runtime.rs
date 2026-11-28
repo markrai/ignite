@@ -4553,7 +4553,7 @@ pub fn run_page_session(
         println!("display_events=none (first-contact fail-safe only)");
         #[cfg(feature = "reader")]
         if cfg.reader_launch.is_some() {
-            return abort_after_loading("reader display requires powerd monitoring".into());
+            return abort_after_loading("reader display requires powerd monitoring");
         }
     }
     let mut display_rx = DisplayEventReceiver::new(Arc::clone(&display_counters));
