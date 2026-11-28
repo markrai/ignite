@@ -121,7 +121,11 @@ fn composition_centers_gray_pixels_and_preserves_stride_padding() {
                 let (width, height) = view.render_box();
                 let x = geo.xoffset + (width - pixels.width) / 2;
                 let y = geo.yoffset + view.bar + (height - pixels.height) / 2;
-                for (row, bytes) in pixels.pixels.chunks_exact(pixels.width as usize).enumerate() {
+                for (row, bytes) in pixels
+                    .pixels
+                    .chunks_exact(pixels.width as usize)
+                    .enumerate()
+                {
                     let offset = (y as usize + row) * geo.line_length as usize + x as usize;
                     assert_eq!(&fb[offset..offset + bytes.len()], bytes);
                 }
@@ -176,7 +180,9 @@ fn refresh_failure_never_acknowledges_or_saves_the_page() {
     spin(|| {
         matches!(
             screen
-                .tick(Duration::ZERO, |_, _| Err("simulated refresh failure".into()))
+                .tick(Duration::ZERO, |_, _| Err(
+                    "simulated refresh failure".into()
+                ))
                 .unwrap(),
             Some(Notice::DisplayFailed(_))
         )
