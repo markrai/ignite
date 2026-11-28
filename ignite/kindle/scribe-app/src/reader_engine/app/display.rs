@@ -72,9 +72,7 @@ pub fn compose(
     {
         return Err("invalid reader page pixels".into());
     }
-    if geo.xoffset.checked_add(geo.xres).is_none()
-        || geo.yoffset.checked_add(geo.yres).is_none()
-    {
+    if geo.xoffset.checked_add(geo.xres).is_none() || geo.yoffset.checked_add(geo.yres).is_none() {
         return Err("reader framebuffer geometry overflow".into());
     }
     {
@@ -84,12 +82,7 @@ pub fn compose(
         let scale = (view.bar / 14).clamp(1, 6);
         canvas.text_centered(Rect::new(0, 0, third, view.bar), scale, "PREV", BLACK);
         let label = format!("HOME {}/{}", page.page + 1, total);
-        canvas.text_centered(
-            Rect::new(third, 0, third, view.bar),
-            scale,
-            &label,
-            BLACK,
-        );
+        canvas.text_centered(Rect::new(third, 0, third, view.bar), scale, &label, BLACK);
         canvas.text_centered(
             Rect::new(third * 2, 0, width - third * 2, view.bar),
             scale,
