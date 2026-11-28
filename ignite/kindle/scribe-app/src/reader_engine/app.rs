@@ -204,6 +204,7 @@ impl ReaderMode {
 
 #[cfg(unix)]
 pub mod diagnostic;
+pub mod display;
 
 #[cfg(test)]
 mod tests;
