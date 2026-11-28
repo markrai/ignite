@@ -225,3 +225,62 @@ fn leaving_during_open_cannot_paint_over_home() {
     assert!(!fixture.root.join("positions").exists());
     screen.shutdown().unwrap();
 }
+
+#[test]
+fn newer_navigation_suppresses_the_initial_unread_render() {
+    let fixture = Fixture::new();
+    let mut screen = fixture.screen();
+    spin(|| {
+        screen
+            .tick(Duration::ZERO, |_, _| panic!("unexpected initial paint"))
+            .unwrap();
+        screen.desired == Some(0)
+    });
+    screen.action(Action::Next).unwrap();
+    screen.action(Action::Next).unwrap();
+    spin(|| {
+        let mut shown = false;
+        screen
+            .tick(Duration::ZERO, |pixels, _| {
+                assert_eq!(pixels.page, 2);
+                shown = true;
+                Ok(())
+            })
+            .unwrap();
+        shown
+    });
+    screen.action(Action::Home).unwrap();
+    close(&mut screen);
+    screen.shutdown().unwrap();
+}
+
+#[test]
+fn failed_later_refresh_flushes_only_the_prior_confirmed_page() {
+    let fixture = Fixture::new();
+    let mut screen = fixture.screen();
+    first_page(&mut screen);
+    screen.action(Action::Next).unwrap();
+    spin(|| {
+        matches!(
+            screen
+                .tick(Duration::ZERO, |pixels, _| {
+                    assert_eq!(pixels.page, 1);
+                    Err("display ownership lost".into())
+                })
+                .unwrap(),
+            Some(Notice::DisplayFailed(_))
+        )
+    });
+    let notices = close(&mut screen);
+    assert!(matches!(
+        notices.as_slice(),
+        [Notice::SaveComplete(SaveStatus::Saved(1)), Notice::Closed]
+    ));
+    screen.shutdown().unwrap();
+
+    let mut reopened = fixture.screen();
+    first_page(&mut reopened);
+    reopened.action(Action::Home).unwrap();
+    close(&mut reopened);
+    reopened.shutdown().unwrap();
+}
