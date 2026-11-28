@@ -4551,6 +4551,10 @@ pub fn run_page_session(
         println!("display_events=powerd watcher (lipc-wait-event; goingToScreenSaver→invalidate, exitingScreenSaver→restore)");
     } else {
         println!("display_events=none (first-contact fail-safe only)");
+        #[cfg(feature = "reader")]
+        if cfg.reader_launch.is_some() {
+            return abort_after_loading("reader display requires powerd monitoring".into());
+        }
     }
     let mut display_rx = DisplayEventReceiver::new(Arc::clone(&display_counters));
 
@@ -4843,7 +4847,14 @@ pub fn run_page_session(
                 return Err("reader handoff lost display ownership".into());
             }
             reader_display::drain_after_reader(&mut src)?;
+            if let Some((pump, _)) = touch.as_ref() {
+                reader_display::drain_touch_after_reader(pump)?;
+            }
             touch_arb.cancel();
+            let handoff = display_rx.take();
+            if handoff.invalidated || handoff.restored || stop.load(Ordering::SeqCst) {
+                return Err("reader handoff lost display ownership".into());
+            }
             Ok(true)
         });
         match result {
