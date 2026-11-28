@@ -191,3 +191,12 @@ pub(super) fn drain_after_reader(input: &mut InputPump) -> Result<(), String> {
     }
     Err("reader handoff pen queue did not drain".into())
 }
+
+pub(super) fn drain_touch_after_reader(pump: &TouchPump) -> Result<(), String> {
+    for _ in 0..1024 {
+        if pump.try_next().is_none() {
+            return Ok(());
+        }
+    }
+    Err("reader handoff touch queue did not drain".into())
+}
