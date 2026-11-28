@@ -69,8 +69,8 @@ pub(super) fn run(launch: Launch, devices: Devices<'_>) -> Result<bool, String> 
         height: 720.0,
         em: 12.0,
     };
-    let mut mode =
-        ReaderMode::start(launch.paths, SavePolicy::default()).map_err(|error| error.to_string())?;
+    let mut mode = ReaderMode::start(launch.paths, SavePolicy::default())
+        .map_err(|error| error.to_string())?;
     mode.enter(&launch.book, layout)
         .map_err(|error| format!("reader enter: {error:?}"))?;
     let mut screen = ReaderScreen::new(mode, view);
@@ -155,9 +155,11 @@ pub(super) fn run(launch: Launch, devices: Devices<'_>) -> Result<bool, String> 
             })
             .map_err(|error| format!("reader tick: {error:?}"))?;
         match notice {
-            Some(Notice::OpenFailed(error)
-            | Notice::RenderFailed(error)
-            | Notice::DisplayFailed(error)) => failure = Some(error),
+            Some(
+                Notice::OpenFailed(error)
+                | Notice::RenderFailed(error)
+                | Notice::DisplayFailed(error),
+            ) => failure = Some(error),
             Some(Notice::SaveFailed(error)) => {
                 eprintln!("reader_save_retry detail={error}");
             }
