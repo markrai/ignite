@@ -1,7 +1,8 @@
 # Reader engine (experimental, opt-in)
 
-Status: **experimental reader lifecycle integration, developer-only.** There is no reader UI.
-The opt-in application can run an exclusive no-display lifecycle check; no customer build contains the engine. Background and plan:
+Status: **experimental reader display integration, developer-only.** The opt-in application has
+a minimal pen-operated reader screen and an exclusive no-display lifecycle check. No customer
+build contains the engine. Background and plan:
 [markrai/ignite#22](https://github.com/markrai/ignite/issues/22).
 
 ## What is here
@@ -562,6 +563,64 @@ executing or packaging it. C.4B will add interactive transitions in the
 existing Home/notebook event loop, display ownership and real presentation
 confirmation. C.4C will harden suspend, restore and exit. Hardware
 qualification remains outstanding.
+
+### Reader display integration (C.4B)
+
+The feature-enabled application accepts a developer-only startup selection:
+
+```sh
+scribe-app --confirm-write --reader-display-book book.pdf --reader-display-root /absolute/reader-root
+```
+
+The root defaults to the proposed C.4A root. The selection is validated before
+physical initialization, against the configured notebook, sync and device roots
+and the protected default roots. Root and books must already exist. Ordinary
+builds refuse these flags. This is not a customer launcher option, and hosted
+stdin relay mode is refused. Do not run on hardware until supervised device
+qualification is arranged.
+
+After ordinary Home initialization, the reader takes exclusive control of the
+existing runtime's framebuffer and pen pump while the notebook controller is
+idle and disarmed. No second framebuffer, grab or pen-writing path is started.
+The regular notebook event loop is not dispatched while reading. The minimal
+top bar has PREV, HOME (with page count), and NEXT pen-tap regions; finger
+input is deliberately not interpreted in this slice. The reader requests the
+restored page only if there is a safe suggestion. Navigation uses absolute
+latest intent, bounded to the document's page count.
+
+The compositor validates the Gray8 buffer length, page index, viewport and
+framebuffer geometry before writing. It clears only the visible area and centers
+the rendered page below the top bar, respecting row stride and visible offsets.
+It uses the existing logical framebuffer convention and its platform-owned
+physical polarity conversion; pen coordinates use the existing calibrated
+rotation mapping. No extra full-frame copy is introduced by the compositor.
+
+The app confirms the display token only after the full GC16 send/wait returns
+success without a reported collision, and after checking for observed display
+invalidation and stop events before and after refresh. This is a software
+presentation contract, not proof of physical panel visibility. A failed or
+obsolete offer is discarded, not acknowledged. A later failed refresh does not
+replace the previously confirmed saved location. The reader retains a latest
+navigation intent while acknowledgment or persistence is in flight.
+
+HOME cancels outstanding renders and waits for the C.3C close barrier,
+including saving or retrying the last acknowledged position. Only then does the
+runtime join the reader worker, repaint Home and discard queued reader input
+before allowing notebook UI dispatch. Signal shutdown closes the reader before
+the notebook controller's existing shutdown. A reported display invalidation
+or restore event terminates this experimental session after closing rather than
+attempting to repaint on a lost display. Powerd monitoring must start
+successfully for this mode; missed events and watcher liveness are not yet
+qualified. A failed save may delay exit until storage recovers. A fatal
+coordinator error terminates the session rather than allowing unsafe handoff.
+
+Host regressions exercise actual coordinator/worker sessions with simulated
+presentation callbacks, padded framebuffer memory, coalesced and superseded
+navigation, failed refreshes, and close-before-handoff. The existing feature-on
+application link checks compile the physical adapter. No physical tests are
+claimed. C.4C must harden suspend/resume, watcher liveness, shutdown policy and
+handoff under physical input races. The polished reader library, book discovery,
+touch gestures and ordinary interactive entry from Home remain Phase D.
 
 ### Document identity ownership
 

@@ -93,6 +93,9 @@ use crate::touch::{
 };
 use crate::ui_gfx::{paper_background, Rect, UiPoint, BLACK};
 
+#[cfg(feature = "reader")]
+mod reader_display;
+
 type KindleCtrl = StrokeController<KindleTransport, RuntimeStore>;
 
 pub struct KindleTransport {
@@ -1013,6 +1016,8 @@ pub struct RuntimeConfig {
     /// library). With `--sync-dir` and no developer `config.json`, sync connects to the paired
     /// Scribe Server and Home shows SYNC.
     pub device_dir: Option<PathBuf>,
+    #[cfg(feature = "reader")]
+    reader_launch: Option<reader_display::Launch>,
 }
 
 /// Load `texts.jsonl` + `links.jsonl` and derive the overlay from that same texts vec.
@@ -4546,6 +4551,10 @@ pub fn run_page_session(
         println!("display_events=powerd watcher (lipc-wait-event; goingToScreenSaver→invalidate, exitingScreenSaver→restore)");
     } else {
         println!("display_events=none (first-contact fail-safe only)");
+        #[cfg(feature = "reader")]
+        if cfg.reader_launch.is_some() {
+            return abort_after_loading("reader display requires powerd monitoring");
+        }
     }
     let mut display_rx = DisplayEventReceiver::new(Arc::clone(&display_counters));
 
@@ -4804,6 +4813,59 @@ pub fn run_page_session(
     let mut inbound_apply_count = 0u64;
     let mut inbound_apply_max_us = 0u64;
     let mut initial_iteration_gate = crate::launch_health::InitialIterationGate::default();
+    #[cfg(feature = "reader")]
+    if let Some(launch) = cfg.reader_launch {
+        let result = reader_display::run(
+            launch,
+            reader_display::Devices {
+                ctrl: &mut ctrl,
+                input: &mut src,
+                touch: touch.as_ref(),
+                display: &mut display_rx,
+                calibration: &cal,
+                stop: &stop,
+            },
+        );
+        let result = result.and_then(|return_home| {
+            if !return_home {
+                return Ok(false);
+            }
+            let before = display_rx.take();
+            if before.invalidated || before.restored || stop.load(Ordering::SeqCst) {
+                return Err("reader handoff lost display ownership".into());
+            }
+            ctrl.transport_mut().render_home(
+                &launch_cards,
+                &ui.folders,
+                None,
+                None,
+                &ui.home,
+                None,
+            )?;
+            let after = display_rx.take();
+            if after.invalidated || after.restored || stop.load(Ordering::SeqCst) {
+                return Err("reader handoff lost display ownership".into());
+            }
+            reader_display::drain_after_reader(&mut src)?;
+            if let Some((pump, _)) = touch.as_ref() {
+                reader_display::drain_touch_after_reader(pump)?;
+            }
+            touch_arb.cancel();
+            let handoff = display_rx.take();
+            if handoff.invalidated || handoff.restored || stop.load(Ordering::SeqCst) {
+                return Err("reader handoff lost display ownership".into());
+            }
+            Ok(true)
+        });
+        match result {
+            Ok(true) => println!("reader_display_exit=home"),
+            Ok(false) => return finish_shutdown(&mut ctrl, true).0,
+            Err(error) => {
+                eprintln!("reader_display_failed detail={error}");
+                return finish_shutdown(&mut ctrl, false).0;
+            }
+        }
+    }
     let code = loop {
         crate::launch_diag::live().maybe_emit_stats();
         if stop.load(Ordering::SeqCst) {
@@ -6483,6 +6545,19 @@ pub fn default_config(
         .windows(2)
         .find(|w| w[0] == "--device-dir")
         .map(|w| PathBuf::from(&w[1]));
+    #[cfg(feature = "reader")]
+    let reader_launch = {
+        let mut protected = vec![
+            data_dir.as_path(),
+            Path::new(crate::store::DEFAULT_DATA_DIR),
+            Path::new("/mnt/us/scribe-app"),
+            Path::new("/mnt/us/scribe-sync"),
+            Path::new("/mnt/us/scribe-device"),
+        ];
+        protected.extend(sync_dir.as_deref());
+        protected.extend(device_dir.as_deref());
+        reader_display::Launch::parse(args, &protected)?
+    };
     Ok(RuntimeConfig {
         fb_path,
         stylus_path,
@@ -6497,5 +6572,7 @@ pub fn default_config(
         touch_path,
         sync_dir,
         device_dir,
+        #[cfg(feature = "reader")]
+        reader_launch,
     })
 }
