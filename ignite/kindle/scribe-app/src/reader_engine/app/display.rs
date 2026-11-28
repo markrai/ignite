@@ -4,6 +4,7 @@ use kindle_platform::FbGeometry;
 
 use super::{ModeError, ModeState, ReaderMode};
 use crate::reader_engine::coordinator::{CoordinatorError, Event};
+use crate::reader_engine::session::SaveStatus;
 use crate::reader_engine::worker::{PagePixels, PageRequestId};
 use crate::ui_gfx::{Canvas, Rect, BLACK, WHITE};
 
@@ -23,7 +24,7 @@ pub struct Viewport {
 
 impl Viewport {
     pub fn new(geo: &FbGeometry) -> Result<Self, String> {
-        if geo.xres < 12 || geo.yres < 16 {
+        if geo.xres < 60 || geo.yres < 56 {
             return Err("reader viewport is too small".into());
         }
         Ok(Self {
@@ -111,7 +112,7 @@ pub enum Notice {
     RenderFailed(String),
     DisplayFailed(String),
     SaveFailed(String),
-    SaveComplete,
+    SaveComplete(SaveStatus),
     Closed,
 }
 
@@ -237,7 +238,7 @@ impl ReaderScreen {
             Some(Event::SaveFailed(error)) => {
                 return Ok(Some(Notice::SaveFailed(format!("{error:?}"))));
             }
-            Some(Event::SaveComplete(_)) => return Ok(Some(Notice::SaveComplete)),
+            Some(Event::SaveComplete(status)) => return Ok(Some(Notice::SaveComplete(status))),
             Some(Event::Closed) => return Ok(Some(Notice::Closed)),
             Some(Event::AcknowledgeFailed(_) | Event::CloseFailed(_)) => {
                 return Err(ModeError::InvalidState);
